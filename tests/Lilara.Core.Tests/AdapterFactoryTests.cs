@@ -34,13 +34,22 @@ public class AdapterFactoryTests
     }
 
     [Fact]
-    public void Protocols_AreDistinctStrings()
+    public void Protocols_PinTheOnDiskWireValues()
     {
-        // ⚠️ 三个常量必须互不相同，且与 ClaudeAdapter.ProtocolId 一致——
-        // 否则 AdapterFactory 的分派与适配器自身的守卫会对不上（这正是之前
-        // 「Repl 硬编码 claude-messages」那类缺陷的同一个坑）。
-        Assert.Equal(ClaudeAdapter.ProtocolId, Protocols.ClaudeMessages);
-        Assert.Equal(3, new[] { Protocols.ClaudeMessages, Protocols.OpenAiChat, Protocols.OpenAiResponses }
-            .Distinct().Count());
+        // ⚠️ 这里**故意写死字面量**，不引用 `Protocols.*` 常量。
+        //
+        // 这些字符串会落盘（spec.json 的 model.protocol、providers/*.json 的 protocol）。
+        // 如果断言也走常量，那么「常量被人改了」在**类型系统内自洽、在测试里也自洽**——
+        // 唯一的症状是用户既有的 providers 文件突然不认了，而那已经是运行期故障。
+        //
+        // 所以：**落盘的字符串，必须由测试按字面量守。**
+        // 这与「单一来源」的直觉相悖，但常量在这里是被测对象，不是参照物——
+        // 就像断言 API 的线上契约时，不该引用自己的常量。
+        Assert.Equal("claude-messages", Protocols.ClaudeMessages);
+        Assert.Equal("openai-chat", Protocols.OpenAiChat);
+        Assert.Equal("openai-responses", Protocols.OpenAiResponses);
+
+        // 且必须互不相同（重复的 switch 臂常量本来就是编译错误，这里是行为层的双保险）
+        Assert.Equal(3, Protocols.All.Distinct().Count());
     }
 }

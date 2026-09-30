@@ -16,6 +16,16 @@ public class ReasoningPolicyTests
     }
 
     [Fact]
+    public void CanCarry_IsKeyedOnTheOnDiskProtocolStrings()
+    {
+        // ⚠️ 同样故意写字面量：这两个字符串会落盘，改动即迁移。
+        // 若这里改用 Protocols.* 常量，篡改常量就没人发现了（见 AdapterFactoryTests 的同名理由）。
+        Assert.False(ReasoningPolicy.CanCarry("openai-chat"));
+        Assert.False(ReasoningPolicy.CanCarry("openai-responses"));
+        Assert.True(ReasoningPolicy.CanCarry("claude-messages"));
+    }
+
+    [Fact]
     public void CanReplayBlock_RequiresASignature()
     {
         // ⚠️ **实测发现，本任务的核心**：
