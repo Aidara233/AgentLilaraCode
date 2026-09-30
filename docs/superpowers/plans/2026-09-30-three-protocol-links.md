@@ -296,14 +296,29 @@ git commit -m "feat(core): 认证方式归提供商配置（网关要 Bearer，�
     }
 
     [Fact]
-    public void StableSerialize_ProducesIdenticalBytesForIdenticalInput()
+    public void StableSerialize_KeepsTheDiscriminator()
     {
-        // ⚠️ 前缀稳定性的地基：同一内容两次渲染必须逐字节相同。
-        // 这条测试是「不依赖字典枚举序」的守卫。
-        var a = new Block.TextBlock("你好");
-        var b = new Block.TextBlock("你好");
+        // ⚠️ 这条测试是「静态类型陷阱」的守卫。
+        // 实测：`Serialize<Block>(b)` 会带上判别式 `"kind"`，而 `Serialize(b)`
+        // （泛型推断成 `TextBlock`）**会把判别式整个丢掉** —— 出站 JSON 变成 `{"text":"hi"}`。
+        // 所以 `StableSerialize` 的参数类型必须是 `Block`，不能是泛型 `T`。
+        //
+        // ⚠️ 计划早期版本的测试写的是
+        //     var a = new Block.TextBlock("你好"); var b = new Block.TextBlock("你好");
+        //     Assert.Equal(Json.StableSerialize(a), Json.StableSerialize(b));
+        // —— 两个操作数**推断出同一个静态类型**，于是**必然相等**，
+        // 判别式丢了也照样绿。那是条**空转的测试**。
+        Assert.Contains("\"kind\":\"text\"", Json.StableSerialize(new Block.TextBlock("你好")));
+        Assert.Contains("\"kind\":\"reasoning\"", Json.StableSerialize(new Block.ReasoningBlock("s", "想")));
+    }
 
-        Assert.Equal(Json.StableSerialize(a), Json.StableSerialize(b));
+    [Fact]
+    public void StableSerialize_IsByteStable()
+    {
+        // 同一内容两次渲染逐字节相同——不依赖字典枚举序
+        Assert.Equal(
+            Json.StableSerialize(new Block.TextBlock("你好")),
+            Json.StableSerialize(new Block.TextBlock("你好")));
     }
 ```
 
@@ -340,12 +355,13 @@ Expected: FAIL — `CS7036: 没有为必需参数 'Signature' 提供参数` / `C
 
 ```csharp
     /// <summary>
-    /// 稳定序列化入口。**所有出站渲染都走这里**。
-    /// ⚠️ 存在的理由：`JsonSerializer` 对同一类型的键序虽然目前稳定，
-    /// 但那是实现细节；而前缀稳定性要求**逐字节可预期**。
-    /// 这里把「稳定」变成一个被测试钉住的**承诺**，而不是对 BCL 的信任。
+    /// 稳定序列化入口。**参数类型必须是 `Block`（基类），不能写成泛型 `T`。**
+    /// ⚠️ 实测：`JsonSerializer.Serialize<Block>(b)` 会带上判别式 `"kind"`；
+    /// 而 `Serialize(b)` 泛型推断成具体子类 `TextBlock` 时，**判别式整个丢掉** ——
+    /// 出站 JSON 变成 `{"text":"hi"}`，反序列化时就认不出这是哪种块了。
+    /// 这正是「静态类型决定序列化形状」的陷阱，而它是静默的。
     /// </summary>
-    public static string StableSerialize<T>(T value) =>
+    public static string StableSerialize(Block value) =>
         JsonSerializer.Serialize(value, Options);
 ```
 
@@ -370,21 +386,25 @@ git commit -m "feat(core): 推理块加 Kind、Signature 可空；加稳定序�
 
 ### Task 3: 推理块的**协议能力表**（纯逻辑，无 HTTP）
 
-**为什么**：三条链路对推理块的**能力不同**——Claude 能承载（且要求逐字回传），Chat / Responses 不能。这个判断必须是**一个显式的地方**，而不是散在三个适配器里的 `if`。
+> ⚠️ **本任务在实现中被实测推翻过一次设计，这里是重写后的版本。** 原设计假设「Claude 一定回传完整推理块」，
+> 但实测发现：**`ThinkingBlockParam.Signature` 与 `.Thinking` 都是 `required`，且该类只有无参构造器**
+> ——「不带 signature 的 thinking 块」在 Anthropic 线上**根本无法表达**。
+> 而本机网关的 `deepseek-flash` **恰恰不返回 signature**。详见 Step 4。
+
+**为什么**：三条链路对推理块的**能力不同**（Chat / Responses 根本不暴露推理），
+且**能承载的那个（Claude）还有前提条件**。这个判断必须是**一个显式的地方**，而不是散在适配器里的 `if`。
 
 **Files:**
 - Create: `src/Lilara.Core/Canonical/ReasoningPolicy.cs`
+- Modify: `src/Lilara.Core/Adapters/Claude/ClaudeRequestBuilder.cs`（修构建阻断）
 - Test: `tests/Lilara.Core.Tests/ReasoningPolicyTests.cs`
 
 **Interfaces:**
 - Consumes: `Block.ReasoningBlock`（Task 2）
 - Produces:
-  - `Lilara.Core.Canonical.ReasoningPolicy.CanReplay(string protocol) → bool`
+  - `Lilara.Core.Canonical.ReasoningPolicy.CanCarry(string protocol) → bool`
+  - `Lilara.Core.Canonical.ReasoningPolicy.CanReplayBlock(Block.ReasoningBlock, string protocol) → bool`
   - `Lilara.Core.Canonical.ReasoningPolicy.FilterFor(IReadOnlyList<Block>, string protocol) → IReadOnlyList<Block>`
-  - ⚠️ **顺带修一处会阻断构建的既有缺陷**（见 Step 3.5）：`ClaudeRequestBuilder` 里
-    `new ThinkingBlockParam { Signature = r.Signature }` 现在赋的是可空值，
-    而实测 `ThinkingBlockParam.Signature` 是 **`NotNull`** → `CS8601` → 在 `TreatWarningsAsErrors` 下**构建失败**。
-    这是 Task 2 把 `Signature` 改成可空**之前**就存在的隐患（旧记录是全参构造，一直非空所以没暴露）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -399,11 +419,40 @@ public class ReasoningPolicyTests
     [InlineData("claude-messages", true)]
     [InlineData("openai-chat", false)]
     [InlineData("openai-responses", false)]
-    public void CanReplay_MatchesWhatEachProtocolActuallyCarries(string protocol, bool expected)
+    public void CanCarry_MatchesWhatEachProtocolActuallyCarries(string protocol, bool expected)
     {
         // ⚠️ 实测：Claude 的 content 里有 thinking 块；Chat 只有 content；
         // Responses 的 output 只有 message/output_text。后两者**不暴露推理**。
-        Assert.Equal(expected, ReasoningPolicy.CanReplay(protocol));
+        Assert.Equal(expected, ReasoningPolicy.CanCarry(protocol));
+    }
+
+    [Fact]
+    public void CanReplayBlock_RequiresASignature()
+    {
+        // ⚠️ **实测发现，本任务的核心**：
+        // `ThinkingBlockParam.Signature` 与 `.Thinking` 都是 `required`，且该类**只有无参构造器**
+        // ——「不带 signature 的 thinking 块」在 Anthropic 线上**无法表达**。
+        // 而本机网关的 deepseek-flash **不返回 signature**。
+        // ⇒ 无签名的推理块，**发不出去**。这不是我们保守，是协议本身没有那个形状。
+        Assert.True(ReasoningPolicy.CanReplayBlock(new Block.ReasoningBlock("sig", "想"), "claude-messages"));
+        Assert.False(ReasoningPolicy.CanReplayBlock(new Block.ReasoningBlock(null, "想"), "claude-messages"));
+    }
+
+    [Fact]
+    public void FilterFor_DropsUnsignedReasoningEvenForClaude()
+    {
+        // ⚠️ 修正后的行为：签名缺失 → 发不出去 → 丢。
+        // 本机网关的 deepseek-flash 就落在这个分支里——**每一条推理都被丢**。
+        var blocks = new List<Block>
+        {
+            new Block.ReasoningBlock(null, "无签名的思考"),
+            new Block.TextBlock("答案"),
+        };
+
+        var filtered = ReasoningPolicy.FilterFor(blocks, "claude-messages");
+
+        Assert.Single(filtered);
+        Assert.IsType<Block.TextBlock>(filtered[0]);
     }
 
     [Fact]
@@ -480,14 +529,14 @@ namespace Lilara.Core.Canonical;
 /// ⚠️ 这是「协议怪癖」的一种（`00` §1.2），但它是**纯数据**，所以放在 canonical 旁边，
 /// 让三个适配器读同一份判断。
 ///
-/// 规则来源（ApiPlan spec §10.2，实测印证）：
-/// - Claude：content 支持 thinking 块 → **能承载，且要求逐字回传**。
-/// - Chat / Responses：**不暴露推理**（实测两者返回体里都没有推理字段）
-///   → 不能承载，**丢就是不丢，绝不伪造**。
+/// 规则来源（ApiPlan spec §10.2 + 控制器实测）：
+/// - Claude：content 里有 thinking 块 → **能承载**；⚠️ 但**要求 signature**
+///   （`ThinkingBlockParam.Signature` 是 `required`，见 `CanReplayBlock`）。
+/// - Chat / Responses：**完全不暴露推理** → 不能承载，**丢且不伪造**。
 /// </summary>
 public static class ReasoningPolicy
 {
-    public static bool CanReplay(string protocol) => protocol switch
+    public static bool CanCarry(string protocol) => protocol switch
     {
         "claude-messages" => true,
         "openai-chat" => false,
@@ -496,14 +545,25 @@ public static class ReasoningPolicy
     };
 
     /// <summary>
-    /// 按目标协议过滤块列表。**保序**。
-    /// ⚠️ 过滤后可能为空——调用方必须能处理空列表（见 Review Focus #2）。
+    /// 这个推理块**发得出去吗**。
+    /// ⚠️ 实测确认的硬约束：`ThinkingBlockParam` 的 `Signature` 与 `Thinking` 都是 `required`，
+    /// 且该类**没有不带 signature 的构造重载** —— 无签名的 thinking 块在 Anthropic 线上
+    /// **无法表达**。而本机网关的 `deepseek-flash` 恰好**不返回 signature**。
+    /// 所以无签名 = 发不出去 = 只能丢。**这不是保守，是协议没有那个形状。**
     /// </summary>
-    public static IReadOnlyList<Block> FilterFor(IReadOnlyList<Block> blocks, string protocol)
-    {
-        if (CanReplay(protocol)) return blocks;
-        return blocks.Where(b => b is not Block.ReasoningBlock).ToList();
-    }
+    public static bool CanReplayBlock(Block.ReasoningBlock block, string protocol) =>
+        CanCarry(protocol) && block.Signature is not null;
+
+    /// <summary>
+    /// 按目标协议过滤块列表。**保序**。
+    /// ⚠️ 过滤后可能为空——调用方必须能处理（见 Review Focus #2：推理模型可能只有思考没有正文）。
+    /// </summary>
+    public static IReadOnlyList<Block> FilterFor(IReadOnlyList<Block> blocks, string protocol) =>
+        blocks.Where(b => b switch
+        {
+            Block.ReasoningBlock r => CanReplayBlock(r, protocol),
+            _ => true,
+        }).ToList();
 }
 ```
 
@@ -515,33 +575,52 @@ dotnet test --filter "FullyQualifiedName~ReasoningPolicyTests"
 
 Expected: PASS
 
-- [ ] **Step 5: 顺带修一处构建阻断（实测确认的 SDK 约束）**
+- [ ] **Step 5: 修 `ClaudeRequestBuilder` 的构建阻断**
 
-⚠️ **实测**：`ThinkingBlockParam.Signature` 的可空性是 **`NotNull`**（探针读的 `NullabilityInfoContext`）。而 Task 2 之后 `ReasoningBlock.Signature` 是**可空**的。于是 `ClaudeRequestBuilder` 里这一句：
+⚠️ **实测三件事，把计划早期的写法全部否掉了：**
+1. `ThinkingBlockParam.Signature` 是可空性 **`NotNull`** 且带 **`RequiredMemberAttribute`**；
+2. 该类**只有无参构造器**（另两个接受 `ThinkingBlockParam` 自身 / `IReadOnlyDictionary`），**没有「不带 signature」的重载**；
+3. 所以 Task 2 之后 `new ThinkingBlockParam { Thinking = r.Text, Signature = r.Signature }` 会 **`CS8601`**，`TreatWarningsAsErrors` 下**构建失败**。
+
+三种看起来能救的写法**全是错的**：
 
 ```csharp
-content.Add(new ThinkingBlockParam { Thinking = r.Text, Signature = r.Signature });
+// ❌ CS8601：Signature 可空，属性非空
+new ThinkingBlockParam { Thinking = r.Text, Signature = r.Signature }
+
+// ❌ 对编译器撒谎：`!` 压制的是**真会发生**的 null（本机网关就不返回 signature）
+new ThinkingBlockParam { Thinking = r.Text, Signature = r.Signature! }
+
+// ❌ CS9035：Signature 是 required 成员，不能省
+new ThinkingBlockParam { Thinking = r.Text }
 ```
 
-会产生 **`CS8601`（可能的 null 引用赋值）**，而 `TreatWarningsAsErrors` 把它变成**构建失败**。
-
-⚠️ **但这里不能简单用 `!` 糊过去**——那是在骗编译器：`Signature` 真的可能是 null（本机网关的 `deepseek-flash` 就不返回）。**正确做法是按有没有 signature 分两种形状**，这也正是真 Anthropic 与这个网关的实际差别：
+**正确做法：走 `ReasoningPolicy`，发不出去的就丢。** 这正是能力表存在的意义：
 
 ```csharp
                 case CanonicalBlock.ReasoningBlock r:
-                    // ⚠️ 上游对 signature 的态度分两种，实测确认：
-                    //   · 真 Anthropic：signature 是不透明凭据，**必须原样回传**，丢了会被拒
-                    //   · 本机网关（deepseek-flash）：**根本不返回 signature**
-                    // 所以不能无条件赋——`ThinkingBlockParam.Signature` 是非空的（实测），
-                    // 赋 null 会 CS8601；而用 `!` 压制就是**在骗编译器**，因为 null 是真的会发生。
-                    // 按「有没有」分形状，两条路各自正确。
-                    content.Add(r.Signature is null
-                        ? new ThinkingBlockParam { Thinking = r.Text }
-                        : new ThinkingBlockParam { Thinking = r.Text, Signature = r.Signature });
+                    // ⚠️ 必须过能力表：签名缺失时**发不出去**（见 ReasoningPolicy.CanReplayBlock）。
+                    // 实测：ThinkingBlockParam 的 Signature 是 required 且类无无参外构造器——
+                    // 既不能赋 null（CS8601），也不能用 `null!` 骗编译器（null 是真会发生的），
+                    // 更不能省掉（CS9035）。丢弃是**协议本身的限制**，不是我们的取舍。
+                    if (!ReasoningPolicy.CanReplayBlock(r, request.Protocol))
+                        break;
+
+                    content.Add(new ThinkingBlockParam
+                    {
+                        Thinking = r.Text,
+                        // ⚠️ 这里的 `!` 与上面那个被否掉的**不是一回事**：
+                        // CanReplayBlock 刚刚确认过 Signature is not null，所以压制是有依据的。
+                        // 别把它当惯例——下一个人看到它要知道为什么合法。
+                        Signature = r.Signature!,
+                    });
                     break;
 ```
 
-⚠️ 若 `new ThinkingBlockParam { Thinking = r.Text }` 因缺 `Signature` 报 `CS9035`（必需成员），改用 SDK 的构造器重载或 `required` 之外的写法——**让编译器告诉你**，别猜。把实际写法记进报告。
+⚠️ **副作用要认**（实现者报告过，控制器确认）：一条**只有无签名推理**的消息，过滤后为空 →
+撞上既有的空消息守卫 `throw new ArgumentException("时间线里有空消息…")`。
+**这是对的**——那种消息对上游没有任何内容。但它把 Review Focus #2 从「理论」变成**常态**：
+本机网关每一轮都走这条路，因为 `deepseek-flash` 的推理**全部无签名**。
 
 - [ ] **Step 6: 跑全量，确认没有回归**
 
@@ -549,13 +628,13 @@ content.Add(new ThinkingBlockParam { Thinking = r.Text, Signature = r.Signature 
 dotnet test
 ```
 
-Expected: PASS（全量 129+ 条）
+Expected: PASS（全量）
 
 - [ ] **Step 7: 提交**
 
 ```bash
 git add -A
-git commit -m "feat(core): 推理块的协议能力表 + 按 signature 有无分形状回传"
+git commit -m "feat(core): 推理块协议能力表（Claude 还需签名；无签名发不出去）"
 ```
 
 ---
