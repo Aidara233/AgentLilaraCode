@@ -12,7 +12,13 @@ let core = "http://127.0.0.1:7788";
 let ws = null;
 let current = null;
 const sessions = new Map();   // sessionId -> { projectKey }
-let seq = 0;
+let currentProject = null;
+
+// ⚠️ **游标必须每流一个**（`03` §7 / `05` §6.2：「每个订阅流各自一个游标」）。
+// 第一版用**一个全局 `seq`**——切到另一个会话时，它的事件从小号开始，
+// 会被 `frame.seq <= seq` **静默丢掉**，直到追上前一个会话的水位。
+// 那就是「头少了一步而它不知道」，正是文档反复要防的那类。
+const cursors = new Map();    // topic -> lastSeq
 
 // ---- 会话（05 §6.1：全局会话列表是**派生**的——对每个 pk 取 sessions 的并集） ----
 
@@ -21,6 +27,7 @@ async function loadSessions() {
   sessions.clear();
 
   for (const pk of projects) {
+    if (currentProject === null) currentProject = pk;   // 最小实现只跟第一个项目
     const ids = await (await fetch(`${core}/projects/${pk}/sessions`)).json();
     for (const id of ids) sessions.set(id, { projectKey: pk });
   }
@@ -112,6 +119,11 @@ function connect() {
 
   ws.onopen = () => {
     $("status").textContent = "已连接";
+
+    // ⚠️ **项目流**：全局会话列表是**派生**的（`05` §6.1），靠 `session.created` 更新。
+    // 不订它的话，在**控制台**敲 `session create`，这个页面看不见新会话，且不会自愈。
+    ws.send(JSON.stringify({ kind: "subscribe", topic: `project:${currentProject}` }));
+
     if (current) {
       // 重连：核心那边的事件缓冲有界，我们**不假装记得**游标——
       // 直接重新拉快照重建（`03` §7 说这是**唯一**该有的降级路径）。
@@ -139,23 +151,25 @@ function connect() {
     if (frame.kind === "resync_required") {
       // ⚠️ 跟不上 ⇒ 拉快照重建。**不发明「部分合并」**——那是另一套状态机，必然与快照对不齐。
       renderMeta("（事件跟不上，已重新拉取快照）");
-      if (current) openSession(current);
+      cursors.delete(frame.topic);
+      if (current && frame.topic === `session:${current}`) openSession(current);
       return;
     }
 
     if (frame.kind !== "event") return;
 
-    // ⚠️ 事件按 `seq` 单调（`03` §4）。这里**只做丢弃重复**（重连时可能重放），
-    // 不做排序——排序是核心的保证，头乱排只会掩盖核心的 bug。
-    if (frame.seq <= seq) return;
-    seq = frame.seq;
+    // ⚠️ **每流独立的游标**（`03` §7）。只做丢弃重复（重连时可能重放），
+    // **不排序**——排序是核心的保证，头乱排只会掩盖核心的 bug。
+    if (frame.seq <= (cursors.get(frame.topic) ?? 0)) return;
+    cursors.set(frame.topic, frame.seq);
+
+    // ⚠️ 项目流上的事件不带 sessionId 语义（它是跨会话那一层）
+    if (frame.topic.startsWith("project:")) {
+      if (frame.payload.kind === "session.created") loadSessions();
+      return;
+    }
 
     handleEvent(frame.payload);
-
-    // ⚠️ 会话列表是**派生**的：新会话出生时刷新它。
-    if (frame.payload.kind === "session.created" && !sessions.has(frame.payload.sessionId)) {
-      loadSessions();
-    }
   };
 }
 

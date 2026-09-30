@@ -98,6 +98,14 @@ public sealed class ControlServer(
         {
             if (!TryFind(id, out var handle)) return Results.NotFound();
 
+            // ⚠️ **先取高水位，再取内容。** 反过来的话，落在「取内容 → 取高水位」
+            // 那段时间里的事件**既不在快照里、也不会被补发**（因为 seq ≤ highWater）⇒
+            // 头**永久少一条**，而且它没办法发现。
+            // ⚠️ 宁可**重**不可**漏**：重可以被头去重（`seq` 是单调的），漏不行。
+            // 第一版写反了，而注释还声称「那个窗口就关上了」——**那句话是过度声称**：
+            // 它只关掉了「快照 → 订阅」那一段，没关掉这一段。
+            var highWater = bus.HighWaterMark(EventBus.SessionTopic(id));
+
             // ⚠️ **先查内存激活表**（`SessionQueries.StateOf`）——读磁盘会在**步进行中报 Idle**，
             // 于是头渲染「空闲」⇒ 用户以为没在跑 ⇒ **再点一次发送** ⇒ 队列两条 ⇒ 烧钱。
             //
@@ -111,7 +119,7 @@ public sealed class ControlServer(
                 {
                     handle.SessionId,
                     State = SessionQueries.StateOf(host, handle),
-                    HighWater = bus.HighWaterMark(EventBus.SessionTopic(id)),
+                    HighWater = highWater,
                     Slots = new
                     {
                         System = Array.Empty<object>(),
@@ -125,6 +133,9 @@ public sealed class ControlServer(
         {
             if (!TryFind(id, out var handle)) return Results.NotFound();
 
+            // ⚠️ 同 `/state`：**先高水位、后内容**，理由见那里。
+            var highWater = bus.HighWaterMark(EventBus.SessionTopic(id));
+
             // ⚠️ 返回的是**当前可渲染的形态**（`05` §3「核心渲染，头只显示」）。
             // 倒查语义（`01` §12.4：≥R 原文 / <R 简化）在**核心侧**完成，头不需要知道 R 在哪。
             // ⚠️ 现在还没有简化机制，所以这一步是恒等的——但**接口形状已经对了**，
@@ -133,7 +144,7 @@ public sealed class ControlServer(
 
             return Results.Json(new
             {
-                highWater = bus.HighWaterMark(EventBus.SessionTopic(id)),
+                highWater,
                 rendered = events.Select(Render).ToList(),
             }, WireJson.Options);
         });
@@ -202,7 +213,17 @@ public sealed class ControlServer(
         var pumps = new List<Task>();
         void Subscribe(string topic, long? since)
         {
-            if (subs.ContainsKey(topic)) return;
+            // ⚠️ **重复订阅必须换掉那条旧的，不能直接 return。**
+            // 第一版写的是 `if (subs.ContainsKey(topic)) return;`——于是一条**已经死掉的**订阅
+            // 会永远占着位置：resync 时 `EventBus` 已经 `TryComplete()` 了那条 channel，
+            // 泵随之结束，头按设计重新 subscribe ⇒ 被这里挡回去 ⇒ **该 topic 从此收不到任何事件**。
+            // 而 `03` §7 说得很清楚：resync 是**唯一**的降级路径——那条路径因此是死的。
+            // 症状更坏的地方在于头**不会发现自己停了**（socket 是健康的，它只是安静）。
+            if (subs.TryGetValue(topic, out var stale))
+            {
+                stale.Dispose();
+                subs.Remove(topic);
+            }
 
             var sub = bus.Subscribe(topic, since);
             subs[topic] = sub;
@@ -265,24 +286,45 @@ public sealed class ControlServer(
     private async Task HandleClientFrameAsync(
         string json, Action<string, long?> subscribe, Func<WireFrame, Task> send, CancellationToken ct)
     {
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-
-        if (!root.TryGetProperty("kind", out var kind)) return;
-
-        switch (kind.GetString())
+        // ⚠️ **整帧解析都要在兜底里。**
+        // 第一版只把 `payload` 的**内容**解析包了 try，而 `JsonDocument.Parse`、
+        // `GetProperty("topic")`、`GetProperty("id")`、`GetProperty("payload")` 都在外面——
+        // 实测三种畸形帧（无 `id`、无 `topic`、根本不是 JSON）都会让 socket 变成 `Aborted`。
+        // 而 `05` §1.1 明说**头是可以整个换掉的**：一个第三方头发错一帧，
+        // 不该让整条连接（以及它上面所有订阅）一起死掉。
+        // ⚠️ 也与既有测试的不变量一致：`WebSocket_RejectsAMalformedCommandWithoutClosingTheSocket`
+        // 断言「socket 还活着」——但它只喂了一条**形状合法、会话不存在**的命令，
+        // 判据比测试覆盖的边界窄得多（这是那次的教训）。
+        JsonElement root;
+        try
         {
-            case "subscribe":
-                subscribe(
-                    root.GetProperty("topic").GetString()!,
-                    root.TryGetProperty("since", out var since) && since.ValueKind == JsonValueKind.Number
-                        ? since.GetInt64() : null);
-                break;
+            root = JsonDocument.Parse(json).RootElement.Clone();
+            if (!root.TryGetProperty("kind", out var kind)) return;
+            var k = kind.GetString();
 
-            case "command":
-                await HandleCommandAsync(root, send, ct);
-                break;
+            switch (k)
+            {
+                case "subscribe":
+                    subscribe(root.GetProperty("topic").GetString()!, OptSince(root));
+                    break;
+
+                case "command":
+                    await HandleCommandAsync(root, send, ct);
+                    break;
+
+                default:
+                    await send(new WireFrame.Ack("?", false, null, $"认不出的帧 kind='{k}'", null));
+                    break;
+            }
         }
+        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
+        {
+            // 畸形帧：**回一句人话，连接留着**。
+            await send(new WireFrame.Ack("?", false, null, $"帧形状不对：{ex.Message}", null));
+        }
+
+        static long? OptSince(JsonElement e) =>
+            e.TryGetProperty("since", out var s) && s.ValueKind == JsonValueKind.Number ? s.GetInt64() : null;
     }
 
     /// <summary>

@@ -34,13 +34,11 @@ public class EventBusTests
     /// <para>⇒ 判据是「订阅者收到的 seq **严格递增**」（而不只是「不重复」：
     /// 不重复却乱序，同样是那个洞）。多生产者并发压，才试得出来。</para>
     ///
-    /// <para>⚠️ **这条测试的区分力实测过，边界如下，别高估它**：
-    /// <list type="bullet">
-    ///   <item>**抓得住**：把 fan-out 挪出锁（锁只罩 seq 分配）⇒ **3/3 红**。</item>
-    ///   <item>**抓不住**：只把 seq 分配挪出锁而投递仍在锁内。那个窗口只有几条指令宽，
-    ///     控制器用 **32 线程 × 200 事件 × 200 轮**压测也**从未复现**。
-    ///     ⇒ 全绿**不等于**那样写安全；那条约束是按推理守的，见 `EventBus` 的类注释。</item>
-    /// </list></para>
+    /// <para>⚠️ **区分力实测过（两次都跑了）**：把 seq 分配挪到 `lock` **之前** ⇒ **红**；
+    /// 把 fan-out 挪出锁 ⇒ **红**。</para>
+    /// <para>⚠️ 作者曾在这里写下「抓不住 seq 分配挪出锁」，**那是错的**——
+    /// 他的两次「变异存活」都是量错了对象：一次把 `Interlocked` 写在**锁内**（语义空操作），
+    /// 一次探针在**还原之后**才跑。**⇒ 报「存活」之前先确认变异真的落上、且跑的是变异版。**</para>
     /// </summary>
     [Fact]
     public async Task ConcurrentPublishers_DeliverStrictlyIncreasingSeq()
@@ -197,5 +195,29 @@ public class EventBusTests
 
         Assert.Equal(1, bus.HighWaterMark(EventBus.SessionTopic("a")));
         Assert.Equal(1, bus.HighWaterMark(EventBus.SessionTopic("b")));
+    }
+
+    /// <summary>
+    /// ⚠️ **复审抓到的真缺陷**：补发时 `TryWrite` 的返回值被丢掉了。
+    /// 要补的条数落在 <c>(subscriptionCapacity, topicCapacity]</c> 之间时，resync 判据
+    /// **不触发**（缓冲里够得着），前 N 条进队列、**其余的写失败且被无视**，
+    /// `NeedsResync` 还是 false ⇒ 头**静默少一段**——正是本类开头警告的那个洞。
+    /// <para>⚠️ 判据是「缺口要么被补上、要么**明说**跟不上」，不能两者都没有。</para>
+    /// </summary>
+    [Fact]
+    public void Subscribe_ReplayBiggerThanTheQueue_ReportsResyncInsteadOfTruncatingSilently()
+    {
+        var bus = new EventBus(topicCapacity: 512, subscriptionCapacity: 256);
+        for (var i = 0; i < 400; i++) bus.Publish(EventBus.SessionTopic("t"), Evt($"{i}"));
+
+        // 要补 300 条，而订阅队列只有 256
+        using var sub = bus.Subscribe(EventBus.SessionTopic("t"), since: 100);
+
+        var got = 0;
+        while (sub.Reader.TryRead(out _)) got++;
+
+        // ⚠️ 要么补齐，要么标 resync。**只有「256 且 NeedsResync=false」才是缺陷。**
+        Assert.True(got == 300 || sub.NeedsResync,
+            $"补发被静默截断：拿到 {got} 条、NeedsResync={sub.NeedsResync}（两者必居其一）");
     }
 }

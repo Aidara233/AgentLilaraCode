@@ -117,6 +117,17 @@ public sealed class CommandDispatcher(
         // 登记进激活表——快照端点据此避免读到盘上过期的 Idle（见 CoreHost.TryGetActivated）。
         _host.Register(handle);
 
+        // ⚠️ **`session.created` 必须发**——`05` §6.1 要求头的「全局会话列表」随事件更新，
+        // 而那份列表是**派生**的（对每个 pk 取 sessions 的并集，核心不存它）。
+        // 第一版**声明并注册了这个事件类型却从没发布**，于是：在控制台敲 `session create`，
+        // 已经打开的页面**看不见**这个新会话，而且不会自愈。
+        // ⚠️ 它同时发到**项目 topic**（跨会话那一层）与**会话 topic**——
+        // 头订的是前者（它还不可能知道这个新会话的 id），而后者让「刚订阅上就活起来」成立。
+        _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
+            new WireEvent.SessionCreated(handle.SessionId, handle.ProjectKey));
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.SessionCreated(handle.SessionId, handle.ProjectKey));
+
         // ⚠️ 分配型命令**必须**回传新身份，否则后续命令无从指涉（03 §2 的唯一例外）。
         return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = handle.SessionId });
     }
@@ -210,9 +221,22 @@ public sealed class CommandDispatcher(
         _host.SetCts(handle.SessionId, stepCts);
 
         var gate = _host.GateFor(handle.SessionId);
+
+        // ⚠️ **「我拿到了闸」必须是显式记录的，不能靠 `gate.CurrentCount == 0` 去猜。**
+        // 第一版在 finally 里写 `if (gate.CurrentCount == 0) gate.Release();`——
+        // 那判的是**闸的当前状态**，不是**本方法的持有记录**。窄路径：
+        //   `WaitAsync` 在**没拿到**闸时抛 OCE（已取消的 token）⇒ 走到 finally
+        //   ⇒ `ExitStep()` **先**放行了下一次推进，新步拿到闸（count→0）
+        //   ⇒ 本步读到 0（那是**别人的**）⇒ 多还一次 ⇒ 第三个步也能进来。
+        // 一次虚假 `Release` 就打破 `02` §3.2「会话内严格串行」这条正确性条款，
+        // 后果是两步并发写 `handle.State`（`Turn` 丢更新）与并发 `DrainQueue`。
+        // ⚠️ 纪律：**没实际跑出过复现**（窗口只有几条指令宽），这是靠**代码审查**定的——
+        // 用状态代理所有权本来就是错的，不需要复现才修。
+        var acquired = false;
         try
         {
             await gate.WaitAsync(stepCts.Token);
+            acquired = true;
 
             // ⚠️ **`step.begin` 是「在跑」的唯一信号源**，不是 `session.state`——
             // 后者是磁盘的镜像，而**磁盘从不存 Running**（`Stepper` 只把它写进内存）。
@@ -250,9 +274,12 @@ public sealed class CommandDispatcher(
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                 new WireEvent.Error(handle.SessionId, ex.Message));
 
-            // ⚠️ 后台路**必须吞掉异常**：`Task.Run` 里逃出去的异常是
-            // **未观测异常**，在 .NET 上会**直接终结进程**。一个上游 400
-            // 不该让整个核心死掉。
+            // ⚠️ 后台路**必须吞掉异常**：`Task.Run` 里逃出去的是**未观测异常**。
+            // ⚠️ 理由要写准：自 .NET 4.5 起未观测的任务异常**默认被吞**、**不终结进程**
+            //   （`TaskScheduler.UnobservedTaskException` 只记日志）。所以**不是**「会打死进程」。
+            // 真正的理由是：那条异常**到一个没人看的地方去了**——头只会看到
+            //   「步开始了但永远等不到 `step.end`」，而用户拿到的是次静默失败。
+            // ⇒ 必须**显式**捕获并**发成 `error` 事件**，让失败**可见**。
             if (throwOnFailure) throw new DispatchException(ex.Message, ex);
             return null;
         }
@@ -260,7 +287,8 @@ public sealed class CommandDispatcher(
         {
             _host.SetCts(handle.SessionId, null);   // 先摘掉，再让 using 释放
             handle.ExitStep();
-            if (gate.CurrentCount == 0) gate.Release();
+            // ⚠️ 按**记录**释放，不按状态猜——见上面 `acquired` 的注释。
+            if (acquired) gate.Release();
         }
     }
 

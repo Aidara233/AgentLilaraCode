@@ -185,4 +185,41 @@ public class QueueSemanticsTests : IDisposable
             };
         }
     }
+
+    /// <summary>
+    /// ⚠️ **复审抓到的真缺陷（Critical）**：`TryEnterStep` 第一版是
+    /// `!_running &amp;&amp; (_running = true)`——**读改写不是原子的**，
+    /// 两个线程都读到 false ⇒ **都返回 true** ⇒ 两次推进都被安排上。
+    /// `volatile` 只保**可见性**，不保**原子性**。
+    ///
+    /// <para>症状正是 Task 4 花大力气修掉的那个（「连发 N 条只调一次模型」失效），
+    /// 而信号量把两次推进**串起来**，所以看起来不像并发 bug，只像「偶尔多烧一次钱」。
+    /// 可达路径：控制台（同步路）与头（后台路）同时对同一会话发送。</para>
+    ///
+    /// <para>⚠️ 这条测的是**原子性**（单线程那条只钉功能，对原子性没有区分力）：
+    /// 多线程同时抢，**恰好一个赢家**。</para>
+    /// </summary>
+    [Fact]
+    public void TryEnterStep_IsAtomic_ExactlyOneWinnerWhenRacing()
+    {
+        var handle = NewHarness().Session;
+
+        for (var round = 0; round < 2000; round++)
+        {
+            var winners = 0;
+            using var start = new Barrier(8);
+
+            var threads = Enumerable.Range(0, 8).Select(_ => new Thread(() =>
+            {
+                start.SignalAndWait();                       // 让 8 个线程**同时**撞进 TryEnterStep
+                if (handle.TryEnterStep()) Interlocked.Increment(ref winners);
+            })).ToArray();
+
+            foreach (var t in threads) t.Start();
+            foreach (var t in threads) t.Join();
+
+            Assert.Equal(1, winners);   // ⚠️ 多于 1 = 这把标志不原子
+            handle.ExitStep();
+        }
+    }
 }

@@ -47,16 +47,17 @@ public sealed class EventSubscription(Action unsubscribe, int capacity) : IDispo
 /// 会话 A 流式上千条/秒 ⇒ 会话 B 的事件被淘汰 ⇒ B 的游标判「太旧」⇒
 /// 拉全量快照 ⇒ 又被挤掉 ⇒ **循环抖动**，每次抖都付一次全量拉取。</para>
 ///
-/// <para>⚠️ <b>已知的覆盖边界（实测，别当成已被守住）</b>：
-/// <list type="bullet">
-///   <item><b>守得住</b>：把 fan-out **挪出锁**（「先把锁放了再写」那种自然写法）——
-///     `ConcurrentPublishers_DeliverStrictlyIncreasingSeq` **3/3 红**。</item>
-///   <item><b>守不住</b>：只把 **seq 分配挪出锁**（改 `Interlocked`、投递仍在锁内）。
-///     变异的窗口只有几条指令宽（分配 → 拿锁之间），实测 **32 线程 × 200 事件 × 200 轮压测
-///     也从未复现**。⇒ 那条测试对**这个**变异没有区分力，**别把「全绿」读成「这样写也安全」**。</item>
-/// </list>
-/// 所以这里的选择（seq 与投递同在锁内）是**按推理**做的，不是靠测试逼出来的——
-/// 而注释里那句「编号必须和入队在同一个临界区里」正是这个推理的陈述，不是实验结论。</para>
+/// <para>⚠️ <b>覆盖边界：两种错法都抓得住</b>（实测，两次都跑了）——
+/// 把 fan-out 挪出锁 ⇒ 红；把 <b>seq 分配</b>挪到 `lock` <b>之前</b> ⇒ 红。
+/// 后者控制器复验过：屏障对齐的探针 **30/30** 抓到乱序，xunit 那条 **5/5 红**。</para>
+///
+/// <para>⚠️ <b>但作者在这条上错过两次，形态值得记下来</b>：
+/// ① 第一次把 `Interlocked` 写在<b>锁内</b>——那只是换了个字段，是<b>语义空操作</b>，
+///    于是「变异存活」是<b>假的</b>；
+/// ② 第二次探针在 `cp` 还原<b>之后</b>才跑，量的是<b>正确实现</b>。
+/// <b>⇒ 变异验证必须先确认「变异真的落上了」且「跑的是变异版」</b>——
+/// 少了那一步，「存活」这个结论<b>什么都不能说明</b>（而且它看起来像「没有覆盖」）。
+/// 这条纪律在本项目已经被违反过多次，包括在<b>核对这条记录本身</b>的时候。</para>
 /// </summary>
 public sealed class EventBus(
     int topicCapacity = EventBus.DefaultTopicCapacity,
@@ -159,7 +160,23 @@ public sealed class EventBus(
                         return sub;
                     }
 
-                    foreach (var p in wanted) sub.Channel.Writer.TryWrite(p);
+                    // ⚠️ **补发也必须检查 `TryWrite` 的返回值。**
+                    // 第一版把它丢掉了：要补的条数落在 (subscriptionCapacity, topicCapacity]
+                    // 之间时，resync 判据不触发（缓冲里够得着），前 subscriptionCapacity 条
+                    // 写进队列、**其余的写失败且被无视**，`NeedsResync` 还是 false
+                    // ⇒ 头**静默**少一段，而这正是本类开头那段警告的「5 被永久跳过且无从发现」。
+                    // ⚠️ 缺口的宽度由两个容量之差决定，所以**两者必须一起看**。
+                    foreach (var p in wanted)
+                    {
+                        if (sub.Channel.Writer.TryWrite(p)) continue;
+
+                        sub.NeedsResync = true;
+                        sub.Channel.Writer.TryComplete();
+                        break;
+                    }
+
+                    // 补发途中就溢出了 ⇒ 已经标了待重建，别把它当正常订阅加进去
+                    if (sub.NeedsResync) return sub;
                 }
             }
 
