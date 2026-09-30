@@ -168,19 +168,42 @@ public class ReplTests : IDisposable
         //   `--key --model m` 旧循环 → `key="--model" model="m"`（`--model` 恰好还被读到，纯属位置巧合），
         //                     **按对**解析而无守卫 → `key="--model"` 且 **`--model m` 整个丢掉**（更糟）。
         // ⇒ 判据是「值长得像不像标志位」，不是「位置上像不像」。两条输入都必须**拒绝且不落盘**。
+        //
+        // ⚠️ 两半各按**各自新增的输出**断言：`_out` 是每个测试实例一个、`NewRepl()` 不重置它，
+        // 所以第二半若直接断言整个 `_out`，会被**第一半写下的文字**满足——那条断言就成了空转的。
+        // ⚠️ **如实说明这条修法的限度**：控制器没能构造出一组输入，让「不切片」版红而「切片」版绿
+        //    ——因为两半本来就会打出同一句话（`参数 --key 缺少值。`）。
+        //    所以这次改动**消除的是一种可能的假满足，不是一条已证的缺陷**；
+        //    真正在干活的是每半各自的 `Assert.Null`（它确实会红）。**别把这条说成已经抓到过东西。**
         var a = NewRepl();
+        var outA = _out.ToString();
 
         await a.ExecuteAsync("provider set w1 --key --model", CancellationToken.None);
 
         Assert.Null(_providers.Load("w1"));
-        Assert.Contains("缺少值", _out.ToString());
+        Assert.Contains("缺少值", _out.ToString()[outA.Length..]);
 
         var b = NewRepl();
+        var outB = _out.ToString();
 
         await b.ExecuteAsync("provider set w2 --key --model m", CancellationToken.None);
 
         Assert.Null(_providers.Load("w2"));
-        Assert.Contains("缺少值", _out.ToString());
+        Assert.Contains("缺少值", _out.ToString()[outB.Length..]);
+    }
+
+    [Fact]
+    public async Task ProviderSet_RejectsAnUnknownFlagWithoutSaving()
+    {
+        // ⚠️ 实测出来的静默路径：未知标志被 `switch` 忽略（无 default），
+        // 于是 `--protcol openai-chat`（拼错一个字母）**照常保存并回 ✓**，
+        // 协议悄悄落成 claude-messages——用户看到 ✓ 就走了。
+        var repl = NewRepl();
+
+        await repl.ExecuteAsync("provider set w --key k --protcol openai-chat", CancellationToken.None);
+
+        Assert.Null(_providers.Load("w"));
+        Assert.Contains("--protcol", _out.ToString());
     }
 
     [Fact]

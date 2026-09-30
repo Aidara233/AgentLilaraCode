@@ -54,9 +54,11 @@ public class ReasoningPolicyTests
     {
         // ⚠️ **实测发现，本任务的核心**：
         // `ThinkingBlockParam.Signature` 与 `.Thinking` 都是 `required`，且该类**只有无参构造器**
-        // ——「不带 signature 的 thinking 块」在 Anthropic 线上**无法表达**。
+        // ——用官方 C# SDK **构造不出**「不带 signature 的 thinking 块」。
         // 而本机网关的 deepseek-flash **不返回 signature**。
-        // ⇒ 无签名的推理块，**发不出去**。这不是我们保守，是协议本身没有那个形状。
+        // ⇒ 无签名的推理块，本 SDK **发不出去**，只能丢。
+        // ⚠️ **但这不是协议限制**（T10 期间实测否证）：直接给网关发无签名 thinking 块，
+        // **上游回 HTTP 200 并正常作答**。约束在**客户端库**，不在上游。
         Assert.True(ReasoningPolicy.CanReplayBlock(new Block.ReasoningBlock("sig", "想"), "claude-messages"));
         Assert.False(ReasoningPolicy.CanReplayBlock(new Block.ReasoningBlock(null, "想"), "claude-messages"));
     }
@@ -73,7 +75,7 @@ public class ReasoningPolicyTests
     [Fact]
     public void FilterFor_DropsUnsignedReasoningEvenForClaude()
     {
-        // ⚠️ 修正后的行为：签名缺失 → 发不出去 → 丢。
+        // ⚠️ 修正后的行为：签名缺失 → 本 SDK 构不出来 → 丢（上游其实收，见上一条的核心注释）。
         // 本机网关的 deepseek-flash 就落在这个分支里——**每一条推理都被丢**。
         var blocks = new List<Block>
         {

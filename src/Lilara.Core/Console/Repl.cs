@@ -114,6 +114,13 @@ public sealed class Repl(
                 case "--protocol": protocol = value; break;
                 case "--endpoint": endpoint = value; break;
                 case "--auth": auth = value; break;
+                // ⚠️ 未知标志必须**拒绝**，不能忽略：`--protcol openai-chat`（拼错）会被
+                // 当成一个「没见过的标志 + 它的值」静默吞掉，然后**照常保存并回一句 ✓**，
+                // 而协议悄悄落成 claude-messages。用户看到 ✓ 就走了——这正是「静默接管」的变体：
+                // 他没得到自己想要的东西，也没被告知。
+                default:
+                    _out.WriteLine($"未知参数 '{parts[i]}'。");
+                    return;
             }
         }
 
@@ -148,14 +155,18 @@ public sealed class Repl(
         // 都是操作者配置，本次没提到就必须活下来，否则「改 key」会静默重置它们。
         var existing = _providers.Load(id);
 
+        // ⚠️ 落盘前两道闸都在这上面：`--protocol` 与 `--auth` 的未知值一律**拒绝且不写**。
+        // ⇒「存得下、发不出」那个旧顾虑，对**从 `--protocol` 进来的值**已经解决——
+        //   所以 Protocol 不再「始终由代码决定」。
+        // ⚠️ **但只解决了一半**：手写进 `providers/<id>.json` 的未知协议**绕过了这两道闸**，
+        //    而缺省分支 `existing?.Protocol` 会让它**原样保留**（有测试钉住这一点）。
+        //    那一半由 `AdapterFactory` 在**发消息时**给人话兜底，不是在这里。
+        var effectiveProtocol = protocol ?? existing?.Protocol ?? Protocols.ClaudeMessages;
+
         _providers.Save(new ProviderDefinition
         {
             Id = id,
-            // ⚠️ 操作者在**已登记且已校验**的协议集合里选（上面的 `Protocols.All.Contains`）；
-            //     手写一个工厂认不出的协议的旧顾虑，在这里已由「落盘前拒绝未知协议」挡住——
-            //     所以 Protocol 不再「始终由代码决定」。
-            //     缺省仍是 `claude-messages`（不破坏既有用法）；已配好的协议则原样保留。
-            Protocol = protocol ?? existing?.Protocol ?? Protocols.ClaudeMessages,
+            Protocol = effectiveProtocol,
             ApiKey = key,
             DefaultModel = model ?? existing?.DefaultModel ?? "claude-opus-5",
             Modality = existing?.Modality ?? "vision",
@@ -163,7 +174,7 @@ public sealed class Repl(
             AuthScheme = string.IsNullOrEmpty(auth) ? existing?.AuthScheme : auth,
         });
 
-        _out.WriteLine($"✓ 提供商 '{id}' 已保存（{protocol ?? existing?.Protocol ?? Protocols.ClaudeMessages}）。");
+        _out.WriteLine($"✓ 提供商 '{id}' 已保存（{effectiveProtocol}）。");
     }
 
     /// <summary>

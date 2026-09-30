@@ -97,10 +97,13 @@ public static class ClaudeRequestBuilder
                     break;
 
                 case CanonicalBlock.ReasoningBlock r:
-                    // ⚠️ 必须过能力表：签名缺失时**发不出去**（见 ReasoningPolicy.CanReplayBlock）。
+                    // ⚠️ 必须过能力表：签名缺失时本 SDK **构不出**这个块（见 ReasoningPolicy.CanReplayBlock）。
                     // 实测：ThinkingBlockParam 的 Signature 是 required 且类无无参外构造器——
                     // 既不能赋 null（CS8601），也不能用 `null!` 骗编译器（null 是真会发生的），
-                    // 更不能省掉（CS9035）。丢弃是**协议本身的限制**，不是我们的取舍。
+                    // 更不能省掉（CS9035）。
+                    // ⚠️ 但**别把这说成「协议限制」**——T10 期间实测：直接给网关发一个无签名的
+                    // thinking 块，**上游回 HTTP 200 并正常作答**。拦住我们的是**客户端库的类型**，
+                    // 不是上游协议。两者的区别要紧：前者换 SDK / 手写 HTTP 就能绕，后者不能。
                     if (!ReasoningPolicy.CanReplayBlock(r, protocol))
                         break;
 
