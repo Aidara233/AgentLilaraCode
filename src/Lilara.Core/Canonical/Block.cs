@@ -41,16 +41,27 @@ public abstract record Block
         string Text,
         string Kind = ReasoningKind.Text) : Block
     {
+        // ⚠️ 归一必须写在 **init 访问器**里，不能只写在属性初始化器上。
+        // 属性初始化器**只在主构造器路径**上跑；而 record 的 `with { Kind = ... }`
+        // 走的是 init setter，会绕过它。实测过：`a with { Kind = null! }`
+        // 归一前是 null → 字段被 WhenWritingNull 丢掉 → 往返后不等于自己。
+        // 落盘格式已冻结，这里漏一次就是一次数据迁移。
+        private readonly string _kind = Normalize(Kind);
+
         /// <summary>
-        /// 块形态。⚠️ 这个属性**必须在构造时归一**，不能只是透传构造参数。
-        /// 为什么：`Json.Options` 设了 `DefaultIgnoreCondition = WhenWritingNull`，
-        /// 于是 `Kind = null` 会被**静默丢掉整个字段**；回读时缺字段 → 落到默认值
-        /// `ReasoningKind.Text`。结果就是这个 record **往返之后不等于自己**（实测：
-        /// `new ReasoningBlock("s","t",null!)` 序列化后没有 `reasoningKind` 字段，
-        /// 回读得到 `"text"`）。落盘格式已冻结，这里出问题就是一次数据迁移。
-        /// 归一之后，「Kind 为 null 的块」不再可能被构造出来。
+        /// 块形态。⚠️ 读取与写入**都**经过 <see cref="Normalize"/>——
+        /// 所以「Kind 为 null 的块」在任何路径上都不可能出现：主构造器、`with`、
+        /// 以及 STJ 反序列化（它可能把字面 `null` 绑到参数上）。
         /// </summary>
         [JsonPropertyName("reasoningKind")]
-        public string Kind { get; init; } = Kind ?? ReasoningKind.Text;
+        public string Kind
+        {
+            get => _kind;
+            init => _kind = Normalize(value);
+        }
+
+        // ⚠️ 参数必须是 `string?`：非空参数会让 `??` 被判为冗余，
+        // 而 STJ 真的会把 `"reasoningKind": null` 绑进来。
+        private static string Normalize(string? kind) => kind ?? ReasoningKind.Text;
     }
 }

@@ -127,9 +127,43 @@ public class BlockTests
     }
 
     [Fact]
+    public void ReasoningBlock_NormalisesANullKindSetThroughWith()
+    {
+        // ⚠️ record 的 `with` 走 init setter，**绕过主构造器的属性初始化器**。
+        // 归一写在初始化器上时，这条路会把 null 放进来 → 字段被丢 → 往返后不等于自己。
+        var original = new Block.ReasoningBlock("s", "t");
+
+        var mutated = original with { Kind = null! };
+
+        Assert.Equal(ReasoningKind.Text, mutated.Kind);
+
+        // ⚠️ 这里必须走 `Json.StableSerialize`（参数是基类 `Block`），**不能**写
+        // `JsonSerializer.Serialize(mutated, Json.Options)`：后者泛型推断成静态类型
+        // `ReasoningBlock`，判别式 `"kind"` 会整个丢掉，读回时直接
+        // `NotSupportedException: must specify a type discriminator`（实测踩到过）。
+        // 这正是 `StableSerialize` 把参数钉死成 `Block` 的理由——写这条测试时就撞上了。
+        var back = JsonSerializer.Deserialize<Block>(
+            Json.StableSerialize(mutated), Json.Options);
+        Assert.Equal(mutated, back);
+    }
+
+    [Fact]
+    public void ReasoningBlock_NormalisesAnExplicitJsonNull()
+    {
+        // ⚠️ STJ 会把字面 `null` 绑到构造参数上——这正是 `??` 存在的理由，之前没测过
+        var json = """{"kind":"reasoning","signature":"s","text":"t","reasoningKind":null}""";
+
+        var back = (Block.ReasoningBlock)JsonSerializer.Deserialize<Block>(json, Json.Options)!;
+
+        Assert.Equal(ReasoningKind.Text, back.Kind);
+    }
+
+    [Fact]
     public void ReasoningBlock_SurvivesJsonMissingTheKindField()
     {
-        // ⚠️ 手写或半截的 history.jsonl 可能没有 reasoningKind 字段
+        // ⚠️ 这条钉的是**反序列化的默认值**：缺字段时落到 `ReasoningKind.Text`。
+        // 它**不是**归一化的回归守卫——缺字段本来就会落到默认值，归一前它也一样绿。
+        // 真正的守卫是上面两条：`with` 那条守构造路径的归一，JSON-null 那条守 `??`。
         var json = """{"kind":"reasoning","signature":"s","text":"t"}""";
 
         var back = (Block.ReasoningBlock)JsonSerializer.Deserialize<Block>(json, Json.Options)!;
