@@ -75,7 +75,7 @@ public class AtomicFileConcurrencyTests : IDisposable
     /// 真实时延：`SaveState` 与 HTTP 快照端点同时碰同一个 `state.json`。
     /// </summary>
     [Fact]
-    public void Write_ToleratesConcurrentWritersToTheSamePath()
+    public async Task Write_ToleratesConcurrentWritersToTheSamePath()
     {
         var target = Path.Combine(_dir, "state.json");
         var errors = new List<Exception>();
@@ -89,7 +89,7 @@ public class AtomicFileConcurrencyTests : IDisposable
             }
         });
 
-        Task.WaitAll(Hammer(0, target, errors), Hammer(1000, target, errors));
+        await Task.WhenAll(Hammer(0, target, errors), Hammer(1000, target, errors));
 
         Assert.Empty(errors);
         Assert.True(File.Exists(target));

@@ -1,9 +1,11 @@
 using Lilara.Core.Adapters;
+using Lilara.Core.Control;
 using Lilara.Core.Console;
 using Lilara.Core.Hosting;
 using Lilara.Core.Persistence;
 using Lilara.Core.Projects;
 using Lilara.Core.Session;
+using Microsoft.AspNetCore.Builder;
 
 var dataRoot = DataRoot.Resolve();
 Directory.CreateDirectory(dataRoot);
@@ -61,6 +63,35 @@ else
 var bus = new EventBus();
 var dispatcher = new CommandDispatcher(host, bus, host.StepperFor);
 
+// ⚠️ 端口**可注入**（环境变量），只在**默认值**上不许静默换（05 §2.1）。
+// 可注入是硬需求：不然测试里两个 host 并行跑必然互撞，集成测试根本写不出来。
+// ⚠️ 但**用户没法靠它绕开「一设备一核心」**——那条守卫在**数据根**上（见上面 `DataRootLock`），
+// 不在端口上。换端口只是让第二个核心起得来，它一样会被数据根锁挡住。
+var port = int.TryParse(Environment.GetEnvironmentVariable("LILARA_PORT"), out var p)
+    ? p
+    : ControlServer.DefaultPort;
+
+var controlServer = new ControlServer(host, dispatcher, bus, port);
+WebApplication? api = null;
+try
+{
+    api = await controlServer.StartAsync(CancellationToken.None);
+    Console.WriteLine($"  控制面 {controlServer.Url}（头连这个；只监听本机）");
+}
+catch (Exception ex)
+{
+    // ⚠️ **显式失败并报告**，不许静默换端口（05 §2.1）——头连不上且不知道为什么，
+    // 比直接起不来更难查。端口那条检查是**独立的另一条**（数据根锁是另一条）。
+    // ⚠️ Windows 上这里可能是两种原因，**别把话说死成「端口被占」**：
+    //   · 端口真被占        → 去看是谁占的
+    //   · 落在 excluded range（Hyper-V/WSL 保留段）→ 报的是**拒绝访问**，
+    //     而**根本没有另一个核心**。说成「端口被占」会把用户引向错的方向。
+    Console.Error.WriteLine($"✗ 控制面起不来（{controlServer.Url}）：{ex.Message}");
+    Console.Error.WriteLine("  端口被占**或**落在 Windows 保留段（`netsh int ipv4 show excludedportrange protocol=tcp`）。");
+    Console.Error.WriteLine("  换个端口：设环境变量 LILARA_PORT。");
+    return 1;
+}
+
 var repl = new Repl(host, dispatcher, host.StepperFor, Console.Out)
 {
     Current = resume,
@@ -90,6 +121,13 @@ while (true)
     // （挂在字符串判据上会让线上 `provider.upsert` 走不到 ⇒ 缓存静默失效）。
     if (Repl.IsProviderSetCommand(line)) PrintEndpoint(host, repl.Current);
 }
+
+// ⚠️ 正常退出也要**显式**返回 0：上面「控制面起不来」那条路 `return 1`，
+// 而顶层语句里只要有一条 `return <值>`，**所有**路径都得有返回值（否则 CS0161）。
+// ⚠️ 退出前停掉控制面：不 `StopAsync` 的话监听 socket 会挂到进程被强杀为止，
+// 紧接着重启会撞上「端口仍被占」——而那个报错**看起来**像另一个核心在跑。
+if (api is not null) await api.StopAsync(CancellationToken.None);
+return 0;
 
 /// <summary>
 /// 端点一行。⚠️ 没有端点（占位适配器）时**不印**——那是「还没配提供商」那条路径，

@@ -31,7 +31,7 @@ public class HistoryLogTests : IDisposable
     /// 而那条用户消息会**彻底消失**（append 在调模型之前，模型压根没被调用）。
     /// </summary>
     [Fact]
-    public void Append_ToleratesConcurrentWriters()
+    public async Task Append_ToleratesConcurrentWriters()
     {
         var errors = new List<Exception>();
 
@@ -44,7 +44,7 @@ public class HistoryLogTests : IDisposable
             }
         });
 
-        Task.WaitAll(Hammer("a", LogPath, errors), Hammer("b", LogPath, errors));
+        await Task.WhenAll(Hammer("a", LogPath, errors), Hammer("b", LogPath, errors));
 
         Assert.Empty(errors);
     }
@@ -60,7 +60,7 @@ public class HistoryLogTests : IDisposable
     /// 拿别的方式开的读句柄去测「我们的读会不会挡写」，测的不是我们的代码。</para>
     /// </summary>
     [Fact]
-    public void ReadAll_DoesNotBlockAConcurrentAppend()
+    public async Task ReadAll_DoesNotBlockAConcurrentAppend()
     {
         for (var i = 0; i < 50; i++) HistoryLog.Append(LogPath, Evt($"预热{i}"));
 
@@ -84,7 +84,7 @@ public class HistoryLogTests : IDisposable
             }
         });
 
-        Task.WaitAll(reader, writer);
+        await Task.WhenAll(reader, writer);
 
         Assert.Empty(errors);
     }
