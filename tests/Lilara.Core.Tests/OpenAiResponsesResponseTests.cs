@@ -167,7 +167,7 @@ public class OpenAiResponsesResponseTests
     /// <para>⚠️ 这条钉住 <c>s.ValueKind == JsonValueKind.String</c> 那半句——实测（控制器复跑）：
     /// 删掉它之后，<c>{"status":5}</c> 与 <c>{"status":["a"]}</c> 都会在 <c>s.GetString()</c> 上抛
     /// <c>InvalidOperationException</c>。</para>
-    /// <para>⚠️ 它是**第五条**守卫，起初被漏掉：控制器在本文件里写过「四条守卫各自被钉住，无一例外」，
+    /// <para>⚠️ 这条守卫起初被漏掉：控制器在本文件里写过「四条守卫各自被钉住，无一例外」，
     /// 复审者指出 <c>status</c> 这条也是守卫且无测试——**控制器实测确认属实**。
     /// 于是**补测试**而不是**改措辞**：这句话之所以曾经过宽，是因为少了一条测试，不是因为话说大了。</para>
     /// <para>注：<c>{"status":null}</c> 不列入——<c>GetString()</c> 对 <c>Null</c> 返回 null，走 <c>?? "unknown"</c>，
