@@ -381,6 +381,10 @@ git commit -m "feat(core): 推理块加 Kind、Signature 可空；加稳定序�
 - Produces:
   - `Lilara.Core.Canonical.ReasoningPolicy.CanReplay(string protocol) → bool`
   - `Lilara.Core.Canonical.ReasoningPolicy.FilterFor(IReadOnlyList<Block>, string protocol) → IReadOnlyList<Block>`
+  - ⚠️ **顺带修一处会阻断构建的既有缺陷**（见 Step 3.5）：`ClaudeRequestBuilder` 里
+    `new ThinkingBlockParam { Signature = r.Signature }` 现在赋的是可空值，
+    而实测 `ThinkingBlockParam.Signature` 是 **`NotNull`** → `CS8601` → 在 `TreatWarningsAsErrors` 下**构建失败**。
+    这是 Task 2 把 `Signature` 改成可空**之前**就存在的隐患（旧记录是全参构造，一直非空所以没暴露）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -511,11 +515,47 @@ dotnet test --filter "FullyQualifiedName~ReasoningPolicyTests"
 
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 5: 顺带修一处构建阻断（实测确认的 SDK 约束）**
+
+⚠️ **实测**：`ThinkingBlockParam.Signature` 的可空性是 **`NotNull`**（探针读的 `NullabilityInfoContext`）。而 Task 2 之后 `ReasoningBlock.Signature` 是**可空**的。于是 `ClaudeRequestBuilder` 里这一句：
+
+```csharp
+content.Add(new ThinkingBlockParam { Thinking = r.Text, Signature = r.Signature });
+```
+
+会产生 **`CS8601`（可能的 null 引用赋值）**，而 `TreatWarningsAsErrors` 把它变成**构建失败**。
+
+⚠️ **但这里不能简单用 `!` 糊过去**——那是在骗编译器：`Signature` 真的可能是 null（本机网关的 `deepseek-flash` 就不返回）。**正确做法是按有没有 signature 分两种形状**，这也正是真 Anthropic 与这个网关的实际差别：
+
+```csharp
+                case CanonicalBlock.ReasoningBlock r:
+                    // ⚠️ 上游对 signature 的态度分两种，实测确认：
+                    //   · 真 Anthropic：signature 是不透明凭据，**必须原样回传**，丢了会被拒
+                    //   · 本机网关（deepseek-flash）：**根本不返回 signature**
+                    // 所以不能无条件赋——`ThinkingBlockParam.Signature` 是非空的（实测），
+                    // 赋 null 会 CS8601；而用 `!` 压制就是**在骗编译器**，因为 null 是真的会发生。
+                    // 按「有没有」分形状，两条路各自正确。
+                    content.Add(r.Signature is null
+                        ? new ThinkingBlockParam { Thinking = r.Text }
+                        : new ThinkingBlockParam { Thinking = r.Text, Signature = r.Signature });
+                    break;
+```
+
+⚠️ 若 `new ThinkingBlockParam { Thinking = r.Text }` 因缺 `Signature` 报 `CS9035`（必需成员），改用 SDK 的构造器重载或 `required` 之外的写法——**让编译器告诉你**，别猜。把实际写法记进报告。
+
+- [ ] **Step 6: 跑全量，确认没有回归**
+
+```bash
+dotnet test
+```
+
+Expected: PASS（全量 129+ 条）
+
+- [ ] **Step 7: 提交**
 
 ```bash
 git add -A
-git commit -m "feat(core): 推理块的协议能力表（能承载才回传，不能则不伪造）"
+git commit -m "feat(core): 推理块的协议能力表 + 按 signature 有无分形状回传"
 ```
 
 ---
@@ -527,7 +567,9 @@ git commit -m "feat(core): 推理块的协议能力表（能承载才回传，�
 **Files:**
 - Create: `src/Lilara.Core/Adapters/Protocols.cs`
 - Modify: `src/Lilara.Core/Adapters/AdapterFactory.cs`
-- Modify: `src/Lilara.Core/Providers/ProviderStore.cs`（`ToSelection` 不变——协议从 `ProviderDefinition.Protocol` 来）
+- Modify: `src/Lilara.Core/Adapters/Claude/ClaudeAdapter.cs`（`ProtocolId` 改成引用常量，**只改这一行**）
+- Create: `src/Lilara.Core/Adapters/OpenAi/OpenAiChatAdapter.cs`（骨架）
+- Create: `src/Lilara.Core/Adapters/OpenAi/OpenAiResponsesAdapter.cs`（骨架）
 - Test: `tests/Lilara.Core.Tests/AdapterFactoryTests.cs`
 
 **Interfaces:**
@@ -662,15 +704,24 @@ using Lilara.Core.Providers;
 
 namespace Lilara.Core.Adapters.OpenAi;
 
-/// <summary>OpenAI Chat 适配器。⚠️ 骨架——Task 5 填入真实实现。</summary>
-public sealed class OpenAiChatAdapter(ProviderDefinition provider) : IModelAdapter
+/// <summary>OpenAI Chat 适配器。⚠️ 骨架——Task 5、6、9 依次填入真实实现。</summary>
+public sealed class OpenAiChatAdapter : IModelAdapter
 {
+    public const string ProtocolId = Protocols.OpenAiChat;
+
+    /// <summary>⚠️ 私有字段必须有，不能用 primary constructor 的裸参数——
+    /// 骨架时期参数没被用到会报 `CS9113`（未读参数），而 `TreatWarningsAsErrors` 会拦下它。</summary>
+    private readonly ProviderDefinition _provider;
+
+    public OpenAiChatAdapter(ProviderDefinition provider) => _provider = provider;
+
     public Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct) =>
         throw new ModelCallFailedException("OpenAI Chat 适配器尚未实现。");
 }
 ```
 
-`OpenAiResponsesAdapter.cs` 同形（Task 7 填实）。
+⚠️ `OpenAiResponsesAdapter.cs` **同形**（`ProtocolId = Protocols.OpenAiResponses`，同样带私有字段）。
+⚠️ Task 9 填实时会用 `_provider` 构造 `OpenAiHttp`——字段不白留。
 
 - [ ] **Step 5: 跑测试，确认通过**
 
@@ -702,6 +753,16 @@ git commit -m "feat(core): 协议常量 + 适配器工厂三分派（OpenAI 两�
 - Produces:
   - `Lilara.Core.Adapters.OpenAi.OpenAiChatRequest.Build(ModelRequest) → string`（**JSON 文本**）
   - `Lilara.Core.Adapters.OpenAi.OpenAiChatRequest.Path`（`const string = "/v1/chat/completions"`）
+
+⚠️ **`ModelRequest` 要加一个 `required` 字段——这会打断现有的全部构造点。**
+实测当前只有**两处** `new ModelRequest`（已核实）：
+
+| 位置 | 改法 |
+|---|---|
+| `src/Lilara.Core/Session/Stepper.cs:53` | 补 `Protocol = handle.Spec.Model.Protocol,` |
+| `tests/Lilara.Core.Tests/StepperResolverTests.cs:83` | 补 `Protocol = Protocols.ClaudeMessages,`（那是 Claude 会话的替身） |
+
+⚠️ 漏改任一处都是**构建失败**（`required` 成员未初始化）。改完先跑一次全量确认无回归，再写新测试。
 
 - [ ] **Step 1: 写失败的测试**
 
