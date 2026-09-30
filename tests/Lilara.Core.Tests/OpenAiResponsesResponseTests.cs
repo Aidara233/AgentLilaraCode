@@ -110,8 +110,8 @@ public class OpenAiResponsesResponseTests
     /// <summary>
     /// ⚠️ 空数组（<c>output:[]</c> / <c>content:[]</c>）是**合法输入**，不是畸形——必须解析得通。
     /// </summary>
-    /// <para>⚠️ 第 1 例是唯一产出块的，故单独断言块数；另两例断言「不崩且状态透传」。
-    /// 不加 <c>Assert.Single</c> 的话，第 1 例与第 2/3 例在断言上无从区分（审阅者指出）。</para>
+    /// <para>⚠️ 第 1 例是唯一产出块的，故按例断言块数（<c>Assert.Equal(expectedBlocks, …)</c>）；
+    /// 三例若都只断言 <c>Refused</c>/<c>StopReason</c>，则在断言上无从区分（审阅者指出）。</para>
     [Theory]
     [InlineData("""{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}""", 1)]
     [InlineData("""{"status":"completed","output":[{"type":"message","content":[]}]}""", 0)]
@@ -127,17 +127,18 @@ public class OpenAiResponsesResponseTests
 
     /// <summary>
     /// ⚠️ <c>output</c> / <c>content</c> **不是数组**（数字 / 字符串 / null）时也必须不崩。
-    /// <para>⚠️ 这两条**各自钉住一条数组守卫**——实测（控制器复跑）：
-    /// 只删 <c>output</c> 的 <c>ValueKind == Array</c> → 本测试 **1 红**；
-    /// 只删 <c>content</c> 的 <c>ValueKind == Array</c> → 本测试 **1 红**。
+    /// <para>⚠️ 本测试**钉住两条数组守卫**——实测（控制器复跑，审阅者独立复算，两次一致）：
+    /// 只删 <c>output</c> 的 <c>ValueKind == Array</c> → 本测试**前 3 行红**；
+    /// 只删 <c>content</c> 的 <c>ValueKind == Array</c> → 本测试**后 3 行红**。
     /// 少了它们，非数组输入会在 <c>EnumerateArray</c> 上抛 <c>InvalidOperationException</c>。</para>
-    /// <para>⚠️ <b>控制器起初把这段写成「两条数组守卫无法被钉住」，那是错的——改正在此，
-    /// 过程记入账本。</b>我当时的错误方法：拿这条测试去跑**未变异**的代码，
-    /// 看到绿就断定「它区分不了」。而**正确的代码上本来就该是绿的**——
-    /// 钉住一个守卫要跑**两次**：变异版必须红，正确版必须绿。我只跑了后一半。</para>
-    /// <para>⚠️ 顺带记一条**真实**的局限（与上面不同，这条成立）：若**同时**删掉数组守卫
-    /// **和**下游的对象守卫，非数组输入仍会被对象守卫吸收而不崩。这个「纵深」是真的，
-    /// 但它**不构成**「无法钉住」——只删一条时，另一层的类型守卫挡不住类型不匹配。</para>
+    /// <para>⚠️ <b>控制器起初把这段写成「两条数组守卫无法被钉住」，那是错的。过程记在此处，
+    /// 因为错误的形状比结论更值得留：</b>我拿这条测试去跑<b>未变异</b>的代码，看到绿就断定「区分不了」——
+    /// 而<b>正确的代码上本来就该是绿的</b>。钉住一个守卫要跑<b>两次</b>：变异版必须红，正确版必须绿。
+    /// 我只跑了后一半。<b>接着我又补了一句自认为「真实」的局限，说删掉数组守卫后下游对象守卫会吸收——
+    /// 那句也是错的</b>（<c>EnumerateArray</c> 在循环体之前求值，对象守卫根本到不了），
+    /// 由复审者实测指出。<b>⇒ 两处错误同源：都是写下未经运行的断言。</b></para>
+    /// <para>⚠️ 因此本文件**不存在已知的守卫覆盖缺口**：四条守卫（<c>output</c>/<c>content</c> 的数组守卫、
+    /// <c>item</c>/<c>block</c> 的对象守卫）**各自被测试钉住**，无一例外。</para>
     /// </summary>
     [Theory]
     [InlineData("""{"status":"completed","output":5}""")]
