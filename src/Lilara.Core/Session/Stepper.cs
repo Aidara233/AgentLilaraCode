@@ -54,6 +54,7 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
             {
                 ModelId = handle.Spec.Model.ModelId,
                 MaxTokens = handle.Spec.Model.MaxTokens,
+                Protocol = handle.Spec.Model.Protocol,
                 Effort = handle.Spec.Model.Effort,
                 SystemBlocks = [], // 04 §1.3：核心自带零内容
                 Timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId),

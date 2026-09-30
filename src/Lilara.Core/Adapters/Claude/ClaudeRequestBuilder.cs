@@ -1,4 +1,5 @@
 using Anthropic.Models.Messages;
+using Lilara.Core.Canonical;
 using Lilara.Core.Records;
 using CanonicalBlock = Lilara.Core.Canonical.Block;
 
@@ -21,7 +22,7 @@ public static class ClaudeRequestBuilder
         {
             Model = request.ModelId,
             MaxTokens = request.MaxTokens,
-            Messages = BuildMessages(request.Timeline),
+            Messages = BuildMessages(request.Timeline, request.Protocol),
             System = BuildSystem(request.SystemBlocks),
             OutputConfig = new OutputConfig { Effort = ToEffort(request.Effort) },
         };
@@ -36,7 +37,7 @@ public static class ClaudeRequestBuilder
     /// 发出去的形状就永远是交替的。顺带这条也让将来的 tool 回合更忠实。
     /// ⚠️ 纯函数：同一份时间线必须构造出逐字节相同的列表（00 §5 铁律 1）。
     /// </summary>
-    private static List<MessageParam> BuildMessages(IReadOnlyList<TimelineEvent> timeline)
+    private static List<MessageParam> BuildMessages(IReadOnlyList<TimelineEvent> timeline, string protocol)
     {
         var messages = new List<MessageParam>();
 
@@ -60,7 +61,7 @@ public static class ClaudeRequestBuilder
         {
             var message = (TimelineEvent.MessageEvent)evt;
             var isUser = message.From == Speaker.User;
-            var blocks = ToContentBlocks(message, evt);
+            var blocks = ToContentBlocks(message, evt, protocol);
 
             if (pending is not null && pendingIsUser == isUser)
             {
@@ -84,7 +85,7 @@ public static class ClaudeRequestBuilder
     /// 顺序或内容一动，上游就 400 `invalid_request_error`。
     /// </summary>
     private static List<ContentBlockParam> ToContentBlocks(
-        TimelineEvent.MessageEvent message, TimelineEvent evt)
+        TimelineEvent.MessageEvent message, TimelineEvent evt, string protocol)
     {
         var content = new List<ContentBlockParam>();
         foreach (var b in message.Blocks)
@@ -96,15 +97,21 @@ public static class ClaudeRequestBuilder
                     break;
 
                 case CanonicalBlock.ReasoningBlock r:
-                    // ⚠️ 实测（反射读 SDK 12.51.0）：`ThinkingBlockParam.Signature` 与 `.Thinking`
-                    // **都是 `required`**，且没有省掉 Signature 的构造器重载——也就是说
-                    // 「无签名的 thinking 块」在这个 SDK 里**根本表达不出来**。
-                    // 那么没有签名时只有两条路：`null!` 骗编译器（会写出 `"signature":null`，
-                    // 上游 400），或**不发**。计划书 §核心语义明说：不能回传时必须
-                    // **静默丢弃而非伪造**，所以取后者。
-                    // ⚠️ 有签名的一支必须逐字回传（00 §5 铁律）。
-                    if (r.Signature is null) break;
-                    content.Add(new ThinkingBlockParam { Thinking = r.Text, Signature = r.Signature });
+                    // ⚠️ 必须过能力表：签名缺失时**发不出去**（见 ReasoningPolicy.CanReplayBlock）。
+                    // 实测：ThinkingBlockParam 的 Signature 是 required 且类无无参外构造器——
+                    // 既不能赋 null（CS8601），也不能用 `null!` 骗编译器（null 是真会发生的），
+                    // 更不能省掉（CS9035）。丢弃是**协议本身的限制**，不是我们的取舍。
+                    if (!ReasoningPolicy.CanReplayBlock(r, protocol))
+                        break;
+
+                    content.Add(new ThinkingBlockParam
+                    {
+                        Thinking = r.Text,
+                        // ⚠️ 这里的 `!` 与上面那个被否掉的**不是一回事**：
+                        // CanReplayBlock 刚刚确认过 Signature is not null，所以压制是有依据的。
+                        // 别把它当惯例——下一个人看到它要知道为什么合法。
+                        Signature = r.Signature!,
+                    });
                     break;
 
                 default:

@@ -23,6 +23,8 @@ public class ClaudeAdapterTests
     {
         ModelId = "claude-opus-5",
         MaxTokens = 1024,
+        // ⚠️ 字面量而非常量：`Protocols` 常量类要到 Task 4 才建，Task 4 顺手换掉。
+        Protocol = "claude-messages",
         Effort = "high",
         SystemBlocks = [],
         Timeline = [],

@@ -12,6 +12,13 @@ public sealed record ModelRequest
     public required string ModelId { get; init; }
     public required int MaxTokens { get; init; }
 
+    /// <summary>
+    /// 这次调用走哪条协议（`claude-messages` / `openai-chat` / `openai-responses`）。
+    /// ⚠️ 能力表（<see cref="Lilara.Core.Canonical.ReasoningPolicy"/>）按它判断
+    /// 哪些块**发得出去**——尤其是无签名的推理块。所以它在构造请求时**必须先于块过滤**存在。
+    /// </summary>
+    public required string Protocol { get; init; }
+
     /// <summary>思考强度轴，映射到协议参数——**绝不进上下文**（01 §3.5）。</summary>
     public required string Effort { get; init; }
 
