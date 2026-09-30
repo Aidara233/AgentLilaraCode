@@ -26,6 +26,17 @@ public sealed class Repl(
     /// </summary>
     public SessionHandle? Current { get; set; }
 
+    /// <summary>
+    /// 「这条命令可能改变提供商集合吗」——Program.cs 的记忆化判据。
+    /// ⚠️ 必须是**同一个**判据，不能各写一份字符串：
+    /// 两处各写 `"provider set "` 的话，改命令名只会改到一处，
+    /// 记忆化就**静默**失效——用户看到「已保存」之后又被回一句「还没有配置提供商」。
+    /// 共享判据而不是共享字面量，是因为调用方要的本来就是「是不是这条命令」这个判断。
+    /// ⚠️ 自己 trim：调用方可以直接把原始行（可能带空白）递进来。
+    /// </summary>
+    public static bool IsProviderSetCommand(string line) =>
+        line.Trim().StartsWith("provider set ", StringComparison.Ordinal);
+
     public async Task<bool> ExecuteAsync(string line, CancellationToken ct)
     {
         var trimmed = line.Trim();
@@ -35,7 +46,7 @@ public sealed class Repl(
         {
             if (trimmed is "quit" or "exit") return false;
 
-            if (trimmed.StartsWith("provider set ", StringComparison.Ordinal))
+            if (IsProviderSetCommand(trimmed))
             {
                 HandleProviderSet(trimmed);
                 return true;

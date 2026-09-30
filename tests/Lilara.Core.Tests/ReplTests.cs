@@ -153,4 +153,14 @@ public class ReplTests : IDisposable
         Assert.True(keepGoing);
         Assert.Contains("上游 503", _out.ToString());
     }
+
+    [Theory]
+    [InlineData("provider set claude --key k", true)]
+    [InlineData("  provider set claude --key k  ", true)]   // 前导空白要认
+    [InlineData("providers set x", false)]                  // 前缀近似但不同
+    [InlineData("history", false)]
+    public void IsProviderSetCommand_MatchesOnlyTheRealCommand(string line, bool expected)
+    {
+        Assert.Equal(expected, Repl.IsProviderSetCommand(line));
+    }
 }

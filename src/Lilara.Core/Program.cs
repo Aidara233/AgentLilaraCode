@@ -67,10 +67,12 @@ while (true)
 
     // ⚠️ 只有 `provider set` 会动 store，所以只在它之后重解析。
     // 每敲一行都重建 Repl 会为 `history` / `status` 这种碰不到模型的命令白 new 一个
-    // AnthropicClient。前缀判据与 `Repl.HandleProviderSet` 保持一致（`Repl.cs`）。
+    // AnthropicClient。判据**共用** `Repl.IsProviderSetCommand`——两处各写一份字符串的话，
+    // 改命令名只会改到一处，记忆化就**静默**失效（详见该方法的注释）。
+    // 这里递原始行即可：谓词自己会 trim。
     // ⚠️ 边界：`session create` 会把当时的选择**快照**进 spec，所以换 provider 的
     // --model / effort 对**已建的会话**不生效——那需要新建会话（01 §7.2）。
-    if (line.Trim().StartsWith("provider set ", StringComparison.Ordinal))
+    if (Repl.IsProviderSetCommand(line))
     {
         var current = repl.Current;
         repl = new Repl(

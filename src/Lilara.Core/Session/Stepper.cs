@@ -21,8 +21,9 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
     /// 构造时定下的适配器。⚠️ 这个只读访问器存在的唯一理由是**可测性**：
     /// `StepperResolver` 的契约就是「解析出来的是不是占位适配器」，
     /// 而适配器是私有字段时那条契约没法断言。它不是给运行时用的。
+    /// ⚠️ 表达式别名，不是第二个字段——同一个事实只能有一份存储。
     /// </summary>
-    public IModelAdapter Adapter { get; } = adapter;
+    public IModelAdapter Adapter => _adapter;
 
     public async Task<ModelReply> StepAsync(
         SessionHandle handle, string userText, CancellationToken ct)
