@@ -1214,9 +1214,10 @@ git commit -m "feat(core): 快照带五轴与三个槽；GET /axes（头不再�
 
 **Files:**
 - Modify: `src/Lilara.Core/Console/CoreCommandParser.cs`
-- Modify: `src/Lilara.Core/Console/Repl.cs:127-143`（回执格式 switch）
+- Modify: `src/Lilara.Core/Console/Repl.cs`（回执格式 switch **+ `PrintStatus`，见「执行中补的缺陷」**）
 - Test: `tests/Lilara.Core.Tests/ParserTests.cs`（**新建**——解析器测试不该寄生在 `ReplTests` 里，
-  它们测的是 `CoreCommandParser` 而不是 `Repl`）
+  它们测的是 `CoreCommandParser` 而不是 `Repl`）· `tests/Lilara.Core.Tests/ReplTests.cs`（追加
+  ——**显示**是 `Repl` 的事，那条 effort 测试就该落在这里）
 
 **Interfaces:**
 - Consumes: `CoreCommand.SessionSetAxis`（T3）
@@ -1348,17 +1349,47 @@ Expected: `AxisSet_ParsesThreeWords` 红（返回的是 `(null, null)` ⇒ 被�
 > ⚠️ **加一条测试**：改轴之后 `session status` 的输出里是**新值**。
 > 断言**输出文本**而不是内部状态——内部状态在修复前后都一样，对这条缺陷没有区分力
 > （与 T3 那条 `SetAxis_Effort_ActuallyReachesTheModelRequest` 同一个道理）。
+>
+> ```csharp
+> /// <summary>
+> /// ⚠️ **`session status` 印的必须是轴的当前值，不是 `Spec.Model.Effort`（冻结的快照）。**
+> /// 与 T3 那条同一个病灶、换到显示层：用户改了轴，控制台说还是旧值。
+> ///
+> /// <para>⚠️ 判据是**输出文本**。断言 `handle.State.Axes["effort"]` 对这条缺陷**没有区分力**
+> /// ——修复前后它都是新值，因为坏的只是「印哪一份」。</para>
+> /// </summary>
+> [Fact]
+> public async Task Status_PrintsTheAxisEffort_NotTheFrozenSpecOne()
+> {
+>     var (repl, dispatcher, session) = NewHarness();   // 照 ReplTests 既有约定
+>
+>     // ⚠️ 先确认起点**不是** max，否则「印了新值」与「印了旧值」看不出区别。
+>     var before = _out.ToString();
+>     Assert.Contains("effort high", before);
+>
+>     await dispatcher.DispatchAsync(
+>         new CoreCommand.SessionSetAxis(session.SessionId, "effort", "max"), "a1", true, CancellationToken.None);
+>     _out.GetStringBuilder().Clear();
+>
+>     await repl.ExecuteAsync("status", CancellationToken.None);
+>
+>     Assert.Contains("effort max", _out.ToString());
+> }
+> ```
+>
+> ⚠️ `NewHarness` 与 `_out` 照 `ReplTests` 既有约定取（它已经有 `StringWriter` 捕获输出）。
+> ⚠️ **变异确认**：把 `PrintStatus` 改回读 `Spec.Model.Effort`，这条必须红。
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `dotnet test --filter "FullyQualifiedName~AxisSet_" -v q`
-Expected: 通过 6，失败 0（Theory 的 6 个用例）
+Run: `dotnet test --filter "FullyQualifiedName~AxisSet_|FullyQualifiedName~Status_PrintsTheAxis" -v q`
+Expected: 通过 7，失败 0（Theory 的 6 个用例 + 那条 effort 显示）
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add src/Lilara.Core/Console/ tests/Lilara.Core.Tests/ParserTests.cs
-git commit -m "feat(console): axis set（段数守卫：少了报错，不落回当成消息）+ status 印策略行"
+git add src/Lilara.Core/Console/ tests/Lilara.Core.Tests/
+git commit -m "feat(console): axis set（段数守卫：少了报错，不落回当成消息）+ status 印轴的 effort 而不是冻结的 spec"
 ```
 
 ⚠️ `Repl.cs` 的改动（回执格式 + `PrintStatus`）**也要进这个提交**——
