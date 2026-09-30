@@ -96,7 +96,14 @@ public static class ClaudeRequestBuilder
                     break;
 
                 case CanonicalBlock.ReasoningBlock r:
-                    // ⚠️ Signature 原样回传，绝不改动、绝不重新生成
+                    // ⚠️ 实测（反射读 SDK 12.51.0）：`ThinkingBlockParam.Signature` 与 `.Thinking`
+                    // **都是 `required`**，且没有省掉 Signature 的构造器重载——也就是说
+                    // 「无签名的 thinking 块」在这个 SDK 里**根本表达不出来**。
+                    // 那么没有签名时只有两条路：`null!` 骗编译器（会写出 `"signature":null`，
+                    // 上游 400），或**不发**。计划书 §核心语义明说：不能回传时必须
+                    // **静默丢弃而非伪造**，所以取后者。
+                    // ⚠️ 有签名的一支必须逐字回传（00 §5 铁律）。
+                    if (r.Signature is null) break;
                     content.Add(new ThinkingBlockParam { Thinking = r.Text, Signature = r.Signature });
                     break;
 

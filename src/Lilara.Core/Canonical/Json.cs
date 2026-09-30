@@ -22,4 +22,13 @@ public static class Json
         // history.jsonl 是只追加、永不重写的，写错一次就是一次数据迁移。
         Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
     };
+
+    /// <summary>
+    /// 稳定序列化入口。**所有出站渲染都走这里**。
+    /// ⚠️ 存在的理由：`JsonSerializer` 对同一类型的键序虽然目前稳定，
+    /// 但那是实现细节；而前缀稳定性要求**逐字节可预期**。
+    /// 这里把「稳定」变成一个被测试钉住的**承诺**，而不是对 BCL 的信任。
+    /// </summary>
+    public static string StableSerialize<T>(T value) =>
+        JsonSerializer.Serialize(value, Options);
 }

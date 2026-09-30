@@ -72,4 +72,54 @@ public class BlockTests
 
         Assert.Equal(original, back);
     }
+
+    [Fact]
+    public void ReasoningBlock_SignatureIsOptional()
+    {
+        // ⚠️ 实测：本机网关的 deepseek-flash 返回 {"type":"thinking","thinking":"..."}
+        // **没有 signature**。把它当必填，整条推理就存不下来。
+        Block original = new Block.ReasoningBlock(Signature: null, Text: "想想", Kind: "text");
+
+        var json = JsonSerializer.Serialize(original, Json.Options);
+        var back = JsonSerializer.Deserialize<Block>(json, Json.Options);
+
+        Assert.Equal(original, back);
+        Assert.Contains("\"kind\":\"reasoning\"", json);
+    }
+
+    [Fact]
+    public void ReasoningBlock_PreservesSignatureByteForByte()
+    {
+        // ⚠️ signature 是不透明凭据，上游会校验——绝不能 trim 或重编码
+        const string sig = "ErUBCkYIBRgCIkAxY±+/= 空格 也保留";
+        Block original = new Block.ReasoningBlock(sig, "想", "text");
+
+        var back = JsonSerializer.Deserialize<Block>(
+            JsonSerializer.Serialize(original, Json.Options), Json.Options);
+
+        Assert.Equal(sig, ((Block.ReasoningBlock)back!).Signature);
+    }
+
+    [Fact]
+    public void RedactedReasoning_RoundTrips()
+    {
+        // redacted 是加密载荷：原样保留、不解释（ApiPlan spec §10.2）
+        Block original = new Block.ReasoningBlock(null, "ZW5jcnlwdGVk", "redacted");
+
+        var back = JsonSerializer.Deserialize<Block>(
+            JsonSerializer.Serialize(original, Json.Options), Json.Options);
+
+        Assert.Equal("redacted", ((Block.ReasoningBlock)back!).Kind);
+    }
+
+    [Fact]
+    public void StableSerialize_ProducesIdenticalBytesForIdenticalInput()
+    {
+        // ⚠️ 前缀稳定性的地基：同一内容两次渲染必须逐字节相同。
+        // 这条测试是「不依赖字典枚举序」的守卫。
+        var a = new Block.TextBlock("你好");
+        var b = new Block.TextBlock("你好");
+
+        Assert.Equal(Json.StableSerialize(a), Json.StableSerialize(b));
+    }
 }
