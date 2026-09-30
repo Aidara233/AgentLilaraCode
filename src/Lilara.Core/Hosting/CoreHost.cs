@@ -47,6 +47,13 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
         _activated.GetOrAdd(sessionId, _ => SessionHandle.Load(_store, projectKey, sessionId));
 
     /// <summary>
+    /// 登记一个**已经建好**的 handle（`session.create` 用的）。
+    /// ⚠️ 与 <see cref="Activate"/> 的区别：那个是「从磁盘载入」，这个是「手里已经有了」。
+    /// 让 create 走 Activate 会白读一次盘，而且在文件刚写完的窗口里可能读到半截。
+    /// </summary>
+    public void Register(SessionHandle handle) => _activated[handle.SessionId] = handle;
+
+    /// <summary>
     /// 快照端点必须**先查这里**再回落磁盘。
     /// ⚠️ 理由：`Stepper` 在步开始时只把 `Running` 写进**内存**（`Stepper.cs:39`，刻意不落盘），
     /// 到步末才写 `state.json`。所以步进行中读磁盘会得到 **Idle** ⇒
