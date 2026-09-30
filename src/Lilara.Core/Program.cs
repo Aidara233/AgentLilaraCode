@@ -1,3 +1,5 @@
+using Lilara.Core.Adapters;
+using Lilara.Core.Adapters.Claude;
 using Lilara.Core.Console;
 using Lilara.Core.Persistence;
 using Lilara.Core.Projects;
@@ -47,15 +49,22 @@ else
 // 所以「该用哪个适配器」必须从 store 现解析（`StepperResolver`），
 // 而不是启动时定死一次。否则「全新跑 → provider set → 发消息」这条最常见的
 // 首次使用路径会撞上占位适配器，而 store 明明已经写好了。
+var stepper = StepperResolver.Resolve(store, providers, resume?.Spec.Model.ProviderId);
+
 var repl = new Repl(
     store,
     providers,
-    StepperResolver.Resolve(store, providers, resume?.Spec.Model.ProviderId),
+    stepper,
     workingDirectory,
     Console.Out)
 {
     Current = resume,
 };
+
+// ⚠️ 端点是**谁定的**必须看得见（01 §7）。
+// 环境变量缺省时接管不是错——本机就是靠它把流量导向本地代理的；
+// **悄悄**接管才是错。所以每次解析出适配器都印一行，并且点名来源。
+PrintEndpoint(stepper);
 
 Console.WriteLine("  `provider set <id> --key <key>` 配置；`session create` 建会话；`history` 回放；`quit` 退出。");
 
@@ -77,14 +86,38 @@ while (true)
     if (Repl.IsProviderSetCommand(line))
     {
         var current = repl.Current;
+        var next = StepperResolver.Resolve(store, providers, current?.Spec.Model.ProviderId);
         repl = new Repl(
             store,
             providers,
-            StepperResolver.Resolve(store, providers, current?.Spec.Model.ProviderId),
+            next,
             workingDirectory,
             Console.Out)
         {
             Current = current,
         };
+
+        // ⚠️ 这里也要印：`provider set` 之后才第一次有适配器（全新跑的常见路径），
+        // 而且端点可能**刚刚变了**——不印的话，环境变量正是在此刻悄悄接管的。
+        PrintEndpoint(next);
     }
 }
+
+/// <summary>
+/// 端点一行。⚠️ 没有适配器（占位）时**不印**——那是「还没配提供商」那条路径，
+/// 印一个地址只会让人以为已经有去处了。
+/// 适配器只经 `StepperResolver` 拿得到，所以走 `Stepper.Adapter` 这个只读访问器。
+/// </summary>
+static void PrintEndpoint(Stepper stepper)
+{
+    if (stepper.Adapter is not ClaudeAdapter claude) return;
+
+    Console.WriteLine($"  端点 {claude.Endpoint.Url}（{DescribeEndpointSource(claude.Endpoint.Source)}）");
+}
+
+static string DescribeEndpointSource(EndpointSource source) => source switch
+{
+    EndpointSource.Configured => "来自 provider 配置",
+    EndpointSource.Environment => $"来自环境变量 {EndpointResolver.EnvVar}",
+    _ => "官方地址",
+};

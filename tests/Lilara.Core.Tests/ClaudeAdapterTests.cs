@@ -63,27 +63,33 @@ public class ClaudeAdapterTests
         Assert.Throws<ArgumentNullException>(() => new ClaudeAdapter(null!));
     }
 
-    // ---- 端点解析（纯函数，离线） ----
-    // Fix 2：核心必须自己决定请求发去哪。环境里的 ANTHROPIC_BASE_URL
-    // 会静默接管请求去向，而一个管理全部会话的无头进程不该让环境说了算。
+    // ---- 端点解析（不联网：只构造，绝不 CallAsync） ----
+    // ⚠️ 判据是「谁定的端点必须说得清」。
+    // 环境变量接管本身不是错——**悄悄**接管才是：本机环境里 ANTHROPIC_BASE_URL
+    // 指向一个本地代理，把它忽略掉反而会把 PROXY_MANAGED 这个占位串
+    // 当成真 key 发去官方地址（已实测：401）。
 
     [Fact]
-    public void ResolveBaseUrl_UsesConfiguredEndpoint()
+    public void Constructor_ResolvesConfiguredEndpoint()
     {
-        var provider = Provider with { Endpoint = "https://gateway.example.com/anthropic" };
+        var adapter = new ClaudeAdapter(Provider with { Endpoint = "http://example.invalid" });
 
-        Assert.Equal("https://gateway.example.com/anthropic", ClaudeAdapter.ResolveBaseUrl(provider));
+        Assert.Equal("http://example.invalid", adapter.Endpoint.Url);
+        Assert.Equal(EndpointSource.Configured, adapter.Endpoint.Source);
     }
 
     /// <summary>
-    /// ⚠️ 没配端点时**也要显式给一个**，绝不能留空让 SDK 去读环境——
-    /// 留空的话环境变量就会接管（实测已确认，见 final-fix-report.md 的探针）。
+    /// 没配端点时**也不是官方地址**（本机就是这种情况：环境变量指向本地代理）。
+    /// 这里只断言「解析出某个来源且说得清」，不断言具体是哪一个——
+    /// 那取决于跑测试的机器，正是 `EndpointResolver` 把那部分抽成可注入的纯函数。
     /// </summary>
     [Fact]
-    public void ResolveBaseUrl_FallsBackToOfficialWhenUnset()
+    public void Constructor_AlwaysResolvesAnEndpointWithAKnownSource()
     {
-        Assert.Null(Provider.Endpoint);
-        Assert.Equal("https://api.anthropic.com", ClaudeAdapter.ResolveBaseUrl(Provider));
+        var adapter = new ClaudeAdapter(Provider);
+
+        Assert.False(string.IsNullOrWhiteSpace(adapter.Endpoint.Url));
+        Assert.True(Enum.IsDefined(adapter.Endpoint.Source));
     }
 
     // ---- CallAsync 的失败包装（离线：Build 在发请求之前就抛了） ----
