@@ -77,7 +77,7 @@ public class AxisTests
 
     /// <summary>
     /// ⚠️ 表是**进程级静态**的，交出去的取值一旦可写，改一处就等于改了所有人的表
-    /// （`TryParse` / `LegalValuesText` / 头的下拉会一起变，且**没有任何报错**）。
+    /// （`TryParse` / `LegalValuesText` / **任何从本表读的调用方**会一起变，且**没有任何报错**）。
     /// 这条钉的是「交出来的是只读视图」——不是「当前值恰好是 dev|staging|prod」。
     /// </summary>
     [Fact]

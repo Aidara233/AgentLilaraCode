@@ -5,7 +5,11 @@ namespace Lilara.Core.Session;
 ///
 /// <para>⚠️ 它是一张**表**，不是五个独立的散落判断。轴名、合法值、默认值三样放在一起，
 /// 是因为它们必须同步演进：加一个档而忘了改默认值或错误信息，正是这类表最常见的漂移。
-/// 任何别处（头的下拉、控制台的解析、错误信息）都**从这张表读**，不许手抄。</para>
+/// 任何别处要用这些值（头的下拉、控制台的解析、错误信息）都**从这张表读**，不许手抄。</para>
+///
+/// <para>⚠️ **但那是要去的方向，不是现状**，别照着写：
+/// `ClaudeRequestBuilder.ToEffort` 就是一份**手抄的第二副本**（已知，计划 G10 那类，见下
+/// `Effort` 那条）；而那面头的下拉**今天还不存在**（`head/` 里没有任何轴字面量）。</para>
 ///
 /// <para>⚠️ **`effort` 在表里，但它不进上下文**（`01` §3.5：纯请求参数）。
 /// 它仍然是一条轴：用户要能改它，机械层（请求参数）也要跟着变。
@@ -27,15 +31,26 @@ public static class Axes
     /// ⚠️ 值类型是 <see cref="IReadOnlyList{T}"/> 而**不是** `string[]`，且每个值都被
     /// <see cref="Array.AsReadOnly{T}"/> 包过一层：`Dictionary` 只是阻止**换掉**条目，
     /// 挡不住调用方拿到数组后**就地改元素**。
-    /// <para>后果不是理论上的：`((string[])Axes.ValuesOf("safety"))[2] = "production"`
-    /// 改的是**进程级静态表**，`TryParse` / `LegalValuesText` / 头的下拉会**一起变**——
-    /// 而当时那 7 条测试**一条都发现不了**（它们每次都重读被改的同一份表）。
-    /// 那正是这个类声称要消灭的漂移，只是换成了运行期版本。</para>
+    ///
+    /// <para>后果不是理论上的：改的是**进程级静态表**，`TryParse` / `LegalValuesText`
+    /// 以及**任何从本表读的调用方**会一起变，且**不报错**——那正是这个类声称要消灭的
+    /// 漂移，只是换成了运行期版本。</para>
+    ///
+    /// <para>⚠️ 当时那 7 条测试**兜不住**它，但「兜不住」有边界，别写成全称句：
+    /// 它们每次都重读**同一份已污染的表**，所以只要被改的元素**既不是默认值、
+    /// 也不是哪条断言点名的值**，就一条都不红。改 `safety[0]` 则相反，是抓得到的——
+    /// 默认值 `dev` 会变非法（`Defaults_CoverEveryAxis…` 红）、
+    /// 而 `production` 由非法变合法（`UnknownValue_IsRefused…` 红）。
+    /// ⇒ 结论不是「测试写得差」，而是**靠现有断言兜底不可靠，得靠类型本身挡**。</para>
     /// </summary>
     private static readonly Dictionary<string, IReadOnlyList<string>> Table = new(StringComparer.Ordinal)
     {
-        // 主动性 = 循环的停止条件（§3.5）。档名就是**本表定义的**串：
-        // 线上协议与落盘携带的值以这里为源，改这里即改协议（故不能随手重命名）。
+        // 主动性 = 循环的停止条件（§3.5）。档名就是**本表定义的**串。
+        // 范围要说准：**落盘**（`state.json` 的 `Axes`）与**控制面快照**
+        //（`ControlServer` 整份序列化 `SessionState`）携带的轴值都以这里为源
+        //（`SessionHandle` 用 `Defaults()` / `TryParse` 播种，见 `SessionHandle.cs:155,165`）。
+        // ⚠️ 但**模型请求**那条路**不是**：`ClaudeRequestBuilder.ToEffort` 是一份
+        // **手抄的第二副本**（已知，即计划 G10 说的那类）——改这里**改不到它**，两头要一起改。
         [Initiative] = Array.AsReadOnly<string>(["step", "standard", "goal"]),
 
         // 权限 = 闸门。0..5 单调阶梯，低档是拒绝线、高档是询问线。
@@ -47,11 +62,16 @@ public static class Axes
 
         [Verify] = Array.AsReadOnly<string>(["none", "self", "strict"]),
 
-        // ⚠️ 与 `ClaudeRequestBuilder.ToEffort` 的取值**必须一致**——
-        // 少了对应关系，轴改了而请求参数没改，用户看到的是「设了没用」。
-        // ⚠️ `01` §3.5 只写三档（低/中/高），这里取五档是**故意的**：表必须覆盖
-        // `ToEffort` 认的全部值，否则用户写 `xhigh` 能被表放行、却在建请求时抛异常。
-        // ⇒ **文档待对齐**（多出来的两档是 SDK 已有的能力，不是这里新造的）。
+        // ⚠️ 与 `ClaudeRequestBuilder.ToEffort`（`ClaudeRequestBuilder.cs:164-173`，5 条臂
+        // 166-170 + 一条 `_ => throw` 在 171）**必须逐值对齐**，但两个方向的后果**不同**，
+        // 别压成一句因果——它们的箭头的**方向是相反的**：
+        //   ① 表**少**一档（如缺 `xhigh`）⇒ 表先把它**拒掉**（`TryParse` 返回 false），
+        //      用户少一档能力、请求根本发不出去 —— **不会**抛异常（`ToEffort` 没机会看到）。
+        //   ② 表**多**一档（`ToEffort` 不认的值）⇒ 表放行、走到 `_ =>` 抛
+        //      `ArgumentException` —— 这才是「放行之后才炸」。
+        // ⇒ 两个集合应当**相等**（本表 5 档 = `ToEffort` 的 5 条臂）。
+        // ⚠️ `01` §3.5 只写三档（低/中/高），这里取五档是**故意的**：**文档待对齐**；
+        // 多出来的两档是 SDK 已有的能力，不是这里新造的。
         [Effort] = Array.AsReadOnly<string>(["low", "medium", "high", "xhigh", "max"]),
     };
 
