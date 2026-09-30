@@ -88,8 +88,13 @@ public sealed class OpenAiHttp
     /// <para>⚠️ 两个 OpenAI 适配器都调这一份。<b>不与 Claude 共用</b>——那是两个独立的减法族各自的边界谓词，
     /// 各自有测试；出现第三份再抽（`InternalsVisibleTo` 已在 `Lilara.Core.csproj`）。</para>
     /// </summary>
+    /// <summary>
+    /// ⚠️ **转发到 <see cref="Cancellation.ShouldWrap"/>**——判据只有一份。
+    /// 保留这个入口是为了既有测试与调用点不动，但**别再在这里加逻辑**：
+    /// 第二份判据一旦各自演化，某一处判反了就是「按 Ctrl-C 报成模型失败」或「超时被静默吞掉」。
+    /// </summary>
     internal static bool ShouldWrap(Exception ex, CancellationToken ct) =>
-        ex is not OperationCanceledException || !ct.IsCancellationRequested;
+        Cancellation.ShouldWrap(ex, ct);
 
     /// <summary>
     /// 拼端点与路径。⚠️ 抽成纯函数是因为**它是本类唯一能离线测的拼接逻辑**，

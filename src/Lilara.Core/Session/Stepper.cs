@@ -25,14 +25,26 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
     /// </summary>
     public IModelAdapter Adapter => _adapter;
 
+    /// <summary>
+    /// 一步 = 渲染 → 调用 → 落盘（02 §2）。
+    ///
+    /// <para>⚠️ **它不再追加用户消息**（Task 4）。按 `01` §6.1 的次序，
+    /// 「入队(x) → 若 x 是事件，**立即追加进记录**」——那次追加归 `CommandDispatcher`，
+    /// 因为**入队与追加是同一个动作的两半**：一旦分开，
+    /// 「已经落盘但还没入队」或「已入队但没落盘」这两种中间态就会各自丢消息。
+    /// 这里的 <paramref name="blocks"/> 是**取空的整个队列**（可能来自多条消息）。</para>
+    ///
+    /// <para>⚠️ 次序仍是刻意的（`01` §4）：模型输出在内存合并完只落一次盘；
+    /// `state.json` 最后写——崩在中间只让 turn 偏小，历史不损坏。</para>
+    /// </summary>
     public async Task<ModelReply> StepAsync(
-        SessionHandle handle, string userText, CancellationToken ct)
+        SessionHandle handle, IReadOnlyList<Canonical.Block> blocks, CancellationToken ct)
     {
         // 「now 冻结在步开始」（00 §2.5）——同一步内重复渲染必须逐字节相同
         var at = DateTimeOffset.UtcNow;
 
         // ⚠️ 先记下落盘的那份，失败了原样放回去。
-        // 调用方（Repl）catch 之后继续用**同一个把手**：不回滚的话，
+        // 调用方 catch 之后继续用**同一个把手**：不回滚的话，
         // 用户刚看着一步失败，`status` 却报 Running——而磁盘上从来没写过 Running。
         // 「内存是落盘的镜像」这条不变量在这里也必须成立。
         var persisted = handle.State;
@@ -41,15 +53,7 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         ModelReply reply;
         try
         {
-            // 1. 用户消息先落盘
-            _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
-            {
-                At = at,
-                From = Speaker.User,
-                Blocks = [new Canonical.Block.TextBlock(userText)],
-            });
-
-            // 2. 渲染：读回完整时间线 → canonical（核心永远发全量，00 §6）
+            // 渲染：读回完整时间线 → canonical（核心永远发全量，00 §6）
             var request = new ModelRequest
             {
                 ModelId = handle.Spec.Model.ModelId,
@@ -67,7 +71,7 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
                 Timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
             };
 
-            // 3. 调用（抛异常时直接传播——这一步没完成，Turn 不动）
+            // 调用（抛异常时直接传播——这一步没完成，Turn 不动）
             reply = await _adapter.CallAsync(request, ct);
         }
         catch
@@ -78,7 +82,7 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
             throw;
         }
 
-        // 4. 落盘：拒答不写空模型消息（Review Focus #2）
+        // 落盘：拒答不写空模型消息（Review Focus #2）
         if (!reply.Refused && reply.Blocks.Count > 0)
         {
             _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
@@ -100,5 +104,31 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         handle.SaveState(_store);
 
         return reply;
+    }
+
+    /// <summary>
+    /// 一步：**追加 + 入队 + 推进**——`01` §6.1 那条复合动作的完整形态。
+    ///
+    /// <para>⚠️ 它保留下来是为了**让既有测试的语义不被稀释**：
+    /// 那些测试断言的是「用户消息会落盘」，而 Task 4 把「追加」挪去了
+    /// <see cref="Hosting.CommandDispatcher"/>。删掉这个入口就等于删掉那些断言；
+    /// 而它们守的是一条**真的不变量**（用户消息是事实，模型调用失败也抹不掉）。
+    /// ⇒ 生产者路径（dispatcher）走「追加 + 入队 + 取空队列」，
+    /// 这个壳子给「我就想跑一步」的调用方用。</para>
+    /// </summary>
+    public Task<ModelReply> StepAsync(SessionHandle handle, string userText, CancellationToken ct)
+    {
+        var blocks = new List<Canonical.Block> { new Canonical.Block.TextBlock(userText) };
+
+        // ⚠️ 与 dispatcher 同一条次序：**先追加再入队**，然后取空。
+        _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
+        {
+            At = DateTimeOffset.UtcNow,
+            From = Speaker.User,
+            Blocks = blocks,
+        });
+        handle.Enqueue(blocks);
+
+        return StepAsync(handle, handle.DrainQueue(), ct);
     }
 }

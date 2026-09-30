@@ -80,8 +80,13 @@ public sealed class ClaudeAdapter : IModelAdapter
     /// 所以判据是「**调用方自己的 token 被取消了没有**」，不是异常类型。
     /// 抽成纯函数是为了能把这张真值表离线测干净——它藏在 catch 过滤器里就没法测了。
     /// </summary>
+    /// <summary>
+    /// ⚠️ **转发到 <see cref="Cancellation.ShouldWrap"/>**——判据只有一份。
+    /// 保留这个入口是为了既有测试与调用点不动，但**别再在这里加逻辑**：
+    /// 第二份判据一旦各自演化，某一处判反了就是「按 Ctrl-C 报成模型失败」或「超时被静默吞掉」。
+    /// </summary>
     internal static bool ShouldWrap(Exception ex, CancellationToken ct) =>
-        ex is not OperationCanceledException || !ct.IsCancellationRequested;
+        Cancellation.ShouldWrap(ex, ct);
 
     /// <summary>把 SDK 的异常翻译成一句人话（Review Focus #6）。</summary>
     internal static string Describe(Exception ex) => ex switch

@@ -26,4 +26,22 @@ public abstract record TimelineEvent
         public required Speaker From { get; init; }
         public required IReadOnlyList<Block> Blocks { get; init; }
     }
+
+    /// <summary>
+    /// 稳定序列化入口。**参数类型必须是 <see cref="TimelineEvent"/>（基类），不能写成泛型 `T`。**
+    ///
+    /// <para>⚠️ **与 <see cref="Canonical.Json.StableSerialize(Canonical.Block)"/> 是同一个陷阱**，
+    /// 实测（不是推测）：
+    /// <code>
+    /// Serialize&lt;TimelineEvent&gt;(evt) → {"kind":"message","from":"user",...}   ✓
+    /// Serialize(evt)  // MessageEvent → {"from":"user",...}                     ✗ 判别式整个丢了
+    /// </code>
+    /// 而**错误只在反序列化时才炸**——写的时候静默，读的时候才失败。</para>
+    ///
+    /// <para>⚠️ 它存在的直接原因是**事件泵要广播它**（控制面）：广播走的是
+    /// 「拿到一个 <c>TimelineEvent</c> 就发出去」，若在那里写成泛型，
+    /// 头收到的每一帧都会缺 <c>kind</c>，而且**直到头去解析才发现**。</para>
+    /// </summary>
+    public static string StableSerialize(TimelineEvent value) =>
+        System.Text.Json.JsonSerializer.Serialize(value, Canonical.Json.Options);
 }

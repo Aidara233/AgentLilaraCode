@@ -1,4 +1,5 @@
 using Lilara.Core.Adapters;
+using Lilara.Core.Hosting;
 using Lilara.Core.Adapters.Claude;
 using Lilara.Core.Canonical;
 using Lilara.Core.Console;
@@ -32,7 +33,19 @@ public class ReplTests : IDisposable
         if (Directory.Exists(_work)) Directory.Delete(_work, recursive: true);
     }
 
-    private Repl NewRepl() => new(_store, _providers, new Stepper(_store, _adapter), _work, _out);
+    /// <summary>
+    /// ⚠️ **接线变了，断言没变**（Task 3 把命令语义抽进了 `CommandDispatcher`）。
+    /// 控制台现在是控制面的一个**客户端适配器**：文本 → 命令 → dispatcher → 格式化回执。
+    /// 所以这里要造一个 `CoreHost` 与 dispatcher——但**测试断言的行为一字未动**。
+    /// ⚠️ `_adapter` 仍然注入：stepper 解析走这个 `Func`，
+    /// 所以 295 个既有测试仍然跑在 `FakeAdapter` 上（`CoreHost.StepperFor` 走的是真工厂）。
+    /// </summary>
+    private Repl NewRepl()
+    {
+        var host = new CoreHost(_root, _work);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), _ => new Stepper(_store, _adapter));
+        return new Repl(host, dispatcher, _ => new Stepper(_store, _adapter), _out);
+    }
 
     /// <summary>配好提供商，并**显式**建一个会话——核心不自动建（01 §8.1）。</summary>
     private Repl ReplWithSession()
