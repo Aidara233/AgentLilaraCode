@@ -90,8 +90,8 @@ public class TimelineEventTests
         var json = JsonSerializer.Serialize(original, Json.Options);
 
         // ⚠️ 落盘格式必须自解释：整数枚举既不可读，也会因重排静默重解释既有历史。
-        // 注意属性名是 PascalCase（Json.Options 未设命名策略），只有判别式写作 "kind"。
-        Assert.Contains("\"From\":\"Model\"", json);
-        Assert.DoesNotContain("\"From\":1", json);
+        // 属性名 camelCase（Json.Options 的命名策略），判别式 kind 由特性显式指定，不受影响。
+        Assert.Contains("\"from\":\"Model\"", json);
+        Assert.DoesNotContain("\"from\":1", json);
     }
 }

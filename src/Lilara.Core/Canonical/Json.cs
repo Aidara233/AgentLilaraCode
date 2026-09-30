@@ -11,6 +11,9 @@ public static class Json
     {
         WriteIndented = false,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        // ⚠️ camelCase：判别式 kind 本来就是小写，属性却是大驼峰——同一对象两种约定。
+        // 控制面（03）要把这些同一批类型序列化给 Web 头，camelCase 正是那边要的形状。
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         // ⚠️ 不转义非 ASCII。Unsafe 是相对「注入 HTML」说的；
         // 本地文件存储正是它的正确用途，否则中文会被写成 \u4f60\u597d。
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
