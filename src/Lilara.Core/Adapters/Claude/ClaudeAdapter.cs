@@ -20,9 +20,16 @@ public sealed class ClaudeAdapter : IModelAdapter
     /// </summary>
     public ResolvedEndpoint Endpoint { get; }
 
+    /// <summary>实际采用的认证方式（解析后的，不是原始配置）。</summary>
+    public string AuthScheme { get; }
+
     public ClaudeAdapter(ProviderDefinition provider)
     {
         ArgumentNullException.ThrowIfNull(provider);
+
+        // ⚠️ 两种认证方式走不同属性：ApiKey → x-api-key，AuthToken → Authorization: Bearer。
+        // 本机网关只认后者（实测：ApiKey 打不通、AuthToken 通）。这是协议怪癖，不是可选优化。
+        AuthScheme = provider.AuthScheme ?? AuthSchemes.Default;
 
         if (provider.Protocol != ProtocolId)
             throw new ArgumentException(
@@ -35,11 +42,9 @@ public sealed class ClaudeAdapter : IModelAdapter
         // 解析顺序：provider 配置 > 环境变量 > 官方地址（`EndpointResolver`）。
         var endpoint = EndpointResolver.Resolve(provider.Endpoint);
 
-        _client = new AnthropicClient
-        {
-            ApiKey = provider.ApiKey,
-            BaseUrl = endpoint.Url,
-        };
+        _client = AuthScheme == AuthSchemes.Bearer
+            ? new AnthropicClient { AuthToken = provider.ApiKey, BaseUrl = endpoint.Url }
+            : new AnthropicClient { ApiKey = provider.ApiKey, BaseUrl = endpoint.Url };
 
         Endpoint = endpoint;
     }

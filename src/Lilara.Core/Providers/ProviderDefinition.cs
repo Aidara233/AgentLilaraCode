@@ -30,4 +30,11 @@ public sealed record ProviderDefinition
     /// ⚠️ 加法式字段：既有 providers/*.json 里没有它，必须照旧能反序列化（为 null）。
     /// </summary>
     public string? Endpoint { get; init; }
+
+    /// <summary>
+    /// 认证方式：<see cref="AuthSchemes.ApiKey"/>（x-api-key，官方）或
+    /// <see cref="AuthSchemes.Bearer"/>（Authorization: Bearer，本机网关）。
+    /// ⚠️ 可空——老 providers/*.json 没这个字段，缺失按 <see cref="AuthSchemes.Default"/> 处理。
+    /// </summary>
+    public string? AuthScheme { get; init; }
 }

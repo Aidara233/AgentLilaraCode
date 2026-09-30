@@ -63,6 +63,38 @@ public class ClaudeAdapterTests
         Assert.Throws<ArgumentNullException>(() => new ClaudeAdapter(null!));
     }
 
+    // ---- 认证方式：后端怪癖，归提供商配置（离线：只构造） ----
+    // ⚠️ 官方只认 x-api-key（SDK 的 ApiKey），本机网关只认 Authorization: Bearer
+    // （SDK 的 AuthToken）。实测：ApiKey 打不通，AuthToken 通。构造不触网。
+
+    [Fact]
+    public void Constructor_UsesBearerWhenAuthSchemeSaysSo()
+    {
+        var provider = new ProviderDefinition
+        {
+            Id = "gw", Protocol = ClaudeAdapter.ProtocolId,
+            ApiKey = "sk-x", DefaultModel = "m", Modality = "vision",
+            AuthScheme = AuthSchemes.Bearer,   // ← 网关要 Bearer
+        };
+
+        // 构造不触网；断言的是「解析出的方案被选中」
+        var adapter = new ClaudeAdapter(provider);
+
+        Assert.Equal(AuthSchemes.Bearer, adapter.AuthScheme);
+    }
+
+    [Fact]
+    public void Constructor_DefaultsToApiKeyWhenUnset()
+    {
+        var provider = new ProviderDefinition
+        {
+            Id = "official", Protocol = ClaudeAdapter.ProtocolId,
+            ApiKey = "sk-x", DefaultModel = "m", Modality = "vision",
+        };
+
+        Assert.Equal(AuthSchemes.ApiKey, new ClaudeAdapter(provider).AuthScheme);
+    }
+
     // ---- 端点解析（不联网：只构造，绝不 CallAsync） ----
     // ⚠️ 判据是「谁定的端点必须说得清」。
     // 环境变量接管本身不是错——**悄悄**接管才是：本机环境里 ANTHROPIC_BASE_URL

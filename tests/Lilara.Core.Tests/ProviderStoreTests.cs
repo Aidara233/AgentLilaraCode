@@ -70,6 +70,27 @@ public class ProviderStoreTests : IDisposable
     }
 
     [Fact]
+    public void SaveThenLoad_RoundTripsAuthScheme()
+    {
+        // ⚠️ 认证方式和端点一样，是**后端怪癖**——归提供商配置，不归代码。
+        // 本机网关只认 Authorization: Bearer，官方只认 x-api-key。
+        _store.Save(Def() with { AuthScheme = AuthSchemes.Bearer });
+
+        Assert.Equal(AuthSchemes.Bearer, _store.Load("claude")!.AuthScheme);
+    }
+
+    [Fact]
+    public void AuthScheme_IsOptional_OldFilesStillLoad()
+    {
+        // ⚠️ 老 providers/*.json 没有这个字段，必须照常反序列化（可空 + 不 required）
+        Directory.CreateDirectory(Path.Combine(_root, "providers"));
+        File.WriteAllText(Path.Combine(_root, "providers", "old.json"),
+            """{"id":"old","protocol":"claude-messages","apiKey":"k","defaultModel":"m","modality":"vision"}""");
+
+        Assert.Null(_store.Load("old")!.AuthScheme);
+    }
+
+    [Fact]
     public void Load_ReturnsNullWhenAbsent()
     {
         Assert.Null(_store.Load("nope"));
