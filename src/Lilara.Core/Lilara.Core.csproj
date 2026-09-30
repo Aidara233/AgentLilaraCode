@@ -6,4 +6,7 @@
     <RootNamespace>Lilara.Core</RootNamespace>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Anthropic" Version="12.51.0" />
+  </ItemGroup>
 </Project>
