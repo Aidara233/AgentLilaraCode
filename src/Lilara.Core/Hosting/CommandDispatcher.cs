@@ -52,7 +52,7 @@ public sealed class CommandDispatcher(
                 return HandleSessionActivate(a, commandId);
 
             case CoreCommand.SessionSend s:
-                return await HandleSessionSendAsync(s, commandId, ct);
+                return await HandleSessionSendAsync(s, commandId, awaitCompletion, ct);
 
             case CoreCommand.SessionStart st:
                 return HandleSessionStart(st, commandId);
@@ -132,7 +132,7 @@ public sealed class CommandDispatcher(
     }
 
     private async Task<DispatchResult> HandleSessionSendAsync(
-        CoreCommand.SessionSend s, string id, CancellationToken ct)
+        CoreCommand.SessionSend s, string id, bool awaitCompletion, CancellationToken ct)
     {
         if (!TryFind(s.SessionId, out var handle, out var rejection)) return rejection!;
 
@@ -173,57 +173,110 @@ public sealed class CommandDispatcher(
         if (!handle.TryEnterStep())
             return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = s.SessionId });
 
-        // ⚠️ **闸只罩「步的执行」**，不罩入队。它防的是 `state.json` 读改写不原子
-        // （`Stepper` 改 `handle.State` 与落盘之间那段）——那才是跨会话/跨前端真正会撞的东西。
-        var gate = _host.GateFor(s.SessionId);
-        await gate.WaitAsync(ct);
+        var accepted = new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = s.SessionId });
 
-        // ⚠️ **`step.begin` 是「在跑」的唯一信号源**，不是 `session.state`——
-        // 后者是磁盘的镜像，而**磁盘从不存 Running**（`Stepper` 只把它写进内存）。
-        // 缺了它，头**连轮询都看不出在跑**。
-        var turnBefore = handle.State.Turn;
-        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-            new WireEvent.StepBegin(handle.SessionId, turnBefore + 1, DateTimeOffset.UtcNow));
+        if (awaitCompletion)
+        {
+            // 控制台：**同步拿结果**（`04` §1.1 明确允许「本地退化成同步拿回执」）。
+            // 它的失败要**抛给调用方**——控制台打印一行人话、REPL 继续活着。
+            var reply = await RunStepAsync(handle, ct, throwOnFailure: true);
+            return accepted with { Reply = reply };
+        }
 
+        // ⚠️ 控制面：**立刻回执，步在后台跑**（`03` §1 判据 2：命令投递即返回、结果走事件）。
+        // 这不只是「协议好看」——**没有它，`session.interrupt` 无事可做**：
+        // 步要是在命令里同步跑完，那条 interrupt 命令根本轮不到执行
+        // （它的"当前步"在它到达之前就已经结束了）。
+        _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
+            CancellationToken.None);
+
+        return accepted;
+    }
+
+    /// <summary>
+    /// 跑一步：闸 → 事件 → 推进。**调用方必须先 `TryEnterStep` 拿到那把标志。**
+    ///
+    /// <para>⚠️ **取消与失败必须分开**（这是本方法的要害）：
+    /// 用户按了中断不是失败，**不能报 `error`**——否则每次正常中断都变成一条红色告警，
+    /// 头会开始忽略 `error`，而那正是它最该看的东西。
+    /// 判据是 <see cref="Cancellation.ShouldWrap"/> 的镜像：看**是不是调用方取消的**。</para>
+    /// </summary>
+    private async Task<ModelReply?> RunStepAsync(SessionHandle handle, CancellationToken ct, bool throwOnFailure)
+    {
+        // ⚠️ **CTS 每步一个**，且**登记进宿主**（`interrupt` 靠它找到"当前那个步"）。
+        // 一个长命的 CTS 会让 `interrupt` 落在空闲期时把**下一次**的 token 变成已取消 ⇒
+        // 适配器判「调用方取消」⇒ 不包装 ⇒ 裸 `OperationCanceledException` 冒到前端。
+        using var stepCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _host.SetCts(handle.SessionId, stepCts);
+
+        var gate = _host.GateFor(handle.SessionId);
         try
         {
+            await gate.WaitAsync(stepCts.Token);
+
+            // ⚠️ **`step.begin` 是「在跑」的唯一信号源**，不是 `session.state`——
+            // 后者是磁盘的镜像，而**磁盘从不存 Running**（`Stepper` 只把它写进内存）。
+            // 缺了它，头**连轮询都看不出在跑**。
+            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                new WireEvent.StepBegin(handle.SessionId, handle.State.Turn + 1, DateTimeOffset.UtcNow));
+
             // 取空队列——**合并是队列的副产品**：第一次推进就把后来那几条一起拿去渲染。
             var blocks = handle.DrainQueue();
-            var stepper = _resolveStepper(handle);
-            var reply = await stepper.StepAsync(handle, blocks, ct);
+            var reply = await _resolveStepper(handle).StepAsync(handle, blocks, stepCts.Token);
 
-            // ⚠️ 模型消息**由这里发**（`Stepper` 不碰事件总线——它是纯推进器，
-            // 而事件属于控制面那一层）。判据跟 `Stepper` 落盘时一致：
-            // 拒答 / 空块不产生模型消息。
+            // ⚠️ 模型消息**由这里发**（`Stepper` 不碰事件总线——它是纯推进器）。
+            // 判据跟 `Stepper` 落盘时一致：拒答 / 空块不产生模型消息。
             if (!reply.Refused && reply.Blocks.Count > 0)
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                     new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, DateTimeOffset.UtcNow));
 
-            // ⚠️ **`step.end` 必须在 `Turn` 自增之后**，且**在拒答分支之外**——
-            // 拒答也走这一步（`Turn` 照样加一）。挂在「模型消息之后」会**漏掉拒答**，
-            // 于是头看着一次拒答像「什么都没发生」，而且它永远等不到 step.end，
-            // 会以为那一步卡住了。
-            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                new WireEvent.StepEnd(handle.SessionId, handle.State.Turn, reply.Refused, reply.StopReason));
-
-            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                new WireEvent.StateChanged(handle.SessionId, handle.State.Status, handle.State.Turn));
-
-            return new DispatchResult(
-                new Ack.Accepted { CommandId = id, SessionId = s.SessionId }, reply);
+            PublishStepEnd(handle, reply);
+            return reply;
         }
-        catch (ModelCallFailedException ex)
+        catch (OperationCanceledException) when (stepCts.IsCancellationRequested)
         {
-            // ⚠️ **不是 rejected**：命令本身完全合法，是**这次调用失败了**（03 §3 的分界线）。
-            // 走 error 事件（Task 6），不走回执——否则头会把一次网络抖动
-            // 当成「你的命令写错了」，然后让用户去改一个没写错的命令。
-            throw new DispatchException(ex.Message, ex);
+            // ⚠️ **中断不是失败。** 用户消息已经落盘了（那是事实），模型那半没写成，
+            // `Turn` 不递增——这是一次**没完成的步**，不是一个错。
+            // ⇒ 发 `state` 回到 Idle，**不发 `error`**。
+            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                new WireEvent.StateChanged(handle.SessionId, "Idle", handle.State.Turn));
+
+            if (throwOnFailure) throw new DispatchException("这一步被中断了。");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            // 真失败：**走事件，不走回执**（`03` §3 的分界线）。
+            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                new WireEvent.Error(handle.SessionId, ex.Message));
+
+            // ⚠️ 后台路**必须吞掉异常**：`Task.Run` 里逃出去的异常是
+            // **未观测异常**，在 .NET 上会**直接终结进程**。一个上游 400
+            // 不该让整个核心死掉。
+            if (throwOnFailure) throw new DispatchException(ex.Message, ex);
+            return null;
         }
         finally
         {
+            _host.SetCts(handle.SessionId, null);   // 先摘掉，再让 using 释放
             handle.ExitStep();
-            gate.Release();
+            if (gate.CurrentCount == 0) gate.Release();
         }
+    }
+
+    /// <summary>
+    /// ⚠️ **`step.end` 必须在 `Turn` 自增之后**（`Stepper` 已经加过了），
+    /// 且**在拒答分支之外**——拒答也走这一步（`Turn` 照样加一）。
+    /// 挂在「模型消息之后」会**漏掉拒答**，于是头看着一次拒答像「什么都没发生」，
+    /// 而且它**永远等不到 `step.end`**，会以为那一步卡住了。
+    /// </summary>
+    private void PublishStepEnd(SessionHandle handle, ModelReply reply)
+    {
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.StepEnd(handle.SessionId, handle.State.Turn, reply.Refused, reply.StopReason));
+
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.StateChanged(handle.SessionId, handle.State.Status, handle.State.Turn));
     }
 
     private DispatchResult HandleSessionStart(CoreCommand.SessionStart s, string id)
@@ -236,12 +289,30 @@ public sealed class CommandDispatcher(
 
     private DispatchResult HandleSessionInterrupt(CoreCommand.SessionInterrupt i, string id)
     {
-        if (!TryFind(i.SessionId, out _, out var rejection)) return rejection!;
+        if (!TryFind(i.SessionId, out var handle, out var rejection)) return rejection!;
 
-        // ⚠️ **故意先不实现**（Task 7 补）：CTS 每步一个、只在 Running 且非空时 Cancel 并置空。
-        // 一个**错的**取消会打死常驻进程（长命 CTS 让下一次的 token 出生即已取消，
-        // 于是 ShouldWrap 判「调用方取消」不包装，裸 OperationCanceledException 冒到 Repl 不接）。
-        // 留一个 no-op 的壳比实现错的强。
+        // ⚠️ **两个条件都必需**，缺一不可：
+        //   ① **该会话确实在跑**（`IsRunning`）——否则这次 interrupt 是在打断一个
+        //      **还没开始的**步。那正是「长命 CTS」会造成的灾难：一个常驻的 CTS
+        //      被 Cancel 之后，**下一次**步的 token 出生即已取消 ⇒
+        //      适配器判「调用方取消」⇒ 不包装 ⇒ 裸 `OperationCanceledException`
+        //      冒到前端（REPL 只接 `ModelCallFailedException`）⇒ **打死常驻进程**。
+        //   ② **CTS 非空**——它是「当前那个步」的句柄，空说明步刚结束、还没来得及摘。
+        // ⇒ 只有「在跑 **且** 有句柄」时才 Cancel。空闲时的 interrupt 是 **no-op**，
+        //   但**仍然回 ack**（命令本身合法——它在语义上等于「停下」，而没在跑就是已经停下了）。
+        if (handle.IsRunning && _host.CtsFor(i.SessionId) is { } cts)
+        {
+            try
+            {
+                cts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // 竞态：步刚好在这一瞬间结束并释放了它。**不是错误**——
+                // 我们本来要做的就是「让它停」，它已经停了。吞掉，回 ack。
+            }
+        }
+
         return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = i.SessionId });
     }
 
