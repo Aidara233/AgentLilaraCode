@@ -106,9 +106,14 @@ public class SessionHandleTests : IDisposable
     }
 
     /// <summary>
-    /// ⚠️ **轴的 effort 从 spec 播种**，不是取表里的硬编码默认值 `high`。
-    /// 不播种的话，提供商配 `effort=low` 时会造出「Spec 说 low、轴说 high」的会话——
-    /// **出生即分叉**，而 `Stepper` 从轴读 ⇒ 用户从没设过轴，effort 却变了。
+    /// ⚠️ **轴的 effort 必须与 spec 一致，否则 `Stepper` 从轴读会与建会话时的意图分叉。**
+    /// 不播种的话，一个 spec 说 `low` 的会话，轴会是表默认值 `high`——**出生即分叉**，
+    /// 而用户从没设过轴。
+    ///
+    /// <para>⚠️ **今天没有任何代码路径能产出 `effort != "high"` 的 spec**：`ProviderDefinition`
+    /// 没有 effort 字段，唯一的建会话调用点写死 `"high"`（`CommandDispatcher.cs:114`）。
+    /// 所以这条测试**用 `with { Effort = "low" }` 直接构造 spec** 来钉规则本身——
+    /// 它守的是「将来接上按提供商配 effort 时不会分叉」，而不是描述今天的行为。</para>
     ///
     /// <para>⚠️ 第二次 <see cref="SessionHandle.Load"/> 是**这条测试的另一半**：
     /// 种子只有落盘才活得过重启（`Create` 里那一份 `state` 直接被 `WriteState`）；
@@ -140,19 +145,38 @@ public class SessionHandleTests : IDisposable
     }
 
     /// <summary>
-    /// ⚠️ **轴与 `Turn` / `Status` 住同一份 `State`**（`SessionState.Axes`）。
-    /// 这条守的是「别把它们拆成两份」：一旦 `SaveAxes` 改成从轴另构造一个 `SessionState`，
-    /// `Turn` / `Status` 会被抹成 0 / Idle，而这一步**没有任何报错**——
-    /// 只是重启后会话「失忆」，且磁盘上看不出是哪次写坏的。
+    /// ⚠️ spec 里的大小写变体要**规范化**再入轴（`CompleteAxes` 用 `Axes.TryParse`）。
+    /// 原样存 `"HIGH"` 会同时坏两件事：`ClaudeRequestBuilder.ToEffort` 的 switch
+    /// **区分大小写** ⇒ 请求时抛异常；头的下拉按表里的小写拼法匹配 ⇒ 一个选项都选不中。
     /// </summary>
     [Fact]
-    public void SaveAxes_WritesTheAxisWithoutDisturbingTurnAndStatus()
+    public void Create_NormalizesTheEffortCaseFromTheSpec()
+    {
+        var handle = SessionHandle.Create(_store, @"C:\work", Model() with { Effort = "HIGH" });
+
+        Assert.Equal("high", handle.State.Axes![Axes.Effort]);
+    }
+
+    /// <summary>
+    /// ⚠️ **轴与 `Turn` 住同一份 `State`**（`SessionState.Axes`）。
+    /// 这条守的是「别把它们拆成两份」：一旦 `SaveAxes` 改成从轴另构造一个 `SessionState`，
+    /// `Turn` 会被抹成 0，而这一步**没有任何报错**——只是重启后会话「失忆」，
+    /// 且磁盘上看不出是哪次写坏的。
+    ///
+    /// <para>⚠️ **判据用 `Turn` 而不是 `Status`**：`"Running"` 只存在于内存
+    /// （`Stepper.cs:51` 那个 `with`），**磁盘上写过的状态只有 `"Idle"`**
+    /// （`SessionHandle.cs` 的建会话处与 `Stepper.cs` 的收尾处）——构造一个
+    /// `Status = "Running"` 的 state 去落盘，等于在测一个真实数据里不存在的形状。
+    /// 而 `Status = "Idle"` 又恰好是 `SessionState` 的默认语义，**抹掉它这条测试也发现不了**
+    /// ⇒ 拿它当判据是假覆盖。`Turn` 的默认值是 0，抹掉会立刻显形。</para>
+    /// </summary>
+    [Fact]
+    public void SaveAxes_WritesTheAxisWithoutDisturbingTurn()
     {
         var handle = SessionHandle.Create(_store, @"C:\work", Model());
         handle.State = handle.State with
         {
             Turn = 3,
-            Status = "Running",
             Axes = new Dictionary<string, string>(handle.State.Axes!, StringComparer.Ordinal)
             {
                 [Axes.Safety] = "prod",
@@ -163,7 +187,6 @@ public class SessionHandleTests : IDisposable
 
         var reread = _store.ReadState(handle.ProjectKey, handle.SessionId);
         Assert.Equal(3, reread.Turn);
-        Assert.Equal("Running", reread.Status);
         Assert.Equal("prod", reread.Axes![Axes.Safety]);
     }
 }

@@ -100,16 +100,18 @@ public sealed record SessionHandle
             Turn = 0,
             Pending = [],
 
-            // ⚠️ **轴的 effort 从 spec 播种，不是从表里的硬编码默认值。**
-            // 提供商配的是 `effort=low` 时会造出一个 **Spec 说 low、轴说 high** 的会话——
-            // **出生即分叉**，而 `Stepper` 从轴读 ⇒ 用户从没设过轴，effort 却变了。
-            // 其余四条轴没有「会话配置里的镜像」，所以仍取默认值。
+            // ⚠️ **轴的 effort 必须与 spec 一致，否则 `Stepper` 从轴读会与建会话时的意图分叉**
+            // （`CompleteAxes` 的注释里有这条规则的完整形态）。
+            // 今天的唯一建会话调用点写死 `effort="high"`（`CommandDispatcher.cs:114`；
+            // `ProviderDefinition` **没有** effort 字段），所以这条路径暂时恒定——
+            // **但规则必须在这里立住**，因为将来接上「按提供商配 effort」时，
+            // 这里是唯一能防住分叉的地方。
             //
             // ⚠️ 播种进 `state` 而不是「先构造 handle、再补一次轴」：轴与 `Turn` / `Status`
             // 住**同一份** <see cref="SessionState"/>，多留一份副本就是多一个能分叉的地方。
             // 顺带的好处：下面那次 `WriteState` 把默认值一并落了盘——磁盘上「没设过」
             // 与「设成了默认值」从此可分辨，将来改默认值不会让老会话**静默改变行为**。
-            Axes = WithEffortFrom(Axes.Defaults(), spec.Model.Effort),
+            Axes = CompleteAxes(stored: null, spec.Model.Effort),
         };
 
         // ⚠️ 先 state 后 spec——顺序是刻意的，别调换。
@@ -131,17 +133,41 @@ public sealed record SessionHandle
         };
     }
 
-    /// <summary>把 spec 里冻结的 effort 播种进轴——见 <see cref="Create"/> 的注释。</summary>
-    private static IReadOnlyDictionary<string, string> WithEffortFrom(
-        IReadOnlyDictionary<string, string> defaults, string effort)
+    /// <summary>
+    /// 一份**完整**的轴字典：先铺 <see cref="Axes.Defaults"/> 打底，再用 spec 里冻结的 effort
+    /// 覆盖，最后让**磁盘上存过的那份**覆盖回来。
+    ///
+    /// <para>⚠️ **`Create` 与 `Load` 共用这一处，这是刻意的。** 两条来路各写一份规则，
+    /// 就会出现「新建的会话按 spec 播种了 effort、重启载入的却退回默认值」这种分叉——
+    /// 而它只有在重启之后才显形。**同一个值出现在多处时，它们是同一个契约的副本。**</para>
+    ///
+    /// <para>⚠️ **打底，而不是「整份为空才补」**：判据是**逐键**齐全，不是整份非空。
+    /// 一份「有键但不全」的 `axes`（手改的、或将来某个只写一条轴的写入方）在旧判据下会漏补，
+    /// 而 `Stepper` 读 `Axes.Effort` 用的是**索引器** ⇒ `KeyNotFoundException`。
+    /// 加第 6 条轴时，**所有** 5 键的老会话都属于这一类。</para>
+    ///
+    /// <para>⚠️ **覆盖顺序（默认 → spec → 磁盘）是有意的**：磁盘上那份排最后，
+    /// 所以用户 `setAxis` 改过的值不会被 spec 或默认值盖掉。</para>
+    /// </summary>
+    private static IReadOnlyDictionary<string, string> CompleteAxes(
+        IReadOnlyDictionary<string, string>? stored, string specEffort)
     {
-        var d = new Dictionary<string, string>(defaults, StringComparer.Ordinal);
+        var d = new Dictionary<string, string>(Axes.Defaults(), StringComparer.Ordinal);
 
-        // ⚠️ 这个 `if` 不是多余的：老的 `spec.json` 里 effort 可能是**表里没有的值**
-        // （`ClaudeRequestBuilder.ToEffort` 抛异常的那类拼写错误）。种子进轴会让头的下拉
-        // **没有任何一个选项被选中**——那是比「悄悄用默认值」更坏的显示。表里没有就退回默认值。
-        if (Axes.ValuesOf(Axes.Effort)!.Contains(effort, StringComparer.OrdinalIgnoreCase))
-            d[Axes.Effort] = effort;
+        // ⚠️ **用 `Axes.TryParse`，不要用 `ValuesOf(...).Contains(..., OrdinalIgnoreCase)`**：
+        // 后者放行 `"HIGH"` 却**原样存进去**，于是 ① `ClaudeRequestBuilder.ToEffort` 的 switch
+        // **区分大小写** ⇒ 请求时抛异常；② 头的下拉按表里的小写拼法匹配 ⇒ `"HIGH"` 一个都选不中。
+        // `TryParse` 顺手把大小写规范化掉——它存在就是为了这件事。
+        //
+        // ⚠️ 解析失败**不是**多余的守卫：老的 `spec.json` 里 effort 可能是表里没有的值
+        // （`ToEffort` 抛异常的那类拼写错误）。种子进轴会让头的下拉**没有任何一个选项被选中**
+        // ——那是比「悄悄用默认值」更坏的显示。表里没有就保留默认值。
+        if (Axes.TryParse(Axes.Effort, specEffort, out var canonical))
+            d[Axes.Effort] = canonical;
+
+        if (stored is not null)
+            foreach (var (k, v) in stored) d[k] = v;
+
         return d;
     }
 
@@ -149,21 +175,28 @@ public sealed record SessionHandle
     {
         var state = store.ReadState(projectKey, sessionId);
 
-        // ⚠️ **老 state.json 没有 `axes` 键** ⇒ 读出来是 null ⇒ 在这里补默认值，
+        // ⚠️ **spec 只读一次**，handle 与 `CompleteAxes` 共用它。
+        // 读两次不只是多一次 IO：两次之间磁盘可能变（这里没有事务），
+        // 于是「用来播种的 effort」与「handle 上那份 spec」可以来自**不同的两代文件**。
+        var spec = store.ReadSpec(projectKey, sessionId);
+
+        // ⚠️ **老 state.json 没有 `axes` 键** ⇒ 读出来是 null ⇒ 在这里补成完整的一份，
         // 而且**补进 `State` 本身**：轴只有这一份存储，`SessionHandle` 上不该有第二份
         // （两份就会分叉，而分叉的表现是「改了轴但别处读到的还是老值」）。
         // 不补的话，头会渲染五个空白下拉，用户分不清「没设过」与「头读不到」。
-        // ⚠️ 按 `Axes.Defaults()` 补齐而不是按硬编码名单——加一条新轴时，
+        // ⚠️ 补齐按 `Axes.Defaults()` 而不是按硬编码名单——加一条新轴时，
         // 老会话也会自动拿到它的默认值，不需要第二处修改。
+        // ⚠️ 走 `CompleteAxes` 而不是「null 才补」：一条**有键但不全**的 axes 也要补全，
+        // 否则 `Stepper` 的索引器会抛 `KeyNotFoundException`。
         // ⚠️ **只补内存、不回写磁盘**：`Load` 是读路径，写盘会让「打开一个老会话」
-        // 产生一次它没要求的写。下一次落盘（`Stepper` 每步都写 `state.json`）自然带上它。
-        if (state.Axes is not { Count: > 0 })
-            state = state with { Axes = Axes.Defaults() };
+        // 产生一次它没要求的写。下一次落盘（`Stepper` **成功的那一步**会写 `state.json`；
+        // 抛异常与取消的路径不写）自然带上它。
+        state = state with { Axes = CompleteAxes(state.Axes, spec.Model.Effort) };
 
         return new SessionHandle
         {
             ProjectKey = projectKey,
-            Spec = store.ReadSpec(projectKey, sessionId),
+            Spec = spec,
             State = state,
             Directory = store.SessionDirectory(projectKey, sessionId),
         };

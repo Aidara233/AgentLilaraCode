@@ -101,12 +101,17 @@ public class AxisTests
     }
 
     /// <summary>
-    /// ⚠️ **老会话（磁盘上没有 `axes`）载入后必须拿到默认值**，而不是空字典。
+    /// ⚠️ **老会话（磁盘上没有 `axes`）载入后必须拿到一整套默认值**，而不是空字典。
     /// 空字典会让头渲染五个空白下拉，用户分不清「没设过」与「头读不到」。
     ///
     /// <para>⚠️ 断言钉的是 `handle.State.Axes`（**不是**别的什么地方挂着的轴）：
     /// 轴只有这一份存储，`Load` 必须把它补进 `State` 本身，
     /// 否则「读轴」和「读其它状态」会走两条路，而它们迟早分叉。</para>
+    ///
+    /// <para>⚠️ **spec 里的 effort 刻意写 `"low"`，不是表默认值 `"high"`。**
+    /// 写 `"high"` 时这条测试对「`Load` 该不该按 spec 播种」是**瞎的**——
+    /// 播种与不播种都会得到 `"high"`，两种实现无法区分。`"low"` 才有区分力：
+    /// 少了播种，这里会读到 `"high"`。</para>
     /// </summary>
     [Fact]
     public void Load_OfALegacyStateFile_FillsInTheDefaults()
@@ -128,13 +133,73 @@ public class AxisTests
                 Model = new Lilara.Core.Persistence.ModelSelection
                 {
                     ProviderId = "p", ModelId = "m", Protocol = "claude-messages",
-                    Effort = "high", MaxTokens = 16000,
+                    Effort = "low", MaxTokens = 16000,
                 },
             });
 
             var handle = SessionHandle.Load(store, pk, "s1");
 
-            Assert.Equal(Axes.Defaults(), handle.State.Axes);
+            // ⚠️ 表默认值的五条，**除了 effort**——effort 来自 spec 的播种。
+            var expected = new Dictionary<string, string>(Axes.Defaults(), StringComparer.Ordinal)
+            {
+                [Axes.Effort] = "low",
+            };
+            Assert.Equal(expected, handle.State.Axes);
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
+    }
+
+    /// <summary>
+    /// ⚠️ **「有键但不全」的 `axes` 也必须补齐**——判据是**逐键**齐全，不是「整份非空」。
+    /// 旧判据（整份 `Count > 0` 就不补）对一份「有键但不全」的字典**不补齐**，
+    /// 而 `Stepper` 读 `Axes.Effort` 用的是**索引器** ⇒ `KeyNotFoundException`。
+    ///
+    /// <para>⚠️ 这不是假想：**加第 6 条轴的那一天，所有 5 键的老会话都属于这一类**
+    /// ——正是 `Load` 注释声称「加轴会自动生效」的那件事。</para>
+    ///
+    /// <para>⚠️ 同时钉住**覆盖顺序**：磁盘上存的那份排最后，所以
+    /// `effort = "max"` 必须**盖过** spec 里的 `"low"`。这条顺序是 T3 的命根子——
+    /// 反过来的话，用户 `setAxis` 改的轴会在**下一次重启时被 spec 悄悄改回去**。</para>
+    /// </summary>
+    [Fact]
+    public void Load_OfAPartialAxesFile_TopsUpTheMissingKeys_AndLetsTheStoredOnesWin()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "lilara-axis-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var store = new Lilara.Core.Persistence.SessionStore(root);
+            var pk = Lilara.Core.Projects.ProjectKey.FromPath(@"C:\work");
+            store.WriteState(pk, new Lilara.Core.Persistence.SessionState
+            {
+                SessionId = "s1", Status = "Idle", Turn = 0, Pending = [],
+                // ⚠️ 5 条轴里只有 2 条：既不全、又合法
+                Axes = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    [Axes.Initiative] = "goal",
+                    [Axes.Effort] = "max",
+                },
+            });
+            store.WriteSpec(pk, new Lilara.Core.Persistence.SessionSpec
+            {
+                SessionId = "s1", ProjectKey = pk, WorkingDirectory = @"C:\work",
+                CreatedAt = DateTimeOffset.UnixEpoch,
+                Model = new Lilara.Core.Persistence.ModelSelection
+                {
+                    ProviderId = "p", ModelId = "m", Protocol = "claude-messages",
+                    Effort = "low", MaxTokens = 16000,   // ⚠️ 与磁盘上那份**故意不同**
+                },
+            });
+
+            var handle = SessionHandle.Load(store, pk, "s1");
+            var axes = handle.State.Axes!;
+
+            Assert.Equal("goal", axes[Axes.Initiative]);       // 存的留着
+            Assert.Equal("max", axes[Axes.Effort]);            // ⚠️ 磁盘的盖过 spec 的 "low"
+            Assert.Equal("standard", axes[Axes.Permission]);   // 缺的按默认值补齐
+            Assert.Equal("dev", axes[Axes.Safety]);
+            Assert.Equal("self", axes[Axes.Verify]);
+            Assert.Equal(Axes.Names.Count, axes.Count);        // 逐键齐全，一条不缺
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
     }
