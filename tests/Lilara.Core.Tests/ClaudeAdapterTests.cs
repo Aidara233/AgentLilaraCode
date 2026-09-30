@@ -63,6 +63,29 @@ public class ClaudeAdapterTests
         Assert.Throws<ArgumentNullException>(() => new ClaudeAdapter(null!));
     }
 
+    // ---- 端点解析（纯函数，离线） ----
+    // Fix 2：核心必须自己决定请求发去哪。环境里的 ANTHROPIC_BASE_URL
+    // 会静默接管请求去向，而一个管理全部会话的无头进程不该让环境说了算。
+
+    [Fact]
+    public void ResolveBaseUrl_UsesConfiguredEndpoint()
+    {
+        var provider = Provider with { Endpoint = "https://gateway.example.com/anthropic" };
+
+        Assert.Equal("https://gateway.example.com/anthropic", ClaudeAdapter.ResolveBaseUrl(provider));
+    }
+
+    /// <summary>
+    /// ⚠️ 没配端点时**也要显式给一个**，绝不能留空让 SDK 去读环境——
+    /// 留空的话环境变量就会接管（实测已确认，见 final-fix-report.md 的探针）。
+    /// </summary>
+    [Fact]
+    public void ResolveBaseUrl_FallsBackToOfficialWhenUnset()
+    {
+        Assert.Null(Provider.Endpoint);
+        Assert.Equal("https://api.anthropic.com", ClaudeAdapter.ResolveBaseUrl(Provider));
+    }
+
     // ---- CallAsync 的失败包装（离线：Build 在发请求之前就抛了） ----
 
     /// <summary>

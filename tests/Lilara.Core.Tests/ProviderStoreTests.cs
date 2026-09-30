@@ -32,6 +32,43 @@ public class ProviderStoreTests : IDisposable
         Assert.Equal(Def(), _store.Load("claude"));
     }
 
+    /// <summary>
+    /// 端点必须能落盘再读回（01 §7：全局层持有「端点、key、协议类型」）。
+    /// </summary>
+    [Fact]
+    public void RoundTrip_PreservesEndpoint()
+    {
+        _store.Save(Def() with { Endpoint = "https://gateway.example.com/anthropic" });
+
+        Assert.Equal("https://gateway.example.com/anthropic", _store.Load("claude")!.Endpoint);
+    }
+
+    /// <summary>
+    /// ⚠️ 加法式改动：既有 providers/*.json 里**没有** endpoint 字段，
+    /// 它们必须照旧能反序列化（Endpoint 为 null），否则升级即炸。
+    /// </summary>
+    [Fact]
+    public void Load_ToleratesFileWithoutEndpointField()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "providers"));
+        File.WriteAllText(
+            Path.Combine(_root, "providers", "legacy.json"),
+            """
+            {
+              "id": "legacy",
+              "protocol": "claude-messages",
+              "apiKey": "sk-legacy",
+              "defaultModel": "claude-opus-5",
+              "modality": "vision"
+            }
+            """);
+
+        var loaded = _store.Load("legacy");
+
+        Assert.NotNull(loaded);
+        Assert.Null(loaded!.Endpoint);
+    }
+
     [Fact]
     public void Load_ReturnsNullWhenAbsent()
     {

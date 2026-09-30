@@ -22,8 +22,24 @@ public sealed class ClaudeAdapter : IModelAdapter
                 $"ClaudeAdapter 只认协议 '{ProtocolId}'，收到 '{provider.Protocol}'",
                 nameof(provider));
 
-        _client = new AnthropicClient { ApiKey = provider.ApiKey };
+        _client = new AnthropicClient
+        {
+            ApiKey = provider.ApiKey,
+            BaseUrl = ResolveBaseUrl(provider),
+        };
     }
+
+    /// <summary>没配端点时的官方地址。</summary>
+    internal const string OfficialBaseUrl = "https://api.anthropic.com";
+
+    /// <summary>
+    /// 端点解析。⚠️ 抽成纯函数是为了能**离线**把「配了用配的 / 没配用官方的」这张表测干净。
+    /// ⚠️ 返回的**绝不能是 null**：留空的话 SDK 会去读环境里的 `ANTHROPIC_BASE_URL`，
+    /// 一个管理全部会话的无头进程就被环境变量悄悄决定了把数据发到哪。
+    /// 实测（探针见 final-fix-report.md）：显式设 BaseUrl 能压过环境变量；不设则被压过。
+    /// </summary>
+    internal static string ResolveBaseUrl(ProviderDefinition provider) =>
+        provider.Endpoint ?? OfficialBaseUrl;
 
     public async Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct)
     {

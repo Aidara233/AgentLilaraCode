@@ -21,4 +21,13 @@ public sealed record ProviderDefinition
     /// 最小闭环用不到（没有附件），但字段现在就留着。
     /// </summary>
     public required string Modality { get; init; }
+
+    /// <summary>
+    /// 端点。空则用官方地址（`01` §7：全局层持有「端点、key、协议类型」）。
+    /// ⚠️ 必须显式设进客户端：只设 ApiKey 的话，环境里的 `ANTHROPIC_BASE_URL`
+    /// 会**静默接管**请求去向，而核心对此毫不知情——一个管理全部会话的无头进程
+    /// 不该让环境决定它把数据发到哪。
+    /// ⚠️ 加法式字段：既有 providers/*.json 里没有它，必须照旧能反序列化（为 null）。
+    /// </summary>
+    public string? Endpoint { get; init; }
 }
