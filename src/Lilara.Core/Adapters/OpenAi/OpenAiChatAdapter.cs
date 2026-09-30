@@ -12,6 +12,9 @@ public sealed class OpenAiChatAdapter : IModelAdapter
     /// <summary>⚠️ 与 <see cref="ClaudeAdapter.Endpoint"/> 同理：能显示才谈得上「没静默接管」。</summary>
     public ResolvedEndpoint? Endpoint => _http.Endpoint;
 
+    /// <inheritdoc />
+    public string Protocol => ProtocolId;
+
     public OpenAiChatAdapter(ProviderDefinition provider)
     {
         ArgumentNullException.ThrowIfNull(provider);

@@ -171,6 +171,29 @@ public class StepperTests : IDisposable
         Assert.Equal("claude-opus-5", _adapter.Calls[0].ModelId);
     }
 
+    /// <summary>
+    /// ⚠️ **协议的单一真相来源是适配器，不是会话 spec**（复审实测出的分叉路径）：
+    /// 适配器按**当前** provider 定义选（`StepperResolver`），而 spec 里那份协议是**建会话时的快照**。
+    /// `provider set --protocol` 一改两者就分叉，后果**不是报错**，而是 `ReasoningPolicy`
+    /// 按快照判断能不能回放——于是在**唯一能承载推理的那条链路上把推理静默丢掉**。
+    /// 所以这里故意让两者不一致（spec 说 openai-chat、适配器说 claude-messages），
+    /// 断言发出去的用的是**适配器**那份。
+    /// </summary>
+    [Fact]
+    public async Task Step_UsesTheAdaptersProtocolNotTheSessionSpecSnapshot()
+    {
+        var handle = SessionHandle.Create(_store, @"C:\work", Model() with
+        {
+            Protocol = Protocols.OpenAiChat,   // 快照：建会话时是这个
+        });
+        _adapter.Protocol = Protocols.ClaudeMessages;   // 适配器：现在实际是这个
+        _adapter.Reply("ok");
+
+        await _stepper.StepAsync(handle, "hi", CancellationToken.None);
+
+        Assert.Equal(Protocols.ClaudeMessages, _adapter.Calls[0].Protocol);
+    }
+
     [Fact]
     public async Task Step_KeepsSystemBlocksEmpty()
     {

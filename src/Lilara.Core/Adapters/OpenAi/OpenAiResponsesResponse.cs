@@ -49,8 +49,11 @@ public static class OpenAiResponsesResponse
         // 目前没有可靠的拒答指示，故恒 false——有的话如实透传即可。
         //
         // ⚠️ 原版 Responses API 另有 `incomplete_details.reason`（`max_output_tokens` 等），
-        // **本实现不读它**——控制器派发时的 Ruling：网关补全端点当时全在报 upstream_error，
-        // 该字段无法实测；没有可观测信号就不发明规则（沿用 Task 6 的纪律）。
+        // **本实现不读它**——控制器派发时的 Ruling：当时 `POST /v1/responses` 对五个模型
+        // （deepseek-flash / gpt-5.6-luna / gpt-5.6-sol / gpt-5.6-terra / gpt-6-astra）
+        // 全都回 `upstream_error`，该字段无从实测；
+        // ⚠️ 网关恢复后补测过：正常与截断两种响应**都不含** `incomplete_details`，截断仍是 `"completed"`。
+        // 没有可观测信号就不发明规则（沿用 Task 6 的纪律）。
         // `status` 原样透传，诊断能力不受损。将来实测到再补。
         var blocks = texts.Count > 0
             ? texts.Select(t => (Block)new Block.TextBlock(t)).ToList()

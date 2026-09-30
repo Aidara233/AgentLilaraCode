@@ -97,14 +97,15 @@ public sealed class OpenAiHttp
     /// <para>⚠️ 裁掉端点末尾的 `/`：path 都以 `/` 开头（`OpenAiChatRequest.Path` = "/v1/chat/completions"），
     /// 而 `--endpoint http://host:port/` 是常见写法——不裁会拼出 `//v1/chat/completions`。
     /// **只裁拼接用的这一份**；`Endpoint.Url` 保持用户配置的原样，显示时才不会篡改他写的东西。</para>
-    /// <para>⚠️ **不可达**：本机全部补全端点没有返回过重定向或错误路径，所以裁与不裁在真实上游的差别
+    /// <para>⚠️ **不可达**：打过的请求里（三条链路各自的 `/v1/chat/completions` 与 `/v1/responses`）
+    /// 没有一条返回重定向或错误路径，所以裁与不裁在真实上游的差别
     /// **没有被观测过**——这是一条由 URL 语法推出的防御，不是实测结论。</para>
     /// </summary>
     internal static string ComposeUrl(string endpointUrl, string path) =>
         endpointUrl.TrimEnd('/') + path;
 
     /// <summary>把 HTTP 失败翻译成一句人话。</summary>
-    private static string Describe(HttpStatusCode status, string body) => status switch
+    internal static string Describe(HttpStatusCode status, string body) => status switch
     {
         HttpStatusCode.Unauthorized =>
             "API key 无效或已吊销（401）。检查 provider 配置里的 key。",
@@ -119,5 +120,5 @@ public sealed class OpenAiHttp
         _ => $"模型调用失败（{(int)status}）：{Truncate(body)}",
     };
 
-    private static string Truncate(string s) => s.Length <= 200 ? s : s[..200] + "…";
+    internal static string Truncate(string s) => s.Length <= 200 ? s : s[..200] + "…";
 }

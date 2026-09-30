@@ -17,6 +17,9 @@ public sealed class FakeAdapter : IModelAdapter
     /// <summary>假适配器不解析端点——按接口约定返回 null（占位语义）。</summary>
     public ResolvedEndpoint? Endpoint => null;
 
+    /// <summary>假适配器说什么协议——由测试设定，默认 Claude 那条。</summary>
+    public string Protocol { get; set; } = Protocols.ClaudeMessages;
+
     public FakeAdapter Reply(string text, string stopReason = "end_turn") =>
         ReplyWith(_ => new ModelReply
         {

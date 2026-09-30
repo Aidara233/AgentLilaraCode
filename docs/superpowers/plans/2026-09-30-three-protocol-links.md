@@ -2,6 +2,22 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> ## ⚠️ 执行完毕后的更正（2026-09-30，别照抄本文的代码块）
+>
+> 本计划**已执行完**（10 个任务，34 个提交）。执行过程中发现本文有多处**写错了**，
+> 最要紧的一条如下——**以 `src/` 里的实际代码为准，本文只当历史记录读**：
+>
+> - **「无签名的 thinking 块在 Anthropic 线上无法表达 / 是协议没有那个形状」是错的**（本文多处出现）。
+>   真联调期间实测：直接给网关发一个无签名的 thinking 块，**上游回 HTTP 200 并正常作答**。
+>   拦住我们的是**官方 C# SDK 的类型**（`ThinkingBlockParam.Signature` 是 `required`、类无无参外构造器），
+>   **不是上游协议**。两者的区别要紧：前者换 SDK 或手写 HTTP 就能绕，后者不能。
+>   正确表述见 `src/Lilara.Core/Canonical/ReasoningPolicy.cs` 与 `ClaudeRequestBuilder.cs` 的注释。
+> - 其它已知更正：`provider set` 的参数解析形状（见 `Repl.cs` 注释）、
+>   `EndpointResolver` 按协议族参数化、`IModelAdapter` 上的 `Endpoint`/`Protocol`。
+>   **逐条裁决记在 `.superpowers/sdd/2026-09-30-three-protocol-links/progress.md`。**
+>
+> ⚠️ **本文下方的代码块一律不要直接抄**——它们是被执行、被推翻、被修正过的**初稿**。
+
 **Goal:** 让核心能通过 Claude Messages / OpenAI Chat / OpenAI Responses 三种协议跟模型对话，且推理块的往返语义在三种协议下都正确。
 
 **Architecture:** 核心发全量 canonical（`00` §6），三个适配器各自做减法。每个适配器都是**薄壳**——翻译逻辑全在两个**纯函数**里（请求构造器 / 响应映射器），适配器本体只做「构造 → 发 → 映射」。

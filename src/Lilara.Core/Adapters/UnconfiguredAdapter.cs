@@ -12,6 +12,9 @@ public sealed class UnconfiguredAdapter(string message = "还没有配置提供�
     /// <summary>⚠️ 占位没有端点——返回 null，调用方据此**不印**那行。</summary>
     public ResolvedEndpoint? Endpoint => null;
 
+    /// <summary>⚠️ 占位不发声——给空串；调用方本就不该拿它发请求（`CallAsync` 会抛人话）。</summary>
+    public string Protocol => "";
+
     public Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct) =>
         throw new ModelCallFailedException(message);
 }

@@ -107,8 +107,9 @@ public class OpenAiChatResponseTests
     [Fact]
     public void Map_HandlesNullContentWithoutThrowing()
     {
-        // ⚠️ 实测见过：推理模型把 token 烧在思考上，content 为 **null**、
-        // finish_reason 为 "length"。绝不能在这里 NRE。
+        // ⚠️ 这一条的分支依据是**响应 schema**，不是观测：上游的 `content` 是可空字段。
+        // ⚠️ 别写成「实测见过 content 为 null」——**观测到**的截断形状是**空串**（见本文件另一条：
+        // `max_tokens=4 → content:""`，原始字节记在 Task 6 报告里）。null 分支是防御性的，保留。
         var reply = OpenAiChatResponse.Map(Body(null, "length"));
 
         Assert.Empty(reply.Blocks);

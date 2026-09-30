@@ -20,6 +20,9 @@ public sealed class ClaudeAdapter : IModelAdapter
     /// </summary>
     public ResolvedEndpoint? Endpoint { get; }
 
+    /// <inheritdoc />
+    public string Protocol => ProtocolId;
+
     /// <summary>实际采用的认证方式（解析后的，不是原始配置）。</summary>
     public string AuthScheme { get; }
 

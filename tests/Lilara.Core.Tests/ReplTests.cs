@@ -207,6 +207,31 @@ public class ReplTests : IDisposable
     }
 
     [Fact]
+    public async Task ProviderSet_RejectsATrailingFlagWithNoValue()
+    {
+        // ⚠️ **真联调后实测发现的静默保存**（复审者独立复现）：循环上界原为 `parts.Length - 1`，
+        // 于是**末尾**那个标志位整个不被检查 ⇒ `--protocol` 末尾缺值时**照常保存并回 ✓**，
+        // 协议悄悄落成默认的 claude-messages；`--endpoint` 末尾缺值时**端点被丢掉**、
+        // 请求落回兜底地址——**也是 ✓ 且无警告**，正是端点裁定要防的静默接管。
+        // ⇒ 两种都断言，端点那条尤其要紧。
+        var a = NewRepl();
+        var outA = _out.ToString();
+
+        await a.ExecuteAsync("provider set w1 --key k --protocol", CancellationToken.None);
+
+        Assert.Null(_providers.Load("w1"));
+        Assert.Contains("--protocol", _out.ToString()[outA.Length..]);
+
+        var b = NewRepl();
+        var outB = _out.ToString();
+
+        await b.ExecuteAsync("provider set w2 --key k --endpoint", CancellationToken.None);
+
+        Assert.Null(_providers.Load("w2"));
+        Assert.Contains("--endpoint", _out.ToString()[outB.Length..]);
+    }
+
+    [Fact]
     public async Task ProviderSet_RejectsAnUnknownAuthWithoutSaving()
     {
         // ⚠️ 实测：`--auth Bearer`（大写）与 AuthSchemes.Bearer（"bearer"）不相等，

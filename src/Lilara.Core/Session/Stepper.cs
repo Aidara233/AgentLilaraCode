@@ -54,7 +54,14 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
             {
                 ModelId = handle.Spec.Model.ModelId,
                 MaxTokens = handle.Spec.Model.MaxTokens,
-                Protocol = handle.Spec.Model.Protocol,
+                // ⚠️ 用**适配器实际会说的**协议，不是 spec 里那份快照。
+                // 适配器是按**当前** provider 定义选的（`StepperResolver`），而 spec 的协议是
+                // 建会话时的快照——`provider set --protocol` 一改，两者就分叉。
+                // 分叉的后果不是报错，是 `ReasoningPolicy` 按快照判断「能不能回放」，
+                // 于是**在唯一能承载推理的那条链路上把推理静默丢掉**（复审实测的路径：
+                // 会话建于 openai-chat，之后把 provider 改成 claude-messages）。
+                // ⇒ 单一真相来源放在适配器上（`IModelAdapter.Protocol`）。
+                Protocol = _adapter.Protocol,
                 Effort = handle.Spec.Model.Effort,
                 SystemBlocks = [], // 04 §1.3：核心自带零内容
                 Timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId),

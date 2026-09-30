@@ -88,8 +88,7 @@ public sealed class Repl(
         var id = parts[2];
 
         string? key = null, model = null, protocol = null, endpoint = null, auth = null;
-        // ⚠️ 从 3 起、每次跳两格：标志与值成对。
-        // 从 3 起是因为 parts[1] == "set"。
+        // ⚠️ 从 3 起、每次跳两格：标志与值成对。从 3 起是因为 parts[1] == "set"。
         //
         // ⚠️ **判据是「值长得像不像标志位」，不是「位置上像不像」**（实测三组输入后定的形状）：
         //   · `--key --model`    → 值缺失       → 必须报错
@@ -98,9 +97,26 @@ public sealed class Repl(
         // 少了这个守卫，第二组会被静默读成 `key=--model` 并把 `--model m` 整个丢掉。
         // 而**不能**改成「跳过长得像标志的位置」（初版写法）——那会把第一组读成 `key=--model`，
         // 白白接住一个明显是笔误的值。两者差别只在上面那两组输入上显形。
-        for (var i = 3; i < parts.Length - 1; i += 2)
+        //
+        // ⚠️ **循环上界必须是 `parts.Length`，不是 `parts.Length - 1`**（真联调后实测发现）：
+        // 用 `- 1` 时，**末尾**那个标志位整个不被检查——
+        //   `provider set w --key k --protocol`   → 静默按默认协议**保存并回 ✓**（想要 openai-chat）
+        //   `provider set w --key k --endpoint`   → **端点被丢掉**，请求落回兜底地址，**也是 ✓ 且无警告**
+        // 后者正是端点裁定要防的静默接管。⇒ 末尾缺值走下面那句显式报错。
+        //   ⚠️ 因此「值以 `--` 开头」不再可能（`parts[1]` 就是字面量 `set`，不参与解析），
+        //     两类输入都被「缺少值」挡住——这是**故意的**取舍，别为了接住某个以 `--` 开头的值而放开它。
+        for (var i = 3; i < parts.Length; i += 2)
         {
+            if (i + 1 >= parts.Length)
+            {
+                _out.WriteLine($"参数 {parts[i]} 缺少值。");
+                return;
+            }
+
             var value = parts[i + 1];
+            // ⚠️ 值长得像标志位 = 这个标志缺值。**这一条和上面的上界缺一不可**：
+            //   上界管「末尾那个标志位」，这条管「值被下一个标志占了的位置」。
+            //   两者都实测过：去掉任一条，就有一类输入会**静默按默认值保存并回 ✓**。
             if (value.StartsWith("--", StringComparison.Ordinal))
             {
                 _out.WriteLine($"参数 {parts[i]} 缺少值。");
@@ -262,8 +278,12 @@ public sealed class Repl(
 
         _out.WriteLine($"⏺  {ModelBody(reply.Blocks)}");
 
-        if (reply.StopReason == "max_tokens")
-            _out.WriteLine("（输出被 max_tokens 截断了）");
+        // ⚠️ 三条链路**各有各的截断用词**：Claude 说 `max_tokens`、Chat 说 `length`、
+        // Responses 说 `incomplete`。只认第一个的话，另外两条的截断会**完全不提示**——
+        // 用户看着 `⏺  （这一步没有正文输出）` 以为是模型没话说，其实是 token 烧完了。
+        // ⚠️ 用 `StopReason` 原样比对，不在上游就叫别的词时臆造（未知词一律不提示）。
+        if (reply.StopReason is "max_tokens" or "length" or "incomplete")
+            _out.WriteLine($"（输出被截断了：{reply.StopReason}）");
     }
 
     /// <summary>
