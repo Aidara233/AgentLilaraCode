@@ -108,29 +108,49 @@ public class OpenAiResponsesResponseTests
     }
 
     /// <summary>
-    /// ⚠️ <c>output</c> / <c>content</c> **不是数组**时也必须不崩。
-    /// <para>⚠️ <b>这条测试现在钉不住那两条数组守卫——原因已实测，不是疏漏：</b>
-    /// 数组守卫（<c>output.ValueKind == Array</c> / <c>content.ValueKind == Array</c>）的下游
-    /// 还有对象守卫（<c>item</c>/<c>block</c> 的 <c>ValueKind == Object</c>，修复轮 1 加的）。
-    /// 实测：把**两条数组守卫都删掉**，非数组输入会在 <c>EnumerateArray</c> 上抛，
-    /// 但那一步在对象守卫**之前**——所以本测试**照样绿**；
-    /// 而单独删一条同样不红（另一条吸收）。
-    /// 控制器量到的唯一能钉住它们的输入形态，只有「另一条守卫仍被保留」时才成立，
-    /// 那种测试是**在测测试自己怎么摆的**，不是测行为。</para>
-    /// <para>⚠️ 因此这里接受一个**已知的覆盖缺口**：两条数组守卫目前**无测试**。
-    /// 它们的价值是**纵深防御**——若将来有人移除对象守卫、或重排这两层判断，
-    /// 本测试就会成为唯一挡在 <c>EnumerateArray</c> 崩溃前面的东西。
-    /// 控制器裁定：**不为它们造一条现在无法失败的测试**（本计划已抓到过四条同类空转测试）。</para>
+    /// ⚠️ 空数组（<c>output:[]</c> / <c>content:[]</c>）是**合法输入**，不是畸形——必须解析得通。
     /// </summary>
+    /// <para>⚠️ 第 1 例是唯一产出块的，故单独断言块数；另两例断言「不崩且状态透传」。
+    /// 不加 <c>Assert.Single</c> 的话，第 1 例与第 2/3 例在断言上无从区分（审阅者指出）。</para>
     [Theory]
-    [InlineData("""{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}""")]
-    [InlineData("""{"status":"completed","output":[{"type":"message","content":[]}]}""")]
-    [InlineData("""{"status":"completed","output":[]}""")]
-    public void Map_ToleratesEmptyArrays(string body)
+    [InlineData("""{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}""", 1)]
+    [InlineData("""{"status":"completed","output":[{"type":"message","content":[]}]}""", 0)]
+    [InlineData("""{"status":"completed","output":[]}""", 0)]
+    public void Map_ToleratesEmptyArrays(string body, int expectedBlocks)
     {
         var reply = OpenAiResponsesResponse.Map(body);
 
+        Assert.Equal(expectedBlocks, reply.Blocks.Count);
         Assert.False(reply.Refused);
+        Assert.Equal("completed", reply.StopReason);
+    }
+
+    /// <summary>
+    /// ⚠️ <c>output</c> / <c>content</c> **不是数组**（数字 / 字符串 / null）时也必须不崩。
+    /// <para>⚠️ 这两条**各自钉住一条数组守卫**——实测（控制器复跑）：
+    /// 只删 <c>output</c> 的 <c>ValueKind == Array</c> → 本测试 **1 红**；
+    /// 只删 <c>content</c> 的 <c>ValueKind == Array</c> → 本测试 **1 红**。
+    /// 少了它们，非数组输入会在 <c>EnumerateArray</c> 上抛 <c>InvalidOperationException</c>。</para>
+    /// <para>⚠️ <b>控制器起初把这段写成「两条数组守卫无法被钉住」，那是错的——改正在此，
+    /// 过程记入账本。</b>我当时的错误方法：拿这条测试去跑**未变异**的代码，
+    /// 看到绿就断定「它区分不了」。而**正确的代码上本来就该是绿的**——
+    /// 钉住一个守卫要跑**两次**：变异版必须红，正确版必须绿。我只跑了后一半。</para>
+    /// <para>⚠️ 顺带记一条**真实**的局限（与上面不同，这条成立）：若**同时**删掉数组守卫
+    /// **和**下游的对象守卫，非数组输入仍会被对象守卫吸收而不崩。这个「纵深」是真的，
+    /// 但它**不构成**「无法钉住」——只删一条时，另一层的类型守卫挡不住类型不匹配。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("""{"status":"completed","output":5}""")]
+    [InlineData("""{"status":"completed","output":"str"}""")]
+    [InlineData("""{"status":"completed","output":null}""")]
+    [InlineData("""{"status":"completed","output":[{"type":"message","content":5}]}""")]
+    [InlineData("""{"status":"completed","output":[{"type":"message","content":"str"}]}""")]
+    [InlineData("""{"status":"completed","output":[{"type":"message","content":null}]}""")]
+    public void Map_ToleratesNonArrayOutputAndContent(string body)
+    {
+        var reply = OpenAiResponsesResponse.Map(body);
+
+        Assert.Empty(reply.Blocks);
         Assert.Equal("completed", reply.StopReason);
     }
 
