@@ -51,6 +51,56 @@ public class ReplTests : IDisposable
         return repl;
     }
 
+    /// <summary>
+    /// ⚠️ 控制台没有 `--endpoint` 参数，手写 providers/&lt;id&gt;.json 是配置端点的**唯一**途径。
+    /// 整文件覆盖会把它抹掉——于是「程序内配置优先」这一档永远够不着，
+    /// 用户被静默退回环境变量那一档，正是裁定要防的那种接管。
+    /// </summary>
+    [Fact]
+    public async Task ProviderSet_PreservesAHandConfiguredEndpoint()
+    {
+        _providers.Save(new ProviderDefinition
+        {
+            Id = "claude",
+            Protocol = "claude-messages",
+            ApiKey = "sk-old",
+            DefaultModel = "claude-opus-5",
+            Modality = "vision",
+            Endpoint = "http://127.0.0.1:15721",
+        });
+
+        var repl = NewRepl();
+        await repl.ExecuteAsync("provider set claude --key sk-new", CancellationToken.None);
+
+        var saved = _providers.Load("claude");
+        Assert.Equal("sk-new", saved!.ApiKey);                  // 本次指定的被更新
+        Assert.Equal("http://127.0.0.1:15721", saved.Endpoint); // 没提到的被保留
+    }
+
+    /// <summary>
+    /// 不对称是刻意的：`Protocol` **始终由代码决定**（手写一个工厂认不出的协议是个陷阱），
+    /// 而 `Modality` 是操作者配置，跟着 `Endpoint` 一起活下来。
+    /// </summary>
+    [Fact]
+    public async Task ProviderSet_KeepsModalityButAlwaysRewritesProtocol()
+    {
+        _providers.Save(new ProviderDefinition
+        {
+            Id = "claude",
+            Protocol = "hand-written-bogus", // 手写的协议必须被代码改正
+            ApiKey = "sk-old",
+            DefaultModel = "claude-opus-5",
+            Modality = "audio-only",         // 操作者配置，必须活下来
+        });
+
+        var repl = NewRepl();
+        await repl.ExecuteAsync("provider set claude --key sk-new", CancellationToken.None);
+
+        var saved = _providers.Load("claude");
+        Assert.Equal(ClaudeAdapter.ProtocolId, saved!.Protocol);
+        Assert.Equal("audio-only", saved.Modality);
+    }
+
     [Fact]
     public async Task ProviderSet_PersistsDefinition()
     {

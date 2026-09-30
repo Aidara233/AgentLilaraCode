@@ -23,6 +23,10 @@ var existing = store.ListSessions(projectKey);
 
 SessionHandle? resume = null;
 
+// ⚠️ 「会话绑定的提供商没了」是一条**独立**的落点，不能和「全新跑」混为一谈：
+// 两者都让 preferredProviderId 变成 null，但只有前者刚刚才向用户报告过一个坏消息。
+var boundProviderMissing = false;
+
 if (existing.Count > 0)
 {
     var handle = SessionHandle.Load(store, projectKey, existing[0]);
@@ -30,6 +34,7 @@ if (existing.Count > 0)
 
     if (provider is null)
     {
+        boundProviderMissing = true;
         // ⚠️ 要点名缺的是哪个提供商——只说「已不存在」，用户不知道该重配哪一条。
         Console.WriteLine(
             $"  会话引用的提供商 '{handle.Spec.Model.ProviderId}' 已不存在。用 `provider set` 重新配一个。");
@@ -64,7 +69,10 @@ var repl = new Repl(
 // ⚠️ 端点是**谁定的**必须看得见（01 §7）。
 // 环境变量缺省时接管不是错——本机就是靠它把流量导向本地代理的；
 // **悄悄**接管才是错。所以每次解析出适配器都印一行，并且点名来源。
-PrintEndpoint(stepper);
+// ⚠️ 但「会话绑定的提供商已不存在」这条落点**不印**：那里 preferredProviderId 是 null，
+// `StepperResolver` 会挑**任意另一个**提供商，印出来的就是那个陌生提供商的端点——
+// 紧跟在「你绑的那个已经没了」后面，纯属误导。这条落点上没有「本会话的端点」可报。
+if (!boundProviderMissing) PrintEndpoint(stepper);
 
 Console.WriteLine("  `provider set <id> --key <key>` 配置；`session create` 建会话；`history` 回放；`quit` 退出。");
 

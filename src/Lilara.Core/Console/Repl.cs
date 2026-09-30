@@ -101,18 +101,25 @@ public sealed class Repl(
             return;
         }
 
+        // ⚠️ 先读旧定义，**保留本次没提到的字段**。
+        // 尤其是 Endpoint：控制台没有 `--endpoint` 参数，手写
+        // providers/<id>.json 是配置端点的唯一途径——整文件覆盖会把它抹掉，
+        // 于是「程序内配置优先」这一档永远够不着，用户被**静默**退回环境变量那一档。
+        // 那正是端点裁定的判据（「尽量别默认接管」）要防的事情。
+        var existing = _providers.Load(id);
+
         _providers.Save(new ProviderDefinition
         {
             Id = id,
-            // ⚠️ 用适配器上的常量，不写字面量——判据只能有一份来源。
-            // 两处各写一份的话，改协议名只会改到一处，落盘的 provider 会指向一个
-            // 适配器工厂认不出的协议（`AdapterFactory` 会抛「未知协议」）。
-            // ⚠️ 这里**不**填 Endpoint：控制台的参数解析没扩展，
-            // 字段存在且被 `ClaudeAdapter` 尊重才是这一轮要的东西。
+            // ⚠️ 不对称是刻意的：
+            //   `Protocol` **始终由代码决定**——手写一个 `AdapterFactory` 认不出的协议
+            //     是个陷阱（存得下、发不出，直到发消息才炸）；
+            //   `Endpoint` / `Modality` 是**操作者配置**，本次没提到就必须活下来。
             Protocol = ClaudeAdapter.ProtocolId,
             ApiKey = key,
             DefaultModel = model ?? "claude-opus-5",
-            Modality = "vision",
+            Modality = existing?.Modality ?? "vision",
+            Endpoint = existing?.Endpoint,
         });
 
         _out.WriteLine($"✓ 提供商 '{id}' 已保存。");
