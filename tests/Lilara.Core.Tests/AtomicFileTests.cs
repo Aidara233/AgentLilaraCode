@@ -57,3 +57,43 @@ public class AtomicFileTests : IDisposable
         Assert.Equal("new", File.ReadAllText(path));
     }
 }
+
+public class AtomicFileConcurrencyTests : IDisposable
+{
+    private readonly string _dir =
+        Path.Combine(Path.GetTempPath(), "lilara-atomic-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true);
+    }
+
+    /// <summary>
+    /// ⚠️ **实测过的真缺陷**：旧实现的 tmp 名是**固定的** `path + ".tmp"`，
+    /// 两个并发写会写同一个 tmp 再各自 <c>Move</c>，第二个 <c>Move</c> 抛
+    /// （文件已被搬走 → <c>FileNotFoundException</c>）。
+    /// 真实时延：`SaveState` 与 HTTP 快照端点同时碰同一个 `state.json`。
+    /// </summary>
+    [Fact]
+    public void Write_ToleratesConcurrentWritersToTheSamePath()
+    {
+        var target = Path.Combine(_dir, "state.json");
+        var errors = new List<Exception>();
+
+        static Task Hammer(int offset, string target, List<Exception> errors) => Task.Run(() =>
+        {
+            for (var i = 0; i < 100; i++)
+            {
+                try { AtomicFile.Write(target, $"{{\"n\":{i + offset}}}"); }
+                catch (Exception e) { lock (errors) errors.Add(e); }
+            }
+        });
+
+        Task.WaitAll(Hammer(0, target, errors), Hammer(1000, target, errors));
+
+        Assert.Empty(errors);
+        Assert.True(File.Exists(target));
+        // ⚠️ 不留残渣：唯一名 tmp 若失败未清，会在磁盘上越积越多。
+        Assert.Empty(Directory.GetFiles(_dir, "*.tmp"));
+    }
+}

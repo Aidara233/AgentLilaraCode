@@ -79,160 +79,77 @@ AtomicFile 的 tmp 名是固定的 path + ".tmp"（AtomicFile.cs:17） → 并�
 
 ---
 
-### Task 1: 存储层并发加固
+### Task 1: 存储层并发加固 ✅ **已完成**（见 `git log` 里本条任务的提交；全量 299/299 绿）
 
 **为什么**：G2 的三个洞是**实测**的。不先修，后面每条都会以间歇性 `IOException` 复现，而那种 bug 最难查。
 
 **Files:**
 - Modify: `src/Lilara.Core/Persistence/HistoryLog.cs`
 - Modify: `src/Lilara.Core/Persistence/AtomicFile.cs`
-- Test: `tests/Lilara.Core.Tests/HistoryLogTests.cs`（新建）、`tests/Lilara.Core.Tests/AtomicFileTests.cs`（加）
+- Test: `tests/Lilara.Core.Tests/HistoryLogTests.cs`（新建）、`tests/Lilara.Core.Tests/AtomicFileTests.cs`（加 `AtomicFileConcurrencyTests`）
 
 **Interfaces:**
 - Consumes: 无
-- Produces: `HistoryLog.Append` / `ReadAll`、`AtomicFile.Write` —— **签名不变**，只改内部的文件共享模式与 tmp 命名
+- Produces: `HistoryLog.Append` / `ReadAll`、`AtomicFile.Write` —— **签名不变**，只改文件共享模式、tmp 命名与重试
 
-- [ ] **Step 1: 写失败的并发测试**（这是「写路径无锁」论断的**唯一**可执行证据，现在没有）
+#### 落地形状（**已实现并验证**，与最初草稿有三处不同，逐条记明）
 
+**① `Append` 与 `ReadAll` 都开 `FileShare.ReadWrite`，且必须对称。**
 ```csharp
-// HistoryLogTests.cs
-using Lilara.Core.Canonical;
-using Lilara.Core.Persistence;
-using Lilara.Core.Records;
+// Append：不用 File.AppendAllText（默认 FileShare.Read 只允许别人读）
+using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+using var writer = new StreamWriter(fs, Utf8NoBom);
+writer.Write(line);
 
-namespace Lilara.Core.Tests;
-
-public class HistoryLogTests : IDisposable
-{
-    private readonly string _root = Path.Combine(Path.GetTempPath(), "lilara-hist-" + Guid.NewGuid().ToString("N"));
-    private string Path_ => System.IO.Path.Combine(_root, "history.jsonl");
-
-    public HistoryLogTests() => Directory.CreateDirectory(_root);
-    public void Dispose() { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); }
-
-    private static TimelineEvent Evt(string text) => new TimelineEvent.MessageEvent
-    {
-        At = DateTimeOffset.UnixEpoch,
-        From = Speaker.User,
-        Blocks = [new Block.TextBlock(text)],
-    };
-
-    /// <summary>
-    /// ⚠️ **实测过的真缺陷**：`File.AppendAllText` 默认 `FileShare.Read`，
-    /// 并发两个 append 会在开句柄那一刻抛 `IOException`（Windows：文件正被另一进程使用）。
-    /// 这不是「脏数据」，是**硬失败**——而调用方看到的是「消息发丢了」。
-    /// ⚠️ 这条也钉住「读挡写」：`ReadLines` 开着句柄时 append 同样抛。
-    /// </summary>
-    [Fact]
-    public void Append_ToleratesConcurrentWriters()
-    {
-        var errors = new List<Exception>();
-
-        var a = Task.Run(() => { for (var i = 0; i < 200; i++) try { HistoryLog.Append(Path_, Evt("a")); } catch (Exception e) { lock (errors) errors.Add(e); } });
-        var b = Task.Run(() => { for (var i = 0; i < 200; i++) try { HistoryLog.Append(Path_, Evt("b")); } catch (Exception e) { lock (errors) errors.Add(e); } });
-        Task.WaitAll(a, b);
-
-        Assert.Empty(errors);
-    }
-
-    /// <summary>
-    /// ⚠️ 读句柄开着时也必须能 append（实测旧实现抛 `IOException`）。
-    /// 真实时延：控制台敲 `history` 读历史，同时头发的消息 append。
-    /// </summary>
-    [Fact]
-    public void Append_SucceedsWhileAReadIsInFlight()
-    {
-        HistoryLog.Append(Path_, Evt("一"));
-
-        using var reader = new StreamReader(
-            new FileStream(Path_, FileMode.Open, FileAccess.Read, FileShare.ReadWrite));
-
-        var ex = Record.Exception(() => HistoryLog.Append(Path_, Evt("二")));
-
-        Assert.Null(ex);
-    }
-}
-```
-
-```csharp
-// AtomicFileTests.cs —— 追加
-    /// <summary>
-    /// ⚠️ **实测过的真缺陷**：旧实现的 tmp 名是**固定的** `path + ".tmp"`，
-    /// 两个并发写会写同一个 tmp 再各自 `Move`，第二个 `Move` 抛。
-    /// 真实时延：`SaveState` 与 HTTP 快照端点同时碰同一个 `state.json`。
-    /// </summary>
-    [Fact]
-    public void Write_ToleratesConcurrentWritersToTheSamePath()
-    {
-        var target = Path.Combine(_root, "state.json");
-        var errors = new List<Exception>();
-
-        var a = Task.Run(() => { for (var i = 0; i < 100; i++) try { AtomicFile.Write(target, $"{{\"n\":{i}}}"); } catch (Exception e) { lock (errors) errors.Add(e); } });
-        var b = Task.Run(() => { for (var i = 0; i < 100; i++) try { AtomicFile.Write(target, $"{{\"n\":{i + 1000}}}"); } catch (Exception e) { lock (errors) errors.Add(e); } });
-        Task.WaitAll(a, b);
-
-        Assert.Empty(errors);
-        Assert.True(File.Exists(target));
-        Assert.False(File.Exists(target + ".tmp"));   // 不留残渣
-    }
-```
-
-- [ ] **Step 2: 跑测试，确认失败**
-
-```bash
-dotnet test --filter "FullyQualifiedName~Append_ToleratesConcurrentWriters|FullyQualifiedName~Append_SucceedsWhileAReadIsInFlight|FullyQualifiedName~Write_ToleratesConcurrentWritersToTheSamePath"
-```
-Expected: FAIL —— 三条都抛 `IOException`
-
-- [ ] **Step 3: 改实现**
-
-`HistoryLog.cs`：`Append` 与 `ReadAll` 都改成**显式开 `FileStream`**，共享模式 `FileShare.ReadWrite`。
-```csharp
-// Append：把 File.AppendAllText 换成
-using (var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
-using (var w = new StreamWriter(fs, new UTF8Encoding(false)))
-{
-    w.Write(line);
-    w.Write('\n');
-}
-
-// ReadAll：把 File.ReadLines 换成
+// ReadAll：不用 File.ReadLines（同样 FileShare.Read，会挡写句柄）
 using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
 using var reader = new StreamReader(fs, Encoding.UTF8);
 while (reader.ReadLine() is { } line) { ... }
 ```
-⚠️ **注释要写清两个洞各修一个**：`ReadWrite` 只解决**句柄冲突**，**不解决字节交错**——两个 append 交错写仍会写出坏行，那靠**每会话逻辑串行**（Task 2）解决。
+⚠️ **两个洞各修一个，不可互替**：`ReadWrite` 只解决**句柄冲突**；**字节交错**仍靠**每会话逻辑串行**（Task 3）。
 
-`AtomicFile.cs`：tmp 名带 `Guid`；`File.Move` 短重试。
+**② `AtomicFile` 的 tmp 名带 `Guid`，且重试必须接**两种**异常。**
 ```csharp
 var tmp = $"{path}.{Guid.NewGuid():N}.tmp";
-File.WriteAllText(tmp, content, new UTF8Encoding(false));
+File.WriteAllText(tmp, content, Utf8NoBom);
 
-// ⚠️ Windows 上目标被读句柄占着时 Move 会 IOException（读没带 FILE_SHARE_DELETE）。
-// 短重试；失败则清 tmp 再抛——**不许留残渣**。
 for (var attempt = 0; ; attempt++)
 {
-    try { File.Move(tmp, path, overwrite: true); break; }
-    catch (IOException) when (attempt < 3) { Thread.Sleep(10 * (attempt + 1)); }
-    catch { TryDelete(tmp); throw; }
+    try { File.Move(tmp, path, overwrite: true); return; }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && attempt < 3)
+    { Thread.Sleep(10 * (attempt + 1)); }
+    catch { try { File.Delete(tmp); } catch (IOException) { } throw; }
 }
 ```
+⚠️ **只接 `IOException` 是不够的**——Windows 上目标被没带 `FILE_SHARE_DELETE` 的句柄占着时，
+`File.Move` 抛的是 **`UnauthorizedAccessException`**。**这条由并发测试实测抓出**（草稿只接了 `IOException`）。
+⇒ 这正是「先写测试」的价值：逻辑对、平台语义错。
 
-- [ ] **Step 4: 跑测试，确认通过**
+**③ 读挡写那条测试的**形状**改过两次——第一版是空转的。**
+> 第一版：测试自己开一个 `FileShare.ReadWrite` 的读句柄，再断言 append 不抛。
+> **新旧代码都绿**——因为那个句柄从一开始就不挡写。**拿别的方式开的句柄去测「我们的读会不会挡写」，
+> 测的不是我们的代码。** 文件共享是**双向协商**，必须让**我们自己的** reader 与 writer 并发。
+> 第二版（现行）：并发跑 `ReadAll` 与 `Append` 各 300 次，断言零异常。
 
-```bash
-dotnet test
-```
-Expected: PASS（全量 295 + 新增 3）
+#### 验证记录（**两次都跑了**）
 
-- [ ] **Step 5: 提交**
+| | 新实现 | 旧实现 |
+|---|---|---|
+| `Append_ToleratesConcurrentWriters` | ✅ 绿 | ❌ 红（`IOException`） |
+| `ReadAll_DoesNotBlockAConcurrentAppend` | ✅ 绿 | ❌ 红（`IOException`） |
+| `Write_ToleratesConcurrentWritersToTheSamePath` | ✅ 绿 | ❌ 红（`UnauthorizedAccessException` + 残留 tmp） |
+| `Append_AndReadAll_RoundTripInOrder`（常规路径） | ✅ 绿 | ✅ 绿 |
 
-```bash
-git add -A
-git commit -m "fix(core): 存储层并发加固（FileShare.ReadWrite / Guid tmp + 重试）"
-```
+**全量 299/299、0 警告。**
 
----
+#### 控制器在这条任务上自己错两次（记入账本）
+
+| # | 我写的 | 实测 | 少做的那步 |
+|---|---|---|---|
+| 20 | 计划里写「现在没有测试覆盖连续两条 user」 | `ClaudeRequestBuilderTests.cs:128` **有** | 没查就写 |
+| 21 | `File.Move` 的重试只接 `IOException` | Windows 抛 `UnauthorizedAccessException` | 只跑了正确的那一半（新代码），没跑变异/旧代码 |
+
+⚠️ 第 21 条是**测试抓出来的**，不是推理出来的——「先写测试」在这次直接换来了一个正确的实现。
 
 ### Task 2: `CoreHost` + 数据根锁
 
