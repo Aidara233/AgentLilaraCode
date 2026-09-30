@@ -396,6 +396,8 @@ git commit -m "feat(core): 推理块加 Kind、Signature 可空；加稳定序�
 
 **Files:**
 - Create: `src/Lilara.Core/Canonical/ReasoningPolicy.cs`
+- Modify: `src/Lilara.Core/Adapters/ModelCall.cs`（`ModelRequest` 加 `Protocol` —— **本任务先做，因为能力表需要它**）
+- Modify: `src/Lilara.Core/Session/Stepper.cs`（构造 `ModelRequest` 时补 `Protocol`）
 - Modify: `src/Lilara.Core/Adapters/Claude/ClaudeRequestBuilder.cs`（修构建阻断）
 - Test: `tests/Lilara.Core.Tests/ReasoningPolicyTests.cs`
 
@@ -405,6 +407,19 @@ git commit -m "feat(core): 推理块加 Kind、Signature 可空；加稳定序�
   - `Lilara.Core.Canonical.ReasoningPolicy.CanCarry(string protocol) → bool`
   - `Lilara.Core.Canonical.ReasoningPolicy.CanReplayBlock(Block.ReasoningBlock, string protocol) → bool`
   - `Lilara.Core.Canonical.ReasoningPolicy.FilterFor(IReadOnlyList<Block>, string protocol) → IReadOnlyList<Block>`
+  - `ModelRequest.Protocol`（`required string`）—— 后续 Task 5/7 的构造器直接用它
+
+⚠️ **`ModelRequest` 加一个 `required` 字段会打断现有的全部构造点。**
+实测当前只有**两处** `new ModelRequest`（已核实）：
+
+| 位置 | 改法 |
+|---|---|
+| `src/Lilara.Core/Session/Stepper.cs:53` | 补 `Protocol = handle.Spec.Model.Protocol,` |
+| `tests/Lilara.Core.Tests/StepperResolverTests.cs:83` | 补 `Protocol = Protocols.ClaudeMessages,` |
+
+⚠️ **`Protocols` 常量类要到 Task 4 才建**。所以本任务里测试那处**先用字面量 `"claude-messages"`**，
+Task 4 建好常量类后**顺手换掉**（Task 4 的 Files 里已列这一步）。
+⚠️ 漏改任一处都是**构建失败**（`required` 成员未初始化）。改完先跑全量确认无回归，再写新测试。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -647,6 +662,7 @@ git commit -m "feat(core): 推理块协议能力表（Claude 还需签名；无�
 - Create: `src/Lilara.Core/Adapters/Protocols.cs`
 - Modify: `src/Lilara.Core/Adapters/AdapterFactory.cs`
 - Modify: `src/Lilara.Core/Adapters/Claude/ClaudeAdapter.cs`（`ProtocolId` 改成引用常量，**只改这一行**）
+- Modify: `tests/Lilara.Core.Tests/StepperResolverTests.cs`（**Task 3 留下的字面量换成常量**——那处当时只能写字面量，常量类到本任务才有）
 - Create: `src/Lilara.Core/Adapters/OpenAi/OpenAiChatAdapter.cs`（骨架）
 - Create: `src/Lilara.Core/Adapters/OpenAi/OpenAiResponsesAdapter.cs`（骨架）
 - Test: `tests/Lilara.Core.Tests/AdapterFactoryTests.cs`
@@ -823,25 +839,15 @@ git commit -m "feat(core): 协议常量 + 适配器工厂三分派（OpenAI 两�
 
 **Files:**
 - Create: `src/Lilara.Core/Adapters/OpenAi/OpenAiChatRequest.cs`
-- Modify: `src/Lilara.Core/Adapters/ModelCall.cs`（`ModelRequest` 加 `Protocol`）
-- Modify: `src/Lilara.Core/Session/Stepper.cs`（构造 `ModelRequest` 时补 `Protocol`）
 - Test: `tests/Lilara.Core.Tests/OpenAiChatRequestTests.cs`
 
 **Interfaces:**
-- Consumes: `ModelRequest`、`Block`、`ReasoningPolicy`（Task 3）
+- Consumes: `ModelRequest`（含 **Task 3 已加的 `Protocol`**）、`Block`、`ReasoningPolicy`（Task 3）
 - Produces:
   - `Lilara.Core.Adapters.OpenAi.OpenAiChatRequest.Build(ModelRequest) → string`（**JSON 文本**）
   - `Lilara.Core.Adapters.OpenAi.OpenAiChatRequest.Path`（`const string = "/v1/chat/completions"`）
 
-⚠️ **`ModelRequest` 要加一个 `required` 字段——这会打断现有的全部构造点。**
-实测当前只有**两处** `new ModelRequest`（已核实）：
-
-| 位置 | 改法 |
-|---|---|
-| `src/Lilara.Core/Session/Stepper.cs:53` | 补 `Protocol = handle.Spec.Model.Protocol,` |
-| `tests/Lilara.Core.Tests/StepperResolverTests.cs:83` | 补 `Protocol = Protocols.ClaudeMessages,`（那是 Claude 会话的替身） |
-
-⚠️ 漏改任一处都是**构建失败**（`required` 成员未初始化）。改完先跑一次全量确认无回归，再写新测试。
+⚠️ `ModelRequest.Protocol` 是 **Task 3 加的**（能力表需要它），本任务直接用，不需要再动 `ModelCall.cs` / `Stepper.cs`。
 
 - [ ] **Step 1: 写失败的测试**
 
