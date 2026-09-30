@@ -29,6 +29,12 @@ public abstract record CoreCommand
     public sealed record SessionStart(string SessionId) : CoreCommand;
 
     public sealed record SessionInterrupt(string SessionId) : CoreCommand;
+
+    /// <summary>
+    /// 设置一条行为控制轴（`01` §3.5）。
+    /// ⚠️ 取值校验在 dispatcher（**线上也要吃**），控制台只做文本拆词。
+    /// </summary>
+    public sealed record SessionSetAxis(string SessionId, string Axis, string Value) : CoreCommand;
 }
 
 /// <summary>

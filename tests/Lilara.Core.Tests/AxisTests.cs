@@ -203,4 +203,29 @@ public class AxisTests
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
     }
+
+    /// <summary>
+    /// ⚠️ **`null` 轴名 = 未知轴**，三条入口都不许抛。
+    ///
+    /// <para>来路是**线上**：`WireJson.Options` 没开 `RespectNullableAnnotations`，
+    /// <c>{"kind":"session.setAxis","axis":null}</c> 能落进 `session.setAxis`；
+    /// 而 `Dictionary` 的 key 不许为 null。修前实测的栈：
+    /// <c>IsKnown(null) ⇒ ContainsKey(null) ⇒ ArgumentNullException「Parameter 'key'」</c>
+    /// （T3 的 `SetAxis_WithANullAxis_IsRejected_NotACrash` 修前就是红的）。</para>
+    ///
+    /// <para>⚠️ **这条为什么必须在这里**（而不是只靠 `session.setAxis` 那条命令测试）：
+    /// 命令路径在 `IsKnown` 那一关就返回了，**走不到 `ValuesOf` / `TryParse`**——
+    /// 只靠命令测试的话，那两条的判空**删掉也不会红**。
+    /// 轴名查询一共就这三条（`LegalValuesText` 是 `ValuesOf` 的包装，`Defaults` 不接轴名），
+    /// 契约由本文件守。</para>
+    /// </summary>
+    [Fact]
+    public void NullAxis_IsTreatedAsUnknown_ByAllThreeEntryPoints()
+    {
+        Assert.False(Axes.IsKnown(null));
+        Assert.Null(Axes.ValuesOf(null));
+        Assert.False(Axes.TryParse(null, "dev", out var canonical));
+        Assert.Equal("", canonical);            // 与「未知轴」一致，不回吐半截
+        Assert.Equal("", Axes.LegalValuesText(null));
+    }
 }

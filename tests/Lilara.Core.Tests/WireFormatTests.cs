@@ -48,6 +48,21 @@ public class WireFormatTests
     }
 
     /// <summary>
+    /// ⚠️ `axis.changed` 的判别式（`session.setAxis` 的产物）。
+    /// 形状与其余事件一致是**头能不能分派**的全部依据——漏了注册时它不会报错，
+    /// 只会序列化成 `{}`（基类没有属性），而头直到解析才发现。
+    /// </summary>
+    [Fact]
+    public void WireEvent_AxisChangedCarriesItsDiscriminatorAndValues()
+    {
+        var json = WireEvent.StableSerialize(new WireEvent.AxisChanged("s1", "effort", "max"));
+
+        Assert.Contains("\"kind\":\"axis.changed\"", json);
+        Assert.Contains("\"axis\":\"effort\"", json);
+        Assert.Contains("\"value\":\"max\"", json);
+    }
+
+    /// <summary>
     /// ⚠️ **嵌套块的判别式也要在**——`WireEvent` 的载荷里带 `IReadOnlyList&lt;Block&gt;`，
     /// 而块自己的多态判别式同样取自静态声明类型（这里是 `Block`，正好对）。
     /// 少了它，头收到一串没有类型的块，渲染不出来。

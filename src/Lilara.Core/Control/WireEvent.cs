@@ -21,6 +21,7 @@ namespace Lilara.Core.Control;
 [JsonDerivedType(typeof(StepEnd), "session.step.end")]
 [JsonDerivedType(typeof(MessageAppended), "message.appended")]
 [JsonDerivedType(typeof(StateChanged), "session.state")]
+[JsonDerivedType(typeof(AxisChanged), "axis.changed")]
 [JsonDerivedType(typeof(Error), "error")]
 public abstract record WireEvent
 {
@@ -50,6 +51,13 @@ public abstract record WireEvent
         string SessionId, string From, IReadOnlyList<Block> Blocks, DateTimeOffset At) : WireEvent;
 
     public sealed record StateChanged(string SessionId, string Status, int Turn) : WireEvent;
+
+    /// <summary>
+    /// 一条轴变了（`03` §4 / `01` §3.5）。
+    /// ⚠️ **只在真的迁移时发**——重复设同一个值是 no-op，不发事件。
+    /// 头据此更新那个下拉；若是 `safety` 或 `permission`，还要重算跨轴告警。
+    /// </summary>
+    public sealed record AxisChanged(string SessionId, string Axis, string Value) : WireEvent;
 
     /// <summary>
     /// ⚠️ **业务失败走这里，不走回执**（`03` §3）：模型 400 / 上游 503 / 提供商失联

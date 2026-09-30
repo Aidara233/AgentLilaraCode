@@ -92,14 +92,39 @@ public static class Axes
         [Effort] = "high",
     };
 
-    public static bool IsKnown(string axis) => Table.ContainsKey(axis);
+    /// <summary>
+    /// ⚠️ **三条入口一律把 <see langword="null"/> 当「未知轴」**（返 false / null / false），
+    /// 所以形参标成 `string?`——这不是防御性编程，是**可达路径**。
+    ///
+    /// <para>来路：`WireJson.Options`（`WireJson.cs:25-32`）**没有**开
+    /// `RespectNullableAnnotations`，所以线上的 <c>{"kind":"session.setAxis","axis":null}</c>
+    /// 会一路落到这里；而 <c>Dictionary</c> 的 **key 不允许为 null**。实测（修前）那条
+    /// <c>SetAxis_WithANullAxis_IsRejected_NotACrash</c> 就是红的，栈是
+    /// <c>IsKnown(null) ⇒ ContainsKey(null) ⇒ ArgumentNullException「Parameter 'key'」</c>。
+    /// 控制面外层是兜底 <c>catch (Exception)</c>（`ControlServer.cs:323`），连接不会死，
+    /// 但用户看到的是「帧形状不对」——而真正的问题是**轴名没给**。</para>
+    ///
+    /// <para>⚠️ **判在这里而不是各调用方**：本类是「轴名 → 合法值」这个契约的拥有者，
+    /// 而 <see cref="ValuesOf"/> 早就声明了「未知 → null」——**null 就是未知的一种**。
+    /// 三条入口今天**只有 <see cref="IsKnown"/> 会被喂到 null**（`session.setAxis` 那条路，
+    /// 见上；另外两条的调用方只传非空轴），但契约不该按调用点拆——
+    /// 把规则留在调用方，下一个调用点就得自己重新记得一遍。
+    /// 顺带那条 <see cref="LegalValuesText"/> 是 <see cref="ValuesOf"/> 的包装，
+    /// 不用单独判（null ⇒ 空串）。</para>
+    /// </summary>
+    public static bool IsKnown(string? axis) => axis is not null && Table.ContainsKey(axis);
 
     /// <summary>该轴的合法取值。<see langword="null"/> = 未知轴。返回的是只读视图，改不动。</summary>
-    public static IReadOnlyList<string>? ValuesOf(string axis) =>
-        Table.TryGetValue(axis, out var v) ? v : null;
+    public static IReadOnlyList<string>? ValuesOf(string? axis)
+    {
+        // ⚠️ 不写成 `axis is not null && Table.TryGetValue(axis, out var v) ? v : null`：
+        // 短路成功时 `v` 有值，短路失败时 `v` **未赋值**（不是 null）⇒ CS0165。
+        if (axis is null) return null;
+        return Table.TryGetValue(axis, out var v) ? v : null;
+    }
 
     /// <summary>合法值清单（错误信息用）。⚠️ 从表里拼，不手抄。</summary>
-    public static string LegalValuesText(string axis) =>
+    public static string LegalValuesText(string? axis) =>
         ValuesOf(axis) is { } v ? string.Join("|", v) : "";
 
     /// <summary>
@@ -115,9 +140,10 @@ public static class Axes
     /// <para>所以 `TryParse("safety", "PROD")` 为真，而 `TryParse("Safety", "dev")` 为假。
     /// 两句都由 <c>AxisTests</c> 各钉一条，改动前先看那两条。</para>
     /// </summary>
-    public static bool TryParse(string axis, string value, out string canonical)
+    public static bool TryParse(string? axis, string value, out string canonical)
     {
         canonical = "";
+        if (axis is null) return false;   // ⚠️ null 键会让 `Dictionary` 抛，见 IsKnown 的注释
         if (!Table.TryGetValue(axis, out var values)) return false;
 
         foreach (var v in values)

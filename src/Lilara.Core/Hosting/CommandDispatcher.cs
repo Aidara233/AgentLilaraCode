@@ -60,6 +60,9 @@ public sealed class CommandDispatcher(
             case CoreCommand.SessionInterrupt i:
                 return HandleSessionInterrupt(i, commandId);
 
+            case CoreCommand.SessionSetAxis x:
+                return HandleSessionSetAxis(x, commandId);
+
             default:
                 return Reject(commandId, $"认不出的命令：{command.GetType().Name}");
         }
@@ -342,6 +345,48 @@ public sealed class CommandDispatcher(
         }
 
         return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = i.SessionId });
+    }
+
+    /// <summary>
+    /// 设置一条轴。⚠️ 三个拒绝理由的**顺序**是刻意的：会话 → 轴 → 值。
+    /// 反过来的话，「会话不存在 + 轴名也写错」会报「轴不认识」，把用户引向错的方向。
+    /// </summary>
+    private DispatchResult HandleSessionSetAxis(CoreCommand.SessionSetAxis x, string id)
+    {
+        if (!_host.TryGetActivated(x.SessionId, out var handle))
+            return Reject(id, $"没有会话 '{x.SessionId}'。");
+
+        if (!Axes.IsKnown(x.Axis))
+            return Reject(id, $"没有 '{x.Axis}' 这条轴。可用的：{string.Join("|", Axes.Names)}");
+
+        // ⚠️ 合法值清单**从表里拼**（G8）——手抄一份会在加档时静默过期，
+        // 而这条错误信息是用户唯一的线索。
+        if (!Axes.TryParse(x.Axis, x.Value, out var canonical))
+            return Reject(id, $"'{x.Axis}' 不取 '{x.Value}'。可用的：{Axes.LegalValuesText(x.Axis)}");
+
+        // ⚠️ `!` 是 **`Load` / `Create` 的契约**（与 `Stepper` 读 effort 那句同源）：
+        // 它们保证 `State.Axes` 非空（见 `SessionState.Axes` 的注释），而激活表里的
+        // handle 只从这两条来路进来（`Register` 的三个调用点 + `Activate`——
+        // 见 `CoreHost` 的注释），能拿到 null 的只有手工 `new SessionHandle`。
+
+        // ⚠️ 相同值不是迁移 ⇒ 不发事件（`01` §5）。见测试里的理由。
+        if (handle.State.Axes!.TryGetValue(x.Axis, out var current) && current == canonical)
+            return new DispatchResult(new Ack.Accepted { CommandId = id });
+
+        var next = new Dictionary<string, string>(handle.State.Axes!, StringComparer.Ordinal) { [x.Axis] = canonical };
+
+        // ⚠️ **赋的是 `handle.State`，不是换掉 `handle`。** `SessionState` 是 record，
+        // `with` 换出一份带新轴的副本；而 `SessionHandle` 是**可变的活对象**，
+        // 宿主的激活表里存的是**它**的引用（`CoreHost._activated`）——
+        // 写 `handle = handle with { … }` 或 `new SessionHandle` 会让表里那份指向**旧实例**，
+        // 于是 dispatcher 与快照端点各读各的，**状态分叉**（`Repl.Current` 的 setter 同源）。
+        handle.State = handle.State with { Axes = next };
+        handle.SaveAxes(_host.Store);
+
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.AxisChanged(handle.SessionId, x.Axis, canonical));
+
+        return new DispatchResult(new Ack.Accepted { CommandId = id });
     }
 
     /// <summary>找会话：先看激活表，miss 才扫项目目录回落到磁盘载入。</summary>
