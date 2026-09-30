@@ -1,5 +1,4 @@
 using Lilara.Core.Adapters;
-using Lilara.Core.Adapters.Claude;
 using Lilara.Core.Canonical;
 using Lilara.Core.Persistence;
 using Lilara.Core.Providers;
@@ -84,45 +83,75 @@ public sealed class Repl(
 
     private void HandleProviderSet(string line)
     {
-        // provider set <id> --key <key> --model <model>
+        // provider set <id> --key <k> [--model <m>] [--protocol <p>] [--endpoint <u>] [--auth <a>]
         var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var id = parts[2];
 
-        string? key = null, model = null;
-        for (var i = 3; i < parts.Length - 1; i++)
+        string? key = null, model = null, protocol = null, endpoint = null, auth = null;
+        // ⚠️ 从 3 起、每次跳两格：标志与值成对。
+        // 从 3 起是因为 parts[1] == "set"；**不要**在里面再判断 parts[i] 是不是标志位——
+        // 上界 parts.Length - 1 已经把「末尾缺值」交给下面那句显式报错，
+        // 而值本身**允许**长得像标志（见测试 `ProviderSet_AcceptsAValueThatLooksLikeAFlag`）。
+        for (var i = 3; i < parts.Length - 1; i += 2)
         {
-            if (parts[i] == "--key") key = parts[i + 1];
-            if (parts[i] == "--model") model = parts[i + 1];
+            var value = parts[i + 1];
+            switch (parts[i])
+            {
+                case "--key": key = value; break;
+                case "--model": model = value; break;
+                case "--protocol": protocol = value; break;
+                case "--endpoint": endpoint = value; break;
+                case "--auth": auth = value; break;
+            }
         }
 
         if (key is null)
         {
-            _out.WriteLine("用法：provider set <id> --key <key> [--model <model>]");
+            _out.WriteLine("用法：provider set <id> --key <key> [--model <model>] "
+                + $"[--protocol <{string.Join("|", Protocols.All)}>] [--endpoint <url>] "
+                + $"[--auth {AuthSchemes.ApiKey}|{AuthSchemes.Bearer}]");
+            return;
+        }
+
+        // 协议必须是已知的——否则工厂会抛，而那时已经落盘了
+        if (protocol is not null && !Protocols.All.Contains(protocol))
+        {
+            _out.WriteLine($"未知协议 '{protocol}'。支持：{string.Join(" / ", Protocols.All)}");
+            return;
+        }
+
+        // ⚠️ --auth 同样必须校验，否则是**静默改行为**：`AuthSchemes.Bearer` 的字面量是
+        //     "bearer"（小写），而 `OpenAiHttp` 里判的是 `AuthScheme == Bearer ? Bearer : x-api-key`。
+        //     于是手写 `--auth Bearer`（大写）序号不等，会被**悄悄**当成 x-api-key 发出去。
+        //     未知值必须拒绝且不落盘。空 = 沿用旧值。
+        if (!string.IsNullOrEmpty(auth)
+            && auth != AuthSchemes.ApiKey && auth != AuthSchemes.Bearer)
+        {
+            _out.WriteLine($"未知认证方式 '{auth}'。支持：{AuthSchemes.ApiKey} / {AuthSchemes.Bearer}");
             return;
         }
 
         // ⚠️ 先读旧定义，**保留本次没提到的字段**。
-        // 尤其是 Endpoint：控制台没有 `--endpoint` 参数，手写
-        // providers/<id>.json 是配置端点的唯一途径——整文件覆盖会把它抹掉，
-        // 于是「程序内配置优先」这一档永远够不着，用户被**静默**退回环境变量那一档。
-        // 那正是端点裁定的判据（「尽量别默认接管」）要防的事情。
+        // 整文件覆盖会抹掉手写配置：Endpoint / Modality / DefaultModel / Protocol
+        // 都是操作者配置，本次没提到就必须活下来，否则「改 key」会静默重置它们。
         var existing = _providers.Load(id);
 
         _providers.Save(new ProviderDefinition
         {
             Id = id,
-            // ⚠️ 不对称是刻意的：
-            //   `Protocol` **始终由代码决定**——手写一个 `AdapterFactory` 认不出的协议
-            //     是个陷阱（存得下、发不出，直到发消息才炸）；
-            //   `Endpoint` / `Modality` 是**操作者配置**，本次没提到就必须活下来。
-            Protocol = ClaudeAdapter.ProtocolId,
+            // ⚠️ 操作者在**已登记且已校验**的协议集合里选（上面的 `Protocols.All.Contains`）；
+            //     手写一个工厂认不出的协议的旧顾虑，在这里已由「落盘前拒绝未知协议」挡住——
+            //     所以 Protocol 不再「始终由代码决定」。
+            //     缺省仍是 `claude-messages`（不破坏既有用法）；已配好的协议则原样保留。
+            Protocol = protocol ?? existing?.Protocol ?? Protocols.ClaudeMessages,
             ApiKey = key,
-            DefaultModel = model ?? "claude-opus-5",
+            DefaultModel = model ?? existing?.DefaultModel ?? "claude-opus-5",
             Modality = existing?.Modality ?? "vision",
-            Endpoint = existing?.Endpoint,
+            Endpoint = endpoint ?? existing?.Endpoint,
+            AuthScheme = string.IsNullOrEmpty(auth) ? existing?.AuthScheme : auth,
         });
 
-        _out.WriteLine($"✓ 提供商 '{id}' 已保存。");
+        _out.WriteLine($"✓ 提供商 '{id}' 已保存（{protocol ?? existing?.Protocol ?? Protocols.ClaudeMessages}）。");
     }
 
     /// <summary>

@@ -79,16 +79,19 @@ public class ReplTests : IDisposable
     }
 
     /// <summary>
-    /// 不对称是刻意的：`Protocol` **始终由代码决定**（手写一个工厂认不出的协议是个陷阱），
-    /// 而 `Modality` 是操作者配置，跟着 `Endpoint` 一起活下来。
+    /// ⚠️ T10 修订后 `Protocol` 与 `Endpoint` / `Modality` 一样是**操作者配置**：
+    /// 本次没提到就原样保留（旧行为是「始终重写成 claude-messages」）。
+    /// 未知协议因此有两道闸：写入口只校验 `--protocol` 进来的值；
+    /// **手写文件**里的未知协议会活下来，直到发消息时由 `AdapterFactory` 给人话拒绝
+    /// （见 `AdapterFactoryTests` 那条 unknown-protocol 断言）——存得住，但发不出去时说得清。
     /// </summary>
     [Fact]
-    public async Task ProviderSet_KeepsModalityButAlwaysRewritesProtocol()
+    public async Task ProviderSet_KeepsModalityAndHandWrittenProtocolWhenNotMentioned()
     {
         _providers.Save(new ProviderDefinition
         {
             Id = "claude",
-            Protocol = "hand-written-bogus", // 手写的协议必须被代码改正
+            Protocol = "hand-written-bogus",
             ApiKey = "sk-old",
             DefaultModel = "claude-opus-5",
             Modality = "audio-only",         // 操作者配置，必须活下来
@@ -98,7 +101,7 @@ public class ReplTests : IDisposable
         await repl.ExecuteAsync("provider set claude --key sk-new", CancellationToken.None);
 
         var saved = _providers.Load("claude");
-        Assert.Equal(ClaudeAdapter.ProtocolId, saved!.Protocol);
+        Assert.Equal("hand-written-bogus", saved!.Protocol);  // 未提到 → 原样保留
         Assert.Equal("audio-only", saved.Modality);
     }
 
@@ -118,6 +121,94 @@ public class ReplTests : IDisposable
         // ⚠️ 落盘的字面量是磁盘格式，不能改；同时钉住「用的是同一个来源」——
         // 判断串写在两处的话，改 `ProtocolId` 只会改到一处（Fix 7 修的正是这个）。
         Assert.Equal(ClaudeAdapter.ProtocolId, saved.Protocol);
+    }
+
+    [Fact]
+    public async Task ProviderSet_HonoursProtocolFlag()
+    {
+        var repl = NewRepl();
+
+        await repl.ExecuteAsync(
+            "provider set gw --key sk-x --model deepseek-flash --protocol openai-chat --endpoint http://localhost:5129 --auth bearer",
+            CancellationToken.None);
+
+        var saved = _providers.Load("gw")!;
+        Assert.Equal(Protocols.OpenAiChat, saved.Protocol);
+        Assert.Equal("http://localhost:5129", saved.Endpoint);
+        Assert.Equal(AuthSchemes.Bearer, saved.AuthScheme);
+    }
+
+    [Fact]
+    public async Task ProviderSet_DefaultsToClaudeWhenProtocolOmitted()
+    {
+        // ⚠️ 缺省保持既有行为，不破坏已经配好的用法
+        var repl = NewRepl();
+
+        await repl.ExecuteAsync("provider set c --key sk-x", CancellationToken.None);
+
+        Assert.Equal(Protocols.ClaudeMessages, _providers.Load("c")!.Protocol);
+    }
+
+    [Fact]
+    public async Task ProviderSet_RejectsAnUnknownProtocolWithoutSaving()
+    {
+        var repl = NewRepl();
+
+        await repl.ExecuteAsync("provider set bad --key k --protocol gemini", CancellationToken.None);
+
+        Assert.Null(_providers.Load("bad"));
+        Assert.Contains("gemini", _out.ToString());
+    }
+
+    [Fact]
+    public async Task ProviderSet_AcceptsAValueThatLooksLikeAFlag()
+    {
+        // ⚠️ 实测过的一个真缺陷：旧循环从 i=3 起、每次跳一格，
+        // `provider set x --key --model m` 会把 `--model` 当成 key 的值。
+        // ⇒ 按对解析后，值长得像标志也要原样接住（这里 key 就是字面量 `--model`）。
+        var repl = NewRepl();
+
+        await repl.ExecuteAsync("provider set w --key --model", CancellationToken.None);
+
+        Assert.Equal("--model", _providers.Load("w")!.ApiKey);
+    }
+
+    [Fact]
+    public async Task ProviderSet_RejectsAnUnknownAuthWithoutSaving()
+    {
+        // ⚠️ 实测：`--auth Bearer`（大写）与 AuthSchemes.Bearer（"bearer"）不相等，
+        // 会被静默当成 x-api-key。未知值必须**拒绝且不落盘**。
+        var repl = NewRepl();
+
+        await repl.ExecuteAsync("provider set bad --key k --auth Bearer", CancellationToken.None);
+
+        Assert.Null(_providers.Load("bad"));
+        Assert.Contains("Bearer", _out.ToString());
+    }
+
+    /// <summary>
+    /// ⚠️ 重新配置（不带 `--model` / `--protocol`）时必须**保留旧的**这两项，
+    /// 否则「改 key」会静默重置模型与协议——那是真实的数据损坏。
+    /// </summary>
+    [Fact]
+    public async Task ProviderSet_KeepsExistingModelAndProtocolWhenNotMentioned()
+    {
+        _providers.Save(new ProviderDefinition
+        {
+            Id = "gw",
+            Protocol = Protocols.OpenAiChat,
+            ApiKey = "sk-old",
+            DefaultModel = "deepseek-flash",
+            Modality = "vision",
+        });
+
+        var repl = NewRepl();
+        await repl.ExecuteAsync("provider set gw --key sk-new", CancellationToken.None);
+
+        var saved = _providers.Load("gw")!;
+        Assert.Equal("sk-new", saved.ApiKey);
+        Assert.Equal(Protocols.OpenAiChat, saved.Protocol);   // 没提到的协议必须活下来
+        Assert.Equal("deepseek-flash", saved.DefaultModel);   // 模型同理
     }
 
     [Fact]
