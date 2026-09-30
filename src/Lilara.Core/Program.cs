@@ -112,15 +112,17 @@ while (true)
 }
 
 /// <summary>
-/// 端点一行。⚠️ 没有适配器（占位）时**不印**——那是「还没配提供商」那条路径，
+/// 端点一行。⚠️ 没有端点（占位适配器）时**不印**——那是「还没配提供商」那条路径，
 /// 印一个地址只会让人以为已经有去处了。
 /// 适配器只经 `StepperResolver` 拿得到，所以走 `Stepper.Adapter` 这个只读访问器。
+/// ⚠️ 用接口上的 <see cref="IModelAdapter.Endpoint"/>，**不是**某个具体适配器的成员——
+/// 否则加了第二种协议就等于「端点没人印得出来」，那正是端点裁定要防的静默接管。
 /// </summary>
 static void PrintEndpoint(Stepper stepper)
 {
-    if (stepper.Adapter is not ClaudeAdapter claude) return;
+    if (stepper.Adapter.Endpoint is not { } endpoint) return;
 
-    Console.WriteLine($"  端点 {claude.Endpoint.Url}（{DescribeEndpointSource(claude.Endpoint.Source)}）");
+    Console.WriteLine($"  端点 {endpoint.Url}（{DescribeEndpointSource(endpoint.Source)}）");
 }
 
 static string DescribeEndpointSource(EndpointSource source) => source switch

@@ -36,10 +36,11 @@ public static class EndpointResolver
 
     /// <summary>
     /// ⚠️ 环境读取器是**注入**的：真实进程环境不可控，注入之后这张真值表才能离线测干净。
-    /// <para>⚠️ <paramref name="getEnv"/> 是**第二个**参数（不是最后一个）——既有调用点一律
-    /// 把它按位置传在第 2 位上（`Resolve(configured, Env(...))`），把它挪到后面会让
-    /// 那些调用点从「注入读器」变成「往 `officialUrl` 传 Func」，直接 `CS1503`。
-    /// 新增的两个参数因此只能**按名**传（见 <c>OpenAiHttp</c>）。</para>
+    /// <para>⚠️ <paramref name="getEnv"/> 是**第二个**参数（不是最后一个）——既有调用点里
+    /// 测试的 5 处把它按位置传在第 2 位上（<c>EndpointResolverTests</c> 的第 19/32/45/58/59 行）；
+    /// <c>ClaudeAdapter</c> 那处只传 configured、不传读器。把它挪到后面会让那 5 处
+    /// 从「注入读器」变成「往 <paramref name="officialUrl"/> 传 Func」，直接 `CS1503`
+    /// （实测：正是这么炸的）。新增的两个参数因此只能**按名**传（见 <c>OpenAiHttp</c>）。</para>
     /// <para>⚠️ <paramref name="envVar"/> 传 <c>null</c> = 本协议族**不读任何环境变量**，
     /// 见 T9 brief 的 Ruling ①（OpenAI 家族由我们自己拼 URL，能不让环境接管就不让）。</para>
     /// <para>⚠️ <paramref name="officialUrl"/> 让每个协议族给自己的官方兜底地址，

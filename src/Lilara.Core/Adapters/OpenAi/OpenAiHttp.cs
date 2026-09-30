@@ -45,7 +45,7 @@ public sealed class OpenAiHttp
 
     public async Task<string> PostAsync(string path, string body, CancellationToken ct)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Post, Endpoint.Url + path);
+        using var request = new HttpRequestMessage(HttpMethod.Post, ComposeUrl(Endpoint.Url, path));
         request.Content = new StringContent(body, Encoding.UTF8, "application/json");
 
         if (AuthScheme == AuthSchemes.Bearer)
@@ -90,6 +90,18 @@ public sealed class OpenAiHttp
     /// </summary>
     internal static bool ShouldWrap(Exception ex, CancellationToken ct) =>
         ex is not OperationCanceledException || !ct.IsCancellationRequested;
+
+    /// <summary>
+    /// 拼端点与路径。⚠️ 抽成纯函数是因为**它是本类唯一能离线测的拼接逻辑**，
+    /// 其余都在 `PostAsync` 内部、无注入口（见 T9 brief 的「不可测的部分」表）。
+    /// <para>⚠️ 裁掉端点末尾的 `/`：path 都以 `/` 开头（`OpenAiChatRequest.Path` = "/v1/chat/completions"），
+    /// 而 `--endpoint http://host:port/` 是常见写法——不裁会拼出 `//v1/chat/completions`。
+    /// **只裁拼接用的这一份**；`Endpoint.Url` 保持用户配置的原样，显示时才不会篡改他写的东西。</para>
+    /// <para>⚠️ **不可达**：本机全部补全端点没有返回过重定向或错误路径，所以裁与不裁在真实上游的差别
+    /// **没有被观测过**——这是一条由 URL 语法推出的防御，不是实测结论。</para>
+    /// </summary>
+    internal static string ComposeUrl(string endpointUrl, string path) =>
+        endpointUrl.TrimEnd('/') + path;
 
     /// <summary>把 HTTP 失败翻译成一句人话。</summary>
     private static string Describe(HttpStatusCode status, string body) => status switch

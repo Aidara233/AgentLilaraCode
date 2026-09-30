@@ -6,5 +6,12 @@ namespace Lilara.Core.Adapters;
 /// </summary>
 public interface IModelAdapter
 {
+    /// <summary>
+    /// 解析出来的端点（含**来源**）。
+    /// ⚠️ 暴露出来是为了**能显示**——「静默接管」才是问题，「接管」本身不是（见 EndpointResolver 类注释）。
+    /// ⚠️ 可空：占位适配器（尚未配置提供商）没有端点，返回 null，调用方**不要印**。
+    /// </summary>
+    ResolvedEndpoint? Endpoint { get; }
+
     Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct);
 }

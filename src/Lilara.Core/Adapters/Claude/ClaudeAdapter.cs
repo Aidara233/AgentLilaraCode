@@ -18,7 +18,7 @@ public sealed class ClaudeAdapter : IModelAdapter
     /// ⚠️ 暴露出来是为了**能显示**——「静默接管」才是问题，「接管」本身不是。
     /// 命令面启动时必须把它印出来，见 `Program.cs`。
     /// </summary>
-    public ResolvedEndpoint Endpoint { get; }
+    public ResolvedEndpoint? Endpoint { get; }
 
     /// <summary>实际采用的认证方式（解析后的，不是原始配置）。</summary>
     public string AuthScheme { get; }

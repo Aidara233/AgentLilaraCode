@@ -107,7 +107,10 @@ public class ClaudeAdapterTests
     {
         var adapter = new ClaudeAdapter(Provider with { Endpoint = "http://example.invalid" });
 
-        Assert.Equal("http://example.invalid", adapter.Endpoint.Url);
+        // ⚠️ 接口上的 Endpoint 是**可空**的（占位适配器没有）——真适配器必须给得出，故这里断言非空。
+        // 少了这句，`adapter.Endpoint!` 之外就没有任何东西在守「真适配器有端点」这件事。
+        Assert.NotNull(adapter.Endpoint);
+        Assert.Equal("http://example.invalid", adapter.Endpoint!.Url);
         Assert.Equal(EndpointSource.Configured, adapter.Endpoint.Source);
     }
 
@@ -121,7 +124,8 @@ public class ClaudeAdapterTests
     {
         var adapter = new ClaudeAdapter(Provider);
 
-        Assert.False(string.IsNullOrWhiteSpace(adapter.Endpoint.Url));
+        Assert.NotNull(adapter.Endpoint);
+        Assert.False(string.IsNullOrWhiteSpace(adapter.Endpoint!.Url));
         Assert.True(Enum.IsDefined(adapter.Endpoint.Source));
     }
 

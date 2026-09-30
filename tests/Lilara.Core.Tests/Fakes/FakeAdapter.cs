@@ -14,6 +14,9 @@ public sealed class FakeAdapter : IModelAdapter
     /// <summary>按调用顺序记下每一个进来的请求，供测试断言 Stepper 发了什么。</summary>
     public List<ModelRequest> Calls { get; } = [];
 
+    /// <summary>假适配器不解析端点——按接口约定返回 null（占位语义）。</summary>
+    public ResolvedEndpoint? Endpoint => null;
+
     public FakeAdapter Reply(string text, string stopReason = "end_turn") =>
         ReplyWith(_ => new ModelReply
         {

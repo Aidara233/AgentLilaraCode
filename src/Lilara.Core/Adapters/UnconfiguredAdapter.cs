@@ -9,6 +9,9 @@ namespace Lilara.Core.Adapters;
 /// </summary>
 public sealed class UnconfiguredAdapter(string message = "还没有配置提供商。") : IModelAdapter
 {
+    /// <summary>⚠️ 占位没有端点——返回 null，调用方据此**不印**那行。</summary>
+    public ResolvedEndpoint? Endpoint => null;
+
     public Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct) =>
         throw new ModelCallFailedException(message);
 }

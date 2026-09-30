@@ -9,6 +9,9 @@ public sealed class OpenAiResponsesAdapter : IModelAdapter
 
     private readonly OpenAiHttp _http;
 
+    /// <summary>⚠️ 与 <see cref="ClaudeAdapter.Endpoint"/> 同理：能显示才谈得上「没静默接管」。</summary>
+    public ResolvedEndpoint? Endpoint => _http.Endpoint;
+
     public OpenAiResponsesAdapter(ProviderDefinition provider)
     {
         ArgumentNullException.ThrowIfNull(provider);
