@@ -195,7 +195,10 @@ public class AtomicFileTests : IDisposable
         AtomicFile.Write(path, "{}");
 
         Assert.False(File.Exists(path + ".tmp"));
-        Assert.Single(Directory.GetFiles(_dir), "state.json");
+        // ⚠️ 不能写 Assert.Single(Directory.GetFiles(_dir), "state.json")：
+        // GetFiles 返回**完整路径**，与字面量 "state.json" 比较永远为假。
+        Assert.Equal("state.json",
+            Path.GetFileName(Assert.Single(Directory.GetFiles(_dir))));
     }
 
     [Fact]
