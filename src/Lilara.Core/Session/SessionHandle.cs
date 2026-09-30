@@ -37,8 +37,15 @@ public sealed record SessionHandle
             Pending = [],
         };
 
-        store.WriteSpec(projectKey, spec);
+        // ⚠️ 先 state 后 spec——顺序是刻意的，别调换。
+        // 崩溃在两次写之间只可能留下「有 state、无 spec」的目录：
+        // TryReadSpec 返回 null，ListSessions 静默跳过它 → 孤儿是**隐形**的。
+        // 反过来（先 spec 后 state）留下的目录**能被 ListSessions 列出来**，
+        // 而 ReadState 会抛 FileNotFoundException ——
+        // Task 11 取 [0] 当"当前会话"，于是启动直接崩，还得手动删目录才能恢复。
+        // 隐形孤儿 vs 致命孤儿：用已有的 null 守卫，不用新的错误处理。
         store.WriteState(projectKey, state);
+        store.WriteSpec(projectKey, spec);
 
         return new SessionHandle
         {

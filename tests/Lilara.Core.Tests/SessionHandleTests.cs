@@ -80,4 +80,27 @@ public class SessionHandleTests : IDisposable
         Assert.NotEqual(a.SessionId, b.SessionId);
         Assert.Equal(2, _store.ListSessions(a.ProjectKey).Count);
     }
+
+    [Fact]
+    public void Create_LeavesNoListableButUnloadableSessionIfItDiesMidway()
+    {
+        // ⚠️ 这条测试直接模拟「崩在两次写之间」，验证残留物是**隐形**的而不是致命的。
+        // 只调 Create() 测不出顺序——必须手工造出那个中间态。
+        var projectKey = Lilara.Core.Projects.ProjectKey.FromPath(@"C:\work");
+        var mid = _store.SessionDirectory(projectKey, "999999999999");
+
+        // 只写 state，不写 spec —— 正是「先 state 后 spec」崩溃后的残骸
+        Directory.CreateDirectory(mid);
+        _store.WriteState(projectKey, new SessionState
+        {
+            SessionId = "999999999999",
+            Status = "Idle",
+            Turn = 0,
+            Pending = [],
+        });
+
+        // 隐形：ListSessions 看不到它，于是没人会去 Load 它
+        Assert.Empty(_store.ListSessions(projectKey));
+        Assert.Null(_store.TryReadSpec(projectKey, "999999999999"));
+    }
 }
