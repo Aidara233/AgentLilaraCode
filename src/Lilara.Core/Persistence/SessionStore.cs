@@ -62,12 +62,25 @@ public sealed class SessionStore(string dataRoot)
             .ToList();
     }
 
-    /// <summary>读不到就返回 null，不抛——调用方要的是「有没有」，不是异常。</summary>
+    /// <summary>
+    /// 读不到就返回 null，不抛——调用方要的是「有没有」，不是异常。
+    /// ⚠️ 两种「读不到」都要吞：**文件不存在**，和**文件损坏**。
+    /// 只判 File.Exists 是不够的——一个损坏的 spec.json 会抛 JsonException，
+    /// 穿透 ListSessions 炸掉整个启动，而这正是调用方那个 null 判断想防的事。
+    /// </summary>
     public SessionSpec? TryReadSpec(string projectKey, string sessionId)
     {
         var path = Path.Combine(SessionDirectory(projectKey, sessionId), "spec.json");
-        return File.Exists(path)
-            ? JsonSerializer.Deserialize<SessionSpec>(File.ReadAllText(path), Json.Options)
-            : null;
+        if (!File.Exists(path)) return null;
+
+        try
+        {
+            return JsonSerializer.Deserialize<SessionSpec>(File.ReadAllText(path), Json.Options);
+        }
+        catch (JsonException)
+        {
+            // 损坏的会话目录应被跳过，而不是让整个核心起不来
+            return null;
+        }
     }
 }

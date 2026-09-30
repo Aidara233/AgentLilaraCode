@@ -103,6 +103,23 @@ public class SessionStoreTests : IDisposable
     }
 
     [Fact]
+    public void ListSessions_SkipsCorruptSpecRatherThanCrashingStartup()
+    {
+        // ⚠️ 一个损坏的会话目录不该让整个核心起不来。
+        // 只判 File.Exists 挡不住这个——损坏的 JSON 会抛 JsonException 穿透出去。
+        _store.WriteSpec("p1", Spec() with { SessionId = "good" });
+
+        var badDir = _store.SessionDirectory("p1", "bad");
+        Directory.CreateDirectory(badDir);
+        File.WriteAllText(Path.Combine(badDir, "spec.json"), "{ this is not json");
+
+        var ids = _store.ListSessions("p1");
+
+        Assert.Equal(new[] { "good" }, ids);
+        Assert.Null(_store.TryReadSpec("p1", "bad"));
+    }
+
+    [Fact]
     public void Timeline_AppendsInOrder()
     {
         _store.AppendEvent("p1", "s1", Msg("一"));
