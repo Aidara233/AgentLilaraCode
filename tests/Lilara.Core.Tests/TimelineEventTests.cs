@@ -90,8 +90,25 @@ public class TimelineEventTests
         var json = JsonSerializer.Serialize(original, Json.Options);
 
         // ⚠️ 落盘格式必须自解释：整数枚举既不可读，也会因重排静默重解释既有历史。
-        // 属性名 camelCase（Json.Options 的命名策略），判别式 kind 由特性显式指定，不受影响。
-        Assert.Contains("\"from\":\"Model\"", json);
+        // 属性名与枚举值都是 camelCase（Json.Options），判别式 kind 由特性显式指定，不受影响。
+        Assert.Contains("\"from\":\"model\"", json);
         Assert.DoesNotContain("\"from\":1", json);
+    }
+
+    [Fact]
+    public void Serialize_UsesLowercaseStringValuesForEnumsAndDiscriminators()
+    {
+        TimelineEvent original = new TimelineEvent.MessageEvent
+        {
+            At = DateTimeOffset.UnixEpoch,
+            From = Speaker.User,
+            Blocks = [new Block.TextBlock("x")],
+        };
+
+        var json = JsonSerializer.Serialize(original, Json.Options);
+
+        // ⚠️ 同一个对象里只能有一种约定：判别式值与枚举值都是小写。
+        Assert.Contains("\"kind\":\"message\"", json);
+        Assert.Contains("\"from\":\"user\"", json);
     }
 }
