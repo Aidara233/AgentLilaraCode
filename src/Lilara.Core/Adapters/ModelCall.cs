@@ -16,6 +16,11 @@ public sealed record ModelRequest
     /// 这次调用走哪条协议（`claude-messages` / `openai-chat` / `openai-responses`）。
     /// ⚠️ 能力表（<see cref="Lilara.Core.Canonical.ReasoningPolicy"/>）按它判断
     /// 哪些块**发得出去**——尤其是无签名的推理块。所以它在构造请求时**必须先于块过滤**存在。
+    /// <para>⚠️ <b>取值必须来自 `IModelAdapter.Protocol`（即将真正发送的那个适配器），
+    /// 不能取会话 spec 里的协议快照。</b>适配器按**当前** provider 定义选，而 spec 是建会话时的快照；
+    /// `provider set --protocol` 一改两者就分叉，而分叉的后果不是报错，是
+    /// <see cref="Lilara.Core.Canonical.ReasoningPolicy"/> 按快照判断能不能回放，
+    /// **在唯一能承载推理的那条链路上把推理静默丢掉**。见 <c>Stepper</c> 里的赋值点。</para>
     /// </summary>
     public required string Protocol { get; init; }
 
