@@ -1,4 +1,3 @@
-using Lilara.Core.Adapters;
 using Lilara.Core.Console;
 using Lilara.Core.Persistence;
 using Lilara.Core.Projects;
@@ -42,10 +41,14 @@ else
     Console.WriteLine("  还没有会话。");
 }
 
+// ⚠️ 适配器在 Repl 构造时固定，而 `provider set` 只写 store——
+// 所以「该用哪个适配器」必须从 store 现解析（`StepperResolver`），
+// 而不是启动时定死一次。否则「全新跑 → provider set → 发消息」这条最常见的
+// 首次使用路径会撞上占位适配器，而 store 明明已经写好了。
 var repl = new Repl(
     store,
     providers,
-    ResolveStepper(store, providers, resume),
+    StepperResolver.Resolve(store, providers, resume?.Spec.Model.ProviderId),
     workingDirectory,
     Console.Out)
 {
@@ -60,43 +63,24 @@ while (true)
     var line = Console.ReadLine();
     if (line is null) break;
 
-    // ⚠️ 适配器在 Repl 构造时固定，而 `provider set` 只写 store——
-    // 所以每次派发前都从 store 重解析一次。否则「全新跑 → provider set → 发消息」
-    // 这条最常见的首次使用路径会撞上占位适配器，而 store 明明已经写好了。
+    if (!await repl.ExecuteAsync(line, CancellationToken.None)) break;
+
+    // ⚠️ 只有 `provider set` 会动 store，所以只在它之后重解析。
+    // 每敲一行都重建 Repl 会为 `history` / `status` 这种碰不到模型的命令白 new 一个
+    // AnthropicClient。前缀判据与 `Repl.HandleProviderSet` 保持一致（`Repl.cs`）。
     // ⚠️ 边界：`session create` 会把当时的选择**快照**进 spec，所以换 provider 的
     // --model / effort 对**已建的会话**不生效——那需要新建会话（01 §7.2）。
-    var current = repl.Current;
-    repl = new Repl(store, providers, ResolveStepper(store, providers, current), workingDirectory, Console.Out)
+    if (line.Trim().StartsWith("provider set ", StringComparison.Ordinal))
     {
-        Current = current,
-    };
-
-    if (!await repl.ExecuteAsync(line, CancellationToken.None)) break;
-}
-
-/// <summary>
-/// 从 store 现解析一个 Stepper：有当前会话就按会话引用的 provider 解析，
-/// 否则取 store 里的第一个 provider；一个都没有就用占位适配器。
-/// ⚠️ 抽成函数是因为它必须在**每次派发前**跑，而不是启动时定死一次。
-/// </summary>
-static Stepper ResolveStepper(SessionStore store, ProviderStore providers, SessionHandle? current)
-{
-    var provider = current is null
-        ? providers.List().FirstOrDefault()
-        : providers.Load(current.Spec.Model.ProviderId) ?? providers.List().FirstOrDefault();
-
-    return provider is null
-        ? new Stepper(store, new UnconfiguredAdapter())
-        : new Stepper(store, AdapterFactory.Create(provider));
-}
-
-/// <summary>
-/// 没有可用适配器时的占位。
-/// ⚠️ 它存在是为了让 REPL **能起来**——没配提供商时你仍然要能收
-/// `provider set` 和 `session create`，否则引导会自锁。
-/// </summary>
-file sealed class UnconfiguredAdapter : IModelAdapter
-{
-    public Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct) =>
-        throw new ModelCallFailedException("还没有配置提供商。");
+        var current = repl.Current;
+        repl = new Repl(
+            store,
+            providers,
+            StepperResolver.Resolve(store, providers, current?.Spec.Model.ProviderId),
+            workingDirectory,
+            Console.Out)
+        {
+            Current = current,
+        };
+    }
 }
