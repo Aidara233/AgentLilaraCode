@@ -1,3 +1,5 @@
+using Lilara.Core.Adapters.Claude;
+using Lilara.Core.Canonical;
 using Lilara.Core.Console;
 using Lilara.Core.Persistence;
 using Lilara.Core.Providers;
@@ -62,6 +64,9 @@ public class ReplTests : IDisposable
         Assert.Equal("sk-abc", saved!.ApiKey);
         Assert.Equal("claude-opus-5", saved.DefaultModel);
         Assert.Equal("claude-messages", saved.Protocol);
+        // ⚠️ 落盘的字面量是磁盘格式，不能改；同时钉住「用的是同一个来源」——
+        // 判断串写在两处的话，改 `ProtocolId` 只会改到一处（Fix 7 修的正是这个）。
+        Assert.Equal(ClaudeAdapter.ProtocolId, saved.Protocol);
     }
 
     [Fact]
@@ -152,6 +157,53 @@ public class ReplTests : IDisposable
 
         Assert.True(keepGoing);
         Assert.Contains("上游 503", _out.ToString());
+    }
+
+    /// <summary>
+    /// ⚠️ Repl catch 之后继续用**同一个把手**：步骤失败时若内存里的 Status 还停在
+    /// Running，用户刚看着一步失败，`status` 却报 Running——磁盘上根本不是这样。
+    /// </summary>
+    [Fact]
+    public async Task ModelFailure_LeavesStatusAtIdleNotRunning()
+    {
+        _adapter.Throws(new Lilara.Core.Adapters.ModelCallFailedException("上游 503"));
+        var repl = ReplWithSession();
+        await repl.ExecuteAsync("你好", CancellationToken.None);
+        _out.GetStringBuilder().Clear();
+
+        await repl.ExecuteAsync("status", CancellationToken.None);
+
+        var text = _out.ToString();
+        Assert.Contains("Idle", text);
+        Assert.DoesNotContain("Running", text);
+    }
+
+    /// <summary>
+    /// 只有推理块、没有正文的回复（Fix 1 之后真会发生）不能印一个光秃秃的 `⏺  `。
+    /// </summary>
+    [Fact]
+    public async Task ReasoningOnlyReply_PrintsAPlaceholderInsteadOfAnEmptyBody()
+    {
+        _adapter.ReplyBlocks(new Block.ReasoningBlock("sig", "想了半天"));
+        var repl = ReplWithSession();
+
+        await repl.ExecuteAsync("你好", CancellationToken.None);
+
+        Assert.Contains("（这一步没有正文输出）", _out.ToString());
+    }
+
+    /// <summary>回放时同理：推理块回合在 `history` 里不该只剩一个孤零零的 `⏺`。</summary>
+    [Fact]
+    public async Task History_ShowsAPlaceholderForReasoningOnlyTurns()
+    {
+        _adapter.ReplyBlocks(new Block.ReasoningBlock("sig", "想了半天"));
+        var repl = ReplWithSession();
+        await repl.ExecuteAsync("你好", CancellationToken.None);
+        _out.GetStringBuilder().Clear();
+
+        await repl.ExecuteAsync("history", CancellationToken.None);
+
+        Assert.Contains("（这一步没有正文输出）", _out.ToString());
     }
 
     [Theory]

@@ -28,7 +28,9 @@ if (existing.Count > 0)
 
     if (provider is null)
     {
-        Console.WriteLine("  会话引用的提供商已不存在。用 `provider set` 重新配一个。");
+        // ⚠️ 要点名缺的是哪个提供商——只说「已不存在」，用户不知道该重配哪一条。
+        Console.WriteLine(
+            $"  会话引用的提供商 '{handle.Spec.Model.ProviderId}' 已不存在。用 `provider set` 重新配一个。");
     }
     else
     {

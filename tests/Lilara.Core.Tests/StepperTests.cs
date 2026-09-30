@@ -115,6 +115,49 @@ public class StepperTests : IDisposable
         Assert.Equal(0, _store.ReadState(handle.ProjectKey, handle.SessionId).Turn);
     }
 
+    /// <summary>
+    /// ⚠️ 内存里的 Status 也必须回到落盘的那份。
+    /// 不回滚的话，调用方（Repl）catch 之后继续用**同一个把手**，
+    /// 用户刚刚看着一步失败，`status` 却显示 Running——磁盘上根本不是这样。
+    /// </summary>
+    [Fact]
+    public async Task Step_RollsBackInMemoryStatusWhenCallFails()
+    {
+        var handle = NewSession();
+        _adapter.Throws(new ModelCallFailedException("上游 503"));
+
+        await Assert.ThrowsAsync<ModelCallFailedException>(
+            () => _stepper.StepAsync(handle, "hi", CancellationToken.None));
+
+        Assert.Equal("Idle", handle.State.Status);
+        // 内存 == 落盘，这才是「镜像」该有的样子
+        Assert.Equal(
+            _store.ReadState(handle.ProjectKey, handle.SessionId).Status,
+            handle.State.Status);
+    }
+
+    /// <summary>
+    /// 推理块随助手回合一起落盘，顺序与签名原样（00 §5 铁律）。
+    /// 这是「落盘镜像」那条教训的延续：内存里对了不等于磁盘上对了。
+    /// </summary>
+    [Fact]
+    public async Task Step_PersistsReasoningBlocksAlongsideText()
+    {
+        var handle = NewSession();
+        _adapter.ReplyBlocks(
+            new Block.ReasoningBlock("sig-==", "想了一会儿"),
+            new Block.TextBlock("答案"));
+
+        await _stepper.StepAsync(handle, "问", CancellationToken.None);
+
+        var timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+        var blocks = ((TimelineEvent.MessageEvent)timeline[1]).Blocks;
+
+        Assert.Equal(2, blocks.Count);
+        Assert.Equal(new Block.ReasoningBlock("sig-==", "想了一会儿"), blocks[0]);
+        Assert.Equal(new Block.TextBlock("答案"), blocks[1]);
+    }
+
     [Fact]
     public async Task Step_PassesEffortAndMaxTokensFromSession()
     {

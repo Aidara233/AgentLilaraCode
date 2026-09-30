@@ -56,14 +56,41 @@ public class StepperResolverTests : IDisposable
         Assert.IsType<ClaudeAdapter>(stepper.Adapter);
     }
 
+    /// <summary>
+    /// ⚠️ 这条原先断言「退回任意一个提供商」——那是**错的**行为，已被反转。
+    /// 会话 spec 里的 ProviderId 正是为了钉住「这一步是哪个提供商跑的」（01 §7.2）；
+    /// 随手换一个可能是**另一个 key + 另一个端点**，等于把数据发给了别人。
+    /// </summary>
     [Fact]
-    public void Resolve_WithUnknownPreferredId_FallsBackToAnyProvider()
+    public void Resolve_WithUnknownPreferredId_DoesNotSubstituteAnotherProvider()
     {
         Save("claude");
 
         var stepper = StepperResolver.Resolve(_store, _providers, preferredProviderId: "ghost");
 
-        Assert.IsType<ClaudeAdapter>(stepper.Adapter);
+        Assert.IsType<UnconfiguredAdapter>(stepper.Adapter);
+    }
+
+    /// <summary>占位适配器必须**点名**缺的是哪个提供商——「还没有配置提供商」是句误导的话。</summary>
+    [Fact]
+    public async Task Resolve_WithUnknownPreferredId_PlaceholderNamesTheMissingProvider()
+    {
+        Save("claude");
+        var stepper = StepperResolver.Resolve(_store, _providers, preferredProviderId: "ghost");
+
+        var ex = await Assert.ThrowsAsync<ModelCallFailedException>(() =>
+            stepper.Adapter.CallAsync(
+                new ModelRequest
+                {
+                    ModelId = "claude-opus-5",
+                    MaxTokens = 16000,
+                    Effort = "high",
+                    SystemBlocks = [],
+                    Timeline = [],
+                },
+                CancellationToken.None));
+
+        Assert.Contains("ghost", ex.Message);
     }
 
     [Fact]

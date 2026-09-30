@@ -1,4 +1,5 @@
 using Lilara.Core.Adapters;
+using Lilara.Core.Adapters.Claude;
 using Lilara.Core.Canonical;
 using Lilara.Core.Persistence;
 using Lilara.Core.Providers;
@@ -103,7 +104,12 @@ public sealed class Repl(
         _providers.Save(new ProviderDefinition
         {
             Id = id,
-            Protocol = "claude-messages",
+            // ⚠️ 用适配器上的常量，不写字面量——判据只能有一份来源。
+            // 两处各写一份的话，改协议名只会改到一处，落盘的 provider 会指向一个
+            // 适配器工厂认不出的协议（`AdapterFactory` 会抛「未知协议」）。
+            // ⚠️ 这里**不**填 Endpoint：控制台的参数解析没扩展，
+            // 字段存在且被 `ClaudeAdapter` 尊重才是这一轮要的东西。
+            Protocol = ClaudeAdapter.ProtocolId,
             ApiKey = key,
             DefaultModel = model ?? "claude-opus-5",
             Modality = "vision",
@@ -148,10 +154,15 @@ public sealed class Repl(
         foreach (var evt in timeline)
         {
             var message = (TimelineEvent.MessageEvent)evt;
-            var who = message.From == Speaker.User ? "你" : "⏺";
-            var text = string.Concat(
-                message.Blocks.OfType<Block.TextBlock>().Select(b => b.Text));
-            _out.WriteLine($"{who}  {text}");
+            if (message.From == Speaker.User)
+            {
+                var userText = string.Concat(
+                    message.Blocks.OfType<Block.TextBlock>().Select(b => b.Text));
+                _out.WriteLine($"你  {userText}");
+                continue;
+            }
+
+            _out.WriteLine($"⏺  {ModelBody(message.Blocks)}");
         }
     }
 
@@ -190,10 +201,21 @@ public sealed class Repl(
             return;
         }
 
-        var body = string.Concat(reply.Blocks.OfType<Block.TextBlock>().Select(b => b.Text));
-        _out.WriteLine($"⏺  {body}");
+        _out.WriteLine($"⏺  {ModelBody(reply.Blocks)}");
 
         if (reply.StopReason == "max_tokens")
             _out.WriteLine("（输出被 max_tokens 截断了）");
+    }
+
+    /// <summary>
+    /// 助手回合的可显示正文。
+    /// ⚠️ 回复可能**只有推理块、没有正文**（Fix 1 之后推理块确实会落盘），
+    /// 于是正文是空串——不能印成一个光秃秃的 `⏺  `，那看起来像渲染坏了。
+    /// 推理块的 Text 只是摘要，**显示与否是显示层的事，块本身不能因此丢**（00 §5 铁律）。
+    /// </summary>
+    private static string ModelBody(IReadOnlyList<Block> blocks)
+    {
+        var text = string.Concat(blocks.OfType<Block.TextBlock>().Select(b => b.Text));
+        return text.Length == 0 ? "（这一步没有正文输出）" : text;
     }
 }

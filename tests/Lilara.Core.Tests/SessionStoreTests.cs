@@ -166,4 +166,28 @@ public class SessionStoreTests : IDisposable
 
         Assert.Empty(_store.ReadTimeline("p1", "s1"));
     }
+
+    /// <summary>
+    /// ⚠️ `Append` 用的是 <c>File.AppendAllText</c>，**不是原子**的：断电可能留下半行。
+    /// 而 history.jsonl 只追加、永不重写（01 §12.4），那半行会一直在。
+    /// 读的时候必须跳过它——完好前缀才是值钱的部分；
+    /// 让一条半行把整个会话炸掉（重启后第一条 `history` 就直接吐栈）是本末倒置。
+    /// </summary>
+    [Fact]
+    public void Timeline_SkipsTornLastLineRatherThanCrashing()
+    {
+        _store.AppendEvent("p1", "s1", Msg("一"));
+        _store.AppendEvent("p1", "s1", Msg("二"));
+
+        // 模拟断电截断：半个 JSON 对象，且**没有结尾换行**
+        File.AppendAllText(
+            Path.Combine(_store.SessionDirectory("p1", "s1"), "history.jsonl"),
+            "{\"kind\":\"message\",\"at\":\"2026-09-30T00:00:00+00:00\",\"from\":\"u");
+
+        var timeline = _store.ReadTimeline("p1", "s1");
+
+        Assert.Equal(2, timeline.Count);
+        Assert.Equal("二",
+            ((Block.TextBlock)((TimelineEvent.MessageEvent)timeline[1]).Blocks[0]).Text);
+    }
 }

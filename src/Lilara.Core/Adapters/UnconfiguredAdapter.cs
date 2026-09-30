@@ -7,8 +7,8 @@ namespace Lilara.Core.Adapters;
 /// ⚠️ 它住在适配器这一层，不是 Program.cs 的私事：`StepperResolver` 要能命名它，
 /// 而「解析不出适配器时用哪个」是核心的契约，不该埋在顶层语句里。
 /// </summary>
-public sealed class UnconfiguredAdapter : IModelAdapter
+public sealed class UnconfiguredAdapter(string message = "还没有配置提供商。") : IModelAdapter
 {
     public Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct) =>
-        throw new ModelCallFailedException("还没有配置提供商。");
+        throw new ModelCallFailedException(message);
 }

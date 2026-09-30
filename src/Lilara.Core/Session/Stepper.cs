@@ -31,28 +31,44 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         // 「now 冻结在步开始」（00 §2.5）——同一步内重复渲染必须逐字节相同
         var at = DateTimeOffset.UtcNow;
 
+        // ⚠️ 先记下落盘的那份，失败了原样放回去。
+        // 调用方（Repl）catch 之后继续用**同一个把手**：不回滚的话，
+        // 用户刚看着一步失败，`status` 却报 Running——而磁盘上从来没写过 Running。
+        // 「内存是落盘的镜像」这条不变量在这里也必须成立。
+        var persisted = handle.State;
         handle.State = handle.State with { Status = "Running" };
 
-        // 1. 用户消息先落盘
-        _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
+        ModelReply reply;
+        try
         {
-            At = at,
-            From = Speaker.User,
-            Blocks = [new Canonical.Block.TextBlock(userText)],
-        });
+            // 1. 用户消息先落盘
+            _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
+            {
+                At = at,
+                From = Speaker.User,
+                Blocks = [new Canonical.Block.TextBlock(userText)],
+            });
 
-        // 2. 渲染：读回完整时间线 → canonical（核心永远发全量，00 §6）
-        var request = new ModelRequest
+            // 2. 渲染：读回完整时间线 → canonical（核心永远发全量，00 §6）
+            var request = new ModelRequest
+            {
+                ModelId = handle.Spec.Model.ModelId,
+                MaxTokens = handle.Spec.Model.MaxTokens,
+                Effort = handle.Spec.Model.Effort,
+                SystemBlocks = [], // 04 §1.3：核心自带零内容
+                Timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
+            };
+
+            // 3. 调用（抛异常时直接传播——这一步没完成，Turn 不动）
+            reply = await _adapter.CallAsync(request, ct);
+        }
+        catch
         {
-            ModelId = handle.Spec.Model.ModelId,
-            MaxTokens = handle.Spec.Model.MaxTokens,
-            Effort = handle.Spec.Model.Effort,
-            SystemBlocks = [], // 04 §1.3：核心自带零内容
-            Timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
-        };
-
-        // 3. 调用（抛异常时直接传播——这一步没完成，Turn 不动）
-        var reply = await _adapter.CallAsync(request, ct);
+            // 回到落盘的那份。⚠️ 用捕获的引用回放，不去读磁盘：
+            // 读盘本身可能失败，那会把原始的失败原因盖掉。
+            handle.State = persisted;
+            throw;
+        }
 
         // 4. 落盘：拒答不写空模型消息（Review Focus #2）
         if (!reply.Refused && reply.Blocks.Count > 0)
