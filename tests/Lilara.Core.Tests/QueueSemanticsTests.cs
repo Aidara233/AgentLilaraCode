@@ -37,7 +37,7 @@ public class QueueSemanticsTests : IDisposable
             Id = "p", Protocol = Protocols.ClaudeMessages, ApiKey = "k",
             DefaultModel = "m", Modality = "vision",
         });
-        var dispatcher = new CommandDispatcher(host, h => new Stepper(host.Store, _adapter));
+        var dispatcher = new CommandDispatcher(host, new EventBus(), h => new Stepper(host.Store, _adapter));
 
         var created = dispatcher.DispatchAsync(
             new CoreCommand.SessionCreate(), "c", false, CancellationToken.None).GetAwaiter().GetResult();
@@ -74,7 +74,7 @@ public class QueueSemanticsTests : IDisposable
             if (Interlocked.Increment(ref call) == 1) { entered.SetResult(); await release.Task; }
             return "ok";
         });
-        var gatedDispatcher = new CommandDispatcher(host, _ => new Stepper(host.Store, gated));
+        var gatedDispatcher = new CommandDispatcher(host, new EventBus(), _ => new Stepper(host.Store, gated));
 
         var first = SendAsync(gatedDispatcher, session, "一");
         await entered.Task;
@@ -127,7 +127,7 @@ public class QueueSemanticsTests : IDisposable
         var (host, _, session) = NewHarness();
         _adapter.Reply("ok").Reply("ok").Reply("ok");
 
-        var dispatcher = new CommandDispatcher(host, _ => new Stepper(host.Store, _adapter));
+        var dispatcher = new CommandDispatcher(host, new EventBus(), _ => new Stepper(host.Store, _adapter));
         await Task.WhenAll(
             SendAsync(dispatcher, session, "一"),
             SendAsync(dispatcher, session, "二"),

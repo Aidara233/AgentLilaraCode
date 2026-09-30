@@ -43,7 +43,7 @@ public class ReplTests : IDisposable
     private Repl NewRepl()
     {
         var host = new CoreHost(_root, _work);
-        var dispatcher = new CommandDispatcher(host, _ => new Stepper(_store, _adapter));
+        var dispatcher = new CommandDispatcher(host, new EventBus(), _ => new Stepper(_store, _adapter));
         return new Repl(host, dispatcher, _ => new Stepper(_store, _adapter), _out);
     }
 

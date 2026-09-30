@@ -1,4 +1,5 @@
 using Lilara.Core.Adapters;
+using Lilara.Core.Control;
 using Lilara.Core.Canonical;
 using Lilara.Core.Persistence;
 using Lilara.Core.Records;
@@ -23,9 +24,10 @@ namespace Lilara.Core.Hosting;
 /// 在这里，否则线上 provider.upsert 能写进一个控制台写不进的坏值。</para>
 /// </summary>
 public sealed class CommandDispatcher(
-    CoreHost host, Func<SessionHandle, Stepper> resolveStepper)
+    CoreHost host, EventBus bus, Func<SessionHandle, Stepper> resolveStepper)
 {
     private readonly CoreHost _host = host;
+    private readonly EventBus _bus = bus;
     private readonly Func<SessionHandle, Stepper> _resolveStepper = resolveStepper;
 
     /// <summary>
@@ -149,13 +151,22 @@ public sealed class CommandDispatcher(
         //   · 追加：`HistoryLog.Append` 自带**按路径**的锁（防字节交错）
         //   · 入队：`SessionHandle.Enqueue` 自带队列锁
         // ⇒ 短临界区各自负责，不必被「整步」那把大闸罩着。
+        var at = DateTimeOffset.UtcNow;
+
         _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
         {
-            At = DateTimeOffset.UtcNow,
+            At = at,
             From = Speaker.User,
             Blocks = s.Blocks,
         });
         handle.Enqueue(s.Blocks);
+
+        // ⚠️ **事件从 dispatcher 发，不从 `Stepper` 发**——这是「控制台的命令也产生事件」的实现。
+        // `03` §8.1 只说控制台**不订阅**，没说它的命令不产生事件。
+        // 若事件在 `Stepper` 里发、或者干脆由控制面自己发，那么**控制台敲的那句话
+        // 在头上是看不见的**——头的视图会**静默**少一步，而且它没办法发现。
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.MessageAppended(handle.SessionId, "user", s.Blocks, at));
 
         // ⚠️ **启动去重**（`01` §6.1「会话 Running？→ no-op」）。
         // 已经有一个推进在飞时，本次只入队、**不再安排一次推进**。
@@ -166,12 +177,37 @@ public sealed class CommandDispatcher(
         // （`Stepper` 改 `handle.State` 与落盘之间那段）——那才是跨会话/跨前端真正会撞的东西。
         var gate = _host.GateFor(s.SessionId);
         await gate.WaitAsync(ct);
+
+        // ⚠️ **`step.begin` 是「在跑」的唯一信号源**，不是 `session.state`——
+        // 后者是磁盘的镜像，而**磁盘从不存 Running**（`Stepper` 只把它写进内存）。
+        // 缺了它，头**连轮询都看不出在跑**。
+        var turnBefore = handle.State.Turn;
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.StepBegin(handle.SessionId, turnBefore + 1, DateTimeOffset.UtcNow));
+
         try
         {
             // 取空队列——**合并是队列的副产品**：第一次推进就把后来那几条一起拿去渲染。
             var blocks = handle.DrainQueue();
             var stepper = _resolveStepper(handle);
             var reply = await stepper.StepAsync(handle, blocks, ct);
+
+            // ⚠️ 模型消息**由这里发**（`Stepper` 不碰事件总线——它是纯推进器，
+            // 而事件属于控制面那一层）。判据跟 `Stepper` 落盘时一致：
+            // 拒答 / 空块不产生模型消息。
+            if (!reply.Refused && reply.Blocks.Count > 0)
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, DateTimeOffset.UtcNow));
+
+            // ⚠️ **`step.end` 必须在 `Turn` 自增之后**，且**在拒答分支之外**——
+            // 拒答也走这一步（`Turn` 照样加一）。挂在「模型消息之后」会**漏掉拒答**，
+            // 于是头看着一次拒答像「什么都没发生」，而且它永远等不到 step.end，
+            // 会以为那一步卡住了。
+            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                new WireEvent.StepEnd(handle.SessionId, handle.State.Turn, reply.Refused, reply.StopReason));
+
+            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                new WireEvent.StateChanged(handle.SessionId, handle.State.Status, handle.State.Turn));
 
             return new DispatchResult(
                 new Ack.Accepted { CommandId = id, SessionId = s.SessionId }, reply);

@@ -58,7 +58,8 @@ else
 // 现解析并缓存，失效点在 dispatcher 的 `provider.upsert` 里。
 // ⇒ 这里不再需要在 `provider set` 之后整个重建 Repl（旧形状就是为了绕开「Repl 持一把固定
 //    stepper」才那么写的），那条记忆化 hack 随之消失。
-var dispatcher = new CommandDispatcher(host, host.StepperFor);
+var bus = new EventBus();
+var dispatcher = new CommandDispatcher(host, bus, host.StepperFor);
 
 var repl = new Repl(host, dispatcher, host.StepperFor, Console.Out)
 {

@@ -1,4 +1,5 @@
 using Lilara.Core.Adapters;
+using Lilara.Core.Control;
 using Lilara.Core.Canonical;
 using Lilara.Core.Hosting;
 using Lilara.Core.Persistence;
@@ -31,7 +32,7 @@ public class CommandDispatcherTests : IDisposable
     private (CoreHost Host, CommandDispatcher Dispatcher) NewHarness()
     {
         var host = new CoreHost(_root, _work);
-        return (host, new CommandDispatcher(host, _ => new Stepper(host.Store, _adapter)));
+        return (host, new CommandDispatcher(host, new EventBus(), _ => new Stepper(host.Store, _adapter)));
     }
 
     private static void SaveProvider(CoreHost host, string protocol = Protocols.ClaudeMessages) =>
@@ -59,7 +60,7 @@ public class CommandDispatcherTests : IDisposable
         _adapter.Reply("ok");
 
         var seen = new List<string>();
-        var dispatcher = new CommandDispatcher(host, h =>
+        var dispatcher = new CommandDispatcher(host, new EventBus(), h =>
         {
             seen.Add(h.SessionId);
             return new Stepper(host.Store, _adapter);
@@ -105,7 +106,7 @@ public class CommandDispatcherTests : IDisposable
             return "ok";
         });
 
-        var dispatcher = new CommandDispatcher(host, _ => new Stepper(host.Store, gated));
+        var dispatcher = new CommandDispatcher(host, new EventBus(), _ => new Stepper(host.Store, gated));
         var sessionId = await CreateSessionAsync(dispatcher);
 
         var first = dispatcher.DispatchAsync(
@@ -155,7 +156,7 @@ public class CommandDispatcherTests : IDisposable
         SaveProvider(host);
         _adapter.Throws(new Lilara.Core.Adapters.ModelCallFailedException("上游 503"));
 
-        var dispatcher = new CommandDispatcher(host, h => new Stepper(host.Store, _adapter));
+        var dispatcher = new CommandDispatcher(host, new EventBus(), h => new Stepper(host.Store, _adapter));
         var sessionId = await CreateSessionAsync(dispatcher);
 
         var ex = await Assert.ThrowsAsync<DispatchException>(() => dispatcher.DispatchAsync(
@@ -226,7 +227,7 @@ public class CommandDispatcherTests : IDisposable
         var (host, _) = NewHarness();
         SaveProvider(host);
 
-        var dispatcher = new CommandDispatcher(host, host.StepperFor);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
         var sessionId = await CreateSessionAsync(dispatcher);
         host.TryGetActivated(sessionId, out var handle);
 
@@ -255,5 +256,72 @@ public class CommandDispatcherTests : IDisposable
                 Refused = false,
             };
         }
+    }
+
+    /// <summary>
+    /// ⚠️ **事件必须从 dispatcher 发，而且控制台那条路也要发**。
+    ///
+    /// <para>`03` §8.1 只说控制台**不订阅**任何流，**没说它的命令不产生事件**。
+    /// 若事件由控制面自己发（或发在 `Stepper` 里），那么**用户在控制台敲的那句话
+    /// 在头上是看不见的**——头的视图会**静默**少一步，且它没办法发现自己少了。
+    /// 这条测试直接走 dispatcher（控制台走的就是它），断言事件确实出来了。</para>
+    /// </summary>
+    [Fact]
+    public async Task Send_PublishesTheStepLifecycleEvents()
+    {
+        var host = new CoreHost(_root, _work);
+        SaveProvider(host);
+        _adapter.Reply("ok");
+
+        var bus = new EventBus();
+        var dispatcher = new CommandDispatcher(host, bus, _ => new Stepper(host.Store, _adapter));
+        var sessionId = await CreateSessionAsync(dispatcher);
+
+        using var sub = bus.Subscribe(EventBus.SessionTopic(sessionId));
+
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("你好")]), "c", true, CancellationToken.None);
+
+        var kinds = new List<string>();
+        while (sub.Reader.TryRead(out var p)) kinds.Add(p.Payload.GetType().Name);
+
+        // ⚠️ 四条都要在，且顺序固定：
+        //   用户消息（send 时就发）→ 步开始 → 模型消息 → 步结束 → 状态
+        Assert.Equal(
+            ["MessageAppended", "StepBegin", "MessageAppended", "StepEnd", "StateChanged"],
+            kinds);
+
+        // 且 seq 严格递增（同一把锁分配的）
+        Assert.False(sub.NeedsResync);
+    }
+
+    /// <summary>
+    /// ⚠️ **拒答也必须走到 `step.end`**。`Stepper` 的拒答分支**不写模型消息**，
+    /// 但 `Turn` 照样递增。把 `step.end` 挂在「模型消息之后」会**漏掉拒答**——
+    /// 于是头看着一次拒答像「什么都没发生」，并且**永远等不到 step.end**，会以为那一步卡住了。
+    /// </summary>
+    [Fact]
+    public async Task Refusal_StillPublishesStepEnd()
+    {
+        var host = new CoreHost(_root, _work);
+        SaveProvider(host);
+        _adapter.Reply("", stopReason: "refusal");
+        var bus = new EventBus();
+
+        var dispatcher = new CommandDispatcher(host, bus, _ => new Stepper(host.Store, _adapter));
+        var sessionId = await CreateSessionAsync(dispatcher);
+        using var sub = bus.Subscribe(EventBus.SessionTopic(sessionId));
+
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("x")]), "c", true, CancellationToken.None);
+
+        var payloads = new List<WireEvent>();
+        while (sub.Reader.TryRead(out var p)) payloads.Add(p.Payload);
+
+        var end = Assert.IsType<WireEvent.StepEnd>(payloads.Last(e => e is WireEvent.StepEnd));
+        Assert.True(end.Refused);
+        Assert.Equal(1, end.Turn);
+        // ⚠️ 拒答**不产生**模型消息——只有那条用户消息
+        Assert.Single(payloads.OfType<WireEvent.MessageAppended>());
     }
 }
