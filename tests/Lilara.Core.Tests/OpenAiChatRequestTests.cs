@@ -104,10 +104,16 @@ public class OpenAiChatRequestTests
         Assert.Contains("空消息", ex.Message);
     }
 
+    /// <summary>
+    /// ⚠️ **这条测试证明不了多少，名字已经改成它真正能证明的事。**
+    /// 两边是**同一个表达式**（自比），同进程内 `JsonObject` 的插入序必然一致，
+    /// 所以它对「形状对不对」零信息量——键换序、漏字段、形状写错，它全绿。
+    /// 它唯一能抓的是**不确定性**：字典枚举序漂移、时钟、随机数。
+    /// <para>形状的守卫是 <see cref="Build_PinsTheExactBytesInTheMeasuredKeyOrder"/>（钉死字面量）。</para>
+    /// </summary>
     [Fact]
-    public void Build_IsByteStable()
+    public void Build_IsDeterministicAcrossRepeatedCalls()
     {
-        // ⚠️ 前缀稳定性的地基：同一输入两次构造必须逐字节相同（不依赖字典枚举序）
         var request = Req(Msg(Speaker.User, new Block.TextBlock("hi")));
 
         Assert.Equal(OpenAiChatRequest.Build(request), OpenAiChatRequest.Build(request));
@@ -115,8 +121,6 @@ public class OpenAiChatRequestTests
 
     // ─────────────────────────────────────────────────────────────────────
     // 以下为加强断言（brief 之外）。
-    // 上面那条 `Build_IsByteStable` 是**自比**：两边是同一个表达式，同进程内
-    // `JsonObject` 的插入序必然一致 → 它实际上**无法失败**（见报告）。
     // 真正守住「键序 + 逐字节形状」的是下面那条**钉死字面量**的测试。
     // ─────────────────────────────────────────────────────────────────────
 
@@ -138,33 +142,54 @@ public class OpenAiChatRequestTests
     }
 
     [Fact]
-    public void Build_MultipleTextBlocks_UseTheArrayForm()
+    public void Build_MultipleTextBlocksUseTypedParts()
     {
-        // ⚠️ 这条覆盖 brief 里**所有测试都没走到**的分支：一条消息含多块文本。
-        // 单文本快路径被覆盖了 8 次，数组路径一次都没有——而它正是没被实测过的形状。
-        // 实测字节：…"messages":[{"role":"user","content":["一","二"]}]
-        var root = Parse(OpenAiChatRequest.Build(Req(Msg(Speaker.User,
-            new Block.TextBlock("一"), new Block.TextBlock("二")))));
+        // ⚠️ 这条覆盖的是**原先没人测的分支**——而 bug 就藏在里面。
+        // 控制器对网关实测：裸字符串数组 `["一","二"]` 被拒
+        // （invalid_request_error: Invalid JSON request body），带类型的 part 才认。
+        // brief 的 9 条测试里每条消息都只有一块文本，全走字符串快路径，
+        // 所以这个分支一次都没被执行过 —— 缺陷在无覆盖的代码里躲了整整一轮。
+        var root = Parse(OpenAiChatRequest.Build(Req(
+            Msg(Speaker.User, new Block.TextBlock("一"), new Block.TextBlock("二")))));
 
         var content = root.GetProperty("messages")[0].GetProperty("content");
 
         Assert.Equal(JsonValueKind.Array, content.ValueKind);
-        Assert.Equal(2, content.GetArrayLength());
-        Assert.Equal("一", content[0].GetString());
-        Assert.Equal("二", content[1].GetString());
+        Assert.Equal("text", content[0].GetProperty("type").GetString());
+        Assert.Equal("一", content[0].GetProperty("text").GetString());
+        Assert.Equal("二", content[1].GetProperty("text").GetString());
+    }
+
+    /// <summary>
+    /// 单块走字符串快路径——上游实测也认这个形状，且最省字节。
+    /// <para>⚠️ **诚实说明（实测，非推断）**：这条**不是**新增覆盖。
+    /// 把实现临时改成「永远发数组」后跑，红的不是 1 条而是 **5 条**，其中就包括 brief 原有的
+    /// <c>Build_SingleTextBlock_UsesThePlainStringForm</c>（它对数组调 `GetString()` 会抛）。
+    /// 「永远发数组」这个退化**本来就被守着**。</para>
+    /// <para>留下它是因为把快路径写成**显式的 `ValueKind` 断言**，读的人不必反推
+    /// `GetString()` 在数组上的失败语义。价值是清晰度，不是覆盖。</para>
+    /// </summary>
+    [Fact]
+    public void Build_SingleTextBlockStaysAPlainString()
+    {
+        var root = Parse(OpenAiChatRequest.Build(Req(Msg(Speaker.User, new Block.TextBlock("一")))));
+
+        Assert.Equal(JsonValueKind.String, root.GetProperty("messages")[0].GetProperty("content").ValueKind);
+        Assert.Equal("一", root.GetProperty("messages")[0].GetProperty("content").GetString());
     }
 
     [Fact]
     public void Build_KeepsTextOrderAroundADroppedReasoningBlock()
     {
         // ⚠️ 丢掉中间那块推理之后，剩下的两块**不能并成一块**，顺序也不能乱。
-        // 载荷不同（前/后），反转或合并都会红。实测：content:["前","后"]
+        // 载荷不同（前/后），反转或合并都会红。形状必须是带类型的 part（实测上游只认这个）。
         var json = OpenAiChatRequest.Build(Req(Msg(Speaker.Model,
             new Block.TextBlock("前"), new Block.ReasoningBlock("s", "中"), new Block.TextBlock("后"))));
 
         Assert.Equal(
             "{\"model\":\"deepseek-flash\",\"max_tokens\":16000,\"messages\":" +
-            "[{\"role\":\"assistant\",\"content\":[\"前\",\"后\"]}]}",
+            "[{\"role\":\"assistant\",\"content\":[" +
+            "{\"type\":\"text\",\"text\":\"前\"},{\"type\":\"text\",\"text\":\"后\"}]}]}",
             json);
     }
 
@@ -199,11 +224,14 @@ public class OpenAiChatRequestTests
     public void Build_TakesTheProtocolFromTheOnDiskValue()
     {
         // ⚠️ 字面量故意写死：真正流进 `Build` 的 `Protocol` 来自 `providers/*.json`
-        // 落盘的 `"openai-chat"`，而不是代码里的常量。用常量构造的测试在
-        // 「常量被改错」时仍然自洽（见 AdapterFactoryTests 同名理由）。
-        // ⚠️ 诚实说明：这条**证明不了**「协议真的被读取了」——实测两条协议产出
-        // 逐字节相同（见报告里的惰性分析）。它守的是「调用点契约」：带着落盘值的
-        // 请求确实得到 Chat 形状。
+        // 落盘的 `"openai-chat"`，而不是代码里的常量。
+        //
+        // ⚠️ **这条证明的是「值被透传了」，不是「拼写对」。** 实测：同一时间线分别按
+        // `"openai-chat"` 与 `"claude-messages"` 过滤，产出**逐字节相同**——因为过滤结果
+        // 只被 `OfType<TextBlock>()` 消费，而推理块永远不是 TextBlock。所以把 `Protocol`
+        // 换成任何拼写，这条照样绿。
+        // ⇒ **落盘拼写的唯一守卫是 `AdapterFactoryTests.Protocols_PinTheOnDiskWireValues`**，
+        //   不在本文件，也不可能有。
         var request = Req(Msg(Speaker.Model,
             new Block.ReasoningBlock("sig", "想想"), new Block.TextBlock("答案")))
             with { Protocol = "openai-chat" };

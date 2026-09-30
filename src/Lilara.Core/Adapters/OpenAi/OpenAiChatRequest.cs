@@ -67,18 +67,25 @@ public static class OpenAiChatRequest
             throw new ArgumentException(
                 $"时间线里有空消息（speaker={message.From}），无法构造请求", nameof(evt));
 
-        // 单文本走字符串形式（协议原生形状，最省字节）；多文本走数组。
-        // ⚠️⚠️ **未经实测的形状**：数组的**元素类型**。核心自带零提示词、且一次发言通常
-        // 只有一块正文，所以走到这里的现实路径极少。OpenAI 官方对 `content` 数组要求的是
-        // 「带 type 的内容部件」（`{"type":"text","text":…}`），**不是裸字符串数组**。
-        // 本计划实测只覆盖了「字符串或数组」这句话本身，没覆盖元素形状。
-        // ⇒ Task 9/10 真联调时必须验证这个分支；若上游 400，就是这里。
+        // 单文本走字符串形式（协议原生形状，最省字节）；多文本走**带类型的 part 数组**。
+        // ⚠️⚠️ **多块时绝不能用裸字符串数组**。控制器对网关实测：
+        //     ["一","二"]                          → invalid_request_error: Invalid JSON request body
+        //     [{"type":"text","text":"一"}, …]     → ✓
+        //     "一二"（纯字符串）                    → ✓
+        // OpenAI 的 `content` 数组要的是**带 type 的 part**，不是裸串——形状错了上游直接拒。
+        // ⚠️ 这个分支曾经没有任何测试覆盖（brief 的每条测试消息都只有一块文本，全走快路径），
+        // 缺陷因此在无覆盖的代码里躲过一轮。现由 `Build_MultipleTextBlocksUseTypedParts` 守住。
         return texts.Count == 1
             ? new JsonObject { ["role"] = role, ["content"] = texts[0] }
             : new JsonObject
             {
                 ["role"] = role,
-                ["content"] = new JsonArray(texts.Select(t => (JsonNode)t!).ToArray()),
+                ["content"] = new JsonArray(
+                    texts.Select(t => (JsonNode)new JsonObject
+                    {
+                        ["type"] = "text",
+                        ["text"] = t,
+                    }).ToArray()),
             };
     }
 }
