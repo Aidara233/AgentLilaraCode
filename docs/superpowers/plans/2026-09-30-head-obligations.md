@@ -1080,7 +1080,7 @@ public async Task Axes_Endpoint_HandsOutEverythingTheHeadNeeds()
     /// <summary>
     /// 轴的中文名（`01` §3.5 的表格）。⚠️ **它归核心**（`05` §3：渲染归核心，头只显示）——
     /// 头的下拉要画 `主动性` / `安全`，而它拿到的只有英文档名。
-    /// ⚠️ 与 `Names` **同序**，且**同一个来源**：两处各写一份列表就会漂。
+    /// ⚠️ **原来这里写的是「与 `Names` 同序、同一个来源」——那句是假的**，见下面那段。
     /// </summary>
     private static readonly Dictionary<string, string> Labels = new(StringComparer.Ordinal)
     {
@@ -1106,6 +1106,60 @@ public async Task Axes_Endpoint_HandsOutEverythingTheHeadNeeds()
     /// <summary>权限轴里「授权及以上」的**起始档**（`01` §3.5 的跨轴告警的另一端）。</summary>
     public const string AlertFrom = "authorized";
 ```
+
+> ### ⚠️ G10 第三次：`Names` / `Labels` / `Table` / `DefaultTable` 是**四份平行容器**
+>
+> **执行时发现（T4 实现者的顾虑 2），控制器核准，作为 T4 审阅的修复项。**
+>
+> 上面那段注释原本写「`Labels` 与 `Names` **同序**，且**同一个来源**」——**那句是假的**：
+> 代码里 `Names` 是一个 `IReadOnlyList`、`Labels` 是一个 `Dictionary`，各写一份字面量。
+> ⚠️ 而 `Dictionary` 的**枚举序在 .NET 下未定义**（`01` §9.1 原话：
+> 「一次 `Remove` 后新 `Add` 会复用空槽跑到前面」）⇒ 「标签跟着档名走」只在**碰巧**时成立。
+>
+> **正解不是加一条顺序测试**（测试只能发现漂移、不能阻止），**是让盘上只有一个来源**：
+>
+> ```csharp
+>     /// <summary>
+>     /// 轴的**全部**静态事实，按渲染顺序排（`01` §3.5 表格的顺序）。
+>     /// ⚠️ **单一张表**：轴名 / 中文名 / 合法值 / 默认值 / 进不进上下文**都从这里读**。
+>     /// 拆成几个平行容器就会漂——`Names` 有序而 `Dictionary` 枚举序未定义（`01` §9.1）。
+>     /// </summary>
+>     private sealed record Spec(
+>         string Name, string Label, IReadOnlyList<string> Values, string Default, bool InContext);
+>
+>     private static readonly IReadOnlyList<Spec> Table =
+>     [
+>         new(Initiative, "主动性", Array.AsReadOnly<string>(["step", "standard", "goal"]),
+>             "step", InContext: true),
+>         new(Permission, "权限",
+>             Array.AsReadOnly<string>(["off", "readonly", "investigate", "standard", "authorized", "trusted"]),
+>             "standard", InContext: true),
+>         new(Safety, "安全", Array.AsReadOnly<string>(["dev", "staging", "prod"]),
+>             "dev", InContext: true),
+>         new(Verify, "验证强度", Array.AsReadOnly<string>(["none", "self", "strict"]),
+>             "self", InContext: true),
+>         // ⚠️ `effort` 是**唯一** `InContext = false` 的（`01` §3.5：纯请求参数，不进上下文）。
+>         new(Effort, "思考强度", Array.AsReadOnly<string>(["low", "medium", "high", "xhigh", "max"]),
+>             "high", InContext: false),
+>     ];
+>
+>     private static Spec? Find(string? axis) =>
+>         axis is null ? null : Table.FirstOrDefault(s => s.Name == axis);
+>
+>     public static IReadOnlyList<string> Names => Table.Select(s => s.Name).ToList();
+>     public static string LabelOf(string axis) => Find(axis)?.Label ?? axis;
+>     public static bool InContext(string axis) => Find(axis)?.InContext ?? true;
+>     public static IReadOnlyList<string>? ValuesOf(string? axis) => Find(axis)?.Values;
+>     public static bool IsKnown(string? axis) => Find(axis) is not null;
+>     public static IReadOnlyDictionary<string, string> Defaults() =>
+>         Table.ToDictionary(s => s.Name, s => s.Default, StringComparer.Ordinal);
+> ```
+>
+> ⚠️ **`TryParse` 改成从 `Find(axis)?.Values` 取**，其余不动。
+> ⚠️ **`ValuesOf` 仍返回 `Array.AsReadOnly` 的视图**（T1 那条修复的成果）——别退回裸数组。
+> ⚠️ **`Names` 变成派生的** ⇒ 顺序**自动**跟着走，不再需要「同序」这个约定。
+> ⚠️ **T1 的 11 条测试一条都不许改断言值**——它们是这次重构的安全网。
+> ⚠️ 代价：T4 的改动比原计划大。**值**——它换掉的是本项目已经付过四次代价的那个模式。
 
 ⚠️ 再加一条 **`Labels` 与 `Names` 同键** 的测试（两份列表最容易漂的地方）：
 
@@ -1143,6 +1197,16 @@ Expected: 两条都红——`axes` 键不存在；`slots.floating` 不存在
                 {
                     handle.SessionId,
                     State = SessionQueries.StateOf(host, handle),
+
+                    // ⚠️ **`HighWater` 不能在这轮改动里掉队。**
+                    // 执行时控制器写的替换块**把它删掉了**——而它上面那十几行注释
+                    // （`ControlServer.cs` 里那段「先取高水位再取内容」）正是它存在的理由：
+                    // 头拿它去 `subscribe(since:)`，「拉快照 → 订阅」之间落的事件才不漏不重。
+                    // ⇒ 少了它，整条原子性就没了，而且**只在并发下看得出来**。
+                    // ⚠️ 更要紧的是：弄红它的是既有的 `History_And_State_CarryTheSeqHighWaterMark`，
+                    // 而**那条不在下面 Step 4 的筛选里** ⇒ 只跑筛选取不出这个错。
+                    // （实现者保留了它并加注释——这是它自己判断的，不是我 brief 里的。）
+                    HighWater = highWater,
 
                     // ⚠️ **轴必须进快照**（`05` §11 #4）：`axis.changed` 只在订阅之后才有，
                     // 头刚打开页面时无事件可等。少了它，五个下拉全是空的——
@@ -1198,8 +1262,16 @@ Expected: 两条都红——`axes` 键不存在；`slots.floating` 不存在
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `dotnet test --filter "FullyQualifiedName~State_Carries|FullyQualifiedName~Axes_Endpoint|FullyQualifiedName~Labels_Cover" -v q`
-Expected: 通过 4，失败 0
+Run: `dotnet test -v q`（**全量，不要只跑 filter**）
+Expected: 全绿。
+
+⚠️ **这一步不要只跑 `--filter`。** 本任务改的是 `/state` 的返回体，
+而**既有**的 `History_And_State_CarryTheSeqHighWaterMark` 也在测它——
+用一个只匹配新测试名的 filter，**取不出「我把既有字段删了」这个错**。
+（执行时控制器写的替换块真的漏了 `HighWater`，正是靠全量才该被发现。）
+
+⚠️ **本任务新增的 4 条**可以单跑确认：
+`--filter "FullyQualifiedName~State_Carries|FullyQualifiedName~Axes_Endpoint|FullyQualifiedName~Labels_Cover"` → 通过 4。
 
 - [ ] **Step 5: 提交**
 
