@@ -89,12 +89,24 @@ public sealed class Repl(
 
         string? key = null, model = null, protocol = null, endpoint = null, auth = null;
         // ⚠️ 从 3 起、每次跳两格：标志与值成对。
-        // 从 3 起是因为 parts[1] == "set"；**不要**在里面再判断 parts[i] 是不是标志位——
-        // 上界 parts.Length - 1 已经把「末尾缺值」交给下面那句显式报错，
-        // 而值本身**允许**长得像标志（见测试 `ProviderSet_AcceptsAValueThatLooksLikeAFlag`）。
+        // 从 3 起是因为 parts[1] == "set"。
+        //
+        // ⚠️ **判据是「值长得像不像标志位」，不是「位置上像不像」**（实测三组输入后定的形状）：
+        //   · `--key --model`    → 值缺失       → 必须报错
+        //   · `--key --model m`  → key 缺值     → 必须报错（**这条最要紧**）
+        //   · `--key k --model m`→ 正常
+        // 少了这个守卫，第二组会被静默读成 `key=--model` 并把 `--model m` 整个丢掉。
+        // 而**不能**改成「跳过长得像标志的位置」（初版写法）——那会把第一组读成 `key=--model`，
+        // 白白接住一个明显是笔误的值。两者差别只在上面那两组输入上显形。
         for (var i = 3; i < parts.Length - 1; i += 2)
         {
             var value = parts[i + 1];
+            if (value.StartsWith("--", StringComparison.Ordinal))
+            {
+                _out.WriteLine($"参数 {parts[i]} 缺少值。");
+                return;
+            }
+
             switch (parts[i])
             {
                 case "--key": key = value; break;

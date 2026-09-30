@@ -161,16 +161,26 @@ public class ReplTests : IDisposable
     }
 
     [Fact]
-    public async Task ProviderSet_AcceptsAValueThatLooksLikeAFlag()
+    public async Task ProviderSet_RejectsAFlagAsAValue()
     {
-        // ⚠️ 实测过的一个真缺陷：旧循环从 i=3 起、每次跳一格，
-        // `provider set x --key --model m` 会把 `--model` 当成 key 的值。
-        // ⇒ 按对解析后，值长得像标志也要原样接住（这里 key 就是字面量 `--model`）。
-        var repl = NewRepl();
+        // ⚠️ 实测三组输入后定的形状（三组都跑过）：
+        //   `--key --model`   旧循环 → `key="--model"`，静默接住一个明显是笔误的值；
+        //   `--key --model m` 旧循环 → `key="--model" model="m"`（`--model` 恰好还被读到，纯属位置巧合），
+        //                     **按对**解析而无守卫 → `key="--model"` 且 **`--model m` 整个丢掉**（更糟）。
+        // ⇒ 判据是「值长得像不像标志位」，不是「位置上像不像」。两条输入都必须**拒绝且不落盘**。
+        var a = NewRepl();
 
-        await repl.ExecuteAsync("provider set w --key --model", CancellationToken.None);
+        await a.ExecuteAsync("provider set w1 --key --model", CancellationToken.None);
 
-        Assert.Equal("--model", _providers.Load("w")!.ApiKey);
+        Assert.Null(_providers.Load("w1"));
+        Assert.Contains("缺少值", _out.ToString());
+
+        var b = NewRepl();
+
+        await b.ExecuteAsync("provider set w2 --key --model m", CancellationToken.None);
+
+        Assert.Null(_providers.Load("w2"));
+        Assert.Contains("缺少值", _out.ToString());
     }
 
     [Fact]
