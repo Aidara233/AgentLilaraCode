@@ -111,18 +111,19 @@ public class SessionHandleTests : IDisposable
     /// **出生即分叉**，而 `Stepper` 从轴读 ⇒ 用户从没设过轴，effort 却变了。
     ///
     /// <para>⚠️ 第二次 <see cref="SessionHandle.Load"/> 是**这条测试的另一半**：
-    /// 种子只有落盘才活得过重启（`Create` 里的 `SaveAxes`）；不落盘的话，
-    /// 重启后 `state.Axes` 是 null，`Load` 会补一份默认值把 `low` **静默改回** `high`。</para>
+    /// 种子只有落盘才活得过重启（`Create` 里那一份 `state` 直接被 `WriteState`）；
+    /// 不落盘的话，重启后 `State.Axes` 是 null，`Load` 会补一份默认值把 `low`
+    /// **静默改回** `high`。</para>
     /// </summary>
     [Fact]
     public void Create_SeedsTheEffortAxisFromTheSpec_AndItSurvivesAReload()
     {
         var created = SessionHandle.Create(_store, @"C:\work", Model() with { Effort = "low" });
 
-        Assert.Equal("low", created.Axes[Axes.Effort]);
+        Assert.Equal("low", created.State.Axes![Axes.Effort]);
 
         var reloaded = SessionHandle.Load(_store, created.ProjectKey, created.SessionId);
-        Assert.Equal("low", reloaded.Axes[Axes.Effort]);
+        Assert.Equal("low", reloaded.State.Axes![Axes.Effort]);
     }
 
     /// <summary>
@@ -135,22 +136,27 @@ public class SessionHandleTests : IDisposable
     {
         var handle = SessionHandle.Create(_store, @"C:\work", Model() with { Effort = "xhihg" });
 
-        Assert.Equal(Axes.Defaults()[Axes.Effort], handle.Axes[Axes.Effort]);
+        Assert.Equal(Axes.Defaults()[Axes.Effort], handle.State.Axes![Axes.Effort]);
     }
 
     /// <summary>
-    /// ⚠️ `SaveAxes` 必须**基于现读的 <see cref="SessionHandle.State"/>**，不能另构造一个：
-    /// 另构造的话会把 `Turn` / `Status` 抹成 0 / Idle，而这一步没有任何报错——
+    /// ⚠️ **轴与 `Turn` / `Status` 住同一份 `State`**（`SessionState.Axes`）。
+    /// 这条守的是「别把它们拆成两份」：一旦 `SaveAxes` 改成从轴另构造一个 `SessionState`，
+    /// `Turn` / `Status` 会被抹成 0 / Idle，而这一步**没有任何报错**——
     /// 只是重启后会话「失忆」，且磁盘上看不出是哪次写坏的。
     /// </summary>
     [Fact]
-    public void SaveAxes_KeepsTurnAndStatus()
+    public void SaveAxes_WritesTheAxisWithoutDisturbingTurnAndStatus()
     {
         var handle = SessionHandle.Create(_store, @"C:\work", Model());
-        handle.State = handle.State with { Turn = 3, Status = "Running" };
-        handle.Axes = new Dictionary<string, string>(handle.Axes, StringComparer.Ordinal)
+        handle.State = handle.State with
         {
-            [Axes.Safety] = "prod",
+            Turn = 3,
+            Status = "Running",
+            Axes = new Dictionary<string, string>(handle.State.Axes!, StringComparer.Ordinal)
+            {
+                [Axes.Safety] = "prod",
+            },
         };
 
         handle.SaveAxes(_store);

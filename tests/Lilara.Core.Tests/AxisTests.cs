@@ -103,6 +103,10 @@ public class AxisTests
     /// <summary>
     /// ⚠️ **老会话（磁盘上没有 `axes`）载入后必须拿到默认值**，而不是空字典。
     /// 空字典会让头渲染五个空白下拉，用户分不清「没设过」与「头读不到」。
+    ///
+    /// <para>⚠️ 断言钉的是 `handle.State.Axes`（**不是**别的什么地方挂着的轴）：
+    /// 轴只有这一份存储，`Load` 必须把它补进 `State` 本身，
+    /// 否则「读轴」和「读其它状态」会走两条路，而它们迟早分叉。</para>
     /// </summary>
     [Fact]
     public void Load_OfALegacyStateFile_FillsInTheDefaults()
@@ -130,7 +134,7 @@ public class AxisTests
 
             var handle = SessionHandle.Load(store, pk, "s1");
 
-            Assert.Equal(Axes.Defaults(), handle.Axes);
+            Assert.Equal(Axes.Defaults(), handle.State.Axes);
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
     }

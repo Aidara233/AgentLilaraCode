@@ -72,7 +72,10 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
                 // 而**请求里发的还是建会话时那个值**——「设了没用」，且无从发现。
                 // ⚠️ 其余四条轴**不进请求**（`01` §3.5：只有 effort 是纯机械轴），
                 // 所以这里只读一条。将来哪条轴有了机械层，在这里加它的读取。
-                Effort = handle.Axes[Axes.Effort],
+                // ⚠️ `!` 是 **`Load` / `Create` 的契约**：它们保证 `State.Axes` 非空
+                // （见 `SessionState.Axes` 的注释）；能拿到 null 的只有手工 `new SessionHandle`，
+                // 那不是运行时路径。
+                Effort = handle.State.Axes![Axes.Effort],
                 SystemBlocks = [], // 04 §1.3：核心自带零内容
                 Timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
             };
