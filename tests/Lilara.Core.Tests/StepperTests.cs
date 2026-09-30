@@ -111,6 +111,8 @@ public class StepperTests : IDisposable
         Assert.Single(timeline);
         Assert.Equal(Speaker.User, ((TimelineEvent.MessageEvent)timeline[0]).From);
         Assert.Equal(0, handle.State.Turn);
+        // ⚠️ 内存断言不够——Turn 那个缺陷就是因为只断言内存才隐形的。
+        Assert.Equal(0, _store.ReadState(handle.ProjectKey, handle.SessionId).Turn);
     }
 
     [Fact]
@@ -147,6 +149,9 @@ public class StepperTests : IDisposable
         await _stepper.StepAsync(handle, "hi", CancellationToken.None);
 
         Assert.Equal("Idle", handle.State.Status);
+        // ⚠️ 内存断言不够——Turn 那个缺陷就是因为只断言内存才隐形的。
+        // handle.State.Status 正是 Task 11 的 `status` 命令要显示的字段。
+        Assert.Equal("Idle", _store.ReadState(handle.ProjectKey, handle.SessionId).Status);
     }
 
     [Fact]
