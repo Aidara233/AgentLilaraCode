@@ -24,11 +24,12 @@ public static class Json
     };
 
     /// <summary>
-    /// 稳定序列化入口。**所有出站渲染都走这里**。
-    /// ⚠️ 存在的理由：`JsonSerializer` 对同一类型的键序虽然目前稳定，
-    /// 但那是实现细节；而前缀稳定性要求**逐字节可预期**。
-    /// 这里把「稳定」变成一个被测试钉住的**承诺**，而不是对 BCL 的信任。
+    /// 稳定序列化入口。**参数类型必须是 `Block`（基类），不能写成泛型 `T`。**
+    /// ⚠️ 实测：`JsonSerializer.Serialize<Block>(b)` 会带上判别式 `"kind"`；
+    /// 而 `Serialize(b)` 泛型推断成具体子类 `TextBlock` 时，**判别式整个丢掉** ——
+    /// 出站 JSON 变成 `{"text":"hi"}`，反序列化时就认不出这是哪种块了。
+    /// 这正是「静态类型决定序列化形状」的陷阱，而它是静默的。
     /// </summary>
-    public static string StableSerialize<T>(T value) =>
+    public static string StableSerialize(Block value) =>
         JsonSerializer.Serialize(value, Options);
 }

@@ -113,13 +113,22 @@ public class BlockTests
     }
 
     [Fact]
-    public void StableSerialize_ProducesIdenticalBytesForIdenticalInput()
+    public void StableSerialize_KeepsTheDiscriminator()
     {
-        // ⚠️ 前缀稳定性的地基：同一内容两次渲染必须逐字节相同。
-        // 这条测试是「不依赖字典枚举序」的守卫。
-        var a = new Block.TextBlock("你好");
-        var b = new Block.TextBlock("你好");
+        // ⚠️ 这条测试是「静态类型陷阱」的守卫。
+        // 计划早期版本的测试写的是「两个 Block.TextBlock 序列化结果相等」——
+        // 两个操作数**推断出同一个静态类型**，于是**必然相等**，判别式丢了也照样绿。
+        // 那是一条**空转的测试**。
+        Assert.Contains("\"kind\":\"text\"", Json.StableSerialize(new Block.TextBlock("你好")));
+        Assert.Contains("\"kind\":\"reasoning\"", Json.StableSerialize(new Block.ReasoningBlock("s", "想")));
+    }
 
-        Assert.Equal(Json.StableSerialize(a), Json.StableSerialize(b));
+    [Fact]
+    public void StableSerialize_IsByteStable()
+    {
+        // 同一内容两次渲染逐字节相同——不依赖字典枚举序
+        Assert.Equal(
+            Json.StableSerialize(new Block.TextBlock("你好")),
+            Json.StableSerialize(new Block.TextBlock("你好")));
     }
 }
