@@ -26,7 +26,18 @@ public sealed class EventSubscription(Action unsubscribe, int capacity) : IDispo
 
     public ChannelReader<Published> Reader => Channel.Reader;
 
-    public void Dispose() => _unsubscribe();
+    /// <summary>
+    /// ⚠️ **除了摘掉自己，还要 `TryComplete()` 那条 channel。**
+    /// 只摘不完成的话，**健康的**旧订阅被换掉时，它的泵任务会**永远阻塞**在
+    /// `ReadAllAsync` 上——没人会再往那条 channel 写，也没人会完成它。
+    /// 可达路径：头「点 A → 点 B → 点回 A」每次 `openSession` 都重新订阅，命中一次。
+    /// 影响有界（连接一断 `ct` 就取消、泵随之结束），但那是**每连接泄漏一个 Task**。
+    /// </summary>
+    public void Dispose()
+    {
+        _unsubscribe();
+        Channel.Writer.TryComplete();
+    }
 }
 
 /// <summary>

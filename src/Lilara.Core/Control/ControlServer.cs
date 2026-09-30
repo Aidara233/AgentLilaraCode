@@ -101,9 +101,12 @@ public sealed class ControlServer(
             // ⚠️ **先取高水位，再取内容。** 反过来的话，落在「取内容 → 取高水位」
             // 那段时间里的事件**既不在快照里、也不会被补发**（因为 seq ≤ highWater）⇒
             // 头**永久少一条**，而且它没办法发现。
-            // ⚠️ 宁可**重**不可**漏**：重可以被头去重（`seq` 是单调的），漏不行。
-            // 第一版写反了，而注释还声称「那个窗口就关上了」——**那句话是过度声称**：
-            // 它只关掉了「快照 → 订阅」那一段，没关掉这一段。
+            // ⚠️ **方向**是从「漏」改成「重」——**不是**「窗口关上了」。
+            // 落在 `(高水位, 内容]` 的事件**既在快照里、又会被补发** ⇒ 头会**重复渲染一次**。
+            // ⚠️ 而「重可以被头去重」这个说法**不成立**：`/history` 的 `rendered` 行**不带 `seq`**，
+            // 头**没有任何东西**能把补发事件和已渲染的行对上（`app.js` 也没实现去重）。
+            // 重比漏轻（下次 `openSession` 会从快照重渲染而自愈），但**别说成关上了**——
+            // 那与本轮刚改掉的那句过度声称**同形**。
             var highWater = bus.HighWaterMark(EventBus.SessionTopic(id));
 
             // ⚠️ **先查内存激活表**（`SessionQueries.StateOf`）——读磁盘会在**步进行中报 Idle**，
@@ -317,9 +320,15 @@ public sealed class ControlServer(
                     break;
             }
         }
-        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
+        catch (Exception ex)
         {
             // 畸形帧：**回一句人话，连接留着**。
+            // ⚠️ **不按异常类型白名单赌**：第一版写的是
+            //   `ex is JsonException or KeyNotFoundException or InvalidOperationException`，
+            //   而 `{"kind":"subscribe","topic":null}` 走的是另一条路——`GetString()` 对 JSON `null`
+            //   **返回 null 而不抛** ⇒ `subscribe(null!)` ⇒ 字典查 null ⇒ **ArgumentNullException**，
+            //   不在白名单里 ⇒ 逃出接收循环 ⇒ **连接 Aborted**（复核者实测 9 帧矩阵，只有这一帧会踢）。
+            // ⇒ 既然「一个第三方头发错一帧，不该让整条连接一起死掉」，那就**不该按类型赌**。
             await send(new WireFrame.Ack("?", false, null, $"帧形状不对：{ex.Message}", null));
         }
 

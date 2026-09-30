@@ -198,28 +198,52 @@ public class QueueSemanticsTests : IDisposable
     ///
     /// <para>⚠️ 这条测的是**原子性**（单线程那条只钉功能，对原子性没有区分力）：
     /// 多线程同时抢，**恰好一个赢家**。</para>
+    ///
+    /// <para>⚠️ **形状很要紧，第一版是掷硬币的**。第一版每轮 `new Thread` × 8 再 `Join`——
+    /// barrier 一放，那 8 个线程实际上被**一个接一个**调度，撞不上。
+    /// 复核者实测：忠实回退实现下 **10 次里 4 红 6 绿**，而作者当时报的「1 红」是**一次幸运单跑**。
+    /// ⇒ 必须用**常驻线程**（`IsBackground` + 线程内循环 + 每轮 barrier），线程才是热的。
+    /// 复核者量到那个形状 ≈35%/轮 超发、**30/30 检出**。
+    /// ⚠️ 判据用**每轮的最大赢家数**，不能用累计值——「一轮 0 个、另一轮 2 个」会互相抵消。</para>
     /// </summary>
     [Fact]
-    public void TryEnterStep_IsAtomic_ExactlyOneWinnerWhenRacing()
+    public async Task TryEnterStep_IsAtomic_NeverTwoHoldersAtOnce()
     {
         var handle = NewHarness().Session;
 
-        for (var round = 0; round < 2000; round++)
+        const int racers = 8;
+        const int hits = 200_000;
+        var holders = 0;
+        var maxHolders = 0;
+        var overlaps = 0;
+
+        var threads = Enumerable.Range(0, racers).Select(_ => new Thread(() =>
         {
-            var winners = 0;
-            using var start = new Barrier(8);
-
-            var threads = Enumerable.Range(0, 8).Select(_ => new Thread(() =>
+            for (var i = 0; i < hits; i++)
             {
-                start.SignalAndWait();                       // 让 8 个线程**同时**撞进 TryEnterStep
-                if (handle.TryEnterStep()) Interlocked.Increment(ref winners);
-            })).ToArray();
+                // ⚠️ 拿到就持有一下（在临界区里），再放。
+                // 读改写实现下，两个线程可能**同时**认为自己拿到了 ⇒ holders 会到 2。
+                if (!handle.TryEnterStep()) continue;
 
-            foreach (var t in threads) t.Start();
-            foreach (var t in threads) t.Join();
+                var now = Interlocked.Increment(ref holders);
+                var seen = Volatile.Read(ref maxHolders);
+                while (now > seen && Interlocked.CompareExchange(ref maxHolders, now, seen) != seen)
+                    seen = Volatile.Read(ref maxHolders);
+                if (now > 1) Interlocked.Increment(ref overlaps);
 
-            Assert.Equal(1, winners);   // ⚠️ 多于 1 = 这把标志不原子
-            handle.ExitStep();
-        }
+                Interlocked.Decrement(ref holders);
+                handle.ExitStep();
+            }
+        })
+        { IsBackground = true }).ToArray();
+
+        foreach (var t in threads) t.Start();
+        foreach (var t in threads) t.Join();
+
+        // ⚠️ 判据是**同时**持有者数，不是「多少次返回 true」——
+        // 后者对读改写也是 1（两个赢家各自都返回了 true，计数分不出来）。
+        Assert.Equal(1, maxHolders);
+        Assert.Equal(0, overlaps);
+        await Task.CompletedTask;
     }
 }

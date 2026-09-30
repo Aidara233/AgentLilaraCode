@@ -308,4 +308,46 @@ public class ControlServerTests : IAsyncLifetime
         Assert.True(sub.Reader.TryRead(out var p), "项目流上必须能收到 session.created");
         Assert.IsType<WireEvent.SessionCreated>(p.Payload);
     }
+
+    /// <summary>
+    /// ⚠️ **复核抓到的漏网畸形帧**：`{"kind":"subscribe","topic":null}`。
+    ///
+    /// <para>它走的是另一条路：`GetString()` 对 JSON `null` **返回 null 而不抛** ⇒
+    /// `subscribe(null!)` ⇒ 字典查 null ⇒ **`ArgumentNullException`**，
+    /// 而不在原来那份异常类型白名单里 ⇒ 逃出接收循环 ⇒ **连接 Aborted**。
+    /// 复核者实测 9 帧矩阵：只有这一帧会踢掉连接，其余 8 种（`topic:123`、无 `topic`、
+    /// 无 `id`、`payload:null`、`id:null`、`kind:123`、非 JSON、未知 kind）都安然无恙。</para>
+    ///
+    /// <para>⇒ 修法不是往白名单里加一类，而是**不按类型赌**：既然「一个第三方头发错一帧
+    /// 不该让整条连接一起死掉」，那就该一律兜住。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("{\"kind\":\"subscribe\",\"topic\":null}")]
+    [InlineData("{\"kind\":\"subscribe\"}")]
+    [InlineData("{\"kind\":\"subscribe\",\"topic\":123}")]
+    [InlineData("{\"kind\":\"command\",\"payload\":{\"kind\":\"session.create\"}}")]
+    [InlineData("not json at all")]
+    public async Task MalformedFrames_NeverKillTheConnection(string frame)
+    {
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+
+        await SendAsync(ws, frame);
+
+        // ⚠️ 连接必须**还活着**：再发一条合法命令，它必须能回执。
+        await SendAsync(ws, """{"kind":"command","id":"ok","payload":{"kind":"provider.upsert","id":"p","apiKey":"k2"}}""");
+
+        JsonElement ack = default;
+        for (var i = 0; i < 4; i++)
+        {
+            var f = await ReceiveAsync(ws);
+            if (f.GetProperty("kind").GetString() == "ack"
+                && f.TryGetProperty("id", out var id) && id.GetString() == "ok")
+            { ack = f; break; }
+        }
+
+        Assert.Equal(WebSocketState.Open, ws.State);
+        Assert.True(ack.ValueKind != JsonValueKind.Undefined, "连接被畸形帧踢掉了——它必须留着");
+        Assert.True(ack.GetProperty("accepted").GetBoolean());
+    }
 }
