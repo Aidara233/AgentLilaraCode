@@ -1,3 +1,4 @@
+using Lilara.Core.Adapters;
 using Lilara.Core.Persistence;
 using Lilara.Core.Session;
 
@@ -20,7 +21,7 @@ public class SessionHandleTests : IDisposable
     {
         ProviderId = "claude",
         ModelId = "claude-opus-5",
-        Protocol = "claude-messages",
+        Protocol = Protocols.ClaudeMessages,
         Effort = "high",
         MaxTokens = 16000,
     };

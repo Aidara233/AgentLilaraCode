@@ -1,3 +1,4 @@
+using Lilara.Core.Adapters;
 using Lilara.Core.Adapters.Claude;
 using Lilara.Core.Canonical;
 using Lilara.Core.Console;
@@ -39,7 +40,7 @@ public class ReplTests : IDisposable
         _providers.Save(new ProviderDefinition
         {
             Id = "claude",
-            Protocol = "claude-messages",
+            Protocol = Protocols.ClaudeMessages,
             ApiKey = "sk-test-not-a-real-key",
             DefaultModel = "claude-opus-5",
             Modality = "vision",
@@ -62,7 +63,7 @@ public class ReplTests : IDisposable
         _providers.Save(new ProviderDefinition
         {
             Id = "claude",
-            Protocol = "claude-messages",
+            Protocol = Protocols.ClaudeMessages,
             ApiKey = "sk-old",
             DefaultModel = "claude-opus-5",
             Modality = "vision",
@@ -138,7 +139,7 @@ public class ReplTests : IDisposable
         _providers.Save(new ProviderDefinition
         {
             Id = "claude",
-            Protocol = "claude-messages",
+            Protocol = Protocols.ClaudeMessages,
             ApiKey = "sk-test-not-a-real-key",
             DefaultModel = "claude-opus-5",
             Modality = "vision",

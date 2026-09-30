@@ -9,7 +9,7 @@ namespace Lilara.Core.Adapters.Claude;
 /// </summary>
 public sealed class ClaudeAdapter : IModelAdapter
 {
-    public const string ProtocolId = "claude-messages";
+    public const string ProtocolId = Protocols.ClaudeMessages;
 
     private readonly AnthropicClient _client;
 

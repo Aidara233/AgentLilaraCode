@@ -1,3 +1,5 @@
+using Lilara.Core.Adapters;
+
 namespace Lilara.Core.Canonical;
 
 /// <summary>
@@ -15,9 +17,9 @@ public static class ReasoningPolicy
 {
     public static bool CanCarry(string protocol) => protocol switch
     {
-        "claude-messages" => true,
-        "openai-chat" => false,
-        "openai-responses" => false,
+        Protocols.ClaudeMessages => true,
+        Protocols.OpenAiChat => false,
+        Protocols.OpenAiResponses => false,
         _ => false,   // 未知协议：保守选择「不能」，宁可丢也不伪造
     };
 

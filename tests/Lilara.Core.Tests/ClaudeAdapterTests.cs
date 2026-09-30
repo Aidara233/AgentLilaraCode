@@ -23,8 +23,7 @@ public class ClaudeAdapterTests
     {
         ModelId = "claude-opus-5",
         MaxTokens = 1024,
-        // ⚠️ 字面量而非常量：`Protocols` 常量类要到 Task 4 才建，Task 4 顺手换掉。
-        Protocol = "claude-messages",
+        Protocol = Protocols.ClaudeMessages,
         Effort = "high",
         SystemBlocks = [],
         Timeline = [],
@@ -40,7 +39,7 @@ public class ClaudeAdapterTests
         var wrong = new ProviderDefinition
         {
             Id = "openai",
-            Protocol = "openai-chat",
+            Protocol = Protocols.OpenAiChat,
             ApiKey = "x",
             DefaultModel = "gpt",
             Modality = "vision",

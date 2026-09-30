@@ -1,3 +1,4 @@
+using Lilara.Core.Adapters;
 using Lilara.Core.Canonical;
 using Lilara.Core.Persistence;
 using Lilara.Core.Records;
@@ -27,7 +28,7 @@ public class SessionStoreTests : IDisposable
         {
             ProviderId = "claude",
             ModelId = "claude-opus-5",
-            Protocol = "claude-messages",
+            Protocol = Protocols.ClaudeMessages,
             Effort = "high",
             MaxTokens = 16000,
         },

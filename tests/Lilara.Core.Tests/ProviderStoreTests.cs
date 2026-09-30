@@ -1,3 +1,4 @@
+using Lilara.Core.Adapters;
 using Lilara.Core.Providers;
 
 namespace Lilara.Core.Tests;
@@ -18,7 +19,7 @@ public class ProviderStoreTests : IDisposable
     private static ProviderDefinition Def(string id = "claude") => new()
     {
         Id = id,
-        Protocol = "claude-messages",
+        Protocol = Protocols.ClaudeMessages,
         ApiKey = "sk-test-not-a-real-key",
         DefaultModel = "claude-opus-5",
         Modality = "vision",
