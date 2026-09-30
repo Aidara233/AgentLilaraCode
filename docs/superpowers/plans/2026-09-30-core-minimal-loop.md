@@ -24,6 +24,10 @@
 - **所有落盘文件 UTF-8 且不带 BOM**（`new UTF8Encoding(false)`）。带 BOM 会让 `history.jsonl` 第一行解析失败。
 - **JSON 不转义非 ASCII**：`Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping`（`Unsafe` 是相对 HTML 注入说的，本地文件存储正是它的正确用途）。否则中文被写成 `\u4f60\u597d`，人不可读。
 - **`history.jsonl` 只追加，永不重写**（`01` §12.4）。
+- ⚠️ **落盘格式：单一命名约定 = camelCase。** 属性名用 `PropertyNamingPolicy = JsonNamingPolicy.CamelCase`；枚举值用 `new JsonStringEnumConverter(JsonNamingPolicy.CamelCase)`；判别式的**值**本来就是小写（`"message"`）。
+  **同一个对象里只允许一种约定**——属性 `from`、枚举值 `"model"`、判别式值 `"message"`，三者都是小写。
+  ⚠️ **枚举绝不能用序号**：`history.jsonl` 只追加永不重写，序号既不可读，又会因成员重排**静默重解释既有历史**。
+  这条不受「只在需要时抽象」约束——落盘格式一开始就得定死，改它是一次数据迁移。
 - **`state.json` 每步原子重写**（先写 `.tmp` 再 replace）。
 - **`spec.json` 创建时写一次，此后不可变**（`01` §8）。
 - **步是持久化的原子单位**（`01` §4）：模型输出在内存里合并完，落盘只落一次。
