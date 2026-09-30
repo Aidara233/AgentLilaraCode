@@ -137,10 +137,15 @@ public class OpenAiResponsesResponseTests
     /// 我只跑了后一半。<b>接着我又补了一句自认为「真实」的局限，说删掉数组守卫后下游对象守卫会吸收——
     /// 那句也是错的</b>（<c>EnumerateArray</c> 在循环体之前求值，对象守卫根本到不了），
     /// 由复审者实测指出。<b>⇒ 两处错误同源：都是写下未经运行的断言。</b></para>
-    /// <para>⚠️ 因此本文件**不存在已知的守卫覆盖缺口**：**五条**守卫（<c>root</c> 的对象守卫、
-    /// <c>status</c> 的字符串守卫、<c>output</c>/<c>content</c> 的数组守卫、<c>item</c>/<c>block</c> 的对象守卫）
-    /// **各自被测试钉住**——逐条实测的红数见各守卫所属测试的注释，还原后 26/26。
-    /// （<c>status</c> 那条起初被漏掉，由复审者指出后补测，见 <c>Map_ToleratesNonStringStatus</c>。）</para>
+    /// <para>⚠️ <b>被钉住的崩溃守卫——按分支类别列出，<u>不列总数</u></b>（总数易腐，且本注释已因写错它返工过）：
+    /// <b>类型守卫</b>见 <c>Map_ToleratesNonObjectRoot</c>（根）、<c>Map_ToleratesNonStringStatus</c>（<c>status</c>）、
+    /// <c>Map_ToleratesNonArrayOutputAndContent</c>（<c>output</c>/<c>content</c> 的数组）、
+    /// <c>Map_ToleratesNonObjectItemsAndBlocks</c>（<c>item</c>/<c>block</c> 的对象）、
+    /// <c>Map_HandlesEmptyOrMissingTextAsNoBlocks</c>（<c>text</c>）；
+    /// <b>缺键守卫</b>（<c>TryGetProperty</c> 的成员检查——换成 <c>GetProperty</c> 即抛 <c>KeyNotFoundException</c>）
+    /// 见 <c>Map_ToleratesMissingKeys</c>；<b>值判据</b>（<c>Length &gt; 0</c>）见 <c>Map_HandlesEmptyOrMissingTextAsNoBlocks</c>。</para>
+    /// <para>⚠️ <c>status</c> 的类型守卫起初被漏掉、<b>缺键那一整类起初也未被计入</b>，两次都是复审者逐条列举后补测的。
+    /// <b>本段注释在四个轮次里改了四次，每次都是因为写下了未经运行的断言</b>——故此处只列测试名，不列数字。</para>
     /// </summary>
     [Theory]
     [InlineData("""{"status":"completed","output":5}""")]
@@ -178,6 +183,36 @@ public class OpenAiResponsesResponseTests
         var reply = OpenAiResponsesResponse.Map(body);
 
         Assert.Equal("unknown", reply.StopReason);
+    }
+
+    /// <summary>
+    /// ⚠️ **缺键**（不是缺值、不是类型错）也必须不崩：`TryGetProperty` 的每一个成员检查
+    /// 都在这里被钉住——换成 `GetProperty` 就会抛 `KeyNotFoundException`。
+    /// <para>⚠️ 这些是**真实**形状，不是构造的：上游省略 <c>output</c>、省略 <c>content</c>、
+    /// 或给一个只有 <c>type</c> 的块，都出现过。断言只取共同不变量（不产出块）——
+    /// 因为缺 <c>status</c> 时 <c>StopReason</c> 是 <c>"unknown"</c>、不缺时是 <c>"completed"</c>，
+    /// 逐例断言状态反而会把这条测试拧成四不像。</para>
+    /// <para>⚠️ 控制器起初只在注释里声明「无覆盖缺口」，**没数这些成员检查**，
+    /// 被复审者逐条列举后补测——这是同一缺陷类在本文件里的**第四次**，故此处逐行列出被钉住的分支：
+    /// <c>status</c> 缺键 · <c>output</c> 缺键 · <c>item.type</c> 缺键 · <c>item.content</c> 缺键 ·
+    /// <c>block.type</c> 缺键 · <c>block.type != "output_text"</c>。<c>block.text</c> 缺键由
+    /// <see cref="Map_HandlesEmptyOrMissingTextAsNoBlocks"/> 那行 <c>{"type":"output_text"}</c> 钉住。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("""{"id":"r"}""")]
+    [InlineData("""{"status":"completed"}""")]
+    [InlineData("""{"output":[]}""")]
+    [InlineData("""{"status":"completed","output":[{}]}""")]
+    [InlineData("""{"status":"completed","output":[{"type":"message"}]}""")]
+    [InlineData("""{"status":"completed","output":[{"type":"message","content":[{}]}]}""")]
+    [InlineData("""{"status":"completed","output":[{"type":"message","content":[{"type":"input_text","text":"x"}]}]}""")]
+    public void Map_ToleratesMissingKeys(string body)
+    {
+        var reply = OpenAiResponsesResponse.Map(body);
+
+        Assert.Empty(reply.Blocks);
+        Assert.False(reply.Refused);
     }
 
     /// <summary>
