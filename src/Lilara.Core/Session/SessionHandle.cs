@@ -14,6 +14,18 @@ public sealed record SessionHandle
     public required SessionState State { get; set; }
     public required string Directory { get; init; }
 
+    /// <summary>
+    /// 轴的当前值。⚠️ **非空**——<see cref="Load"/> 已经把磁盘上的 null 补成默认值。
+    /// 加一条轴时**只改 <see cref="Axes.Defaults"/>**：<see cref="Load"/> 是按默认值补齐的，
+    /// 不是按硬编码名单，所以新轴对老会话自动生效。
+    ///
+    /// <para>⚠️ **`set` 而不是 `init`**：`session.setAxis`（Task 3）要改它，
+    /// 而 T3 的处理器**不**走 `with`——`SessionHandle` 是可变的活对象，
+    /// 换一个新实例会让激活表里那份**指向旧实例**（状态分叉）。
+    /// 改属性 + <see cref="SaveAxes"/> 才是对的。</para>
+    /// </summary>
+    public required IReadOnlyDictionary<string, string> Axes { get; set; }
+
     public string SessionId => Spec.SessionId;
     public string SpecPath => Path.Combine(Directory, "spec.json");
     public string StatePath => Path.Combine(Directory, "state.json");
@@ -111,22 +123,74 @@ public sealed record SessionHandle
         store.WriteState(projectKey, state);
         store.WriteSpec(projectKey, spec);
 
-        return new SessionHandle
+        var handle = new SessionHandle
         {
             ProjectKey = projectKey,
             Spec = spec,
             State = state,
             Directory = store.SessionDirectory(projectKey, spec.SessionId),
+
+            // ⚠️ **轴的 effort 从 spec 播种，不是从表里的硬编码默认值。**
+            // 提供商配的是 `effort=low` 时会造出一个 **Spec 说 low、轴说 high** 的会话——
+            // **出生即分叉**，而 `Stepper` 从轴读 ⇒ 用户从没设过轴，effort 却变了。
+            // 其余四条轴没有「会话配置里的镜像」，所以仍取默认值。
+            // ⚠️ 类型必须写全 `Lilara.Core.Session.Axes`：本类有个同名属性 `Axes`，
+            // 裸写 `Axes.Defaults()` 会被解析成那个实例属性（CS0120），**不是**这张表。
+            Axes = WithEffortFrom(Lilara.Core.Session.Axes.Defaults(), spec.Model.Effort),
+        };
+
+        // ⚠️ 默认值也**要落盘**：不落的话第一次重启时 `state.Axes` 是 null，
+        // `Load` 会补一份新的默认值——结果一样，但磁盘上「没设过」与「设成了默认值」
+        // 就永远分不出来，而将来改默认值会让老会话**静默改变行为**。
+        handle.SaveAxes(store);
+        return handle;
+    }
+
+    /// <summary>把 spec 里冻结的 effort 播种进轴——见 <see cref="Create"/> 的注释。</summary>
+    private static IReadOnlyDictionary<string, string> WithEffortFrom(
+        IReadOnlyDictionary<string, string> defaults, string effort)
+    {
+        var d = new Dictionary<string, string>(defaults, StringComparer.Ordinal);
+
+        // ⚠️ 这个 `if` 不是多余的：老的 `spec.json` 里 effort 可能是**表里没有的值**
+        // （`ClaudeRequestBuilder.ToEffort` 抛异常的那类拼写错误）。种子进轴会让头的下拉
+        // **没有任何一个选项被选中**——那是比「悄悄用默认值」更坏的显示。表里没有就退回默认值。
+        if (Lilara.Core.Session.Axes.ValuesOf(Lilara.Core.Session.Axes.Effort)!
+                .Contains(effort, StringComparer.OrdinalIgnoreCase))
+            d[Lilara.Core.Session.Axes.Effort] = effort;
+        return d;
+    }
+
+    public static SessionHandle Load(SessionStore store, string projectKey, string sessionId)
+    {
+        var state = store.ReadState(projectKey, sessionId);
+        return new SessionHandle
+        {
+            ProjectKey = projectKey,
+            Spec = store.ReadSpec(projectKey, sessionId),
+            State = state,
+            Directory = store.SessionDirectory(projectKey, sessionId),
+
+            // ⚠️ **老 state.json 没有 `axes` 键** ⇒ 读出来是 null ⇒ 在这里补默认值。
+            // 不补的话，头会渲染五个空白下拉，用户分不清「没设过」与「头读不到」。
+            // ⚠️ 按 `Lilara.Core.Session.Axes.Defaults()` 补齐而不是按硬编码名单——
+            // 加一条新轴时，老会话也会自动拿到它的默认值，不需要第二处修改。
+            Axes = state.Axes is { Count: > 0 }
+                ? state.Axes
+                : Lilara.Core.Session.Axes.Defaults(),
         };
     }
 
-    public static SessionHandle Load(SessionStore store, string projectKey, string sessionId) => new()
-    {
-        ProjectKey = projectKey,
-        Spec = store.ReadSpec(projectKey, sessionId),
-        State = store.ReadState(projectKey, sessionId),
-        Directory = store.SessionDirectory(projectKey, sessionId),
-    };
-
     public void SaveState(SessionStore store) => store.WriteState(ProjectKey, State);
+
+    /// <summary>
+    /// 把当前轴写进 `state.json`。
+    /// ⚠️ **整文件重写**（`state.json` 本来就是每步原子重写，`01` §8）——
+    /// 但要**基于 <see cref="State"/> 现读的副本**，不能另构造一个，否则会把 `Turn` / `Status` 抹掉。
+    /// </summary>
+    public void SaveAxes(SessionStore store)
+    {
+        State = State with { Axes = Axes };
+        store.WriteState(ProjectKey, State);
+    }
 }

@@ -67,4 +67,39 @@ public class AxisTests
         foreach (var v in Axes.ValuesOf("safety")!) Assert.Contains(v, text);
         Assert.Equal(string.Join("|", Axes.ValuesOf("safety")!), text);
     }
+
+    /// <summary>
+    /// ⚠️ **老会话（磁盘上没有 `axes`）载入后必须拿到默认值**，而不是空字典。
+    /// 空字典会让头渲染五个空白下拉，用户分不清「没设过」与「头读不到」。
+    /// </summary>
+    [Fact]
+    public void Load_OfALegacyStateFile_FillsInTheDefaults()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "lilara-axis-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var store = new Lilara.Core.Persistence.SessionStore(root);
+            var pk = Lilara.Core.Projects.ProjectKey.FromPath(@"C:\work");
+            store.WriteState(pk, new Lilara.Core.Persistence.SessionState
+            {
+                SessionId = "s1", Status = "Idle", Turn = 0, Pending = [],   // ⚠️ 刻意不设 Axes
+            });
+            store.WriteSpec(pk, new Lilara.Core.Persistence.SessionSpec
+            {
+                SessionId = "s1", ProjectKey = pk, WorkingDirectory = @"C:\work",
+                CreatedAt = DateTimeOffset.UnixEpoch,
+                Model = new Lilara.Core.Persistence.ModelSelection
+                {
+                    ProviderId = "p", ModelId = "m", Protocol = "claude-messages",
+                    Effort = "high", MaxTokens = 16000,
+                },
+            });
+
+            var handle = SessionHandle.Load(store, pk, "s1");
+
+            Assert.Equal(Axes.Defaults(), handle.Axes);
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
+    }
 }

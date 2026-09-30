@@ -123,4 +123,39 @@ public class DiskFormatGoldenTests
         Assert.DoesNotContain("\"kind\":\"message\"", typed);
         Assert.Contains("\"kind\":\"text\"", typed);   // 嵌套块的判别式**仍在**——这正是粗断言会误伤的地方
     }
+
+    /// <summary>
+    /// ⚠️ **老 `state.json` 里没有 `axes` 键，它必须仍然是合法的。**
+    /// `Json.Options` 的 `WhenWritingNull` 让「没设轴」的 state 序列化结果**逐字节不变**——
+    /// 这是本计划唯一一次磁盘迁移，而它之所以安全正是因为这条。
+    /// 把它钉成测试：将来谁把 `Axes` 改成 `required` 或给它一个非 null 默认值，这条会红。
+    ///
+    /// <para>⚠️ 实测（本任务 Step 1，加属性前后各跑一次同一个探针，落文件比 SHA256）：
+    /// 加属性前 60 字节 / `EEF69F9314CDFC8DCC7CED8ED634A43B211053FA21F2808CB2AEA270A2AD0C0C`，
+    /// 加属性后**逐字节相同**。下面这句断言就是那次测量的固化形态。</para>
+    /// </summary>
+    [Fact]
+    public void SessionState_WithoutAxes_IsByteIdenticalToBeforeTheAxisFeature()
+    {
+        var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
+
+        Assert.Equal(
+            """{"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
+    }
+
+    /// <summary>设了轴就写出来——形状要能一眼看出来，别嵌套成对象套对象。</summary>
+    [Fact]
+    public void SessionState_WithAxes_SerializesThemAsAFlatObject()
+    {
+        var state = new SessionState
+        {
+            SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [],
+            Axes = new Dictionary<string, string> { ["safety"] = "prod" },
+        };
+
+        Assert.Equal(
+            """{"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
+            System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
+    }
 }

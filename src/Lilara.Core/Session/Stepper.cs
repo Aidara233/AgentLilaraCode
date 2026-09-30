@@ -66,7 +66,13 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
                 // 会话建于 openai-chat，之后把 provider 改成 claude-messages）。
                 // ⇒ 单一真相来源放在适配器上（`IModelAdapter.Protocol`）。
                 Protocol = _adapter.Protocol,
-                Effort = handle.Spec.Model.Effort,
+                // ⚠️ **从轴读，不从 Spec 读。** Spec 是**建会话时冻结的快照**，
+                // 而轴是**活**的（`session.setAxis` 改的就是它）。
+                // 按 Spec 读的话，用户在头上把 effort 拨到 `max`、头显示 `max`，
+                // 而**请求里发的还是建会话时那个值**——「设了没用」，且无从发现。
+                // ⚠️ 其余四条轴**不进请求**（`01` §3.5：只有 effort 是纯机械轴），
+                // 所以这里只读一条。将来哪条轴有了机械层，在这里加它的读取。
+                Effort = handle.Axes[Axes.Effort],
                 SystemBlocks = [], // 04 §1.3：核心自带零内容
                 Timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
             };

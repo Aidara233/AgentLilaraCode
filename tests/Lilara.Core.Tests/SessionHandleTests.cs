@@ -104,4 +104,60 @@ public class SessionHandleTests : IDisposable
         Assert.Empty(_store.ListSessions(projectKey));
         Assert.Null(_store.TryReadSpec(projectKey, "999999999999"));
     }
+
+    /// <summary>
+    /// ⚠️ **轴的 effort 从 spec 播种**，不是取表里的硬编码默认值 `high`。
+    /// 不播种的话，提供商配 `effort=low` 时会造出「Spec 说 low、轴说 high」的会话——
+    /// **出生即分叉**，而 `Stepper` 从轴读 ⇒ 用户从没设过轴，effort 却变了。
+    ///
+    /// <para>⚠️ 第二次 <see cref="SessionHandle.Load"/> 是**这条测试的另一半**：
+    /// 种子只有落盘才活得过重启（`Create` 里的 `SaveAxes`）；不落盘的话，
+    /// 重启后 `state.Axes` 是 null，`Load` 会补一份默认值把 `low` **静默改回** `high`。</para>
+    /// </summary>
+    [Fact]
+    public void Create_SeedsTheEffortAxisFromTheSpec_AndItSurvivesAReload()
+    {
+        var created = SessionHandle.Create(_store, @"C:\work", Model() with { Effort = "low" });
+
+        Assert.Equal("low", created.Axes[Axes.Effort]);
+
+        var reloaded = SessionHandle.Load(_store, created.ProjectKey, created.SessionId);
+        Assert.Equal("low", reloaded.Axes[Axes.Effort]);
+    }
+
+    /// <summary>
+    /// ⚠️ spec 里的 effort 可能是**表里没有的拼写错误**（`ClaudeRequestBuilder.ToEffort` 会为它抛异常）。
+    /// 那种值**不能**种进轴：头会渲染出一个「没有任何选项被选中」的下拉，
+    /// 比「悄悄用默认值」更坏——用户看到的是一个无法解释的空档。
+    /// </summary>
+    [Fact]
+    public void Create_WithAnUnknownEffortInTheSpec_FallsBackToTheTableDefault()
+    {
+        var handle = SessionHandle.Create(_store, @"C:\work", Model() with { Effort = "xhihg" });
+
+        Assert.Equal(Axes.Defaults()[Axes.Effort], handle.Axes[Axes.Effort]);
+    }
+
+    /// <summary>
+    /// ⚠️ `SaveAxes` 必须**基于现读的 <see cref="SessionHandle.State"/>**，不能另构造一个：
+    /// 另构造的话会把 `Turn` / `Status` 抹成 0 / Idle，而这一步没有任何报错——
+    /// 只是重启后会话「失忆」，且磁盘上看不出是哪次写坏的。
+    /// </summary>
+    [Fact]
+    public void SaveAxes_KeepsTurnAndStatus()
+    {
+        var handle = SessionHandle.Create(_store, @"C:\work", Model());
+        handle.State = handle.State with { Turn = 3, Status = "Running" };
+        handle.Axes = new Dictionary<string, string>(handle.Axes, StringComparer.Ordinal)
+        {
+            [Axes.Safety] = "prod",
+        };
+
+        handle.SaveAxes(_store);
+
+        var reread = _store.ReadState(handle.ProjectKey, handle.SessionId);
+        Assert.Equal(3, reread.Turn);
+        Assert.Equal("Running", reread.Status);
+        Assert.Equal("prod", reread.Axes![Axes.Safety]);
+    }
 }
