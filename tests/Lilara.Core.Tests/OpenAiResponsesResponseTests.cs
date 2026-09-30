@@ -108,6 +108,33 @@ public class OpenAiResponsesResponseTests
     }
 
     /// <summary>
+    /// ⚠️ <c>output</c> / <c>content</c> **不是数组**时也必须不崩。
+    /// <para>⚠️ <b>这条测试现在钉不住那两条数组守卫——原因已实测，不是疏漏：</b>
+    /// 数组守卫（<c>output.ValueKind == Array</c> / <c>content.ValueKind == Array</c>）的下游
+    /// 还有对象守卫（<c>item</c>/<c>block</c> 的 <c>ValueKind == Object</c>，修复轮 1 加的）。
+    /// 实测：把**两条数组守卫都删掉**，非数组输入会在 <c>EnumerateArray</c> 上抛，
+    /// 但那一步在对象守卫**之前**——所以本测试**照样绿**；
+    /// 而单独删一条同样不红（另一条吸收）。
+    /// 控制器量到的唯一能钉住它们的输入形态，只有「另一条守卫仍被保留」时才成立，
+    /// 那种测试是**在测测试自己怎么摆的**，不是测行为。</para>
+    /// <para>⚠️ 因此这里接受一个**已知的覆盖缺口**：两条数组守卫目前**无测试**。
+    /// 它们的价值是**纵深防御**——若将来有人移除对象守卫、或重排这两层判断，
+    /// 本测试就会成为唯一挡在 <c>EnumerateArray</c> 崩溃前面的东西。
+    /// 控制器裁定：**不为它们造一条现在无法失败的测试**（本计划已抓到过四条同类空转测试）。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("""{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}""")]
+    [InlineData("""{"status":"completed","output":[{"type":"message","content":[]}]}""")]
+    [InlineData("""{"status":"completed","output":[]}""")]
+    public void Map_ToleratesEmptyArrays(string body)
+    {
+        var reply = OpenAiResponsesResponse.Map(body);
+
+        Assert.False(reply.Refused);
+        Assert.Equal("completed", reply.StopReason);
+    }
+
+    /// <summary>
     /// ⚠️ **实测**：`output` 数组里的**非对象项**（数字等）会让 `item.TryGetProperty` 抛
     /// `InvalidOperationException`。兄弟实现 `OpenAiChatResponse` 对 `choices[0]` 有同样的守卫，
     /// 且实测 `{"choices":[5]}` 不崩——**这是对齐，不是新增严格性**。
