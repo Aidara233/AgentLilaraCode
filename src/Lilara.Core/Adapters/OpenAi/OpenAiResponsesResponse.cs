@@ -28,12 +28,14 @@ public static class OpenAiResponsesResponse
         {
             foreach (var item in output.EnumerateArray())
             {
+                if (item.ValueKind != JsonValueKind.Object) continue;
                 if (!item.TryGetProperty("type", out var t) || t.GetString() != "message") continue;
                 if (!item.TryGetProperty("content", out var content)
                     || content.ValueKind != JsonValueKind.Array) continue;
 
                 foreach (var block in content.EnumerateArray())
                 {
+                    if (block.ValueKind != JsonValueKind.Object) continue;
                     if (block.TryGetProperty("type", out var bt) && bt.GetString() == "output_text"
                         && block.TryGetProperty("text", out var txt)
                         && txt.ValueKind == JsonValueKind.String

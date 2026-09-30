@@ -106,4 +106,23 @@ public class OpenAiResponsesResponseTests
         Assert.Empty(reply.Blocks);
         Assert.Equal("completed", reply.StopReason);
     }
+
+    /// <summary>
+    /// ⚠️ **实测**：`output` 数组里的**非对象项**（数字等）会让 `item.TryGetProperty` 抛
+    /// `InvalidOperationException`。兄弟实现 `OpenAiChatResponse` 对 `choices[0]` 有同样的守卫，
+    /// 且实测 `{"choices":[5]}` 不崩——**这是对齐，不是新增严格性**。
+    /// 同一条也适用于 `content` 数组里的非对象块。
+    /// </summary>
+    [Theory]
+    [InlineData("""{"status":"completed","output":[5]}""")]
+    [InlineData("""{"status":"completed","output":[{"type":"message","content":[5]}]}""")]
+    [InlineData("""{"status":"completed","output":[null]}""")]
+    [InlineData("""{"status":"completed","output":[{"type":"message","content":[null]}]}""")]
+    public void Map_ToleratesNonObjectItemsAndBlocks(string body)
+    {
+        var reply = OpenAiResponsesResponse.Map(body);
+
+        Assert.Empty(reply.Blocks);
+        Assert.Equal("completed", reply.StopReason);
+    }
 }
