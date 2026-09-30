@@ -228,4 +228,21 @@ public class AxisTests
         Assert.Equal("", canonical);            // 与「未知轴」一致，不回吐半截
         Assert.Equal("", Axes.LegalValuesText(null));
     }
+
+    /// <summary>
+    /// ⚠️ `Labels` 与 `Names` 是同一条要求的两个视图，键集必须一致——
+    /// 少一个键就是头的某一格空白，而用户分不清「没标签」与「头坏了」。
+    /// </summary>
+    [Fact]
+    public void Labels_CoverExactlyTheSameAxesAsNames()
+    {
+        foreach (var n in Axes.Names)
+        {
+            var label = Axes.LabelOf(n);
+            Assert.False(string.IsNullOrWhiteSpace(label), $"轴 '{n}' 没有标签");
+            // ⚠️ 断言它**不是回退成档名**：`LabelOf` 对未知轴返回原样，
+            // 所以「返回 non-empty」单独还不够——中文名与英文档名不可能相等。
+            Assert.NotEqual(n, label);
+        }
+    }
 }

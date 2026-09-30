@@ -350,4 +350,78 @@ public class ControlServerTests : IAsyncLifetime
         Assert.True(ack.ValueKind != JsonValueKind.Undefined, "连接被畸形帧踢掉了——它必须留着");
         Assert.True(ack.GetProperty("accepted").GetBoolean());
     }
+
+    /// <summary>
+    /// ⚠️ **初始轴值必须来自快照**（`05` §11 #4）：`axis.changed` 只在订阅**之后**才有，
+    /// 头刚打开页面时没有任何事件可等。少了这一项，五个下拉全是空的，
+    /// 而用户看到的「空」与「默认值」在视觉上无法区分。
+    /// </summary>
+    [Fact]
+    public async Task State_CarriesTheFiveAxes()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        var state = await Client.GetStringAsync(Http($"/sessions/{sid}/state"));
+        using var doc = JsonDocument.Parse(state);
+        var axes = doc.RootElement.GetProperty("axes");
+
+        foreach (var axis in Axes.Names)
+            Assert.True(axes.TryGetProperty(axis, out _), $"快照少了轴 '{axis}'");
+        Assert.Equal("dev", axes.GetProperty("safety").GetString());
+    }
+
+    /// <summary>
+    /// ⚠️ **三个槽位**（`01` §3.1 头两个 + §3.2 尾槽位「浮动」）。
+    /// `05` §7.1 的「空的也要显示」要求它**恒在**且是**数组**——
+    /// 省略字段会让头分不清「空」与「没有这个概念」（既有注释已写明这条）。
+    /// </summary>
+    [Fact]
+    public async Task State_CarriesThreeSlots_FloatingIncluded()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        using var doc = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/state")));
+        var slots = doc.RootElement.GetProperty("slots");
+
+        Assert.Equal(JsonValueKind.Array, slots.GetProperty("system").ValueKind);
+        Assert.Equal(JsonValueKind.Array, slots.GetProperty("premier").ValueKind);
+        Assert.Equal(JsonValueKind.Array, slots.GetProperty("floating").ValueKind);
+        Assert.Empty(slots.GetProperty("floating").EnumerateArray());
+    }
+
+    /// <summary>
+    /// ⚠️ **`GET /axes` 是头唯一的轴来源**（G8：头不许手抄）。
+    /// 少了它，头里那份手抄的 `AXES` 常量就是第二份契约——而 `Axes.cs:8` 明说「不许手抄」。
+    ///
+    /// <para>⚠️ 这条测试**同时钉住「中文标签归核心」**：`05` §3「渲染归核心，头只显示」——
+    /// 而下拉的 `主动性` / `安全` 就是渲染。头拿到英文档名自己是画不出中文的。</para>
+    /// </summary>
+    [Fact]
+    public async Task Axes_Endpoint_HandsOutEverythingTheHeadNeeds()
+    {
+        using var doc = JsonDocument.Parse(await Client.GetStringAsync(Http("/axes")));
+        var axes = doc.RootElement.GetProperty("axes").EnumerateArray().ToList();
+
+        Assert.Equal(Axes.Names.Count, axes.Count);
+        // ⚠️ 顺序**就是** `Axes.Names` 的顺序——它决定头的渲染顺序（与 T1 那条同名约定一致）。
+        Assert.Equal(Axes.Names, axes.Select(a => a.GetProperty("name").GetString()!).ToList());
+
+        foreach (var a in axes)
+        {
+            Assert.False(string.IsNullOrWhiteSpace(a.GetProperty("label").GetString()),
+                $"轴 {a.GetProperty("name").GetString()} 没有标签——头画不出中文名");
+            Assert.NotEmpty(a.GetProperty("values").EnumerateArray());
+        }
+
+        // ⚠️ **`inContext` 必须是真值而不是漏字段**：`effort` 是 false（`01` §3.5：不进上下文），
+        // 头据此把它画灰。少了这个字段，头分不清「不进上下文」与「核心没这个信息」。
+        var effort = axes.Single(a => a.GetProperty("name").GetString() == "effort");
+        Assert.False(effort.GetProperty("inContext").GetBoolean());
+
+        // ⚠️ **告警的两端也归核心**：头里写字面量的话，轴里改一个档名就会让告警**静默失效**。
+        Assert.Equal("prod", doc.RootElement.GetProperty("alertSafety").GetString());
+        Assert.Equal("authorized", doc.RootElement.GetProperty("alertFrom").GetString());
+    }
 }

@@ -111,22 +111,47 @@ public sealed class ControlServer(
 
             // ⚠️ **先查内存激活表**（`SessionQueries.StateOf`）——读磁盘会在**步进行中报 Idle**，
             // 于是头渲染「空闲」⇒ 用户以为没在跑 ⇒ **再点一次发送** ⇒ 队列两条 ⇒ 烧钱。
-            //
-            // ⚠️ `slots` 是**两个槽位的渲染产物**（`05` §3.1 义务 1）。
-            // 核心现在还**没有槽位机制**（`04` §1.3：裸核心连系统提示词都没有），
-            // 所以恒为空——但 `05` §7.1 要的正是「**空的也要显示**」：
-            // 用户要能看见「它真的是空的」，而不是以为头坏了。
-            // ⇒ 这里如实交出空值，**不省略字段**（省略了头就分不出「空」与「没有这个概念」）。
             return Results.Json(
                 new
                 {
                     handle.SessionId,
                     State = SessionQueries.StateOf(host, handle),
+
+                    // ⚠️ **高水位不能在这轮改动里掉队**：`History_And_State_CarryTheSeqHighWaterMark`
+                    // 断言 `state.highWater` 存在且等于流高水位——brief 里的替换块漏了它，
+                    // 只跑 Step 4 那三条筛选的话看不到（本条不在筛选里）。
                     HighWater = highWater,
+
+                    // ⚠️ **轴必须进快照**（`05` §11 #4）：`axis.changed` 只在订阅**之后**才有，
+                    // 头刚打开页面时无事件可等。少了它，五个下拉全是空的——
+                    // 而「空」与「默认值」在视觉上分不出来。
+                    // ⚠️ 轴只有一份，住在 `State` 里（`SessionHandle` 上不该有第二份——两份会分叉）。
+                    // `State.Axes` 的类型仍带 `?`，那是为**磁盘迁移**留的（见 `SessionState` 的注释）；
+                    // 而这把 `handle` 必经 `Load` / `Create`：`TryFind` 要么从激活表拿
+                    //（`CoreHost.Register` 的调用点只有 `Create` 与 `Load` 出来的那份），
+                    // 要么 `host.Activate` 重新 `Load`——两条路都过 `CompleteAxes`。
+                    // ⇒ `!` 不是赌，是那条不变量的落点。
+                    Axes = handle.State.Axes!,
+
+                    // ⚠️ **三个槽**：`01` §3.1 的头两个（系统 / 首要）+ §3.2 的**尾槽位**（浮动）。
+                    // 第一版只有两个——它把 `01` 的「头槽位」当成全部，漏了尾槽位；
+                    // 而尾槽位正是五轴显示的地方（§3.2「策略：主动性 · 权限 · 安全 · 验证强度」）。
+                    // ⇒ 漏了它，义务 4 就没有落点。
+                    //
+                    // ⚠️ `slots` 是**渲染产物**（`05` §3.1：核心渲染、头显示）。
+                    // 核心现在还没有装配器（`04` §1.3：裸核心连系统提示词都没有），
+                    // 所以三个都恒为空——但 `05` §7.1 要的正是「**空的也要显示**」：
+                    // 用户要能看见「它真的是空的」，而不是以为头坏了。
+                    // ⇒ 如实交出空数组，**不省略字段**。
+                    //
+                    // ⚠️ **浮动槽的内容由头拼**：它的字段（态势 / 策略 / 其他）核心已经
+                    // 用 `Axes` 如实交出来了，而「怎么排」是**显示**（`05` §3 归头）。
+                    // 换个头可以排成别样——那是 §1.1 允许的。
                     Slots = new
                     {
                         System = Array.Empty<object>(),
                         Premier = Array.Empty<object>(),
+                        Floating = Array.Empty<object>(),
                     },
                 },
                 WireJson.Options);
@@ -157,6 +182,28 @@ public sealed class ControlServer(
             if (!TryFind(id, out var handle)) return Results.NotFound();
             return Results.Json(new { handle.IsRunning, handle.QueueDepth }, WireJson.Options);
         });
+
+        // ⚠️ **头唯一的轴来源**（G8：头不许手抄轴表——`Axes.cs` 的类头明说「别处都从这张表读」）。
+        // ⚠️ **标签也交出去**（`05` §3：渲染归核心）——头拿到英文档名画不出中文名。
+        // ⚠️ **告警的两端也交出去**：头里写字面量的话，轴里改一个档名就让告警**静默失效**——
+        // 用户以为它在守，而它再也不响。
+        // ⚠️ **`alertFrom` 是「起始档」，不是「两个合法值之一」**：权限是**单调阶梯**
+        //（0 禁用 … 5 信任），所以头的判据要按**档位序**——`values.indexOf(当前) >= values.indexOf(alertFrom)`。
+        // 枚举 `{authorized, trusted}` 恰好等于今天的结果，但权限轴加第 6 档时枚举会静默漏掉它，
+        // 序数写法自动覆盖。⇒ `values` 的顺序（= 表的顺序 = 档位序）也是契约的一部分，别排序。
+        app.MapGet("/axes", () => Results.Json(new
+        {
+            // ⚠️ **不许排序**：`Axes.Names` 的顺序**就是**渲染顺序（T1 定的约定）。
+            Axes = Session.Axes.Names.Select(n => new
+            {
+                Name = n,
+                Label = Session.Axes.LabelOf(n),
+                Values = Session.Axes.ValuesOf(n),
+                InContext = Session.Axes.InContext(n),
+            }),
+            AlertSafety = Session.Axes.AlertSafety,
+            AlertFrom = Session.Axes.AlertFrom,
+        }, WireJson.Options));
     }
 
     /// <summary>

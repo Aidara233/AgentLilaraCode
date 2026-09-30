@@ -28,6 +28,40 @@ public static class Axes
         [Initiative, Permission, Safety, Verify, Effort];
 
     /// <summary>
+    /// 轴的中文名（`01` §3.5 的表格）。⚠️ **它归核心**（`05` §3：渲染归核心，头只显示）——
+    /// 头的下拉要画 `主动性` / `安全`，而它拿到的只有英文档名。
+    ///
+    /// <para>⚠️ 键是上面那几个 <see langword="const"/>，与 <see cref="Names"/> **同一个来源**：
+    /// 轴名只有一处字面量（那几个常量），这里再抄一份英文串就会漂。
+    /// ⚠️ 与 <see cref="Names"/> **同序**——但那是**读的时候**的要求，
+    /// 本字典的枚举顺序不承担它（头按 `Names` 的顺序取标签，见 `GET /axes`）。</para>
+    /// </summary>
+    private static readonly Dictionary<string, string> Labels = new(StringComparer.Ordinal)
+    {
+        [Initiative] = "主动性",
+        [Permission] = "权限",
+        [Safety] = "安全",
+        [Verify] = "验证强度",
+        [Effort] = "思考强度",
+    };
+
+    /// <summary>轴的中文名。未知轴**原样返回**（与 <see cref="ValuesOf"/> 的「未知 → null」同一套约定）。</summary>
+    public static string LabelOf(string axis) => Labels.GetValueOrDefault(axis, axis);
+
+    /// <summary>
+    /// 这条轴的取值**进不进上下文**（`01` §3.5）。
+    /// ⚠️ 只有 `effort` 是 `false`——它是**纯请求参数**，模型不必被告知自己的推理预算。
+    /// 头据此把它画灰；写进提示词才是错的（那句话是全系统每步都付全价的槽位）。
+    /// </summary>
+    public static bool InContext(string axis) => axis != Effort;
+
+    /// <summary>安全轴里代表「生产」的档名（`01` §3.5 的跨轴告警的一端）。</summary>
+    public const string AlertSafety = "prod";
+
+    /// <summary>权限轴里「授权及以上」的**起始档**（`01` §3.5 的跨轴告警的另一端）。</summary>
+    public const string AlertFrom = "authorized";
+
+    /// <summary>
     /// ⚠️ 值类型是 <see cref="IReadOnlyList{T}"/> 而**不是** `string[]`，且每个值都被
     /// <see cref="Array.AsReadOnly{T}"/> 包过一层：`Dictionary` 只是阻止**换掉**条目，
     /// 挡不住调用方拿到数组后**就地改元素**。
