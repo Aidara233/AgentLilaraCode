@@ -100,8 +100,24 @@ public sealed class ControlServer(
 
             // ⚠️ **先查内存激活表**（`SessionQueries.StateOf`）——读磁盘会在**步进行中报 Idle**，
             // 于是头渲染「空闲」⇒ 用户以为没在跑 ⇒ **再点一次发送** ⇒ 队列两条 ⇒ 烧钱。
+            //
+            // ⚠️ `slots` 是**两个槽位的渲染产物**（`05` §3.1 义务 1）。
+            // 核心现在还**没有槽位机制**（`04` §1.3：裸核心连系统提示词都没有），
+            // 所以恒为空——但 `05` §7.1 要的正是「**空的也要显示**」：
+            // 用户要能看见「它真的是空的」，而不是以为头坏了。
+            // ⇒ 这里如实交出空值，**不省略字段**（省略了头就分不出「空」与「没有这个概念」）。
             return Results.Json(
-                new { handle.SessionId, State = SessionQueries.StateOf(host, handle), HighWater = bus.HighWaterMark(EventBus.SessionTopic(id)) },
+                new
+                {
+                    handle.SessionId,
+                    State = SessionQueries.StateOf(host, handle),
+                    HighWater = bus.HighWaterMark(EventBus.SessionTopic(id)),
+                    Slots = new
+                    {
+                        System = Array.Empty<object>(),
+                        Premier = Array.Empty<object>(),
+                    },
+                },
                 WireJson.Options);
         });
 
