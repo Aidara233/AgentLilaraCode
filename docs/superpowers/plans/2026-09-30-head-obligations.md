@@ -624,7 +624,8 @@ git commit -m "feat(core): 状态带轴（可空字段 + 读时补默认值）�
 - Modify: `src/Lilara.Core/Hosting/CoreCommand.cs`
 - Modify: `src/Lilara.Core/Control/WireEvent.cs`
 - Modify: `src/Lilara.Core/Hosting/CommandDispatcher.cs`
-- Test: `tests/Lilara.Core.Tests/CommandDispatcherTests.cs`（追加）
+- Modify: `src/Lilara.Core/Session/Axes.cs`（null 轴名守卫——`IsKnown`/`ValuesOf`/`TryParse` 三条入口）
+- Test: `tests/Lilara.Core.Tests/AxisCommandTests.cs`（**新建**，见正文）· `tests/Lilara.Core.Tests/WireFormatTests.cs`（追加）
 
 **Interfaces:**
 - Consumes: `SessionHandle.Axes` / `.SaveAxes`（T2）· `Axes`（T1）
@@ -902,9 +903,7 @@ Expected: 编译失败，`CoreCommand.SessionSetAxis` / `WireEvent.AxisChanged` 
     /// 反过来的话，「会话不存在 + 轴名也写错」会报「轴不认识」，把用户引向错的方向。
     /// </summary>
     private DispatchResult HandleSessionSetAxis(CoreCommand.SessionSetAxis x, string id)
-    {
-        if (!_host.TryGetActivated(x.SessionId, out var handle))
-            return Reject(id, $"没有会话 '{x.SessionId}'。");
+    {        if (!TryFind(x.SessionId, out var handle, out var rejection)) return rejection!;
 
         if (!Axes.IsKnown(x.Axis))
             return Reject(id, $"没有 '{x.Axis}' 这条轴。可用的：{string.Join("|", Axes.Names)}");
@@ -929,7 +928,19 @@ Expected: 编译失败，`CoreCommand.SessionSetAxis` / `WireEvent.AxisChanged` 
     }
 ```
 
-⚠️ **上面那句 `handle.State = handle.State with { Axes = next };` 是刻意的**——
+⚠️ **上面那句 `TryFind` 是执行中改的，原计划写的是 `_host.TryGetActivated`——那是控制器的错。**
+`TryFind`（`CommandDispatcher.cs:393`）先查激活表、**miss 才扫项目目录回落到磁盘并 `Activate`**；
+而 `_host.TryGetActivated` 只看激活表。⇒ 原写法会让**盘上有、但还没激活**的会话
+被回一句「会话不存在」——**假话**：它存在，只是没在内存里。
+
+⚠️ 其它**所有** handler（`SessionActivate` / `SessionSend` / `SessionStart` / `SessionInterrupt`）
+都走 `TryFind`。本任务是唯一例外的那个——而实现者**照 brief 做了并主动报了出来**。
+⇒ 纪律：**新 handler 一律走 `TryFind`**；要绕过它得有理由，并写进注释。
+
+⚠️ **为什么这个错值得记**：它不会让任何既有测试变红（测试里会话都已经激活了），
+只会在一台**重启过的核心**上、用户对着控制台敲 `axis set` 时，回一句错的话。
+
+⚠️ `handle.State.Axes` 那个 `!`：`Load` / `Create` 之后保证非空（T2 的约定）。
 `SessionState` 是 **record**，`with` 给它换一份副本；而 `SessionHandle` 是**可变的活对象**，
 宿主的激活表里存的是**它**的引用，所以 `handle.State` 这个**属性**被赋新值，**不是**换 handle 实例。
 ⇒ 表里那份仍然指向同一个 handle，`State` 换成了带新轴的副本。**状态不分叉。**
@@ -941,12 +952,12 @@ Expected: 编译失败，`CoreCommand.SessionSetAxis` / `WireEvent.AxisChanged` 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `dotnet test --filter "FullyQualifiedName~AxisCommandTests" -v q`
-Expected: 通过 5，失败 0
+Expected: 通过 9，失败 0
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add src/Lilara.Core/Hosting/ tests/Lilara.Core.Tests/CommandDispatcherTests.cs
+git add src/Lilara.Core/Hosting/ src/Lilara.Core/Session/Axes.cs src/Lilara.Core/Control/WireEvent.cs tests/Lilara.Core.Tests/
 git commit -m "feat(core): session.setAxis（迁移才发 axis.changed / 非法值列合法值 / 拒绝顺序会话→轴→值 / 落盘）"
 ```
 
