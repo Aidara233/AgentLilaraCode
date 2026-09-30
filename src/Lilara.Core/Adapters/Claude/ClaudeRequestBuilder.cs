@@ -21,36 +21,99 @@ public static class ClaudeRequestBuilder
         {
             Model = request.ModelId,
             MaxTokens = request.MaxTokens,
-            Messages = request.Timeline.Select(ToMessage).ToList(),
+            Messages = BuildMessages(request.Timeline),
             System = BuildSystem(request.SystemBlocks),
             OutputConfig = new OutputConfig { Effort = ToEffort(request.Effort) },
         };
     }
 
-    private static MessageParam ToMessage(TimelineEvent evt)
+    /// <summary>
+    /// canonical 时间线 → 协议消息列表。
+    /// ⚠️ **合并相邻同角色**的事件。拒答不写模型事件，于是
+    /// 「问 → 拒答 → 再问」在时间线上就是连着两条 user。
+    /// API 参考自相矛盾（SDK README 说同角色会被合并；错误表却把
+    /// `roles must alternate` 列为 400）——不赌歧义，构造期自己合并，
+    /// 发出去的形状就永远是交替的。顺带这条也让将来的 tool 回合更忠实。
+    /// ⚠️ 纯函数：同一份时间线必须构造出逐字节相同的列表（00 §5 铁律 1）。
+    /// </summary>
+    private static List<MessageParam> BuildMessages(IReadOnlyList<TimelineEvent> timeline)
     {
-        var message = (TimelineEvent.MessageEvent)evt;
-        var role = message.From == Speaker.User ? Role.User : Role.Assistant;
+        var messages = new List<MessageParam>();
 
-        var texts = message.Blocks.OfType<CanonicalBlock.TextBlock>().ToList();
+        // 用 bool 而不是 Role 做比较：Role 是 SDK 的 union 类型，
+        // 直接比它要么依赖它的相等语义、要么多一次装箱，没必要。
+        bool? pendingIsUser = null;
+        List<ContentBlockParam>? pending = null;
+
+        void Flush()
+        {
+            if (pending is null) return;
+            messages.Add(new MessageParam
+            {
+                Role = pendingIsUser!.Value ? Role.User : Role.Assistant,
+                Content = pending,
+            });
+            pending = null;
+        }
+
+        foreach (var evt in timeline)
+        {
+            var message = (TimelineEvent.MessageEvent)evt;
+            var isUser = message.From == Speaker.User;
+            var blocks = ToContentBlocks(message, evt);
+
+            if (pending is not null && pendingIsUser == isUser)
+            {
+                pending.AddRange(blocks);
+                continue;
+            }
+
+            Flush();
+            pending = blocks;
+            pendingIsUser = isUser;
+        }
+
+        Flush();
+        return messages;
+    }
+
+    /// <summary>
+    /// 一条 canonical 消息 → 协议内容块列表。
+    /// ⚠️ 按**原始顺序**映射，绝不能只挑 text：
+    /// 推理块必须逐字回传给上游（00 §5 铁律），且顺序是 [reasoning, text]，
+    /// 顺序或内容一动，上游就 400 `invalid_request_error`。
+    /// </summary>
+    private static List<ContentBlockParam> ToContentBlocks(
+        TimelineEvent.MessageEvent message, TimelineEvent evt)
+    {
+        var content = new List<ContentBlockParam>();
+        foreach (var b in message.Blocks)
+        {
+            switch (b)
+            {
+                case CanonicalBlock.TextBlock t:
+                    content.Add(new TextBlockParam { Text = t.Text });
+                    break;
+
+                case CanonicalBlock.ReasoningBlock r:
+                    // ⚠️ Signature 原样回传，绝不改动、绝不重新生成
+                    content.Add(new ThinkingBlockParam { Thinking = r.Text, Signature = r.Signature });
+                    break;
+
+                default:
+                    // 认不出的块**抛**，不静默丢——静默丢正是本轮要修的缺陷本身
+                    throw new ArgumentException(
+                        $"时间线里有无法翻译的块（{b.GetType().Name}），无法构造请求", nameof(evt));
+            }
+        }
 
         // Review Focus #1 的同类：`Content = []` 会被 API 400 拒绝，
         // 且 Blocks 是普通 required 列表、没有非空不变量，真能走到这里
-        if (texts.Count == 0)
+        if (content.Count == 0)
             throw new ArgumentException(
                 $"时间线里有空消息（speaker={message.From}），无法构造请求", nameof(evt));
 
-        // 单块走字符串形式（协议原生形状，最省），多块走块列表
-        if (texts.Count == 1)
-            return new MessageParam { Role = role, Content = texts[0].Text };
-
-        return new MessageParam
-        {
-            Role = role,
-            Content = texts
-                .Select(t => (ContentBlockParam)new TextBlockParam { Text = t.Text })
-                .ToList(),
-        };
+        return content;
     }
 
     /// <summary>

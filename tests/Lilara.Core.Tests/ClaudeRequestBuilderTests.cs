@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Lilara.Core.Adapters;
 using Lilara.Core.Adapters.Claude;
 using Lilara.Core.Canonical;
@@ -25,6 +26,23 @@ public class ClaudeRequestBuilderTests
         SystemBlocks = [],
         Timeline = timeline,
     };
+
+    /// <summary>
+    /// 取出消息的内容块列表。
+    /// ⚠️ 构造期**总是**块列表——单条文本的 string 快路径已经去掉了，
+    /// 因为推理块必须和文本块一起按顺序回放，快路径表达不了这件事。
+    /// </summary>
+    private static IReadOnlyList<ContentBlockParam> BlocksOf(MessageParam m)
+    {
+        Assert.True(m.Content.TryPickContentBlockParams(out var blocks));
+        return blocks!;
+    }
+
+    private static string FirstText(MessageParam m)
+    {
+        Assert.True(BlocksOf(m)[0].TryPickText(out var text));
+        return text!.Text;
+    }
 
     [Fact]
     public void Build_PassesModelAndMaxTokens()
@@ -63,11 +81,90 @@ public class ClaudeRequestBuilderTests
             Msg(Speaker.Model, "二"),
             Msg(Speaker.User, "三")));
 
-        var texts = p.Messages
-            .Select(m => m.Content.Value as string)
-            .ToList();
+        var texts = p.Messages.Select(FirstText).ToList();
 
         Assert.Equal(["一", "二", "三"], texts);
+    }
+
+    /// <summary>
+    /// ⚠️ 00 §5 铁律：推理块**逐字回传**（含签名），顺序不能乱。
+    /// 这是多轮 tool use 的前提，也是严格上游的硬要求。
+    /// </summary>
+    [Fact]
+    public void Build_ReplaysReasoningBlocksVerbatimBeforeText()
+    {
+        var modelTurn = new TimelineEvent.MessageEvent
+        {
+            At = DateTimeOffset.UnixEpoch,
+            From = Speaker.Model,
+            Blocks =
+            [
+                new CanonicalBlock.ReasoningBlock("sig-==", "想想"),
+                new CanonicalBlock.TextBlock("答案"),
+            ],
+        };
+
+        var p = ClaudeRequestBuilder.Build(Request(Msg(Speaker.User, "问"), modelTurn));
+
+        var blocks = BlocksOf(p.Messages[1]);
+        Assert.Equal(2, blocks.Count);
+
+        // 签名一个字符都不能动
+        Assert.True(blocks[0].TryPickThinking(out var thinking));
+        Assert.Equal("想想", thinking!.Thinking);
+        Assert.Equal("sig-==", thinking.Signature);
+
+        Assert.True(blocks[1].TryPickText(out var text));
+        Assert.Equal("答案", text!.Text);
+    }
+
+    /// <summary>
+    /// 拒答不写模型事件，于是「问 → 拒答 → 再问」在时间线上是**连着两条 user**。
+    /// API 参考自相矛盾（README 说同角色会被合并；错误表把 `roles must alternate`
+    /// 列为 400）——不赌歧义，构造期自己合并成一条。
+    /// </summary>
+    [Fact]
+    public void Build_MergesAdjacentSameRoleEvents()
+    {
+        var p = ClaudeRequestBuilder.Build(Request(
+            Msg(Speaker.User, "一"),
+            Msg(Speaker.User, "二")));
+
+        Assert.Single(p.Messages);
+        Assert.Equal(AnthropicRole.User, p.Messages[0].Role.Value());
+
+        var blocks = BlocksOf(p.Messages[0]);
+        Assert.Equal(2, blocks.Count);
+        Assert.Equal("一", FirstText(p.Messages[0]));
+        Assert.True(blocks[1].TryPickText(out var second));
+        Assert.Equal("二", second!.Text);
+    }
+
+    /// <summary>合并只发生在**相邻**处——中间隔着模型回话的两条 user 不能并。</summary>
+    [Fact]
+    public void Build_DoesNotMergeAcrossADifferentRole()
+    {
+        var p = ClaudeRequestBuilder.Build(Request(
+            Msg(Speaker.User, "一"),
+            Msg(Speaker.Model, "二"),
+            Msg(Speaker.User, "三")));
+
+        Assert.Equal(3, p.Messages.Count);
+    }
+
+    /// <summary>纯函数（00 §5 铁律 1）：同一份输入必须构造出逐字节相同的请求。</summary>
+    [Fact]
+    public void Build_IsPure()
+    {
+        var request = Request(
+            Msg(Speaker.User, "一"),
+            Msg(Speaker.User, "二"),
+            Msg(Speaker.Model, "三"));
+
+        var first = JsonSerializer.Serialize(ClaudeRequestBuilder.Build(request), Json.Options);
+        var second = JsonSerializer.Serialize(ClaudeRequestBuilder.Build(request), Json.Options);
+
+        Assert.Equal(first, second);
     }
 
     [Fact]

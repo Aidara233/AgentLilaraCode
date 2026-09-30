@@ -75,8 +75,12 @@ public class ClaudeResponseMapperTests
         Assert.Empty(reply.Blocks);
     }
 
+    /// <summary>
+    /// ⚠️ 这条测试原先断言的是**错的行为**（推理块被忽略）——它把 00 §5 铁律的违反钉住了。
+    /// 现在断言相反的事实：推理块逐字保留，签名原样。
+    /// </summary>
     [Fact]
-    public void Map_IgnoresNonTextBlocks()
+    public void Map_KeepsReasoningBlocksWithTheirSignature()
     {
         var withThinking = new Message
         {
@@ -97,7 +101,11 @@ public class ClaudeResponseMapperTests
 
         var reply = ClaudeResponseMapper.Map(withThinking);
 
-        Assert.Single(reply.Blocks);
-        Assert.Equal("答案", ((CanonicalBlock.TextBlock)reply.Blocks[0]).Text);
+        // ⚠️ 顺序是 [reasoning, text]，且必须原样保住——上游会校验签名与顺序
+        Assert.Equal(2, reply.Blocks.Count);
+        var reasoning = Assert.IsType<CanonicalBlock.ReasoningBlock>(reply.Blocks[0]);
+        Assert.Equal("想想", reasoning.Text);
+        Assert.Equal("sig", reasoning.Signature);
+        Assert.Equal("答案", ((CanonicalBlock.TextBlock)reply.Blocks[1]).Text);
     }
 }

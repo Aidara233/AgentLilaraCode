@@ -28,6 +28,18 @@ public sealed class FakeAdapter : IModelAdapter
         return this;
     }
 
+    /// <summary>
+    /// 直接脚本一串块。⚠️ 推理块这类非文本载荷只能走这里——
+    /// 「只有推理块、没有正文」的回复是 Task 10 空正文用例的形状。
+    /// </summary>
+    public FakeAdapter ReplyBlocks(params CanonicalBlock[] blocks) =>
+        ReplyWith(_ => new ModelReply
+        {
+            Blocks = blocks,
+            StopReason = "end_turn",
+            Refused = false,
+        });
+
     public FakeAdapter Throws(Exception ex)
     {
         _scripted.Enqueue(_ => throw ex);
