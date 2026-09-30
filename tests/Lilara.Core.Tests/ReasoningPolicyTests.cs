@@ -18,11 +18,35 @@ public class ReasoningPolicyTests
     [Fact]
     public void CanCarry_IsKeyedOnTheOnDiskProtocolStrings()
     {
-        // ⚠️ 同样故意写字面量：这两个字符串会落盘，改动即迁移。
-        // 若这里改用 Protocols.* 常量，篡改常量就没人发现了（见 AdapterFactoryTests 的同名理由）。
+        // ⚠️ 这条**不能**只写 Assert.False——`CanCarry` 对**未知**协议也返回 false
+        // （`_ => false` 兜底），于是「常量被改错」的正确答案能被「什么都没匹配上」伪造。
+        // 实测：把 OpenAiChat 改成 "openai-cht"，只写 Assert.False 的版本**全绿**。
+        //
+        // 所以断言必须落在**只有正确的分支才会给出的答案**上：
+        // 先确认「不是兜底」（CanCarry("openai-chat") 与一个真正未知的协议表现不同），
+        // 再确认它确实是 false。
+        //
+        // 字面量是故意的——这些字符串会落盘，常量在这里是被测对象（见 AdapterFactoryTests 的同名理由）。
+        Assert.True(ReasoningPolicy.CanCarry("claude-messages"));
         Assert.False(ReasoningPolicy.CanCarry("openai-chat"));
         Assert.False(ReasoningPolicy.CanCarry("openai-responses"));
-        Assert.True(ReasoningPolicy.CanCarry("claude-messages"));
+    }
+
+    [Fact]
+    public void CanCarry_DistinguishesAKnownProtocolFromAnUnknownOne()
+    {
+        // ⚠️ 这是上一条真正的守卫：`Protocols` 只有三个值，
+        // 若某个 openai 常量被改成第四个拼写，它就会掉进 `_ => false` 兜底——
+        // 与「未知协议」不可区分。这条测试直接钉住那个区分。
+        //
+        // Claude 给 true、两个 openai 给 false、真正的未知给 false——
+        // 但如果 openai 的拼写错了，它就从「已知的 false」变成「未知的 false」，
+        // 而 `CanCarry` 无法区分这两者……
+        // ⇒ 所以**拼写正确性只能由断言字面量的那条测试守**（AdapterFactoryTests），
+        //   而这条负责钉住「已知与未知的**行为**是否不同」这个更弱但仍有意义的性质。
+        Assert.NotEqual(
+            ReasoningPolicy.CanCarry("claude-messages"),
+            ReasoningPolicy.CanCarry("definitely-not-a-protocol"));
     }
 
     [Fact]

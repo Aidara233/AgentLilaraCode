@@ -1,5 +1,4 @@
 using Lilara.Core.Adapters;
-using Lilara.Core.Adapters.Claude;
 using Lilara.Core.Providers;
 
 namespace Lilara.Core.Tests;
@@ -12,17 +11,18 @@ public class AdapterFactoryTests
         DefaultModel = "m", Modality = "vision",
     };
 
-    [Fact]
-    public void Create_ClaudeMessages() =>
-        Assert.IsType<ClaudeAdapter>(AdapterFactory.Create(Def(Protocols.ClaudeMessages)));
+    [Theory]
+    [InlineData("claude-messages", typeof(Adapters.Claude.ClaudeAdapter))]
+    [InlineData("openai-chat", typeof(Adapters.OpenAi.OpenAiChatAdapter))]
+    [InlineData("openai-responses", typeof(Adapters.OpenAi.OpenAiResponsesAdapter))]
+    public void Create_DispatchesTheOnDiskProtocolStrings(string onDiskValue, Type expected)
+    {
+        // ⚠️ 字面量故意写死——这些是**落盘的**字符串，常量在这里是被测对象。
+        // 这条比 IsType 那三条更强：它用的是真实会出现在 providers/*.json 里的值。
+        var adapter = AdapterFactory.Create(Def(onDiskValue));
 
-    [Fact]
-    public void Create_OpenAiChat() =>
-        Assert.IsType<Adapters.OpenAi.OpenAiChatAdapter>(AdapterFactory.Create(Def(Protocols.OpenAiChat)));
-
-    [Fact]
-    public void Create_OpenAiResponses() =>
-        Assert.IsType<Adapters.OpenAi.OpenAiResponsesAdapter>(AdapterFactory.Create(Def(Protocols.OpenAiResponses)));
+        Assert.IsType(expected, adapter);
+    }
 
     [Fact]
     public void Create_UnknownProtocol_ThrowsWithAHumanMessage()
