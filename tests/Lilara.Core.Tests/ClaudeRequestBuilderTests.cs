@@ -89,7 +89,33 @@ public class ClaudeRequestBuilderTests
 
         var p = ClaudeRequestBuilder.Build(request);
 
-        Assert.NotNull(p.System);
+        // MessageCreateParamsSystem 是 union（string | 块列表），只能 TryPick 出来
+        Assert.True(p.System!.TryPickTextBlockParams(out var systemBlocks));
+        Assert.Equal("你是助手", systemBlocks![0].Text);
+    }
+
+    [Theory]
+    [InlineData("low", Effort.Low)]
+    [InlineData("medium", Effort.Medium)]
+    [InlineData("high", Effort.High)]
+    [InlineData("xhigh", Effort.Xhigh)]
+    [InlineData("max", Effort.Max)]
+    public void Build_MapsEveryEffortLevel(string effort, Effort expected)
+    {
+        var request = Request(Msg(Speaker.User, "hi")) with { Effort = effort };
+
+        var p = ClaudeRequestBuilder.Build(request);
+
+        Assert.Equal(expected, p.OutputConfig!.Effort!.Value());
+    }
+
+    [Fact]
+    public void Build_RejectsUnknownEffortInsteadOfSilentlyDowngrading()
+    {
+        // ⚠️ 静默降级会把 "xhihg" 这种拼写错误变成 High——最难查的一类 bug
+        var request = Request(Msg(Speaker.User, "hi")) with { Effort = "xhihg" };
+
+        Assert.Throws<ArgumentException>(() => ClaudeRequestBuilder.Build(request));
     }
 
     [Fact]
@@ -108,5 +134,20 @@ public class ClaudeRequestBuilderTests
             () => ClaudeRequestBuilder.Build(Request()));
 
         Assert.Contains("时间线为空", ex.Message);
+    }
+
+    [Fact]
+    public void Build_ThrowsOnMessageWithNoBlocks()
+    {
+        // 与空时间线同类：Content = [] 会被 API 400 拒绝，也必须早失败。
+        // Blocks 是普通 required 列表，没有非空不变量，所以真能走到这里
+        var empty = new TimelineEvent.MessageEvent
+        {
+            At = DateTimeOffset.UnixEpoch,
+            From = Speaker.User,
+            Blocks = [],
+        };
+
+        Assert.Throws<ArgumentException>(() => ClaudeRequestBuilder.Build(Request(empty)));
     }
 }
