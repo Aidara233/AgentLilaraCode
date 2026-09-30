@@ -41,11 +41,33 @@ public sealed class SessionStore(string dataRoot)
     public IReadOnlyList<TimelineEvent> ReadTimeline(string projectKey, string sessionId) =>
         HistoryLog.ReadAll(Path.Combine(SessionDirectory(projectKey, sessionId), "history.jsonl"));
 
-    /// <summary>该项目下已有的全部会话 id。启动时「选最近的会话」用它（01 §8.1）。</summary>
+    /// <summary>
+    /// 该项目下的全部会话 id，**按创建时间降序**（最近的在最前）。
+    /// 启动时「选最近的会话」用它（01 §8.1）。
+    /// ⚠️ 顺序必须确定：调用方（Program.cs）取 [0] 当"当前会话"，
+    /// 而 Directory.GetDirectories 的顺序是未定义的。
+    /// 不按目录 mtime（脆弱），不按 id 降序（id 是随机的 Guid，做不了时间代理）——
+    /// 按 spec.json 里的 CreatedAt，那是唯一权威的时间来源。
+    /// </summary>
     public IReadOnlyList<string> ListSessions(string projectKey)
     {
         var dir = Path.Combine(ProjectsRoot, projectKey, "sessions");
         if (!Directory.Exists(dir)) return [];
-        return Directory.GetDirectories(dir).Select(Path.GetFileName).OfType<string>().ToList();
+
+        return Directory.GetDirectories(dir)
+            .Select(d => (Id: Path.GetFileName(d), Spec: TryReadSpec(projectKey, Path.GetFileName(d)!)))
+            .Where(x => x.Spec is not null)
+            .OrderByDescending(x => x.Spec!.CreatedAt)
+            .Select(x => x.Id!)
+            .ToList();
+    }
+
+    /// <summary>读不到就返回 null，不抛——调用方要的是「有没有」，不是异常。</summary>
+    public SessionSpec? TryReadSpec(string projectKey, string sessionId)
+    {
+        var path = Path.Combine(SessionDirectory(projectKey, sessionId), "spec.json");
+        return File.Exists(path)
+            ? JsonSerializer.Deserialize<SessionSpec>(File.ReadAllText(path), Json.Options)
+            : null;
     }
 }

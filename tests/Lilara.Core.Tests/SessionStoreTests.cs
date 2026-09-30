@@ -66,6 +66,43 @@ public class SessionStoreTests : IDisposable
     }
 
     [Fact]
+    public void State_RoundTripsAPopulatedPendingQueue()
+    {
+        // ⚠️ Pending 存在的全部理由就是「崩溃重启后待办不丢」——
+        // 只测空队列等于没测这个字段。它序列化成 IReadOnlyList<string>，
+        // 是有真实风险的接口类型，必须带值走一遍。
+        var state = new SessionState
+        {
+            SessionId = "s1",
+            Status = "WaitingForInput",
+            Turn = 7,
+            Pending = ["m1", "m2"],
+        };
+
+        _store.WriteState("p1", state);
+        var back = _store.ReadState("p1", "s1");
+
+        Assert.Equal("WaitingForInput", back.Status);
+        Assert.Equal(7, back.Turn);
+        // 逐元素比较——Pending 是集合，整记录 Assert.Equal 会退化成引用相等
+        Assert.Equal(new[] { "m1", "m2" }, back.Pending);
+    }
+
+    [Fact]
+    public void ListSessions_ReturnsMostRecentFirst()
+    {
+        // ⚠️ 调用方取 [0] 当"当前会话"——顺序错了会随机续到别的会话上
+        void Make(string id, DateTimeOffset createdAt) =>
+            _store.WriteSpec("p1", Spec() with { SessionId = id, CreatedAt = createdAt });
+
+        Make("old", new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        Make("new", new DateTimeOffset(2026, 6, 1, 0, 0, 0, TimeSpan.Zero));
+        Make("mid", new DateTimeOffset(2026, 3, 1, 0, 0, 0, TimeSpan.Zero));
+
+        Assert.Equal(new[] { "new", "mid", "old" }, _store.ListSessions("p1"));
+    }
+
+    [Fact]
     public void Timeline_AppendsInOrder()
     {
         _store.AppendEvent("p1", "s1", Msg("一"));
