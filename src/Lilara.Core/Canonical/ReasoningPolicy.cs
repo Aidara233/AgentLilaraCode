@@ -27,9 +27,11 @@ public static class ReasoningPolicy
     /// 且该类**没有不带 signature 的构造重载** —— 无签名的 thinking 块在 Anthropic 线上
     /// **无法表达**。而本机网关的 `deepseek-flash` 恰好**不返回 signature**。
     /// 所以无签名 = 发不出去 = 只能丢。**这不是保守，是协议没有那个形状。**
+    /// ⚠️ **空串与 null 同义**：上游眼里都是「没有签名」。用 `is not null` 会让 `""` 漏过去，
+    /// 发出 `"signature":""`——值逃出约束，正是本项目反复付代价的那类缺陷。故用 `IsNullOrEmpty`。
     /// </summary>
     public static bool CanReplayBlock(Block.ReasoningBlock block, string protocol) =>
-        CanCarry(protocol) && block.Signature is not null;
+        CanCarry(protocol) && !string.IsNullOrEmpty(block.Signature);
 
     /// <summary>
     /// 按目标协议过滤块列表。**保序**。

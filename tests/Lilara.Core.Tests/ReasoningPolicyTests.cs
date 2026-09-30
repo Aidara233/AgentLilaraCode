@@ -28,6 +28,15 @@ public class ReasoningPolicyTests
     }
 
     [Fact]
+    public void CanReplayBlock_RejectsAnEmptySignatureToo()
+    {
+        // ⚠️ 空串与 null 在上游眼里同义：**没有签名**。
+        // `is not null` 会让它通过，于是发出 `"signature":""`——
+        // 值逃出了它的约束，正是这个项目已经付过五次代价的那类缺陷。
+        Assert.False(ReasoningPolicy.CanReplayBlock(new Block.ReasoningBlock("", "想"), "claude-messages"));
+    }
+
+    [Fact]
     public void FilterFor_DropsUnsignedReasoningEvenForClaude()
     {
         // ⚠️ 修正后的行为：签名缺失 → 发不出去 → 丢。
@@ -74,18 +83,47 @@ public class ReasoningPolicyTests
     [Fact]
     public void FilterFor_PreservesOrder()
     {
+        // ⚠️ 原测试断言的是 ["reasoning","text","reasoning"]——**回文**，
+        // 反转实现照样绿，等于没测「保序」。
+        // 所以按**载荷**断言，且做成不对称的形状。
         var blocks = new List<Block>
         {
-            new Block.ReasoningBlock("s", "想"),
-            new Block.TextBlock("正文"),
-            new Block.ReasoningBlock("s2", "再想"),
+            new Block.ReasoningBlock("s1", "甲"),
+            new Block.TextBlock("乙"),
+            new Block.ReasoningBlock("s2", "丙"),
+            new Block.TextBlock("丁"),
         };
 
         var filtered = ReasoningPolicy.FilterFor(blocks, "claude-messages");
 
-        Assert.Equal(["reasoning", "text", "reasoning"],
-            filtered.Select(b => b is Block.ReasoningBlock ? "reasoning" : "text"));
+        Assert.Equal(["甲", "乙", "丙", "丁"], filtered.Select(Label));
     }
+
+    [Fact]
+    public void FilterFor_PreservesOrderAcrossADrop()
+    {
+        // ⚠️ 这条覆盖原测试漏掉的那半：**丢弃之后仍然保序**。
+        // 无签名的那块被丢掉，但剩下的相对顺序不能乱。
+        var blocks = new List<Block>
+        {
+            new Block.TextBlock("甲"),
+            new Block.ReasoningBlock(null, "被丢的"),   // 无签名 → 丢
+            new Block.TextBlock("乙"),
+            new Block.ReasoningBlock("s", "丙"),
+        };
+
+        var filtered = ReasoningPolicy.FilterFor(blocks, "claude-messages");
+
+        Assert.Equal(["甲", "乙", "丙"], filtered.Select(Label));
+    }
+
+    /// <summary>把块映射回它自己的载荷文本——比 kind 标签更能区分顺序。</summary>
+    private static string Label(Block b) => b switch
+    {
+        Block.TextBlock t => t.Text,
+        Block.ReasoningBlock r => r.Text,
+        _ => "?",
+    };
 
     [Fact]
     public void FilterFor_DoesNotFabricateReasoningForProtocolsThatLackIt()
