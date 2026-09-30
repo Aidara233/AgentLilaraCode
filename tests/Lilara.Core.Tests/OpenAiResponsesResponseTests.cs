@@ -145,7 +145,7 @@ public class OpenAiResponsesResponseTests
     /// <b>缺键守卫</b>（<c>TryGetProperty</c> 的成员检查——换成 <c>GetProperty</c> 即抛 <c>KeyNotFoundException</c>）
     /// 见 <c>Map_ToleratesMissingKeys</c>；<b>值判据</b>（<c>Length &gt; 0</c>）见 <c>Map_HandlesEmptyOrMissingTextAsNoBlocks</c>。</para>
     /// <para>⚠️ <c>status</c> 的类型守卫起初被漏掉、<b>缺键那一整类起初也未被计入</b>，两次都是复审者逐条列举后补测的。
-    /// <b>本段注释在四个轮次里改了四次，每次都是因为写下了未经运行的断言</b>——故此处只列测试名，不列数字。</para>
+    /// <b>本条注释被改写多次，每次都是因为写下了未经运行的断言</b>——故此处只列测试名，不列数字。</para>
     /// </summary>
     [Theory]
     [InlineData("""{"status":"completed","output":5}""")]
@@ -186,17 +186,20 @@ public class OpenAiResponsesResponseTests
     }
 
     /// <summary>
-    /// ⚠️ **缺键**（不是缺值、不是类型错）也必须不崩：`TryGetProperty` 的每一个成员检查
-    /// 都在这里被钉住——换成 `GetProperty` 就会抛 `KeyNotFoundException`。
-    /// <para>⚠️ 这些是**真实**形状，不是构造的：上游省略 <c>output</c>、省略 <c>content</c>、
-    /// 或给一个只有 <c>type</c> 的块，都出现过。断言只取共同不变量（不产出块）——
-    /// 因为缺 <c>status</c> 时 <c>StopReason</c> 是 <c>"unknown"</c>、不缺时是 <c>"completed"</c>，
-    /// 逐例断言状态反而会把这条测试拧成四不像。</para>
+    /// ⚠️ **缺键**（不是缺值、不是类型错）也必须不崩：<c>TryGetProperty</c> 的成员检查
+    /// 换成 <c>GetProperty</c> 就会抛 <c>KeyNotFoundException</c>。本测试钉住其中五个，
+    /// 第六个（<c>block.text</c> 缺键）由 <see cref="Map_HandlesEmptyOrMissingTextAsNoBlocks"/> 钉住。
+    /// <para>⚠️ <b>这些形状的选取依据是「schema 允许」，不是「观测到的」。</b>
+    /// 派发与实现期间本机网关的全部补全端点都在返回 <c>upstream_error</c>，
+    /// <b>这些形状从未被观测到过</b>——它们由响应 schema 推得（<c>output</c> 与 <c>content</c> 均为可选，
+    /// 块上除 <c>type</c> 外的字段均可选）。<b>控制器初稿在这里写了「都出现过」，那是它观测不到的断言，
+    /// 由复审者指出后改正。</b></para>
+    /// <para>断言只取共同不变量（不产出块、不判拒答）——因为缺 <c>status</c> 时
+    /// <c>StopReason</c> 是 <c>"unknown"</c>、不缺时是 <c>"completed"</c>，逐例断言状态会把这条测试拧成四不像。</para>
     /// <para>⚠️ 控制器起初只在注释里声明「无覆盖缺口」，**没数这些成员检查**，
-    /// 被复审者逐条列举后补测——这是同一缺陷类在本文件里的**第四次**，故此处逐行列出被钉住的分支：
-    /// <c>status</c> 缺键 · <c>output</c> 缺键 · <c>item.type</c> 缺键 · <c>item.content</c> 缺键 ·
-    /// <c>block.type</c> 缺键 · <c>block.type != "output_text"</c>。<c>block.text</c> 缺键由
-    /// <see cref="Map_HandlesEmptyOrMissingTextAsNoBlocks"/> 那行 <c>{"type":"output_text"}</c> 钉住。</para>
+    /// 被复审者逐条列举后补测。此处逐行列出被钉住的分支：<c>status</c> 缺键 · <c>output</c> 缺键 ·
+    /// <c>item.type</c> 缺键 · <c>item.content</c> 缺键 · <c>block.type</c> 缺键 ·
+    /// <c>block.type != "output_text"</c>。</para>
     /// </summary>
     [Theory]
     [InlineData("{}")]
