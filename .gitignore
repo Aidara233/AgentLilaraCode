@@ -4,3 +4,5 @@ obj/
 .vs/
 .idea/
 *.tmp
+.claude/
+.superpowers/
