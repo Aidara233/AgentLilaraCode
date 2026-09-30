@@ -1,12 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
+    <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>Lilara.Core</RootNamespace>
+    <AssemblyName>lilara</AssemblyName>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
+    <!-- ⚠️ 版本号保留 Task 7 里 `dotnet add package Anthropic` 写进去的那个，
+         不要改成浮动的 "*"。 -->
     <PackageReference Include="Anthropic" Version="12.51.0" />
   </ItemGroup>
   <!-- 让测试能直接测 internal 的纯函数（Describe / ShouldWrap），
