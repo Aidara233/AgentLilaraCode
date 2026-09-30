@@ -329,9 +329,26 @@ git commit -m "feat(core): 五轴真相来源（轴名/合法值/默认值一张
 **Files:**
 - Modify: `src/Lilara.Core/Persistence/SessionState.cs`
 - Modify: `src/Lilara.Core/Session/SessionHandle.cs:123-129`（`Load`）与 `Create`
+- Modify: **`src/Lilara.Core/Persistence/SessionSpec.cs`** —— ⚠️ 见下面的「执行中补的缺陷」
 - Modify: **`src/Lilara.Core/Session/Stepper.cs:69`** —— ⚠️ 见下面的「执行中补的缺陷」
 - Modify: `tests/Lilara.Core.Tests/DiskFormatGoldenTests.cs`
 - Test: `tests/Lilara.Core.Tests/AxisTests.cs`（追加）
+
+> ### ⚠️ 执行中补的第二处（T2 审阅发现，控制器核准）：`SessionSpec.Model.Effort` 是**快照**，注释没说
+>
+> 计划在 Review Focus 里写了「T2 必须在 `SessionSpec.cs` 的 `Model.ModelSelection.Effort` 上加一条注释，
+> 点名它是快照、不是当前值」——**但控制器写 T2 的 brief 时漏把它带进去**，实现者不可能知道。
+>
+> ⚠️ **这个坑已经现实发生了一次**：`Repl.cs:205` 的 `session status` 正是把
+> `Spec.Model.Effort` 当**当前值**印出来的那个「下一个人」。已归 T5 修。
+>
+> ⇒ 注释内容：**`Effort` 是建会话时冻结的快照，只用于给轴播种；当前值在 `SessionState.Axes[Axes.Effort]`**。
+> 不写的话，下一个读它的人会以为那是当前值——而两者在用户改过轴之后**必然分叉**。
+>
+> ⚠️ **附带一条更一般的教训**：计划把要求写在「Review Focus」节，而 brief 生成脚本只抽
+> 「Task N」那一段 ⇒ **写在 Review Focus 里的强制项不会进 brief**。
+> 本计划里 Review Focus 表还写着「setAxis 的两条判据落在 T2」而它们实际由 T3 交付——
+> **那张表的任务编号是漂的**。以各任务正文为准。
 
 > ### ⚠️ 执行中补的缺陷（T1 的实现者发现，控制器核准）
 >
@@ -610,8 +627,18 @@ git commit -m "feat(core): 状态带轴（可空字段 + 读时补默认值）�
 - Test: `tests/Lilara.Core.Tests/CommandDispatcherTests.cs`（追加）
 
 **Interfaces:**
-- Consumes: `Axes`（T1）· `SessionHandle.Axes` / `.SaveAxes`（T2）
+- Consumes: `SessionHandle.Axes` / `.SaveAxes`（T2）· `Axes`（T1）
 - Produces: `CoreCommand.SessionSetAxis(string SessionId, string Axis, string Value)` · `WireEvent.AxisChanged(string SessionId, string Axis, string Value)`
+
+> ### ⚠️ 全部改动的**唯一目的**：让「改轴」真的到达模型请求
+>
+> `01` §3.5 说 `effort` 是**纯机械轴**——走请求参数。T2 已经把 `Stepper` 改成从轴读，
+> 所以本任务加完命令之后，链路才是通的：`setAxis` → `SaveAxes` 落盘 → `Stepper` 从轴读 → 请求带新值。
+>
+> ⚠️ **T1 的 brief 里已经写过这条警告，而计划当时没把它接上**：
+> 「少了对应关系，轴改了而请求参数没改，用户看到的是『**设了没用**』」。
+> ⇒ 那个测试（`SetAxis_Effort_ActuallyReachesTheModelRequest`）**必须真的走完整条链路**，
+> 断言**适配器收到的 `ModelRequest.Effort`**——断言 `handle.State.Axes` 对这条缺陷**没有区分力**（修复前后都是新值）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -925,15 +952,38 @@ git commit -m "feat(core): session.setAxis（迁移才发 axis.changed / 非法�
 
 ---
 
-### Task 4: 快照带轴 —— 头的初始值
+### Task 4: 快照带轴 + `GET /axes` —— 头的初始值
 
 **Files:**
-- Modify: `src/Lilara.Core/Control/ControlServer.cs:120-133`
-- Test: `tests/Lilara.Core.Tests/ControlServerTests.cs`（追加）
+- Modify: `src/Lilara.Core/Session/Axes.cs`（补中文标签与 `inContext`，见下）
+- Modify: `src/Lilara.Core/Control/ControlServer.cs:120-133`（快照）**与新增 `GET /axes`**
+- Test: `tests/Lilara.Core.Tests/ControlServerTests.cs`（追加）· `tests/Lilara.Core.Tests/AxisTests.cs`（追加）
 
 **Interfaces:**
-- Consumes: `SessionHandle.Axes`（T2）
-- Produces: `GET /sessions/{id}/state` 的响应体新增 `axes`（对象）与三元素 `slots`（`system` / `premier` / `floating`，均为块数组）
+- Consumes: `SessionHandle.State.Axes`（T2）· `Axes`（T1）
+- Produces:
+  - `GET /sessions/{id}/state` 新增 `axes`（对象）与三元素 `slots`（`system` / `premier` / `floating`，块数组）
+  - **`GET /axes`** → `{ axes: [{ name, label, values, inContext }], alertSafety, alertFrom }`
+  - `Axes.LabelOf(string axis)` · `Axes.InContext(string axis)` · `Axes.AlertSafety` · `Axes.AlertFrom`
+
+> ### ⚠️ `GET /axes` 是**必须的**，不是锦上添花（评审发现，控制器核准）
+>
+> `Axes.cs:8` 的类头写着「任何别处（**头的下拉**、控制台的解析、错误信息）都**从这张表读**，
+> 不许手抄」，而**计划 T9 的头里是一份手抄的 `AXES` 常量**（含手抄的 `effort: true` 标记 = 又一份副本）。
+> ⇒ **计划违反了它自己的 G8。**
+>
+> 加这个端点，头一个字面量都不留：加一条轴、改一个档，只改核心的 `Axes.Table` 一处。
+>
+> ⚠️ **中文标签也归核心**（`05` §3：渲染归核心，头只显示）——
+> 而下拉的 `主动性` / `安全` 这些**就是**渲染。`01` §3.5 的表格里有中文名，
+> 但 `Axes.Table` 现在只有英文档名 ⇒ 本任务把中文名**加进 `Axes`**（那是唯一真相来源）。
+>
+> ⚠️ **告警的两端也交出去**（`alertSafety` = 哪个安全档代表生产，`alertFrom` = 权限从哪一档算「授权及以上」）。
+> 头里写字面量的话，轴里改一个档名就会让告警**静默失效**——用户以为它在守，而它再也不响。
+>
+> ⚠️ **头的告警判据要按「档位序」**，不是「是不是这两个值之一」：权限是**单调阶梯**
+> （`01` §3.5：0 禁用 … 5 信任），所以正确的写法是「`values.indexOf(当前) >= values.indexOf(alertFrom)`」。
+> 枚举 `{authorized, trusted}` 恰好等于今天的结果，但权限轴加第 6 档时枚举会静默漏掉它，序数写法自动覆盖。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1162,6 +1212,22 @@ Expected: `AxisSet_ParsesThreeWords` 红（返回的是 `(null, null)` ⇒ 被�
         _out.WriteLine("策略 " + string.Join(" · ",
             Lilara.Core.Session.Axes.Names.Select(n => $"{n}={Current.State.Axes!.GetValueOrDefault(n, "?")}")));
 ```
+
+> ### ⚠️ 执行中补的缺陷（T2 的实现者发现，控制器核准）
+>
+> **`Repl.cs:205` 印的是 `Current.Spec.Model.Effort`——冻结的快照。**
+> 轴一改，控制台的 `session status` 就会与**请求里实际发的** effort 分叉。
+> 这是**同一个「设了没用」，换到了显示层**：用户改了轴、控制台说还是旧值，
+> 或者（更坏）控制台说新值、而请求发的是旧的。
+>
+> ⇒ `PrintStatus` 里那行 `模型 {ModelId} · effort {Spec.Model.Effort}` 要改成
+> **从轴读**：`effort {Current.State.Axes!["effort"]}`。
+> ⚠️ 顺带把「模型」与「effort」分开——模型来自 spec（那是**不会变**的），
+> effort 来自轴（**会变**）。两者现在写在同一个 `WriteLine` 里，读起来像同一个来源。
+>
+> ⚠️ **加一条测试**：改轴之后 `session status` 的输出里是**新值**。
+> 断言**输出文本**而不是内部状态——内部状态在修复前后都一样，对这条缺陷没有区分力
+> （与 T3 那条 `SetAxis_Effort_ActuallyReachesTheModelRequest` 同一个道理）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -2017,7 +2083,8 @@ git commit -m "feat(console): claim/claim release/claim list（光一个 claim �
   <!-- ⚠️ **义务 4**：安全轴在最上面，且跨轴告警就长在它下面。 -->
   <h4>安全轴（义务 4）</h4>
   <div id="safety-row">
-    <div class="axis"><label>安全</label><select id="ax-safety"></select></div>
+    <!-- ⚠️ 标签**留空**：由 `renderAxes` 从核心交的 `label` 填（`05` §3：渲染归核心）。 -->
+    <div class="axis"><label id="ax-safety-label"></label><select id="ax-safety"></select></div>
     <div id="alert"></div>
   </div>
 
@@ -2081,6 +2148,9 @@ let axes = {};                      // 当前会话的轴值
 // ⚠️ **幂等是硬要求**：这段每次开页面都跑，所以「项目下有会话就打开它」——
 // 少了它，每开一次浏览器就多一个会话（`01` §8.1）。
 async function bootstrap() {
+  // ⚠️ **轴表先拉**（G8：头不自带副本）。少了这一步，`AXES` 是空数组
+  // ⇒ 右栏一个控件都画不出来，而用户看到的「没有轴」与「头坏了」分不清。
+  await loadAxes();
   await loadSessions();
 
   // ① 有没有提供商？——没有就不能做别的（§2.2：引导页此时**挡住**其余操作）
@@ -2203,17 +2273,26 @@ function setStatus(status, turn) {
 }
 
 // ---- 五轴（义务 4 的落点） ----
+//
+// ⚠️ **轴表从核心拉，头不自带副本**（G8 / `Axes.cs:8`：「任何别处（头的下拉…）
+// 都从这张表读，**不许手抄**」）。加一条轴、改一个档，只改核心 `Axes.Table` 一处。
+//
+// ⚠️ 标签（`主动性` / `安全` …）与 `inContext` 也**归核心**——`05` §3「渲染归核心，头只显示」，
+// 而下拉的标签就是渲染。核心交 `{ name, label, values, inContext }`，头只画控件。
+// ⚠️ 由此 `GET /axes` 端点在 **T4**，而 `Axes` 要补上 `01` §3.5 的中文名（那是唯一真相来源，不是头）。
+let AXES = [];
+async function loadAxes() { AXES = await (await fetch(core + "/axes")).json(); }
 
-const AXES = [
-  { name: "initiative", label: "主动性", values: ["step", "standard", "goal"] },
-  { name: "permission", label: "权限",   values: ["off", "readonly", "investigate", "standard", "authorized", "trusted"] },
-  { name: "safety",     label: "安全",   values: ["dev", "staging", "prod"] },
-  { name: "verify",     label: "验证强度", values: ["none", "self", "strict"] },
-  // ⚠️ effort **不进上下文**（`01` §3.5）——头显示它是对的，标出来它只是参数。
-  { name: "effort",     label: "思考强度", values: ["low", "medium", "high", "xhigh", "max"], effort: true },
-];
+// ⚠️ **这一份不是副本，是判定**：它说的是「权限到哪一档算『授权及以上』」，
+// 而那是**告警规则**（`01` §3.5），不是轴表。轴表只能有一份，规则可以有。
+// ⚠️ 但它仍然**手抄了档名**——`authorized` / `trusted` 是权限轴的第 4、5 档。
+// 若权限轴加了档，这里会静默过期（告警不再覆盖新档）。⇒ 在 T4 的 `GET /axes`
+// 里一并交一个 `alertFrom`（权限轴里算「授权及以上」的起始档），这里改成读它。
 
-const PERMISSION_ASK_OR_ABOVE = ["authorized", "trusted"];
+// ⚠️ **告警线的两端也归核心**：`安全=生产` 的档名与「权限≥授权」的起始档都写成字面量，
+// 改一个档名就静默失效（告警不再响，而用户以为它在守）。⇒ 从 `GET /axes` 一并读回。
+let ALERT_SAFETY = "prod";     // loadAxes() 里被核心交的值覆盖
+let ALERT_FROM   = "authorized";
 
 function renderAxes(values) {
   axes = values || {};
@@ -2222,7 +2301,9 @@ function renderAxes(values) {
 
   for (const a of AXES) {
     const row = document.createElement("div");
-    row.className = "axis" + (a.effort ? " effort" : "");
+    // ⚠️ `inContext` 由**核心**给（`01` §3.5：`effort` 不进上下文）——
+    // 头不再靠手抄的 `effort: true` 标记，那又是一份副本。
+    row.className = "axis" + (a.inContext ? "" : " effort");
 
     const sel = document.createElement("select");
     sel.id = "ax-" + a.name;
@@ -2242,7 +2323,12 @@ function renderAxes(values) {
     lab.textContent = a.label;
 
     // ⚠️ **安全轴放在右栏最上面单独一份**（义务 4），这里跳过它免得出现两个控件。
-    if (a.name === "safety") { $("ax-safety").appendChild(sel); continue; }
+    // ⚠️ 但**标签也要填**——它是从核心来的（`05` §3：渲染归核心），不能因为换了位置就丢掉。
+    if (a.name === "safety") {
+      $("ax-safety-label").textContent = a.label;
+      $("ax-safety").appendChild(sel);
+      continue;
+    }
 
     row.appendChild(lab); row.appendChild(sel);
     $("axes").appendChild(row);
@@ -2254,8 +2340,28 @@ function renderAxes(values) {
 /// ⚠️ **跨轴告警**（`01` §3.5 定的那条）：`安全=生产` + `权限≥授权` → 告警。
 /// ⚠️ 它是**纯提示、不联动**——不设「生产 ⇒ 权限封顶」，那是家长式干预且会掩盖
 /// 「安全是建议」这个诚实的定位。
+/// ⚠️ **跨轴告警**（`01` §3.5 定的那条）：`安全=生产` + `权限≥授权` → 告警。
+/// ⚠️ 它是**纯提示、不联动**——不设「生产 ⇒ 权限封顶」，那是家长式干预且会掩盖
+/// 「安全是建议」这个诚实的定位。
+///
+/// ⚠️ **两头都读核心交的值，不写字面量**：`ALERT_SAFETY` 是安全轴里代表生产的**档名**，
+/// `ALERT_FROM` 是权限轴里「授权及以上」的**起始档**。写字面量的话，
+/// 轴里改一个档名就会让告警**静默失效**——用户以为它在守，而它再也不响。
+///
+/// ⚠️ **判据是「档位序」而不是「是不是这两个值之一」**：权限是**单调阶梯**（`01` §3.5，
+/// 0 禁用 … 5 信任），所以 `≥授权` 的正确写法是「在表里的下标 ≥ `ALERT_FROM` 的下标」。
+/// 今天 `AT_OR_ABOVE` 恰好等于 {authorized, trusted} 两个，但那是**巧合**——
+/// 权限轴加第 6 档时，枚举写法会漏掉它，而序数写法自动覆盖。
+function alertFromIndex() {
+  const perm = AXES.find((a) => a.name === "permission");
+  return perm ? perm.values.indexOf(ALERT_FROM) : -1;
+}
+
 function renderAlert() {
-  const risky = axes.safety === "prod" && PERMISSION_ASK_OR_ABOVE.includes(axes.permission);
+  const perm = AXES.find((a) => a.name === "permission");
+  const at = perm ? perm.values.indexOf(axes.permission) : -1;
+  const risky = axes.safety === ALERT_SAFETY && at >= 0 && at >= alertFromIndex();
+
   $("safety-row").className = risky ? "alert" : "";
   $("alert").textContent = risky
     ? "⚠️ 生产环境 + 权限 ≥ 授权：高危操作会被**自动放行**。确认这是你要的。"
