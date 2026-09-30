@@ -1,6 +1,7 @@
 using Lilara.Core.Adapters;
 using Lilara.Core.Canonical;
 using Lilara.Core.Persistence;
+using Lilara.Core.Records;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
 
@@ -133,21 +134,44 @@ public sealed class CommandDispatcher(
     {
         if (!TryFind(s.SessionId, out var handle, out var rejection)) return rejection!;
 
-        // ⚠️ **闸在这里**，不在 Stepper 里也不在 Repl 里。
-        // 放在下面两层任一处都会留一条旁路：放 Stepper 里控制台照样绕过（它同步直调），
-        // 放 Repl 里控制面绕过（它不走 Repl）。**控制台就是那条旁路**——
-        // 它没有视图，必须同步拿结果。⇒ 唯一的正确位置是**两个前端都在下面**的这里。
+        // ⚠️ **次序照 `01` §6.1 原文**：
+        //   入队(x) → 若 x 是事件，**立即追加进记录** → 安排一次「启动」（去重）
+        // 追加与入队必须**紧挨着**：一旦分开，「已落盘未入队」或「已入队未落盘」
+        // 这两种中间态就会各自丢消息。
         //
-        // ⚠️ 它防两件事，一个都不能少：
-        //   ① **字节交错**——两个 append 真并发会写出交错的坏行（FileShare.ReadWrite 挡不住这个）；
-        //   ② **state.json 撕裂**——Stepper 的 L95 改状态与 L100 落盘之间不原子。
+        // ⚠️ **这两步刻意不拿闸**（放在闸外）——这是「合并是队列的副产品」能成立的**前提**。
+        // 第一次实测就抓到了：把入队放进闸里，第二条 send 会**卡在闸上**、
+        // 根本没机会入队，于是「3 次入队 → 第一次取空队列」永远不成立，
+        // 连发 3 条真的调了 **3 次模型**（`call=3`）。
+        // 文档要的是「后两次是 no-op」，而 no-op 的前提是**它们先进得来**。
+        //
+        // ⚠️ 那并发安全吗？——**安全**，靠的是各自那一层的锁：
+        //   · 追加：`HistoryLog.Append` 自带**按路径**的锁（防字节交错）
+        //   · 入队：`SessionHandle.Enqueue` 自带队列锁
+        // ⇒ 短临界区各自负责，不必被「整步」那把大闸罩着。
+        _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
+        {
+            At = DateTimeOffset.UtcNow,
+            From = Speaker.User,
+            Blocks = s.Blocks,
+        });
+        handle.Enqueue(s.Blocks);
+
+        // ⚠️ **启动去重**（`01` §6.1「会话 Running？→ no-op」）。
+        // 已经有一个推进在飞时，本次只入队、**不再安排一次推进**。
+        if (!handle.TryEnterStep())
+            return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = s.SessionId });
+
+        // ⚠️ **闸只罩「步的执行」**，不罩入队。它防的是 `state.json` 读改写不原子
+        // （`Stepper` 改 `handle.State` 与落盘之间那段）——那才是跨会话/跨前端真正会撞的东西。
         var gate = _host.GateFor(s.SessionId);
         await gate.WaitAsync(ct);
         try
         {
-            var text = string.Concat(s.Blocks.OfType<Block.TextBlock>().Select(b => b.Text));
+            // 取空队列——**合并是队列的副产品**：第一次推进就把后来那几条一起拿去渲染。
+            var blocks = handle.DrainQueue();
             var stepper = _resolveStepper(handle);
-            var reply = await stepper.StepAsync(handle, text, ct);
+            var reply = await stepper.StepAsync(handle, blocks, ct);
 
             return new DispatchResult(
                 new Ack.Accepted { CommandId = id, SessionId = s.SessionId }, reply);
@@ -161,6 +185,7 @@ public sealed class CommandDispatcher(
         }
         finally
         {
+            handle.ExitStep();
             gate.Release();
         }
     }

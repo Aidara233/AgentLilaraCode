@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using Lilara.Core.Canonical;
@@ -13,6 +14,21 @@ public static class HistoryLog
 {
     private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
 
+    /// <summary>
+    /// 每个文件一把锁，**防字节交错**。
+    ///
+    /// <para>⚠️ 与 `FileShare.ReadWrite` 是**两件事，缺一不可**：
+    /// 共享模式解决「**句柄冲突**」（第二个 append 打不开文件）；
+    /// 这把锁解决「**字节交错**」——两个 append 都能打开文件，但各自 `Write` 到一半
+    /// 被对方插进去，于是写出**两个半行拼成的坏行**。
+    /// 而 `history.jsonl` **只追加、永不重写**，那半行会一直在，且只在下次读时才炸。</para>
+    ///
+    /// <para>⚠️ 放在**这里**而不是调用方，是因为这是**文件本身的**性质：
+    /// 任何往同一个 path 追加的人都该被串行化，不该指望每个调用点各自记得加锁。
+    /// ⇒ 调用方的会话级闸因此**不必**覆盖 append，可以只覆盖「步的执行」。</para>
+    /// </summary>
+    private static readonly ConcurrentDictionary<string, Lock> PathLocks = new();
+
     public static void Append(string path, TimelineEvent evt)
     {
         var dir = Path.GetDirectoryName(path)!;
@@ -23,12 +39,12 @@ public static class HistoryLog
         // ⚠️ 显式开 FileStream，**不用 File.AppendAllText**：后者的默认共享模式是
         // FileShare.Read，**只允许别人读**——第二个 append 在开句柄那一刻就抛
         // IOException（Windows：文件正被另一进程使用）。实测过，是**硬失败**不是脏数据。
-        // ⚠️ 但 ReadWrite 只解决**句柄冲突**，**不解决字节交错**：两个 append 真并发时
-        // 仍可能写出交错的坏行。那靠**每会话逻辑串行**解决（CommandDispatcher 的每会话信号量）。
-        // 两个洞各修一个，不可互替。
-        using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
-        using var writer = new StreamWriter(fs, Utf8NoBom);
-        writer.Write(line);
+        lock (PathLocks.GetOrAdd(Path.GetFullPath(path), _ => new Lock()))
+        {
+            using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+            using var writer = new StreamWriter(fs, Utf8NoBom);
+            writer.Write(line);
+        }
     }
 
     /// <summary>

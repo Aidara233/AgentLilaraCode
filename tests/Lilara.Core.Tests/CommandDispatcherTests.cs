@@ -73,14 +73,18 @@ public class CommandDispatcherTests : IDisposable
     }
 
     /// <summary>
-    /// ⚠️ **闸的旁路证明**：dispatcher 必须**串行**同一会话的步。
-    /// `FakeAdapter` 是同步返回的（`Task.FromResult`），所以它自己造不出重叠；
-    /// 这里用一个「卡住直到放行」的适配器 + 两个并发 send，
-    /// 断言第二个**必须等第一个放行之后**才开始调用模型。
-    /// 少了这把闸，`history.jsonl` 会字节交错、`state.json` 会撕裂。
+    /// ⚠️ **同一会话的两步不许重叠**——但**入队不许被挡住**。
+    ///
+    /// <para>⚠️ 这条测试在 Task 4 被**改过断言**，理由正当，记在此处：
+    /// Task 3 时 `send` = 直接跑一步，所以「第二个 send 必须**阻塞**到第一个放行」是对的。
+    /// Task 4 按 `01` §6.1 改成「send = 入队 + 安排启动」后，第二个 send **必须立刻返回**
+    /// （它只入队，不推进）——**否则「合并是队列的副产品」永远不成立**：
+    /// 卡在闸上的第二条根本没机会入队，连发 3 条就真的调 3 次模型（第一次实测就是 `call=3`）。
+    /// ⇒ 不变量从「第二个阻塞」变成「**两步不重叠** + 第二个立即返回」。
+    /// 防重叠的职责也从闸（覆盖全部）收窄成 `TryEnterStep` 那把标志（只管推进）。</para>
     /// </summary>
     [Fact]
-    public async Task Send_SerialisesStepsOnTheSameSession()
+    public async Task Send_DoesNotOverlapTwoStepsButDoesNotBlockEnqueueing()
     {
         var (host, _) = NewHarness();
         SaveProvider(host);
@@ -108,18 +112,19 @@ public class CommandDispatcherTests : IDisposable
             new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("一")]), "a", true, CancellationToken.None);
         await firstEntered.Task;   // 第一个已经在模型里了
 
-        var second = dispatcher.DispatchAsync(
+        // ⚠️ 第二个必须**立刻**回来（只入队，不推进）
+        var second = await dispatcher.DispatchAsync(
             new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("二")]), "b", true, CancellationToken.None);
+        Assert.IsType<Ack.Accepted>(second.Ack);
 
-        // 给它足够时间**去**重叠——如果闸失效，它现在就在模型里了
+        // 给它足够时间去**重叠**——如果防重叠失效，它现在就在模型里了
         await Task.Delay(150);
         Assert.Equal(1, Volatile.Read(ref maxConcurrent));
 
         releaseFirst.SetResult();
-        await Task.WhenAll(first, second);
+        await first;
 
         Assert.Equal(1, maxConcurrent);   // 全程没有两个步同时在飞
-        Assert.Equal(2, call);
     }
 
     /// <summary>

@@ -1,3 +1,4 @@
+using Lilara.Core.Canonical;
 using Lilara.Core.Persistence;
 
 namespace Lilara.Core.Session;
@@ -17,6 +18,59 @@ public sealed record SessionHandle
     public string SpecPath => Path.Combine(Directory, "spec.json");
     public string StatePath => Path.Combine(Directory, "state.json");
     public string HistoryPath => Path.Combine(Directory, "history.jsonl");
+
+    // ---- 待办队列与「一把标志」（01 §6.1 / 02 §3.1） ----
+
+    /// <summary>
+    /// ⚠️ **内存队列，不落盘**——这是**刻意的偏离**，别当成漏了。
+    /// `01` §6.1 / §12.8 要求队列进 `state.json`，但 `SessionState.Pending` 是
+    /// `IReadOnlyList&lt;string&gt;`，**装不下块**（`03` §9.1 的 `session.send` 带附件块）。
+    /// 改它的类型是一次**磁盘格式迁移**，而磁盘格式已冻结。
+    /// ⇒ 最小实现只在内存排队：崩溃会丢掉未开跑的待办，而磁盘上**看不出来**
+    /// （`Pending` 恒为空列表，不是「有而没写」）。
+    /// </summary>
+    private readonly Queue<IReadOnlyList<Block>> _pending = new();
+    private readonly Lock _queueLock = new();
+
+    /// <summary>
+    /// 「这一步在跑」——`02` §3.1 说的「重入保护只剩**一把标志**」。
+    /// ⚠️ 它是 `启动(s)` 的**去重**判据（`01` §6.1：「会话 Running？→ no-op」），
+    /// 不是并发保护——串行由 `CoreHost.GateFor` 那把信号量负责。两者都要：
+    /// 信号量防「两步同时在飞」，这把标志让「连发 3 条只触发一次推进」成立。
+    /// </summary>
+    private volatile bool _running;
+
+    public bool IsRunning => _running;
+
+    /// <summary>入队。⚠️ 调用方**已经**把这条消息追加进记录了（`01` §6.1 的次序）。</summary>
+    public void Enqueue(IReadOnlyList<Block> blocks)
+    {
+        lock (_queueLock) _pending.Enqueue(blocks);
+    }
+
+    public int QueueDepth { get { lock (_queueLock) return _pending.Count; } }
+
+    /// <summary>
+    /// 取空队列（`01` §6.1：「否则取空队列 → 推进」）。
+    /// ⚠️ **取空**是「合并是队列的副产品」那条的实现：连发 3 条时，
+    /// 第一次取就把 3 条一起拿去渲染，于是只调一次模型。
+    /// </summary>
+    public IReadOnlyList<Block> DrainQueue()
+    {
+        lock (_queueLock)
+        {
+            if (_pending.Count == 0) return [];
+
+            var batch = new List<Block>();
+            while (_pending.Count > 0) batch.AddRange(_pending.Dequeue());
+            return batch;
+        }
+    }
+
+    /// <summary>`启动(s)` 的去重：已在 Running 则返回 false（no-op）。</summary>
+    public bool TryEnterStep() => !_running && (_running = true);
+
+    public void ExitStep() => _running = false;
 
     public static SessionHandle Create(SessionStore store, string workingDirectory, ModelSelection model)
     {
