@@ -78,7 +78,7 @@ public class BlockTests
     {
         // ⚠️ 实测：本机网关的 deepseek-flash 返回 {"type":"thinking","thinking":"..."}
         // **没有 signature**。把它当必填，整条推理就存不下来。
-        Block original = new Block.ReasoningBlock(Signature: null, Text: "想想", Kind: "text");
+        Block original = new Block.ReasoningBlock(Signature: null, Text: "想想", Kind: ReasoningKind.Text);
 
         var json = JsonSerializer.Serialize(original, Json.Options);
         var back = JsonSerializer.Deserialize<Block>(json, Json.Options);
@@ -92,7 +92,7 @@ public class BlockTests
     {
         // ⚠️ signature 是不透明凭据，上游会校验——绝不能 trim 或重编码
         const string sig = "ErUBCkYIBRgCIkAxY±+/= 空格 也保留";
-        Block original = new Block.ReasoningBlock(sig, "想", "text");
+        Block original = new Block.ReasoningBlock(sig, "想", ReasoningKind.Text);
 
         var back = JsonSerializer.Deserialize<Block>(
             JsonSerializer.Serialize(original, Json.Options), Json.Options);
@@ -104,12 +104,37 @@ public class BlockTests
     public void RedactedReasoning_RoundTrips()
     {
         // redacted 是加密载荷：原样保留、不解释（ApiPlan spec §10.2）
-        Block original = new Block.ReasoningBlock(null, "ZW5jcnlwdGVk", "redacted");
+        Block original = new Block.ReasoningBlock(null, "ZW5jcnlwdGVk", ReasoningKind.Redacted);
 
         var back = JsonSerializer.Deserialize<Block>(
             JsonSerializer.Serialize(original, Json.Options), Json.Options);
 
-        Assert.Equal("redacted", ((Block.ReasoningBlock)back!).Kind);
+        Assert.Equal(ReasoningKind.Redacted, ((Block.ReasoningBlock)back!).Kind);
+    }
+
+    [Fact]
+    public void ReasoningBlock_NormalisesANullKindToText()
+    {
+        // ⚠️ 实测过：Kind=null 会被 `WhenWritingNull` 静默丢字段，回读成默认值，
+        // 于是 record **往返后不等于自己**。归一之后不可能再出现那种块。
+        Block original = new Block.ReasoningBlock("s", "t", null!);
+
+        var back = JsonSerializer.Deserialize<Block>(
+            JsonSerializer.Serialize(original, Json.Options), Json.Options);
+
+        Assert.Equal(ReasoningKind.Text, ((Block.ReasoningBlock)back!).Kind);
+        Assert.Equal(original, back);
+    }
+
+    [Fact]
+    public void ReasoningBlock_SurvivesJsonMissingTheKindField()
+    {
+        // ⚠️ 手写或半截的 history.jsonl 可能没有 reasoningKind 字段
+        var json = """{"kind":"reasoning","signature":"s","text":"t"}""";
+
+        var back = (Block.ReasoningBlock)JsonSerializer.Deserialize<Block>(json, Json.Options)!;
+
+        Assert.Equal(ReasoningKind.Text, back.Kind);
     }
 
     [Fact]

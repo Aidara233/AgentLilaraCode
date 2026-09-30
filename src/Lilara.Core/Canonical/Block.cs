@@ -24,9 +24,10 @@ public abstract record Block
     /// 不透明凭据，上游校验用。**原样存、原样传，绝不修改**。
     /// ⚠️ **可以为 null**：实测本机网关的 deepseek-flash 返回的 thinking 块没有 signature。
     /// </param>
-    /// <param name="Text">可读推理文本；`Kind = "redacted"` 时是加密载荷的 base64。</param>
+    /// <param name="Text">可读推理文本；`Kind = ReasoningKind.Redacted` 时是加密载荷的 base64。</param>
     /// <param name="Kind">
-    /// `"text"`（明文推理，可回传）或 `"redacted"`（加密载荷，原样保留不解释）。
+    /// <see cref="ReasoningKind.Text"/>（明文推理，可回传）或
+    /// <see cref="ReasoningKind.Redacted"/>（加密载荷，原样保留不解释）。
     /// </param>
     /// ⚠️ `[JsonPropertyName("reasoningKind")]` **不是审美选择，是硬约束**：
     /// 判别式（TypeDiscriminatorPropertyName）已经占用了 `"kind"`，而 camelCase 会把
@@ -38,5 +39,18 @@ public abstract record Block
     public sealed record ReasoningBlock(
         string? Signature,
         string Text,
-        [property: JsonPropertyName("reasoningKind")] string Kind = "text") : Block;
+        string Kind = ReasoningKind.Text) : Block
+    {
+        /// <summary>
+        /// 块形态。⚠️ 这个属性**必须在构造时归一**，不能只是透传构造参数。
+        /// 为什么：`Json.Options` 设了 `DefaultIgnoreCondition = WhenWritingNull`，
+        /// 于是 `Kind = null` 会被**静默丢掉整个字段**；回读时缺字段 → 落到默认值
+        /// `ReasoningKind.Text`。结果就是这个 record **往返之后不等于自己**（实测：
+        /// `new ReasoningBlock("s","t",null!)` 序列化后没有 `reasoningKind` 字段，
+        /// 回读得到 `"text"`）。落盘格式已冻结，这里出问题就是一次数据迁移。
+        /// 归一之后，「Kind 为 null 的块」不再可能被构造出来。
+        /// </summary>
+        [JsonPropertyName("reasoningKind")]
+        public string Kind { get; init; } = Kind ?? ReasoningKind.Text;
+    }
 }
