@@ -56,6 +56,38 @@ public class AxisTests
         Assert.Equal("", canonical);
     }
 
+    /// <summary>取值是用户手打的，`PROD` 要认，并且回吐的是**表里的那个拼法**。</summary>
+    [Fact]
+    public void ValueCase_IsInsensitive_AndNormalizesToTheTableSpelling()
+    {
+        Assert.True(Axes.TryParse("safety", "PROD", out var canonical));
+        Assert.Equal("prod", canonical);
+    }
+
+    /// <summary>
+    /// ⚠️ 轴名走 `StringComparer.Ordinal`，**敏感是有意的**：它是协议标识符，
+    /// `Safety` 不是 `safety`，应当拒绝而不是替用户猜。别"顺手统一"成忽略大小写。
+    /// </summary>
+    [Fact]
+    public void AxisName_IsCaseSensitive()
+    {
+        Assert.False(Axes.TryParse("Safety", "dev", out var canonical));
+        Assert.Equal("", canonical);
+    }
+
+    /// <summary>
+    /// ⚠️ 表是**进程级静态**的，交出去的取值一旦可写，改一处就等于改了所有人的表
+    /// （`TryParse` / `LegalValuesText` / 头的下拉会一起变，且**没有任何报错**）。
+    /// 这条钉的是「交出来的是只读视图」——不是「当前值恰好是 dev|staging|prod」。
+    /// </summary>
+    [Fact]
+    public void ValuesOf_HandsOutSomethingTheCallerCannotMutate()
+    {
+        var list = (IList<string>)Axes.ValuesOf("safety")!;
+        Assert.Throws<NotSupportedException>(() => list[0] = "production");
+        Assert.Equal("dev", Axes.ValuesOf("safety")![0]);   // 静态表毫发无损
+    }
+
     /// <summary>
     /// ⚠️ 合法值清单必须是**从枚举拼出来的**，不是手抄的字符串。
     /// 手抄的清单在加档时会静默过期，而错误信息恰恰是用户唯一的线索。
