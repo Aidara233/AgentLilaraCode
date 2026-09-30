@@ -966,8 +966,8 @@ git commit -m "feat(core): session.setAxis（迁移才发 axis.changed / 非法�
 ### Task 4: 快照带轴 + `GET /axes` —— 头的初始值
 
 **Files:**
-- Modify: `src/Lilara.Core/Session/Axes.cs`（补中文标签与 `inContext`，见下）
-- Modify: `src/Lilara.Core/Control/ControlServer.cs:120-133`（快照）**与新增 `GET /axes`**
+- Modify: `src/Lilara.Core/Session/Axes.cs`（补中文标签 / `InContext` / 告警两端）
+- Modify: `src/Lilara.Core/Control/ControlServer.cs`（快照 + 新增 `GET /axes`）
 - Test: `tests/Lilara.Core.Tests/ControlServerTests.cs`（追加）· `tests/Lilara.Core.Tests/AxisTests.cs`（追加）
 
 **Interfaces:**
@@ -1038,6 +1038,94 @@ public async Task State_CarriesThreeSlots_FloatingIncluded()
     Assert.Equal(JsonValueKind.Array, slots.GetProperty("floating").ValueKind);
     Assert.Empty(slots.GetProperty("floating").EnumerateArray());
 }
+
+/// <summary>
+/// ⚠️ **`GET /axes` 是头唯一的轴来源**（G8：头不许手抄）。
+/// 少了它，头里那份手抄的 `AXES` 常量就是第二份契约——而 `Axes.cs:8` 明说「不许手抄」。
+///
+/// <para>⚠️ 这条测试**同时钉住「中文标签归核心」**：`05` §3「渲染归核心，头只显示」——
+/// 而下拉的 `主动性` / `安全` 就是渲染。头拿到英文档名自己是画不出中文的。</para>
+/// </summary>
+[Fact]
+public async Task Axes_Endpoint_HandsOutEverythingTheHeadNeeds()
+{
+    using var doc = JsonDocument.Parse(await Client.GetStringAsync(Http("/axes")));
+    var axes = doc.RootElement.GetProperty("axes").EnumerateArray().ToList();
+
+    Assert.Equal(Axes.Names.Count, axes.Count);
+    // ⚠️ 顺序**就是** `Axes.Names` 的顺序——它决定头的渲染顺序（与 T1 那条同名约定一致）。
+    Assert.Equal(Axes.Names, axes.Select(a => a.GetProperty("name").GetString()!).ToList());
+
+    foreach (var a in axes)
+    {
+        Assert.False(string.IsNullOrWhiteSpace(a.GetProperty("label").GetString()),
+            $"轴 {a.GetProperty("name").GetString()} 没有标签——头画不出中文名");
+        Assert.NotEmpty(a.GetProperty("values").EnumerateArray());
+    }
+
+    // ⚠️ **`inContext` 必须是真值而不是漏字段**：`effort` 是 false（`01` §3.5：不进上下文），
+    // 头据此把它画灰。少了这个字段，头分不清「不进上下文」与「核心没这个信息」。
+    var effort = axes.Single(a => a.GetProperty("name").GetString() == "effort");
+    Assert.False(effort.GetProperty("inContext").GetBoolean());
+
+    // ⚠️ **告警的两端也归核心**：头里写字面量的话，轴里改一个档名就会让告警**静默失效**。
+    Assert.Equal("prod", doc.RootElement.GetProperty("alertSafety").GetString());
+    Assert.Equal("authorized", doc.RootElement.GetProperty("alertFrom").GetString());
+}
+```
+
+⚠️ **`Axes` 要新增的东西**（这些是上面那条测试的前提，也是「标签归核心」的落点）：
+
+```csharp
+    /// <summary>
+    /// 轴的中文名（`01` §3.5 的表格）。⚠️ **它归核心**（`05` §3：渲染归核心，头只显示）——
+    /// 头的下拉要画 `主动性` / `安全`，而它拿到的只有英文档名。
+    /// ⚠️ 与 `Names` **同序**，且**同一个来源**：两处各写一份列表就会漂。
+    /// </summary>
+    private static readonly Dictionary<string, string> Labels = new(StringComparer.Ordinal)
+    {
+        [Initiative] = "主动性",
+        [Permission] = "权限",
+        [Safety] = "安全",
+        [Verify] = "验证强度",
+        [Effort] = "思考强度",
+    };
+
+    public static string LabelOf(string axis) => Labels.GetValueOrDefault(axis, axis);
+
+    /// <summary>
+    /// 这条轴的取值**进不进上下文**（`01` §3.5）。
+    /// ⚠️ 只有 `effort` 是 `false`——它是**纯请求参数**，模型不必被告知自己的推理预算。
+    /// 头据此把它画灰；写进提示词才是错的（那句话是全系统每步都付全价的槽位）。
+    /// </summary>
+    public static bool InContext(string axis) => axis != Effort;
+
+    /// <summary>安全轴里代表「生产」的档名（`01` §3.5 的跨轴告警的一端）。</summary>
+    public const string AlertSafety = "prod";
+
+    /// <summary>权限轴里「授权及以上」的**起始档**（`01` §3.5 的跨轴告警的另一端）。</summary>
+    public const string AlertFrom = "authorized";
+```
+
+⚠️ 再加一条 **`Labels` 与 `Names` 同键** 的测试（两份列表最容易漂的地方）：
+
+```csharp
+/// <summary>
+/// ⚠️ `Labels` 与 `Names` 是同一条要求的两个视图，键集必须一致——
+/// 少一个键就是头的某一格空白，而用户分不清「没标签」与「头坏了」。
+/// </summary>
+[Fact]
+public void Labels_CoverExactlyTheSameAxesAsNames()
+{
+    foreach (var n in Axes.Names)
+    {
+        var label = Axes.LabelOf(n);
+        Assert.False(string.IsNullOrWhiteSpace(label), $"轴 '{n}' 没有标签");
+        // ⚠️ 断言它**不是回退成档名**：`LabelOf` 对未知轴返回原样，
+        // 所以「返回 non-empty」单独还不够——中文名与英文档名不可能相等。
+        Assert.NotEqual(n, label);
+    }
+}
 ```
 
 - [ ] **Step 2: 跑测试确认它失败**
@@ -1059,10 +1147,9 @@ Expected: 两条都红——`axes` 键不存在；`slots.floating` 不存在
                     // ⚠️ **轴必须进快照**（`05` §11 #4）：`axis.changed` 只在订阅之后才有，
                     // 头刚打开页面时无事件可等。少了它，五个下拉全是空的——
                     // 而「空」与「默认值」在视觉上分不出来。
-                    // ⚠️ 从 **handle** 读而不是从 State 读：`State` 是磁盘镜像，
-                    // 而 handle 上是补齐过的（见 `SessionHandle.Load`）。
+                    // ⚠️ 轴只有一份，住在 `State` 里（`SessionHandle` 上不该有第二份——两份会分叉）。
+                    // `Load` / `Create` 之后它保证非空，见 `SessionHandle.CompleteAxes`。
                     Axes = handle.State.Axes,
-
                     // ⚠️ **三个槽**：`01` §3.1 的头两个（系统 / 首要）+ §3.2 的**尾槽位**（浮动）。
                     // 第一版只有两个——它把 `01` 的「头槽位」当成全部，漏了尾槽位；
                     // 而尾槽位正是五轴显示的地方（§3.2「策略：主动性 · 权限 · 安全 · 验证强度」）。
@@ -1087,16 +1174,38 @@ Expected: 两条都红——`axes` 键不存在；`slots.floating` 不存在
                 WireJson.Options);
 ```
 
+以及 **`GET /axes`**（放在 `MapSnapshots` 里，与其它快照端点同处）：
+
+```csharp
+        // ⚠️ **头唯一的轴来源**（G8：头不许手抄轴表）。
+        // ⚠️ **标签也交出去**（`05` §3：渲染归核心）——头拿到英文档名画不出中文名。
+        // ⚠️ **告警的两端也交出去**：头里写字面量的话，轴里改一个档名就让告警**静默失效**。
+        app.MapGet("/axes", () => Results.Json(new
+        {
+            Axes = Session.Axes.Names.Select(n => new
+            {
+                Name = n,
+                Label = Session.Axes.LabelOf(n),
+                Values = Session.Axes.ValuesOf(n),
+                InContext = Session.Axes.InContext(n),
+            }),
+            AlertSafety = Session.Axes.AlertSafety,
+            AlertFrom = Session.Axes.AlertFrom,
+        }, WireJson.Options));
+```
+
+⚠️ `Axes.Names` 的顺序**就是**渲染顺序（T1 定的约定），这里**不要**排序。
+
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `dotnet test --filter "FullyQualifiedName~State_Carries" -v q`
-Expected: 通过 2，失败 0
+Run: `dotnet test --filter "FullyQualifiedName~State_Carries|FullyQualifiedName~Axes_Endpoint|FullyQualifiedName~Labels_Cover" -v q`
+Expected: 通过 4，失败 0
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add src/Lilara.Core/Control/ControlServer.cs tests/Lilara.Core.Tests/ControlServerTests.cs
-git commit -m "feat(core): 快照带五轴与三个槽（浮动槽是义务 4 的落点，第一版漏了它）"
+git add src/Lilara.Core/Session/Axes.cs src/Lilara.Core/Control/ControlServer.cs tests/Lilara.Core.Tests/
+git commit -m "feat(core): 快照带五轴与三个槽；GET /axes（头不再手抄轴表，标签与告警两端也归核心）"
 ```
 
 ---
