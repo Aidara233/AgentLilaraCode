@@ -36,19 +36,34 @@ public static class EndpointResolver
 
     /// <summary>
     /// ⚠️ 环境读取器是**注入**的：真实进程环境不可控，注入之后这张真值表才能离线测干净。
+    /// <para>⚠️ <paramref name="getEnv"/> 是**第二个**参数（不是最后一个）——既有调用点一律
+    /// 把它按位置传在第 2 位上（`Resolve(configured, Env(...))`），把它挪到后面会让
+    /// 那些调用点从「注入读器」变成「往 `officialUrl` 传 Func」，直接 `CS1503`。
+    /// 新增的两个参数因此只能**按名**传（见 <c>OpenAiHttp</c>）。</para>
+    /// <para>⚠️ <paramref name="envVar"/> 传 <c>null</c> = 本协议族**不读任何环境变量**，
+    /// 见 T9 brief 的 Ruling ①（OpenAI 家族由我们自己拼 URL，能不让环境接管就不让）。</para>
+    /// <para>⚠️ <paramref name="officialUrl"/> 让每个协议族给自己的官方兜底地址，
+    /// 免得 OpenAI 的请求兜底到 Anthropic 的地址。</para>
     /// </summary>
     public static ResolvedEndpoint Resolve(
-        string? configuredEndpoint, Func<string, string?>? getEnv = null)
+        string? configuredEndpoint,
+        Func<string, string?>? getEnv = null,
+        string officialUrl = OfficialUrl,
+        string? envVar = EnvVar)
     {
         getEnv ??= Environment.GetEnvironmentVariable;
 
         if (!string.IsNullOrWhiteSpace(configuredEndpoint))
             return new ResolvedEndpoint(configuredEndpoint, EndpointSource.Configured);
 
-        var fromEnv = getEnv(EnvVar);
-        if (!string.IsNullOrWhiteSpace(fromEnv))
-            return new ResolvedEndpoint(fromEnv, EndpointSource.Environment);
+        // ⚠️ envVar 为 null = 本协议族不读任何环境变量。
+        if (envVar is not null)
+        {
+            var fromEnv = getEnv(envVar);
+            if (!string.IsNullOrWhiteSpace(fromEnv))
+                return new ResolvedEndpoint(fromEnv, EndpointSource.Environment);
+        }
 
-        return new ResolvedEndpoint(OfficialUrl, EndpointSource.Default);
+        return new ResolvedEndpoint(officialUrl, EndpointSource.Default);
     }
 }

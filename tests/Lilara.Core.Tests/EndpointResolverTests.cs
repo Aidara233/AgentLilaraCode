@@ -71,4 +71,39 @@ public class EndpointResolverTests
     {
         Assert.Equal("ANTHROPIC_BASE_URL", EndpointResolver.EnvVar);
     }
+
+    // ---- 每个协议族给自己的官方兜底 + 是否读环境（T9 修复轮 1 的 Ruling ①） ----
+    // ⚠️ 这三条都用**按名传参**：新增的 `officialUrl` / `envVar` 排在 `getEnv` 之后，
+    //    按位置传会把 Func 送进 string 形参（既有调用点就踩过这个 `CS1503`）。
+
+    [Fact]
+    public void Resolve_UsesTheCallersOfficialUrlAsFallback()
+    {
+        var resolved = EndpointResolver.Resolve(null, officialUrl: "https://api.openai.com", envVar: null);
+
+        Assert.Equal("https://api.openai.com", resolved.Url);
+        Assert.Equal(EndpointSource.Default, resolved.Source);
+    }
+
+    [Fact]
+    public void Resolve_WithNullEnvVarReadsNoEnvironment()
+    {
+        // ⚠️ 这是「不让环境接管」的判据：即便环境里那变量有值，也不许它赢。
+        var resolved = EndpointResolver.Resolve(
+            null, officialUrl: "https://api.openai.com", envVar: null,
+            getEnv: Env("http://127.0.0.1:15721"));
+
+        Assert.Equal("https://api.openai.com", resolved.Url);
+        Assert.Equal(EndpointSource.Default, resolved.Source);
+    }
+
+    [Fact]
+    public void Resolve_ConfiguredStillWinsWithNullEnvVar()
+    {
+        var resolved = EndpointResolver.Resolve(
+            "https://configured.example.com", officialUrl: "https://api.openai.com", envVar: null);
+
+        Assert.Equal("https://configured.example.com", resolved.Url);
+        Assert.Equal(EndpointSource.Configured, resolved.Source);
+    }
 }

@@ -12,7 +12,15 @@ namespace Lilara.Core.Adapters.OpenAi;
 /// </summary>
 public sealed class OpenAiHttp
 {
-    private readonly HttpClient _client = new();
+    /// <summary>
+    /// OpenAI 兼容协议的官方兜底地址。
+    /// ⚠️ **绝不能兜底到 Anthropic 的地址**——那是两个不同的 API。
+    /// </summary>
+    public const string OfficialUrl = "https://api.openai.com";
+
+    /// <summary>⚠️ 全类共用一个——核心是常驻进程，每会话新建会泄漏 socket。本类不写 DefaultRequestHeaders，共用安全。</summary>
+    private static readonly HttpClient Client = new();
+
     private readonly string _key;
 
     public string AuthScheme { get; }
@@ -24,7 +32,14 @@ public sealed class OpenAiHttp
 
         // ⚠️ 缺省与 Claude 相反：OpenAI 兼容端点默认就是 Bearer
         AuthScheme = provider.AuthScheme ?? AuthSchemes.Bearer;
-        Endpoint = EndpointResolver.Resolve(provider.Endpoint);
+
+        // ⚠️ `envVar: null` = **不读任何环境变量**。Claude 那条读 `ANTHROPIC_BASE_URL` 是被迫的
+        // （官方 SDK 自己去读，拦不住——所以 `ClaudeAdapter` 才必须显式设 `BaseUrl`）；
+        // OpenAI 这条由我们自己拼 URL，**能拦就拦**：否则一个 OpenAI 协议的 provider
+        // 会被 `ANTHROPIC_BASE_URL` 悄悄导向 Anthropic 的代理（本机实测就是这个值）。
+        // 也不发明 `OPENAI_BASE_URL` 之类的名字——生态里没有公认的那一个，猜一个就是新的静默接管源。
+        // 两个新参数**必须按名传**：`getEnv` 是第 2 个形参（见 `EndpointResolver.Resolve` 的说明）。
+        Endpoint = EndpointResolver.Resolve(provider.Endpoint, officialUrl: OfficialUrl, envVar: null);
         _key = provider.ApiKey;
     }
 
@@ -40,7 +55,7 @@ public sealed class OpenAiHttp
 
         try
         {
-            using var response = await _client.SendAsync(request, ct);
+            using var response = await Client.SendAsync(request, ct);
             var text = await response.Content.ReadAsStringAsync(ct);
 
             if (!response.IsSuccessStatusCode)

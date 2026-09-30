@@ -81,4 +81,30 @@ public class OpenAiHttpTests
 
         Assert.False(OpenAiHttp.ShouldWrap(new OperationCanceledException(cts.Token), cts.Token));
     }
+
+    /// <summary>
+    /// ⚠️ **实测复现过的真 bug**：控制器在本机环境里量到
+    /// `ANTHROPIC_BASE_URL=http://127.0.0.1:15721` 会让**未配 endpoint 的 OpenAI provider**
+    /// 把请求发到那个地址（`source=Environment`）。本测试钉住「OpenAI 家族不读任何环境变量」。
+    /// ⚠️ 走真实的进程环境（`Environment.SetEnvironmentVariable`），因为要证的正是
+    /// 「真实环境里设了也不许赢」——注入式读器证明不了这一点。
+    /// </summary>
+    [Fact]
+    public void OpenAiHttp_IgnoresAnthropicBaseUrlFromTheRealEnvironment()
+    {
+        var saved = Environment.GetEnvironmentVariable("ANTHROPIC_BASE_URL");
+        try
+        {
+            Environment.SetEnvironmentVariable("ANTHROPIC_BASE_URL", "http://should-not-be-used.invalid");
+
+            var http = new OpenAiHttp(Def(Protocols.OpenAiChat));
+
+            Assert.Equal(OpenAiHttp.OfficialUrl, http.Endpoint.Url);
+            Assert.Equal(EndpointSource.Default, http.Endpoint.Source);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("ANTHROPIC_BASE_URL", saved);
+        }
+    }
 }
