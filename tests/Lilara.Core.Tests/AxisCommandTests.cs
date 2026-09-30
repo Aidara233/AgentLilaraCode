@@ -66,7 +66,7 @@ public class AxisCommandTests : IDisposable
 
         Assert.IsType<Ack.Accepted>(r.Ack);
         Assert.Equal("prod", session.State.Axes!["safety"]);
-        Assert.True(sub.Reader.TryRead(out var p), "改轴必须发 axis.changed——头靠它更新那个下拉");
+        Assert.True(sub.Reader.TryRead(out var p), "改轴必须发 axis.changed——头靠它更新显示");
         var evt = Assert.IsType<WireEvent.AxisChanged>(p.Payload);
         Assert.Equal("safety", evt.Axis);
         Assert.Equal("prod", evt.Value);
@@ -74,7 +74,7 @@ public class AxisCommandTests : IDisposable
 
     /// <summary>
     /// ⚠️ **重复设同一个值不发事件**（`01` §5：事件是**迁移**的产物）。
-    /// 发了的话，头每收到一条都要重渲染那个下拉，而用户的鼠标正悬在上面。
+    /// 发了的话，头每收到一条都要重渲染一次，而用户的鼠标正悬在上面。
     /// </summary>
     [Fact]
     public async Task SetAxis_ToTheSameValue_IsANoOpAndPublishesNothing()
@@ -136,6 +136,43 @@ public class AxisCommandTests : IDisposable
     }
 
     /// <summary>
+    /// ⚠️ **「会话在盘上、不在内存里」也必须能改轴**——核心重启之后的常态。
+    ///
+    /// <para>夹具用的是**第二个 `CoreHost` 指向同一个数据根**：它等价于「未激活」，
+    /// 因为激活表是 per-`CoreHost` 的私有 `ConcurrentDictionary`（`CoreHost._activated`），
+    /// 新实例的表是空的，而盘上的 `spec.json` / `state.json` 是**同一份**
+    /// （`CoreHost` 与 `SessionStore` 都不对数据根加锁，`DataRootLock` 只在 `Program.cs` 用）。
+    /// 这正是重启后的真实形状。⚠️ `CoreHost` **没有**能把会话从激活表里拿掉的公开手段
+    /// （`Activate` / `Register` / `TryGetActivated` / `Activated` / `InvalidateSteppers`…），
+    /// 所以不硬造那种夹具。</para>
+    ///
+    /// <para>⚠️ 改回「只查激活表」（`_host.TryGetActivated`）这条就**红**：
+    /// 那条路会回一句**假话**——「不存在」，而它明明在盘上。</para>
+    /// </summary>
+    [Fact]
+    public async Task SetAxis_OnASessionThatIsNotActivated_FallsBackToDisk()
+    {
+        var (host, _, _, session) = Harness();
+
+        var fresh = new CoreHost(_root, _work);
+        var d2 = new CommandDispatcher(fresh, new EventBus(), h => new Stepper(fresh.Store, new Fakes.FakeAdapter()));
+        Assert.False(fresh.TryGetActivated(session.SessionId, out _), "前提：新宿主的激活表里没有它");
+
+        var r = await d2.DispatchAsync(
+            new CoreCommand.SessionSetAxis(session.SessionId, "safety", "prod"), "a1", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+
+        // 回落分支必须把它**载进激活表**（TryFind 的 Activate），改的是表里那一份
+        Assert.True(fresh.TryGetActivated(session.SessionId, out var activated));
+        Assert.Equal("prod", activated.State.Axes!["safety"]);
+
+        // ⚠️ 而且**真的落了盘**：另起一个 handle 从磁盘读，读的不是内存那一份
+        var reloaded = SessionHandle.Load(host.Store, session.ProjectKey, session.SessionId);
+        Assert.Equal("prod", reloaded.State.Axes!["safety"]);
+    }
+
+    /// <summary>
     /// ⚠️ **`axis: null` 必须回 `rejected`，不能抛异常。**
     ///
     /// <para>线上那条路是可达的：`WireJson.Options` **没有**开
@@ -173,8 +210,8 @@ public class AxisCommandTests : IDisposable
 
     /// <summary>
     /// ⚠️ **值大小写不敏感**（`Axes.TryParse` 刻意如此），但**存的是表里的规范形**。
-    /// 存原样的话，`Prod` 与 `prod` 会同时存在于不同会话，而头的下拉是按规范值渲染的
-    /// ⇒ 那个选项显示不出来，用户看到「设了但没生效」。
+    /// 存原样的话，`Prod` 与 `prod` 会同时存在于不同会话，而头的显示按表里的规范拼法来
+    /// ⇒ 头认不出那个取值（它不在表里），用户看到「设了但没生效」。
     /// </summary>
     [Fact]
     public async Task SetAxis_NormalizesTheCase()

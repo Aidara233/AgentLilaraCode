@@ -350,11 +350,14 @@ public sealed class CommandDispatcher(
     /// <summary>
     /// 设置一条轴。⚠️ 三个拒绝理由的**顺序**是刻意的：会话 → 轴 → 值。
     /// 反过来的话，「会话不存在 + 轴名也写错」会报「轴不认识」，把用户引向错的方向。
+    ///
+    /// <para>⚠️ 找会话走 <see cref="TryFind"/>，**不是**只看激活表：核心重启之后会话
+    /// **在盘上、不在内存里**，只看激活表会回一句**假话**——「不存在」，
+    /// 而它存在，只是没被激活。`TryFind` 的回落分支会 `Activate` 把它载进来。</para>
     /// </summary>
     private DispatchResult HandleSessionSetAxis(CoreCommand.SessionSetAxis x, string id)
     {
-        if (!_host.TryGetActivated(x.SessionId, out var handle))
-            return Reject(id, $"没有会话 '{x.SessionId}'。");
+        if (!TryFind(x.SessionId, out var handle, out var rejection)) return rejection!;
 
         if (!Axes.IsKnown(x.Axis))
             return Reject(id, $"没有 '{x.Axis}' 这条轴。可用的：{string.Join("|", Axes.Names)}");
@@ -365,9 +368,10 @@ public sealed class CommandDispatcher(
             return Reject(id, $"'{x.Axis}' 不取 '{x.Value}'。可用的：{Axes.LegalValuesText(x.Axis)}");
 
         // ⚠️ `!` 是 **`Load` / `Create` 的契约**（与 `Stepper` 读 effort 那句同源）：
-        // 它们保证 `State.Axes` 非空（见 `SessionState.Axes` 的注释），而激活表里的
-        // handle 只从这两条来路进来（`Register` 的三个调用点 + `Activate`——
-        // 见 `CoreHost` 的注释），能拿到 null 的只有手工 `new SessionHandle`。
+        // 它们保证 `State.Axes` 非空（见 `SessionState.Axes` 的注释）。`TryFind` 给的
+        // handle 只可能来自这两条来路——激活表里那份本来就是 `Create` / `Load` 的产物，
+        // 回落分支走的是 `CoreHost.Activate` ⇒ `Load`；能拿到 null 的只有手工
+        // `new SessionHandle`，那不是运行时路径。
 
         // ⚠️ 相同值不是迁移 ⇒ 不发事件（`01` §5）。见测试里的理由。
         if (handle.State.Axes!.TryGetValue(x.Axis, out var current) && current == canonical)

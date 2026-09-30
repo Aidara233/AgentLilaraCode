@@ -55,7 +55,7 @@ public abstract record WireEvent
     /// <summary>
     /// 一条轴变了（`03` §4 / `01` §3.5）。
     /// ⚠️ **只在真的迁移时发**——重复设同一个值是 no-op，不发事件。
-    /// 头据此更新那个下拉；若是 `safety` 或 `permission`，还要重算跨轴告警。
+    /// 头据此更新显示；若是 `safety` 或 `permission`，还要重算跨轴告警。
     /// </summary>
     public sealed record AxisChanged(string SessionId, string Axis, string Value) : WireEvent;
 
