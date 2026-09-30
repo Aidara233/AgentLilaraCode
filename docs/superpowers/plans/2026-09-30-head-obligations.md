@@ -1941,7 +1941,7 @@ public sealed class ClaimStore(string workingDirectory)
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `dotnet test -v q`
-Expected: 全绿（新增 7 条 + 既有 371）
+Expected: 全绿（新增 7 条 + **执行时的既有基线**）
 
 - [ ] **Step 5: 提交**
 
@@ -2125,10 +2125,11 @@ git commit -m "feat(console): claim/claim release/claim list（光一个 claim �
 **Files:**
 - Modify: `head/wwwroot/index.html`
 - Modify: `head/wwwroot/app.js`
+- Modify: `src/Lilara.Core/Control/ControlServer.cs`（**新增 `GET /providers`**，见下面的 ⚠️）
 
 **Interfaces:**
-- Consumes: `GET /projects` · `GET /projects/{pk}/sessions` · `GET /sessions/{id}/state`（含 `axes` / 三槽）· `GET /sessions/{id}/history` · `GET /claims` · WS `subscribe` / `command` / `resync_required`
-- Produces: 页面（无对外接口）
+- Consumes: `GET /projects` · `GET /projects/{pk}/sessions` · `GET /sessions/{id}/state`（含 `axes` / 三槽）· `GET /sessions/{id}/history` · **`GET /axes`**（T4）· `GET /claims` · **`GET /providers`**（本任务新增）· WS `subscribe` / `command` / `resync_required`
+- Produces: 页面（无对外接口）· `GET /providers` → `[{ id, protocol, defaultModel }]`（**不含 `apiKey`**）
 
 - [ ] **Step 1: 换掉 `index.html`**
 
@@ -2432,18 +2433,27 @@ function setStatus(status, turn) {
 // 而下拉的标签就是渲染。核心交 `{ name, label, values, inContext }`，头只画控件。
 // ⚠️ 由此 `GET /axes` 端点在 **T4**，而 `Axes` 要补上 `01` §3.5 的中文名（那是唯一真相来源，不是头）。
 let AXES = [];
-async function loadAxes() { AXES = await (await fetch(core + "/axes")).json(); }
+async function loadAxes() {
+  // ⚠️ **一次拉取拿到三样**：轴表本身 + 告警线的两端。
+  // ⚠️ **告警两端必须被真的覆盖**——只声明 `let ALERT_SAFETY = "prod"` 而不赋值，
+  // 那两个字面量就还是硬编码的副本（「静默失效」的入口），白写了 `GET /axes` 的那两个字段。
+  const cfg = await (await fetch(core + "/axes")).json();
+  AXES = cfg.axes;
+  ALERT_SAFETY = cfg.alertSafety;
+  ALERT_FROM = cfg.alertFrom;
+}
 
-// ⚠️ **这一份不是副本，是判定**：它说的是「权限到哪一档算『授权及以上』」，
-// 而那是**告警规则**（`01` §3.5），不是轴表。轴表只能有一份，规则可以有。
-// ⚠️ 但它仍然**手抄了档名**——`authorized` / `trusted` 是权限轴的第 4、5 档。
-// 若权限轴加了档，这里会静默过期（告警不再覆盖新档）。⇒ 在 T4 的 `GET /axes`
-// 里一并交一个 `alertFrom`（权限轴里算「授权及以上」的起始档），这里改成读它。
-
-// ⚠️ **告警线的两端也归核心**：`安全=生产` 的档名与「权限≥授权」的起始档都写成字面量，
-// 改一个档名就静默失效（告警不再响，而用户以为它在守）。⇒ 从 `GET /axes` 一并读回。
-let ALERT_SAFETY = "prod";     // loadAxes() 里被核心交的值覆盖
-let ALERT_FROM   = "authorized";
+// ⚠️ **告警线的两端也归核心**：`安全=生产` 的档名与「权限≥授权」的起始档，
+// 头里各写一个字面量就是**两份副本**——改一个档名就静默失效（告警不再响，而用户以为它在守）。
+//
+// ⚠️ 下面的初始值是**占位**，`loadAxes()` 会用核心交的值覆盖它。
+// ⚠️ 但「有初始值」这件事本身有代价：**如果 `loadAxes()` 失败或没跑**，
+// 这两个占位值就成了真的在用——那时告警按一份**没人维护的副本**判断。
+// ⇒ 占位值取**永不触发告警**的那个（空串），宁可漏报也不误报：
+// 漏报的表现是「该响没响」，而误报会让用户学会无视这个告警。
+// ⚠️ 这也解释了为什么 `bootstrap()` 的第一句必须是 `await loadAxes()`。
+let ALERT_SAFETY = "";
+let ALERT_FROM   = "";
 
 function renderAxes(values) {
   axes = values || {};
@@ -2511,7 +2521,15 @@ function alertFromIndex() {
 function renderAlert() {
   const perm = AXES.find((a) => a.name === "permission");
   const at = perm ? perm.values.indexOf(axes.permission) : -1;
-  const risky = axes.safety === ALERT_SAFETY && at >= 0 && at >= alertFromIndex();
+
+  // ⚠️ **每一端都必须先「解析出来」才算数。**
+  // `indexOf` 找不到时返回 `-1`，而 `at >= -1` **恒真** ⇒ 少了 `from >= 0` 这道守卫，
+  // 只要安全档恰好相符就会**误报**（而误报会让用户学会无视这个告警）。
+  // 同理 `ALERT_SAFETY === ""` 表示「核心还没把告警线交过来」（见 `loadAxes` 的注释），
+  // 那时**不该**按一个占位值判断。
+  const from = alertFromIndex();
+  const ready = ALERT_SAFETY !== "" && from >= 0;
+  const risky = ready && axes.safety === ALERT_SAFETY && at >= from;
 
   $("safety-row").className = risky ? "alert" : "";
   $("alert").textContent = risky
@@ -2683,6 +2701,18 @@ $("new").onclick = () => command(crypto.randomUUID().slice(0, 8), { kind: "sessi
 $("interrupt").onclick = () => {
   if (current) command(crypto.randomUUID().slice(0, 8), { kind: "session.interrupt", sessionId: current });
 };
+
+// ⚠️ **`GET /providers` 是头的引导要用的**（`05` §2.2）：没有提供商时**不能做别的**。
+// 端点不存在的话 `bootstrap()` 会在 `fetch(...).json()` 上抛，
+// 而那是**第一条**要跑的异步动作 ⇒ 整个页面停在空白，控制台里一条错。
+// ⇒ 它在 `ControlServer.MapSnapshots` 里加：
+
+//         // ⚠️ 头的引导（`05` §2.2）要判断「有没有提供商」——没有就得挡住其余操作。
+//         // ⚠️ **`apiKey` 绝不进响应**：它是本机秘密，而头的页面在浏览器里、还开着 CORS（`*`）。
+//         // 只回「有没有」，不回「是什么」。
+//         app.MapGet("/providers", () =>
+//             Results.Json(host.Providers.List().Select(p => new { p.Id, p.Protocol, p.DefaultModel }),
+//                 WireJson.Options));
 
 (async () => {
   try { core = (await (await fetch("/config.json")).json()).core; } catch { /* 用默认值 */ }
