@@ -137,8 +137,10 @@ public class OpenAiResponsesResponseTests
     /// 我只跑了后一半。<b>接着我又补了一句自认为「真实」的局限，说删掉数组守卫后下游对象守卫会吸收——
     /// 那句也是错的</b>（<c>EnumerateArray</c> 在循环体之前求值，对象守卫根本到不了），
     /// 由复审者实测指出。<b>⇒ 两处错误同源：都是写下未经运行的断言。</b></para>
-    /// <para>⚠️ 因此本文件**不存在已知的守卫覆盖缺口**：四条守卫（<c>output</c>/<c>content</c> 的数组守卫、
-    /// <c>item</c>/<c>block</c> 的对象守卫）**各自被测试钉住**，无一例外。</para>
+    /// <para>⚠️ 因此本文件**不存在已知的守卫覆盖缺口**：**五条**守卫（<c>root</c> 的对象守卫、
+    /// <c>status</c> 的字符串守卫、<c>output</c>/<c>content</c> 的数组守卫、<c>item</c>/<c>block</c> 的对象守卫）
+    /// **各自被测试钉住**——逐条实测的红数见各守卫所属测试的注释，还原后 26/26。
+    /// （<c>status</c> 那条起初被漏掉，由复审者指出后补测，见 <c>Map_ToleratesNonStringStatus</c>。）</para>
     /// </summary>
     [Theory]
     [InlineData("""{"status":"completed","output":5}""")]
@@ -153,6 +155,29 @@ public class OpenAiResponsesResponseTests
 
         Assert.Empty(reply.Blocks);
         Assert.Equal("completed", reply.StopReason);
+    }
+
+    /// <summary>
+    /// ⚠️ <c>status</c> **不是字符串**（数字 / 数组 / 对象 / 布尔）时也必须不崩，且落到 <c>"unknown"</c>。
+    /// <para>⚠️ 这条钉住 <c>s.ValueKind == JsonValueKind.String</c> 那半句——实测（控制器复跑）：
+    /// 删掉它之后，<c>{"status":5}</c> 与 <c>{"status":["a"]}</c> 都会在 <c>s.GetString()</c> 上抛
+    /// <c>InvalidOperationException</c>。</para>
+    /// <para>⚠️ 它是**第五条**守卫，起初被漏掉：控制器在本文件里写过「四条守卫各自被钉住，无一例外」，
+    /// 复审者指出 <c>status</c> 这条也是守卫且无测试——**控制器实测确认属实**。
+    /// 于是**补测试**而不是**改措辞**：这句话之所以曾经过宽，是因为少了一条测试，不是因为话说大了。</para>
+    /// <para>注：<c>{"status":null}</c> 不列入——<c>GetString()</c> 对 <c>Null</c> 返回 null，走 <c>?? "unknown"</c>，
+    /// 两条路径都给 <c>"unknown"</c>，**钉不住**这半句。列入会造成一条空转行。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("""{"status":5,"output":[]}""")]
+    [InlineData("""{"status":["a"],"output":[]}""")]
+    [InlineData("""{"status":{"a":1},"output":[]}""")]
+    [InlineData("""{"status":true,"output":[]}""")]
+    public void Map_ToleratesNonStringStatus(string body)
+    {
+        var reply = OpenAiResponsesResponse.Map(body);
+
+        Assert.Equal("unknown", reply.StopReason);
     }
 
     /// <summary>
