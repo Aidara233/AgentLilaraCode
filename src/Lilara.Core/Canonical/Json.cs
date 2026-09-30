@@ -14,5 +14,8 @@ public static class Json
         // ⚠️ 不转义非 ASCII。Unsafe 是相对「注入 HTML」说的；
         // 本地文件存储正是它的正确用途，否则中文会被写成 \u4f60\u597d。
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        // ⚠️ 枚举按名落盘。整数枚举既不可读，也会因成员重排静默重解释既有历史——
+        // history.jsonl 是只追加、永不重写的，写错一次就是一次数据迁移。
+        Converters = { new JsonStringEnumConverter() },
     };
 }

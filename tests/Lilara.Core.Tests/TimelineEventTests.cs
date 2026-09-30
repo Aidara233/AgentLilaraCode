@@ -76,4 +76,22 @@ public class TimelineEventTests
 
         Assert.Contains("\"kind\":\"message\"", json);
     }
+
+    [Fact]
+    public void Serialize_WritesSpeakerAsItsNameNotItsOrdinal()
+    {
+        TimelineEvent original = new TimelineEvent.MessageEvent
+        {
+            At = DateTimeOffset.UnixEpoch,
+            From = Speaker.Model,
+            Blocks = [],
+        };
+
+        var json = JsonSerializer.Serialize(original, Json.Options);
+
+        // ⚠️ 落盘格式必须自解释：整数枚举既不可读，也会因重排静默重解释既有历史。
+        // 注意属性名是 PascalCase（Json.Options 未设命名策略），只有判别式写作 "kind"。
+        Assert.Contains("\"From\":\"Model\"", json);
+        Assert.DoesNotContain("\"From\":1", json);
+    }
 }
