@@ -15,6 +15,8 @@ public sealed class ClaudeAdapter : IModelAdapter
 
     public ClaudeAdapter(ProviderDefinition provider)
     {
+        ArgumentNullException.ThrowIfNull(provider);
+
         if (provider.Protocol != ProtocolId)
             throw new ArgumentException(
                 $"ClaudeAdapter 只认协议 '{ProtocolId}'，收到 '{provider.Protocol}'",
@@ -25,22 +27,40 @@ public sealed class ClaudeAdapter : IModelAdapter
 
     public async Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct)
     {
-        var parameters = ClaudeRequestBuilder.Build(request);
-
+        // ⚠️ Build 必须在 try **里面**。
+        // 它的三处 ArgumentException（时间线为空 / 消息为空 / 未知 effort）都是
+        // 「这次调用失败了」的一种——让它们逃出包装，调用方就抓不到，
+        // 于是一个 --effort xhihg 的拼写错误会以**未捕获异常**的形式崩掉，
+        // 而不是给用户一句能读懂的话。
         try
         {
+            var parameters = ClaudeRequestBuilder.Build(request);
             var response = await _client.Messages.Create(parameters, cancellationToken: ct);
             return ClaudeResponseMapper.Map(response);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ShouldWrap(ex, ct))
         {
             throw new ModelCallFailedException(Describe(ex), ex);
         }
     }
 
+    /// <summary>
+    /// 这个异常该不该包成 <see cref="ModelCallFailedException"/>？
+    /// ⚠️ **取消不是失败**：用户按 Ctrl-C 要原样冒出去（03 §3 `session.interrupt`、
+    /// 01 §9 的工具取消钩子），不能被报成「模型调用失败」。
+    /// 但反过来，`HttpClient` 超时**也**是以 `TaskCanceledException`（→ `OperationCanceledException`）
+    /// 到达的，那是一次真失败，必须包。
+    /// 所以判据是「**调用方自己的 token 被取消了没有**」，不是异常类型。
+    /// 抽成纯函数是为了能把这张真值表离线测干净——它藏在 catch 过滤器里就没法测了。
+    /// </summary>
+    internal static bool ShouldWrap(Exception ex, CancellationToken ct) =>
+        ex is not OperationCanceledException || !ct.IsCancellationRequested;
+
     /// <summary>把 SDK 的异常翻译成一句人话（Review Focus #6）。</summary>
-    private static string Describe(Exception ex) => ex switch
+    internal static string Describe(Exception ex) => ex switch
     {
+        Anthropic.Exceptions.AnthropicBadRequestException =>
+            "请求被上游拒绝（400）。多半是参数不合法——检查模型 id 与 max tokens 的设置。",
         Anthropic.Exceptions.AnthropicUnauthorizedException =>
             "API key 无效或已吊销（401）。检查 `provider set` 里的 --key。",
         Anthropic.Exceptions.AnthropicForbiddenException =>

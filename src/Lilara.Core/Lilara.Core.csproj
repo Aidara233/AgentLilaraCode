@@ -9,4 +9,9 @@
   <ItemGroup>
     <PackageReference Include="Anthropic" Version="12.51.0" />
   </ItemGroup>
+  <!-- 让测试能直接测 internal 的纯函数（Describe / ShouldWrap），
+       免得错误文案这种东西只能靠人工验收才第一次被看到 -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Lilara.Core.Tests" />
+  </ItemGroup>
 </Project>
