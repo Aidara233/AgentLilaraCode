@@ -35,23 +35,37 @@ public static class CoreCommandParser
     /// </summary>
     public static bool IsClaimList(string line)
     {
+        if (!IsClaimVerb(line)) return false;
+
+        var t = line.Trim();
+        var words = t["claim".Length..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return words.Length == 1 && string.Equals(words[0], "list", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// ⚠️ **「这一行以 `claim` 打头、且 `claim` 后面是分隔符或行尾」——词块入口的唯一判据。**
+    ///
+    /// <para>⚠️ **它必须被 <see cref="IsClaimList"/> 与 <c>Parse</c> 的 claim 分支共用**
+    /// （`Repl` 经 <see cref="IsClaimList"/> 也用到它）。两处曾各写一份，而 `Parse` 那份
+    /// **只查了 `trimmed[5]` 是不是空白、从不查前五个字符是什么**——
+    /// 于是任何**首词恰好 5 个字符**的普通消息（`hello world` / `write a test`）都被静默
+    /// 变成 `claim.acquire`：**话没发出去**，反而在 `&lt;工作目录&gt;` 下占了一条声明。
+    /// ⇒ 这是「两层判据必须共用一个谓词」那类缺陷的又一次现身，
+    /// **而且它正是「把判据收敛成一处」那次修复漏掉的一半。**</para>
+    ///
+    /// <para>⚠️ 边界用 **<see cref="char.IsWhiteSpace"/>（宽口径）**，不是 `' '` / `'\t'`（窄）：
+    /// 窄口径下 `claim` + **NBSP** + 路径会**两边都不认** ⇒ 当成消息发给模型。</para>
+    /// </summary>
+    public static bool IsClaimVerb(string line)
+    {
         var t = line.Trim();
         if (t.Length < "claim".Length) return false;
         if (!t.StartsWith("claim", StringComparison.Ordinal)) return false;
 
         // ⚠️ **`"claim"` 之后必须是空白（或到此为止）——这是词边界，不能省。**
-        // 少了这一句，`"claimlist"` 也会被切出 `"list"`
-        //（`"claimlist"["claim".Length..]` == `"list"`），于是 `claimlist` 被认成查询、
-        // 被 `Repl` 拦下印声明列表 ⇒ **用户敲的那行字被吞掉了**（本该当成消息发出去）。
-        // ⚠️ 对照 `Parse` 里那条入口守卫的写法——它现在是**宽口径**：
-        // `trimmed == "claim" || (trimmed.Length > "claim".Length && char.IsWhiteSpace(trimmed["claim".Length]))`，
-        // **同样是「claim 后面必须有分隔、且分隔用 `char.IsWhiteSpace`」**；这里必须与它口径一致。
-        // ⚠️ **别照抄窄口径**（`' '` / `'\t'`）——那正是 `claim`+NBSP+路径
-        // 「两边都不认 ⇒ 当成消息发出去」那个洞的成因。
-        if (t.Length > "claim".Length && !char.IsWhiteSpace(t["claim".Length])) return false;
-
-        var words = t["claim".Length..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-        return words.Length == 1 && string.Equals(words[0], "list", StringComparison.OrdinalIgnoreCase);
+        // 少了这一句，`"claimlist"` 也会被切出 `"list"`（`"claimlist"[5..]` == `"list"`），
+        // 于是 `claimlist` 被认成查询、被 `Repl` 拦下 ⇒ **用户敲的那行字被吞掉了**。
+        return t.Length == "claim".Length || char.IsWhiteSpace(t["claim".Length]);
     }
 
     /// <summary>
@@ -92,14 +106,16 @@ public static class CoreCommandParser
 
         if (IsClaimList(trimmed)) return (null, null);
 
-        // ⚠️ **入口判据必须与 `IsClaimList` 的边界口径**一致**：用 `char.IsWhiteSpace`（宽），
-        // 不是 `' '` / `'\t'`（窄）。**
-        // ⚠️ 窄口径下 `claim` + **NBSP**（` `）+ 路径 **两边都不认**：
-        // `IsClaimList` 因谓词不成立返回 false，这里因 `StartsWith("claim ")` 不成立而落空
-        // ⇒ **当成消息发给了模型**。而 NBSP 从**网页复制粘贴**就会带进来——
-        // 正是本任务要根除的那一类，从侧面漏了回来（审阅实测）。
-        if (trimmed == "claim"
-            || (trimmed.Length > "claim".Length && char.IsWhiteSpace(trimmed["claim".Length])))
+        // ⚠️ **入口判据与 `IsClaimList` 共用同一个谓词**（`IsClaimVerb`）——
+        // 它们**曾经是两份副本，而且漂了**：这里那份**只查 `trimmed[5]` 是不是空白、
+        // 从不查前五个字符是什么** ⇒ 任何**首词恰好 5 个字符**的普通消息
+        //（`hello world` / `write a test`）都被静默变成 `claim.acquire`，
+        // 于是**话没发出去、反而在工作目录下占了一条声明**。
+        // ⇒ 这是 [[one-predicate-for-both-layers]] 那类缺陷的又一次现身，
+        //   **而且它就发生在「把判据收敛成一处」的那次修复里**——
+        //   `IsClaimList` 补了前缀校验，旁边这份没有。
+        // ⚠️ 宽口径（`char.IsWhiteSpace`）也由谓词统一管着，别再在这里手写边界。
+        if (IsClaimVerb(trimmed))
         {
             // `Split(null, RemoveEmptyEntries)`：**所有空白**（空格、Tab、NBSP、连续多个）
             // 都算分隔符——与上面的宽边界口径一致。

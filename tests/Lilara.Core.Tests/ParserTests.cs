@@ -271,4 +271,42 @@ public class ParserTests
         Assert.Equal("s9", acquire.SessionId);
         Assert.Equal(["src/foo"], acquire.Scope);
     }
+
+    /// <summary>
+    /// ⚠️ **`claim` 入口判据必须先确认「前五个字符就是 `claim`」。**
+    /// 它一度写成 `trimmed.Length > 5 &amp;&amp; char.IsWhiteSpace(trimmed[5])`——
+    /// **只看第 6 个字符是不是空白，从不看前五个是什么**。
+    /// ⇒ 任何**首词恰好 5 个字符**的普通消息都被静默变成 `claim.acquire`：
+    /// `hello world` 会在 `&lt;工作目录&gt;/world` 落一条声明（并回 `✓ 已占 world`），
+    /// **话根本没发出去**；`write a test` 会回一句无关的语法错。
+    ///
+    /// <para>⚠️ 这是 [[one-predicate-for-both-layers]] 那类缺陷的**又一次现身**，
+    /// 而且就在「把判据收敛成一处」的那次修复里：`IsClaimList` **有**前缀校验，
+    /// 而它旁边这个入口判据**没有**——同一份判据的两份副本，只改了一处。</para>
+    ///
+    /// <para>⚠️ 485 条测试全绿是因为：所有「消息类」测试的首词**恰好都绕开了 index 5**。</para>
+    ///
+    /// <para>⚠️ **每条 `InlineData` 的首词都必须恰好 5 个字符**——否则 `trimmed[5]`
+    /// 不是空白，**这条用例在坏代码上也会绿**（零区分力）。我第一稿写了两条假用例：
+    /// `show me the file`（`show` 只有 4 字符，`[5]='m'`）与一条中文的（`[5]='o'`）——
+    /// **两条都证明不了任何事**。这正是 [[invisible-input-needs-byte-check]] 要防的那类。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("hello world")]           // hello  = 5 字符 ⇒ [5]=' '
+    [InlineData("write a test")]          // write  = 5 字符 ⇒ [5]=' '
+    [InlineData("there is a bug")]        // there  = 5 字符 ⇒ [5]=' '
+    [InlineData("你好世界啊 测试")]         // 5 个 CJK 字符后是空格 ⇒ [5]=' '（UTF-16 下每字 1 char）
+    public void OrdinaryMessage_WhoseFirstWordIsFiveChars_IsNotACommand(string line)
+    {
+        // ⚠️ **先核死这条用例真的有区分力**：`Parse` 的入口判据读的是 `line[5]`，
+        // ⇒ 本断言只有在 `line[5]` 是空白时才可能被坏代码打破。
+        Assert.True(line.Length > 5 && char.IsWhiteSpace(line[5]),
+            $"用例本身写坏了：'{line}' 的 [5] 不是空白 ⇒ 它在坏代码上也会绿，证明不了任何事。");
+
+        var (cmd, err) = CoreCommandParser.Parse(line, "s1");
+
+        // ⚠️ **两者都 null = 「不是命令形态」⇒ 调用方按普通消息发出去。**
+        Assert.Null(cmd);
+        Assert.Null(err);
+    }
 }
