@@ -396,34 +396,53 @@ public sealed class CommandDispatcher(
         return new DispatchResult(new Ack.Accepted { CommandId = id });
     }
 
+    /// <summary>
+    /// ⚠️ **找会话走 `TryFind`，不是只看激活表。** 核心重启之后会话**在盘上、不在内存里**，
+    /// 只看激活表会回一句**假话**——「没有会话 '…'」，而它存在，只是没被激活。
+    ///
+    /// <para>⚠️ **这条纪律的来路**：`HandleSessionSetAxis` 踩过同一个坑，在 `9c3bd0d` 修过
+    /// （`TryGetActivated` → `TryFind`）。⇒ **本文件的任何「按 id 取会话」都必须走
+    /// <see cref="TryFind"/>**——写新处理器时照抄这一行，别自己拼。</para>
+    /// </summary>
     private DispatchResult HandleClaimAcquire(CoreCommand.ClaimAcquire c, string id)
     {
-        // ⚠️ **找会话走 `TryFind`，不是只看激活表。** 核心重启之后会话**在盘上、不在内存里**，
-        // 只看激活表会回一句**假话**——「没有会话 '…'」，而它存在，只是没被激活。
-        // ⚠️ **这是 T3 那个缺陷的原样重演**：`HandleSessionSetAxis` 修过一次
-        // （`9c3bd0d`，`TryGetActivated` → `TryFind`），这里是两个**新**处理器又写回去了。
-        // ⇒ 纪律：`CommandDispatcher` 里**任何**「按 id 取会话」都必须走 `TryFind`。
         if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
+        if (c.Scope.Count == 0) return Reject(id, "没给要占的路径。用法：claim.acquire(sessionId, scope: [...])");
 
         var store = new ClaimStore(handle.Spec.WorkingDirectory);
-        var path = Claims.Normalize(c.Path, handle.Spec.WorkingDirectory);
 
-        // ⚠️ **冲突 ⇒ rejected 且点名持有者**（`01` §12.2）。这句话是「你的工作集会被作废」
-        // 在界面上唯一能被看见的地方——只回一句「已被占用」，用户不知道去找谁。
-        var clash = Claims.FindConflict(store.All(), c.SessionId, path);
+        // ⚠️ **`scope` 是列表（`01` §12.4）⇒ 先整体校验，再整体写入**：
+        // 任一条与他人冲突就**整条命令回 rejected**，不部分写入——
+        // 部分写入会让用户看到"占了一半"，而命令语义是"占这片区域"。
+        var paths = c.Scope.Select(p => Claims.Normalize(p, handle.Spec.WorkingDirectory)).ToList();
+
+        // ⚠️ **读-改-写必须在 `store.Update` 的**同一把锁**里**（见它的注释）：
+        // 两个会话同时 acquire 时，分开的 `All()`/`Save()` 会**丢更新**（静默）。
+        Claim? clash = null;
+        var accepted = store.Update(current =>
+            {
+                var list = current.ToList();
+                foreach (var path in paths)
+                {
+                    // ⚠️ **冲突 ⇒ rejected 且点名持有者**（`01` §12.2）。这句话是「你的工作集会被作废」
+                    // 在界面上唯一能被看见的地方——只回一句「已被占用」，用户不知道去找谁。
+                    clash = Claims.FindConflict(list, c.SessionId, path);
+                    if (clash is not null) return list;          // 整条拒绝，一个都不写
+
+                    // 幂等：自己已经占着这条就跳过
+                    if (list.Any(x => x.SessionId == c.SessionId && x.Path == path)) continue;
+                    list.Add(new Claim(c.SessionId, handle.ProjectKey, path, DateTimeOffset.UtcNow));
+                }
+                return list;
+            });
+
         if (clash is not null)
-            return Reject(id, $"'{path}' 已被会话 {clash.SessionId} 占用。");
-
-        var all = store.All().ToList();
-        if (all.Any(x => x.SessionId == c.SessionId && x.Path == path))
-            return new DispatchResult(new Ack.Accepted { CommandId = id });   // 幂等
-
-        all.Add(new Claim(c.SessionId, handle.ProjectKey, path, DateTimeOffset.UtcNow));
-        store.Save(all);
+            return Reject(id, $"'{clash.Path}' 已被会话 {clash.SessionId} 占用。");
 
         // ⚠️ **项目流**：声明是跨会话的（`03` §5）
-        _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
-            new WireEvent.ClaimAcquired(c.SessionId, path));
+        foreach (var path in paths)
+            _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
+                new WireEvent.ClaimAcquired(c.SessionId, path));
 
         return new DispatchResult(new Ack.Accepted { CommandId = id });
     }
@@ -434,17 +453,26 @@ public sealed class CommandDispatcher(
         if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
         var store = new ClaimStore(handle.Spec.WorkingDirectory);
-        var path = Claims.Normalize(c.Path, handle.Spec.WorkingDirectory);
+        var paths = c.Scope.Select(p => Claims.Normalize(p, handle.Spec.WorkingDirectory)).ToList();
 
-        var all = store.All().ToList();
         // ⚠️ **逃生口**（`03` §3）：不检查占用者是不是自己——模型失控时，
         // 用户要能从一个**别的**会话里把锁摘掉。
-        var removed = all.RemoveAll(x => x.Path == path);
-        if (removed == 0) return new DispatchResult(new Ack.Accepted { CommandId = id });
+        // ⚠️ 同样在 `Update` 的锁里（读-改-写不可分）。
+        var removed = store.Update(current =>
+        {
+            var list = current.ToList();
+            foreach (var path in paths) list.RemoveAll(x => x.Path == path);
+            return list;
+        });
 
-        store.Save(all);
-        _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
-            new WireEvent.ClaimReleased(c.SessionId, path));
+        // ⚠️ **只有真删掉了才发事件**（`01` §5：无迁移则无事件）。
+        // 判据是**整条命令有没有改变任何东西**，不是"逐条比较"——
+        // 一条没删上也发事件会让头把没有的变化渲染成有。
+        if (!removed) return new DispatchResult(new Ack.Accepted { CommandId = id });
+
+        foreach (var path in paths)
+            _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
+                new WireEvent.ClaimReleased(c.SessionId, path));
 
         return new DispatchResult(new Ack.Accepted { CommandId = id });
     }

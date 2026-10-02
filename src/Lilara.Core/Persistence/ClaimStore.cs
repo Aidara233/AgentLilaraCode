@@ -59,4 +59,42 @@ public sealed class ClaimStore(string workingDirectory)
 
     public void Save(IEnumerable<Claim> claims) =>
         AtomicFile.Write(Path_, System.Text.Json.JsonSerializer.Serialize(claims.ToList(), Canonical.Json.Options));
+
+    // ⚠️ **按路径的锁**，形态照 `HistoryLog.PathLocks`（同一处代码库的既有做法）。
+    // `claims.json` 是**跨会话共享**的，而 `claim.*` **不拿会话闸**
+    //（对：闸是**会话粒度**的，声明是**跨会话**的操作）。
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Lock> PathLocks = new();
+
+    /// <summary>
+    /// ⚠️ **把「读 → 改 → 写」放进同一把锁里** —— 这是本方法与
+    /// 分开调 `All()` / `Save()` 的**唯一区别**，而那正是要害。
+    ///
+    /// <para>⚠️ **分开调用会丢更新，而且丢得静默。** 两个会话同时 acquire 时：
+    /// 各自 `All()` 读到**同一份旧列表** → 各自改 → 各自 `Save()` ⇒ **后写的盖掉前写的**，
+    /// 盘上少一条声明，而**两边都收到 `Accepted`**。
+    /// ⚠️ `AtomicFile.Write` 只保证「文件不半截」与「并发写不撞名」——**它不管读-改-写**。</para>
+    ///
+    /// <para>⚠️ **实测过**（审阅者，8 会话并发占互不重叠的路径）：带 `Barrier` **40/40 轮只剩 1 条**；
+    /// 无 `Barrier` **30/30 轮丢更新 + 19/30 轮抛 `UnauthorizedAccessException`**
+    /// （`AtomicFile` 的重试耗尽后 rethrow ⇒ 逃出 `DispatchAsync`）。
+    /// 后者是本方法**顺带**修掉的第二个症状。</para>
+    ///
+    /// <para>⚠️ **读必须在锁内**（就是这里的 `All()`）——把锁外的快照传进来等于锁没起作用。
+    /// 调用方的**判据**（如 `FindConflict`）也要放进 <paramref name="change"/> 里，
+    /// 否则「查了没冲突 → 别人占了 → 我写进去」照样超占。</para>
+    ///
+    /// <returns>⚠️ **这次调用有没有真的改变列表**——调用方据此决定发不发事件
+    /// （`01` §5：无迁移则无事件）。返回值由**比较前后**得出，不是由调用方自己猜。</returns>
+    /// </summary>
+    public bool Update(Func<IReadOnlyList<Claim>, IEnumerable<Claim>> change)
+    {
+        lock (PathLocks.GetOrAdd(Path_, _ => new Lock()))
+        {
+            var before = All();
+            var after = change(before).ToList();
+            if (before.SequenceEqual(after)) return false;   // `Claim` 是 record ⇒ 值相等
+            Save(after);
+            return true;
+        }
+    }
 }

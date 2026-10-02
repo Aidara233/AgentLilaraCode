@@ -51,7 +51,7 @@ public class ClaimCommandTests : IDisposable
         var (_, d, _) = Harness();
         var sid = NewSession(d);
 
-        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
 
         Assert.IsType<Ack.Accepted>(r.Ack);
         Assert.True(File.Exists(Path.Combine(_work, ".lilara", "claims.json")),
@@ -66,7 +66,7 @@ public class ClaimCommandTests : IDisposable
         var pk = Lilara.Core.Projects.ProjectKey.FromPath(_work);
         using var sub = bus.Subscribe(EventBus.ProjectTopic(pk));
 
-        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
 
         // ⚠️ **项目流，不是会话流**：声明是「谁在动哪些文件」，**跨会话**才有意义（03 §5）
         Assert.True(sub.Reader.TryRead(out var p), "声明必须发到项目流——会话流上别的人看不见");
@@ -88,8 +88,8 @@ public class ClaimCommandTests : IDisposable
         var a = NewSession(d);
         var b = NewSession(d);
 
-        await d.DispatchAsync(new CoreCommand.ClaimAcquire(a, "src"), "c1", false, CancellationToken.None);
-        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(b, "src\\a.cs"), "c2", false, CancellationToken.None);
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(a, ["src"]), "c1", false, CancellationToken.None);
+        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(b, ["src\\a.cs"]), "c2", false, CancellationToken.None);
 
         var rejected = Assert.IsType<Ack.Rejected>(r.Ack);
         Assert.Contains(a, rejected.Reason);   // ⚠️ 点名，不是一句「已被占用」
@@ -101,8 +101,8 @@ public class ClaimCommandTests : IDisposable
         var (_, d, _) = Harness();
         var sid = NewSession(d);
 
-        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
-        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c2", false, CancellationToken.None);
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
+        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c2", false, CancellationToken.None);
 
         Assert.IsType<Ack.Accepted>(r.Ack);
         // ⚠️ 第二次不该多出一条声明——否则右栏会列出两遍同一个区域。
@@ -114,10 +114,10 @@ public class ClaimCommandTests : IDisposable
     {
         var (_, d, bus) = Harness();
         var sid = NewSession(d);
-        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
 
         using var sub = bus.Subscribe(EventBus.ProjectTopic(Lilara.Core.Projects.ProjectKey.FromPath(_work)));
-        var r = await d.DispatchAsync(new CoreCommand.ClaimRelease(sid, "src"), "c2", false, CancellationToken.None);
+        var r = await d.DispatchAsync(new CoreCommand.ClaimRelease(sid, ["src"]), "c2", false, CancellationToken.None);
 
         Assert.IsType<Ack.Accepted>(r.Ack);
         Assert.Empty(ClaimsOf(_work));
@@ -133,7 +133,7 @@ public class ClaimCommandTests : IDisposable
         var sid = NewSession(d);
         using var sub = bus.Subscribe(EventBus.ProjectTopic(Lilara.Core.Projects.ProjectKey.FromPath(_work)));
 
-        var r = await d.DispatchAsync(new CoreCommand.ClaimRelease(sid, "never"), "c1", false, CancellationToken.None);
+        var r = await d.DispatchAsync(new CoreCommand.ClaimRelease(sid, ["never"]), "c1", false, CancellationToken.None);
 
         Assert.IsType<Ack.Accepted>(r.Ack);
         Assert.False(sub.Reader.TryRead(out _));
@@ -163,7 +163,7 @@ public class ClaimCommandTests : IDisposable
         Directory.CreateDirectory(Path.Combine(_work, ".lilara"));
         File.WriteAllText(Path.Combine(_work, ".lilara", "claims.json"), badJson);
 
-        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
 
         // 坏条目被丢掉 ⇒ 这条命令**照常成功**，而不是把核心抛死。
         Assert.IsType<Ack.Accepted>(r.Ack);
@@ -191,10 +191,112 @@ public class ClaimCommandTests : IDisposable
         var d2 = new CommandDispatcher(restarted, new EventBus(),
             h => new Stepper(restarted.Store, new Fakes.FakeAdapter()));
 
-        var r = await d2.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+        var r = await d2.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
 
         // ⚠️ 缺陷下这里是 `Rejected`（「没有会话 '…'」）——而会话明明在盘上。
         Assert.IsType<Ack.Accepted>(r.Ack);
+    }
+
+    /// <summary>
+    /// ⚠️ **`Release` 也必须走 `TryFind`——而审阅者证明这条以前没有网。**
+    /// 它把 `Release` 的 `TryFind` 变异回 `TryGetActivated` ⇒ **29/29 全绿**
+    /// （对照：`Acquire` 有 disk-only 那条网，所以它变异会红）。
+    /// ⇒ 「同一纪律、两个入口」只测一个等于没测另一个。形状与 `Acquire` 那条对称。
+    /// </summary>
+    [Fact]
+    public async Task Release_OnASessionThatIsOnlyOnDisk_IsFoundNotReportedMissing()
+    {
+        var (_, d, _) = Harness();
+        var sid = NewSession(d);
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c0", false, CancellationToken.None);
+
+        var restarted = new CoreHost(_root, _work);      // 新宿主 ⇒ 空激活表 ⇒ 会话只在盘上
+        var d2 = new CommandDispatcher(restarted, new EventBus(),
+            h => new Stepper(restarted.Store, new Fakes.FakeAdapter()));
+
+        var r = await d2.DispatchAsync(new CoreCommand.ClaimRelease(sid, ["src"]), "c1", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.Empty(ClaimsOf(_work));                   // 真的删掉了，不只是回了个 accepted
+    }
+
+    /// <summary>
+    /// ⚠️ **`Release` 的「跨会话强删」是**刻意**的（`03` §3：模型失控时的逃生口），
+    /// 但审阅者证明它**零回归网**——没有任何测试会在它被改成「只删自己的」时变红。**
+    ///
+    /// <para>⚠️ 这条钉的正是那个**方向**：A 占的声明，**B** 能把它删掉。
+    /// 若有人「顺手」给 `RemoveAll` 加上 `x.SessionId == c.SessionId`，这条**必须红**——
+    /// 而那个改动看起来很安全（"只删自己的更保守"），实际**堵死了逃生口**。</para>
+    /// </summary>
+    [Fact]
+    public async Task Release_ByADifferentSession_StillRemovesIt()
+    {
+        var (_, d, _) = Harness();
+        var a = NewSession(d);
+        var b = NewSession(d);
+
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(a, ["src"]), "c1", false, CancellationToken.None);
+        Assert.Single(ClaimsOf(_work));
+
+        // ⚠️ **B 从没占过 `src`**——它仍然能删。
+        var r = await d.DispatchAsync(new CoreCommand.ClaimRelease(b, ["src"]), "c2", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.Empty(ClaimsOf(_work));
+    }
+
+    /// <summary>
+    /// ⚠️ **两个会话并发 acquire 两条互不重叠的路径 ⇒ 两条都必须留下。**
+    ///
+    /// <para>⚠️ **这条钉的是读-改-写的原子性。** 缺陷下（`All()` → 改 → `Save()` 分开调用）
+    /// 两个任务各自读到**同一份旧列表**、各自写回 ⇒ **后写的盖掉前写的**，盘上只剩一条，
+    /// 而**两边都收到 `Accepted`**（静默）。实际计数由 `ClaimStore.Update` 的按路径锁保证。</para>
+    ///
+    /// <para>⚠️ **实测过的严重度**（审阅者，8 会话）：带 `Barrier` **40/40 轮只剩 1 条**；
+    /// 无 `Barrier` **30/30 轮丢更新 + 19/30 轮抛 `UnauthorizedAccessException`**
+    /// （`AtomicFile` 重试耗尽后 rethrow ⇒ 逃出 `DispatchAsync`）。
+    /// ⇒ 本测试顺带钉住第二种症状。</para>
+    ///
+    /// <para>⚠️ **用 `Barrier` 对齐，不用 `Task.Delay` 错开**：后者是在测试里**编造**
+    /// 时序，而不是**产生**并发。⚠️ 这类测试天然间歇——跑**多轮**（见下面的循环），
+    /// 单跑一次绿说明不了什么。</para>
+    /// </summary>
+    [Fact]
+    public async Task Acquire_FromTwoSessionsConcurrently_KeepsBothClaims()
+    {
+        var (_, d, _) = Harness();
+        var a = NewSession(d);
+        var b = NewSession(d);
+
+        // ⚠️ 跑多轮：单轮可能因调度恰好错开而"碰巧绿"。
+        // ⚠️ **每轮用不同路径**（不是先删文件）——这样每轮都**真的**产生两次写入，
+        // 丢更新会直接体现为「累计数少了」。早先版本用 `File.Delete` 清场，
+        // 在第一轮就抛 `DirectoryNotFoundException`（`.lilara/` 还没建）——
+        // **那是测试的 bug，不是实现的**。
+        for (var round = 0; round < 20; round++)
+        {
+            var pa = $"a-dir-{round}";
+            var pb = $"b-dir-{round}";
+
+            using var barrier = new Barrier(2);
+            var t1 = Task.Run(async () =>
+            {
+                barrier.SignalAndWait();
+                return await d.DispatchAsync(new CoreCommand.ClaimAcquire(a, [pa]), "r1", false, CancellationToken.None);
+            });
+            var t2 = Task.Run(async () =>
+            {
+                barrier.SignalAndWait();
+                return await d.DispatchAsync(new CoreCommand.ClaimAcquire(b, [pb]), "r2", false, CancellationToken.None);
+            });
+
+            var both = await Task.WhenAll(t1, t2);
+
+            Assert.IsType<Ack.Accepted>(both[0].Ack);
+            Assert.IsType<Ack.Accepted>(both[1].Ack);
+            // ⚠️ 断言是「**累计**两条都在」——缺陷下某轮会丢一条 ⇒ 累计数少。
+            Assert.Equal(2 * (round + 1), ClaimsOf(_work).Count);
+        }
     }
 
     private static List<Claim> ClaimsOf(string work) =>

@@ -215,13 +215,21 @@ public sealed class ControlServer(
         //
         // ⚠️ **这里能用 `SelectMany`**：`TryFind` 是 `ControlServer` 的私有方法，
         // 而 `ProjectDirs()` 给的是 `projects/` 下的**目录名**——那正是 `projectKey`。
+        // ⚠️ **读 spec，不用 `TryFind`——因为本类的 `TryFind` 会 `Activate` 会话！**
+        // （见它的回落分支 `host.Activate(pk, sessionId)`。）
+        // 那意味着**每拉一次 `/claims` 就把数据根下所有会话激活进内存**：
+        // 一个 **GET 端点产生了状态副作用**，且**随会话数无限增长**。
+        // 与 `01` §8.3 的懒激活取向（「激活即缓存」，按需才有）相悖。
+        // ⇒ 直接 `TryReadSpec` 取 `WorkingDirectory`：**不激活、更简单、无副作用**。
+        // ⚠️ 且**没有陈旧问题**：`SessionSpec.WorkingDirectory` 是 `init`、建会话时定下、之后不变，
+        // 所以读盘那份与内存那份**必然一致**。
         app.MapGet("/claims", () =>
         {
             var claims = ProjectKeys()
-                .SelectMany(pk => host.Store.ListSessions(pk))
-                .Select(id => TryFind(id, out var h) ? h : null)
-                .Where(h => h is not null)
-                .SelectMany(h => new ClaimStore(h!.Spec.WorkingDirectory).All())
+                .SelectMany(pk => host.Store.ListSessions(pk)
+                    .Select(id => host.Store.TryReadSpec(pk, id)))
+                .Where(spec => spec is not null)
+                .SelectMany(spec => new ClaimStore(spec!.WorkingDirectory).All())
                 .Distinct()
                 .ToList();
 
@@ -470,9 +478,11 @@ public sealed class ControlServer(
             // ⚠️ **只有 release，没有 acquire**——`03` §3 的命令表里资源那节只有 release，
             // 且 §8.2 把它归入「止血」（头在核心/控制台不响应时的逃生口）。
             // 头的认领动作走控制台（T8），头自己**从不发** `claim.acquire`。
+            // ⚠️ **字段名是 `scope`（数组），不是 `path`**——`03` §3 写 `claim.release(sessionId, scope)`，
+            // `01` §12.4 写 `scope: [...]`。头的将来客户端按 `scope` 发帧。
             "claim.release" => new CoreCommand.ClaimRelease(
                 payload.GetProperty("sessionId").GetString()!,
-                payload.GetProperty("path").GetString()!),
+                payload.GetProperty("scope").Deserialize<List<string>>(WireJson.Options)!),
             "provider.upsert" => new CoreCommand.ProviderUpsert(
                 payload.GetProperty("id").GetString()!,
                 payload.GetProperty("apiKey").GetString()!,

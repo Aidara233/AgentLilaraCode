@@ -37,10 +37,16 @@ public abstract record CoreCommand
     public sealed record SessionSetAxis(string SessionId, string Axis, string Value) : CoreCommand;
 
     /// <summary>占用一片区域（`01` §12.2）。路径可以是相对的，按会话的工作目录解析。</summary>
-    public sealed record ClaimAcquire(string SessionId, string Path) : CoreCommand;
+    /// <param name="Scope">
+    /// ⚠️ **名字与形状都照协议**：`03` §3 写的是 `claim.acquire(sessionId, scope)`，
+    /// 而 `01` §12.4 的 release 形参写作 `scope: [...]` ⇒ 它是**列表**。
+    /// ⚠️ 叫 `Path` 会与协议不符（头的将来客户端按 `scope` 发帧 ⇒ 「命令形状不对」）。
+    /// </param>
+    public sealed record ClaimAcquire(string SessionId, IReadOnlyList<string> Scope) : CoreCommand;
 
     /// <summary>释放。⚠️ 这是「模型失控时的逃生口」（`03` §3）——所以它**不检查**占用者是不是自己。</summary>
-    public sealed record ClaimRelease(string SessionId, string Path) : CoreCommand;
+    /// <param name="Scope">⚠️ 同 <see cref="ClaimAcquire"/>：列表、名字照协议。</param>
+    public sealed record ClaimRelease(string SessionId, IReadOnlyList<string> Scope) : CoreCommand;
 }
 
 /// <summary>

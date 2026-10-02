@@ -511,7 +511,7 @@ public class ControlServerTests : IAsyncLifetime
 
         // ⚠️ 先占上。`claim.acquire` **不在**线上命令表里（`03` §3 资源那节只有 release），
         // 所以这里直接走 dispatcher——认领是控制台/模型的动作，头**从不发**它。
-        await _dispatcher.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c2", false, CancellationToken.None);
+        await _dispatcher.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c2", false, CancellationToken.None);
         Assert.NotEmpty(new ClaimStore(_work).All());
 
         using var ws = new ClientWebSocket();
@@ -519,7 +519,7 @@ public class ControlServerTests : IAsyncLifetime
         // ⚠️ **用拼接而不是 `$$"""`**：内插原始字符串里，载荷末尾的 `}}}` 会被当成内插洞的收尾
         // （`CS9007`）——见 `WebSocket_AcksCommandsAndStreamsEvents` 的同款注释。
         await SendAsync(ws, "{\"kind\":\"command\",\"id\":\"a1\",\"payload\":{\"kind\":\"claim.release\","
-            + "\"sessionId\":\"" + sid + "\",\"path\":\"src\"}}");
+            + "\"sessionId\":\"" + sid + "\",\"scope\":[\"src\"]}}");
 
         var ack = await ReceiveAsync(ws);
         Assert.Equal("ack", ack.GetProperty("kind").GetString());
