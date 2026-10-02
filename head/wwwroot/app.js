@@ -55,8 +55,13 @@ async function bootstrap() {
     return;
   }
 
-  // ③ 有 ⇒ 打开最近的（**不新建**——见上面的幂等）
-  openSession([...sessions.keys()][sessions.size - 1]);
+  // ③ 有 ⇒ 打开**最近的**（**不新建**——见上面的幂等）
+  // ⚠️ **取 `[0]`，不是 `[size - 1]`**：`SessionStore.ListSessions` 是
+  // `OrderByDescending(x => x.Spec.CreatedAt)` ⇒ **最新在前**，所以最近的会话是**第一个**。
+  // ⚠️ 原来写的是 `[sessions.size - 1]`——那取到的是**最旧**的，与注释和意图都相反，
+  // 而且与核心自己不一致：`Program.cs` 启动时 `resume = existing[0]`（**最新**）
+  // ⇒ 头打开最旧的、核心 resume 最新的，**同一次启动里两个前端指着不同的会话**。
+  openSession([...sessions.keys()][0]);
 }
 
 function showOnboarding() {
