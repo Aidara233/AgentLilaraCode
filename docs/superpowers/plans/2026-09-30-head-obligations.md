@@ -1913,7 +1913,7 @@ git commit -m "feat(core): 声明判据（规范化大小写无关 / 前缀需�
 - Consumes: `Claims` / `Claim`（T6）· `AtomicFile.Write` · `EventBus.ProjectTopic`
 - Produces:
   - `ClaimStore(string workingDirectory)` —— `IReadOnlyList<Claim> All()` · `void Save(IEnumerable<Claim>)`
-  - `CoreCommand.ClaimAcquire(string SessionId, string Path)` · `CoreCommand.ClaimRelease(string SessionId, string Path)`
+  - `CoreCommand.ClaimAcquire(string SessionId, IReadOnlyList<string> Scope)` · `CoreCommand.ClaimRelease(string SessionId, IReadOnlyList<string> Scope)`
   - `WireEvent.ClaimAcquired(string SessionId, string Path)` · `WireEvent.ClaimReleased(string SessionId, string Path)`
   - `GET /claims` → `Claim[]`
 
@@ -1964,7 +1964,7 @@ public class ClaimCommandTests : IDisposable
         var (_, d, _) = Harness();
         var sid = NewSession(d);
 
-        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
 
         Assert.IsType<Ack.Accepted>(r.Ack);
         Assert.True(File.Exists(Path.Combine(_work, ".lilara", "claims.json")),
@@ -1979,7 +1979,7 @@ public class ClaimCommandTests : IDisposable
         var pk = Lilara.Core.Projects.ProjectKey.FromPath(_work);
         using var sub = bus.Subscribe(EventBus.ProjectTopic(pk));
 
-        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
 
         // ⚠️ **项目流，不是会话流**：声明是「谁在动哪些文件」，**跨会话**才有意义（03 §5）
         Assert.True(sub.Reader.TryRead(out var p), "声明必须发到项目流——会话流上别的人看不见");
@@ -2001,8 +2001,8 @@ public class ClaimCommandTests : IDisposable
         var a = NewSession(d);
         var b = NewSession(d);
 
-        await d.DispatchAsync(new CoreCommand.ClaimAcquire(a, "src"), "c1", false, CancellationToken.None);
-        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(b, "src\\a.cs"), "c2", false, CancellationToken.None);
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(a, ["src"]), "c1", false, CancellationToken.None);
+        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(b, ["src\\a.cs"]), "c2", false, CancellationToken.None);
 
         var rejected = Assert.IsType<Ack.Rejected>(r.Ack);
         Assert.Contains(a, rejected.Reason);   // ⚠️ 点名，不是一句「已被占用」
@@ -2014,8 +2014,8 @@ public class ClaimCommandTests : IDisposable
         var (_, d, _) = Harness();
         var sid = NewSession(d);
 
-        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
-        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c2", false, CancellationToken.None);
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
+        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c2", false, CancellationToken.None);
 
         Assert.IsType<Ack.Accepted>(r.Ack);
         // ⚠️ 第二次不该多出一条声明——否则右栏会列出两遍同一个区域。
@@ -2027,10 +2027,10 @@ public class ClaimCommandTests : IDisposable
     {
         var (_, d, bus) = Harness();
         var sid = NewSession(d);
-        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
 
         using var sub = bus.Subscribe(EventBus.ProjectTopic(Lilara.Core.Projects.ProjectKey.FromPath(_work)));
-        var r = await d.DispatchAsync(new CoreCommand.ClaimRelease(sid, "src"), "c2", false, CancellationToken.None);
+        var r = await d.DispatchAsync(new CoreCommand.ClaimRelease(sid, ["src"]), "c2", false, CancellationToken.None);
 
         Assert.IsType<Ack.Accepted>(r.Ack);
         Assert.Empty(ClaimsOf(_work));
@@ -2046,7 +2046,7 @@ public class ClaimCommandTests : IDisposable
         var sid = NewSession(d);
         using var sub = bus.Subscribe(EventBus.ProjectTopic(Lilara.Core.Projects.ProjectKey.FromPath(_work)));
 
-        var r = await d.DispatchAsync(new CoreCommand.ClaimRelease(sid, "never"), "c1", false, CancellationToken.None);
+        var r = await d.DispatchAsync(new CoreCommand.ClaimRelease(sid, ["never"]), "c1", false, CancellationToken.None);
 
         Assert.IsType<Ack.Accepted>(r.Ack);
         Assert.False(sub.Reader.TryRead(out _));
@@ -2084,7 +2084,7 @@ public async Task Acquire_WithAHandEditedBadClaimsFile_SurvivesInsteadOfKillingT
     Directory.CreateDirectory(Path.Combine(_work, ".lilara"));
     File.WriteAllText(Path.Combine(_work, ".lilara", "claims.json"), badJson);
 
-    var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+    var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
 
     // 坏条目被丢掉 ⇒ 这条命令**照常成功**，而不是把核心抛死。
     Assert.IsType<Ack.Accepted>(r.Ack);
@@ -2112,7 +2112,7 @@ public async Task Acquire_OnASessionThatIsOnlyOnDisk_IsFoundNotReportedMissing()
     var d2 = new CommandDispatcher(restarted, new EventBus(),
         h => new Stepper(restarted.Store, new Fakes.FakeAdapter()));
 
-    var r = await d2.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+    var r = await d2.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
 
     // ⚠️ 缺陷下这里是 `Rejected`（「没有会话 '…'」）——而会话明明在盘上。
     Assert.IsType<Ack.Accepted>(r.Ack);
@@ -2214,10 +2214,10 @@ public sealed class ClaimStore(string workingDirectory)
 
 ```csharp
     /// <summary>占用一片区域（`01` §12.2）。路径可以是相对的，按会话的工作目录解析。</summary>
-    public sealed record ClaimAcquire(string SessionId, string Path) : CoreCommand;
+    public sealed record ClaimAcquire(string SessionId, IReadOnlyList<string> Scope) : CoreCommand;
 
     /// <summary>释放。⚠️ 这是「模型失控时的逃生口」（`03` §3）——所以它**不检查**占用者是不是自己。</summary>
-    public sealed record ClaimRelease(string SessionId, string Path) : CoreCommand;
+    public sealed record ClaimRelease(string SessionId, IReadOnlyList<string> Scope) : CoreCommand;
 ```
 
 `WireEvent.cs`：
@@ -2305,15 +2305,21 @@ public sealed class ClaimStore(string workingDirectory)
         // ⚠️ **声明的落点是工作目录**（`01` §8：可分享的项目信息），而数据根里
         // 只存了会话——所以得先找一个会话问它的工作目录。没有会话时无从问起，如实回空数组。
         //
-        // ⚠️ **这里能用 `SelectMany`**：`TryFind` 是 `ControlServer` 的私有方法，
-        // 而 `ProjectDirs()` 给的是 `projects/` 下的**目录名**——那正是 `projectKey`。
+        // ⚠️ **读 spec，不用 `TryFind`——因为 `ControlServer.TryFind` 会 `Activate` 会话！**
+        // （见它的回落分支：`host.Activate(pk, sessionId)`。）
+        // 那意味着：**每拉一次 `/claims` 就把数据根下所有会话激活进内存**——
+        // 一个 **GET 端点产生了状态副作用**，而且**随会话数无限增长**。
+        // 与 `01` §8.3 的懒激活取向（「激活即缓存」，按需才有）相悖。
+        // ⇒ 直接 `TryReadSpec` 取 `WorkingDirectory`：**不激活、更简单、无副作用**。
+        // ⚠️ 而且**没有陈旧问题**：spec 的 `WorkingDirectory` 建会话时定下、之后不变
+        //（`SessionSpec.WorkingDirectory` 是 `init`），所以读盘那份与内存那份**必然一致**。
         app.MapGet("/claims", () =>
         {
             var claims = ProjectKeys()
-                .SelectMany(pk => host.Store.ListSessions(pk))
-                .Select(id => TryFind(id, out var h) ? h : null)
-                .Where(h => h is not null)
-                .SelectMany(h => new ClaimStore(h!.Spec.WorkingDirectory).All())
+                .SelectMany(pk => host.Store.ListSessions(pk)
+                    .Select(id => host.Store.TryReadSpec(pk, id)))
+                .Where(spec => spec is not null)
+                .SelectMany(spec => new ClaimStore(spec!.WorkingDirectory).All())
                 .Distinct()
                 .ToList();
 
