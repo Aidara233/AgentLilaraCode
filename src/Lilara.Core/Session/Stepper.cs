@@ -87,7 +87,17 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         {
             // 回到落盘的那份。⚠️ 用捕获的引用回放，不去读磁盘：
             // 读盘本身可能失败，那会把原始的失败原因盖掉。
-            handle.State = persisted;
+            //
+            // ⚠️ **回滚保留轴**：轴是**控制面状态**，不是这一步的产物——
+            // 回滚要撤销的是「这一步推进了什么」（`Turn` / `Status`），轴不在其中。
+            // `session.setAxis` **不拿会话闸**（`HandleSessionSetAxis` 里没有 `GateFor`），
+            // 所以它能在**整个模型调用**的窗口里发生——那正是这里会走到的失败 / 取消窗口。
+            // （不拿闸是刻意的：`01` §3.5 要求权限这类轴**即时生效**——「调整权限 =
+            // 改一个浮动字段，零前缀代价、即时生效」；排在闸后面等这一步跑完就不是即时了。）
+            // ⇒ 不保留的话，用户改的轴会被一次失败 / 中断**静默吞掉**：头收到过
+            // `axis.changed`、显示新值，而内存回到旧值、下一次请求带旧值发出去；
+            // 再下一次成功的步把旧值写回磁盘 ⇒ 用户看到的那个新值**就此消失，且没有报错**。
+            handle.State = persisted with { Axes = handle.State.Axes };
             throw;
         }
 

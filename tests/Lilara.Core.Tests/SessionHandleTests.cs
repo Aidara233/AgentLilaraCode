@@ -164,8 +164,10 @@ public class SessionHandleTests : IDisposable
     /// 且磁盘上看不出是哪次写坏的。
     ///
     /// <para>⚠️ **判据用 `Turn` 而不是 `Status`**：`"Running"` 只存在于内存
-    /// （`Stepper.cs:51` 那个 `with`），**磁盘上写过的状态只有 `"Idle"`**
-    /// （`SessionHandle.cs` 的建会话处与 `Stepper.cs` 的收尾处）——构造一个
+    /// （`Stepper.cs:51` 那个 `with`），**磁盘上写过的状态只有 `"Idle"`**——
+    /// 写点共三处：`SessionHandle.Create` 的播种、`Stepper` 的收尾、
+    /// `SessionHandle.SaveAxes`（`session.setAxis` 的写回点；它写整份 `State`，
+    /// 所以**先把 `Status` 钉回 `Idle`**，见那里的注释）。构造一个
     /// `Status = "Running"` 的 state 去落盘，等于在测一个真实数据里不存在的形状。
     /// 而 `Status = "Idle"` 又恰好是 `SessionState` 的默认语义，**抹掉它这条测试也发现不了**
     /// ⇒ 拿它当判据是假覆盖。`Turn` 的默认值是 0，抹掉会立刻显形。</para>

@@ -137,7 +137,7 @@ public sealed class CommandDispatcher(
 
     private DispatchResult HandleSessionActivate(CoreCommand.SessionActivate a, string id)
     {
-        if (!TryFind(a.SessionId, out _, out var rejection)) return rejection!;
+        if (!TryFind(a.SessionId, out _, out var notFound)) return Reject(id, notFound!);
 
         // ⚠️ 激活**只是载入内存**。它**不许**去写「控制台的当前会话」——
         // 那是控制台自己的概念（Repl.Current）。头点一下 B 就改掉控制台的当前会话，
@@ -148,7 +148,7 @@ public sealed class CommandDispatcher(
     private async Task<DispatchResult> HandleSessionSendAsync(
         CoreCommand.SessionSend s, string id, bool awaitCompletion, CancellationToken ct)
     {
-        if (!TryFind(s.SessionId, out var handle, out var rejection)) return rejection!;
+        if (!TryFind(s.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
         // ⚠️ **次序照 `01` §6.1 原文**：
         //   入队(x) → 若 x 是事件，**立即追加进记录** → 安排一次「启动」（去重）
@@ -312,7 +312,7 @@ public sealed class CommandDispatcher(
 
     private DispatchResult HandleSessionStart(CoreCommand.SessionStart s, string id)
     {
-        if (!TryFind(s.SessionId, out _, out var rejection)) return rejection!;
+        if (!TryFind(s.SessionId, out _, out var notFound)) return Reject(id, notFound!);
 
         // Task 4 接上队列语义（01 §6.1「启动」）。当前 send 已直接完成一步，故此处是 no-op。
         return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = s.SessionId });
@@ -320,7 +320,7 @@ public sealed class CommandDispatcher(
 
     private DispatchResult HandleSessionInterrupt(CoreCommand.SessionInterrupt i, string id)
     {
-        if (!TryFind(i.SessionId, out var handle, out var rejection)) return rejection!;
+        if (!TryFind(i.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
         // ⚠️ **两个条件都必需**，缺一不可：
         //   ① **该会话确实在跑**（`IsRunning`）——否则这次 interrupt 是在打断一个
@@ -357,7 +357,7 @@ public sealed class CommandDispatcher(
     /// </summary>
     private DispatchResult HandleSessionSetAxis(CoreCommand.SessionSetAxis x, string id)
     {
-        if (!TryFind(x.SessionId, out var handle, out var rejection)) return rejection!;
+        if (!TryFind(x.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
         if (!Axes.IsKnown(x.Axis))
             return Reject(id, $"没有 '{x.Axis}' 这条轴。可用的：{string.Join("|", Axes.Names)}");
@@ -393,11 +393,19 @@ public sealed class CommandDispatcher(
         return new DispatchResult(new Ack.Accepted { CommandId = id });
     }
 
-    /// <summary>找会话：先看激活表，miss 才扫项目目录回落到磁盘载入。</summary>
-    private bool TryFind(string sessionId, out SessionHandle handle, out DispatchResult? rejection)
+    /// <summary>
+    /// 找会话：先看激活表，miss 才扫项目目录回落到磁盘载入。
+    ///
+    /// <para>⚠️ **miss 时 out 的是「理由字符串」，不是拼好的回执**：回执的
+    /// <see cref="Ack.CommandId"/> 是**发起这条命令的那一方**给的 id（`Ack.CommandId` 的契约是
+    /// 「命令 id 由头生成，核心原样带回——头靠它把『我发过的那条』对上」），而 `sessionId`
+    /// 是**另一个**东西。在这里拼 `Reject` 只能用会话 id 当 `CommandId`（错误），
+    /// 所以把理由交回调用方，由它用自己的命令 id 去 `Reject`。</para>
+    /// </summary>
+    private bool TryFind(string sessionId, out SessionHandle handle, out string? notFoundReason)
     {
         handle = null!;
-        rejection = null;
+        notFoundReason = null;
 
         if (_host.TryGetActivated(sessionId, out var activated))
         {
@@ -415,7 +423,7 @@ public sealed class CommandDispatcher(
             return true;
         }
 
-        rejection = Reject(sessionId, $"会话 '{sessionId}' 不存在。");
+        notFoundReason = $"会话 '{sessionId}' 不存在。";
         return false;
     }
 

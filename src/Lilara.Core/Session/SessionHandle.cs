@@ -207,13 +207,27 @@ public sealed record SessionHandle
     /// <summary>
     /// 把轴写进 `state.json`（`session.setAxis` 的写回点，Task 3）。
     ///
-    /// <para>⚠️ **它就是 <see cref="SaveState"/>，不是另一次写。** 轴住在
-    /// <see cref="SessionState.Axes"/> 里，与 `Turn` / `Status` **同一份** `State`——
-    /// 所以「改了轴却把 `Turn` 抹掉」这种分叉在结构上不可能发生。
+    /// <para>⚠️ **轴与 `Turn` / `Status` 住同一份 `State`**（<see cref="SessionState.Axes"/>），
+    /// 所以这里写的是**整份** `State`——「改了轴却把 `Turn` 抹掉」这种分叉在结构上不可能发生。
     /// 保留这个名字只是让调用点自己说清楚「我改的是轴」。</para>
+    ///
+    /// <para>⚠️ **但正因为写的是整份 `State`，`Status` 得先钉回磁盘语义。**
+    /// `session.setAxis` **不拿会话闸**，所以它能在**整个模型调用**的窗口里发生——
+    /// 而那时内存里的 `Status` 已经被 `Stepper` 置成了 `Running`（`Stepper.cs:51`，
+    /// 刻意**只写内存、不落盘**：这是被 `WireEvent` / `CommandDispatcher` / `CoreHost` /
+    /// `SessionQueries` 四处断言的「磁盘从不存 Running」）。不钉的话，一次 `setAxis`
+    /// 就把 `Running` 带上了磁盘 ⇒ 进程在步中被 kill 后 `Load` 读到它 ⇒ 快照如实回
+    /// `Running` ⇒ **会话永远显示在跑，而没有任何步在跑**，也永远等不到 `step.end`。</para>
+    ///
+    /// <para>⚠️ **钉成 `Idle` 的依据**：运行时给 `Status` 赋过的值只有两个——
+    /// `Idle`（`Create` 的播种、`Stepper` 的收尾，都上盘）与 `Running`（只上内存）。
+    /// ⇒ 今天 `Running` 是**唯一**的内存专有取值，钉成 `Idle` 是对的。
+    /// ⚠️ 将来若别的内存专有状态真的接上（`WaitingForInput` 等），这里要跟着改——
+    /// 判据是「磁盘上合法的是哪些取值」，不是「钉成 Idle」这个动作本身。</para>
     ///
     /// <para>⚠️ 改轴要走 `handle.State = handle.State with { Axes = … }` 再调这里：
     /// `SessionState` 是 record，`Axes` 是 `init`，就地改不了。</para>
     /// </summary>
-    public void SaveAxes(SessionStore store) => SaveState(store);
+    public void SaveAxes(SessionStore store) =>
+        store.WriteState(ProjectKey, State with { Status = "Idle" });
 }

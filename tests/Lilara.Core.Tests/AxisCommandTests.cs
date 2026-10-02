@@ -256,4 +256,146 @@ public class AxisCommandTests : IDisposable
         Assert.NotEmpty(adapter.Calls);
         Assert.Equal("max", adapter.Calls[^1].Effort);
     }
+
+    /// <summary>
+    /// ⚠️ **步进行中改的轴，不能被这一步的失败回滚吞掉。**
+    ///
+    /// <para>窗口是**整个模型调用**（不是几条指令宽）：`session.setAxis` 不拿会话闸，
+    /// 而 `Stepper` 在步开始时存下 `persisted = handle.State`，失败时
+    /// `handle.State = persisted; throw;`——原样放回的是**整份** `State`，含 `Axes`。
+    /// 这条走完整条命令路：**步进行中改轴 → 这一步失败 → 查轴**。</para>
+    ///
+    /// <para>症状：头把 effort 拨到 `max`（正好在模型调用那段时间里），这一步随后失败。
+    /// 头收到过 `axis.changed`、显示 `max`，磁盘也写着 `max`；而**内存回到 `high`**，
+    /// 下一次请求带 `high`；再下一次成功的步把 `high` 写回磁盘 ⇒ 用户看到的 `max`
+    /// **就此消失，且没有任何报错**。</para>
+    ///
+    /// <para>⚠️ **内存那条才是本缺陷的判据**——磁盘上它一直是 `max`（改轴那一次
+    /// `SaveAxes` 已经写过盘了），磁盘断言留着是为了同时钉住「改轴确实落盘」。</para>
+    /// </summary>
+    [Fact]
+    public async Task StepFailure_DoesNotSwallowAnAxisChangedMidStep()
+    {
+        var host = new CoreHost(_root, _work);
+        host.Providers.Save(new ProviderDefinition
+        {
+            Id = "p", Protocol = Protocols.ClaudeMessages, ApiKey = "k",
+            DefaultModel = "m", Modality = "vision",
+        });
+        var adapter = new DuringCallAdapter { Fail = true };
+        var d = new CommandDispatcher(host, new EventBus(), h => new Stepper(host.Store, adapter));
+        var created = await d.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        host.TryGetActivated(sid, out var session);
+
+        // 钩子 = 「步正卡在模型调用里」的那一刻
+        adapter.DuringCall = () => d.DispatchAsync(
+            new CoreCommand.SessionSetAxis(sid, "effort", "max"), "a1", false, CancellationToken.None);
+
+        await Assert.ThrowsAsync<DispatchException>(() => d.DispatchAsync(
+            new CoreCommand.SessionSend(sid, [new Block.TextBlock("hi")]), "a2", true, CancellationToken.None));
+
+        // 内存：这一步的失败**不许**把用户改的轴吞掉
+        Assert.Equal("max", session.State.Axes![Axes.Effort]);
+        // 磁盘：轴落了盘，且没被回滚波及
+        var reloaded = SessionHandle.Load(host.Store, session.ProjectKey, sid);
+        Assert.Equal("max", reloaded.State.Axes![Axes.Effort]);
+    }
+
+    /// <summary>
+    /// ⚠️ **步进行中改轴，不许把内存专用的 `Running` 带上磁盘。**
+    ///
+    /// <para>`SaveAxes` 写的是**整份** `State`，而步进行中内存里 `Status` 是 `"Running"`
+    /// （`Stepper` 只写内存，刻意不落盘——「磁盘从不存 Running」是被四处断言的不变量）。
+    /// 不修的话：改轴后进程被 kill / 崩溃 ⇒ 重启 `Load` 读到 `Status="Running"` ⇒
+    /// 快照如实回 `Running` ⇒ **会话永远显示在跑，而没有任何步在跑**，也永远等不到 `step.end`。</para>
+    ///
+    /// <para>⚠️ 断言的是**磁盘文本**（落盘的原始字节），不是 `handle.State.Status`——
+    /// 后者在修复前后**都是 `Running`**（那正是设计），对这条缺陷没有区分力。
+    /// 也**必须在步进行中读**：步正常收尾时 `Stepper` 会把 `Idle` 写回去，
+    /// 事后再读那个文本在两个版本里都对，同样没有区分力。</para>
+    /// </summary>
+    [Fact]
+    public async Task SetAxisDuringAStep_DoesNotWriteRunningToDisk()
+    {
+        var host = new CoreHost(_root, _work);
+        host.Providers.Save(new ProviderDefinition
+        {
+            Id = "p", Protocol = Protocols.ClaudeMessages, ApiKey = "k",
+            DefaultModel = "m", Modality = "vision",
+        });
+        var adapter = new DuringCallAdapter();
+        var d = new CommandDispatcher(host, new EventBus(), h => new Stepper(host.Store, adapter));
+        var created = await d.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        host.TryGetActivated(sid, out var session);
+
+        string? statusDuringCall = null;
+        string? onDiskDuringCall = null;
+        adapter.DuringCall = () =>
+        {
+            statusDuringCall = session.State.Status;
+            d.DispatchAsync(new CoreCommand.SessionSetAxis(sid, "safety", "prod"), "a1", false, CancellationToken.None)
+                .GetAwaiter().GetResult();
+            onDiskDuringCall = File.ReadAllText(session.StatePath);
+            return Task.CompletedTask;
+        };
+
+        await d.DispatchAsync(
+            new CoreCommand.SessionSend(sid, [new Block.TextBlock("hi")]), "a2", true, CancellationToken.None);
+
+        // 前提：窗口确实是「步进行中」，否则这条测试根本没测到它
+        Assert.Equal("Running", statusDuringCall);
+        Assert.NotNull(onDiskDuringCall);
+        Assert.DoesNotContain("Running", onDiskDuringCall);
+    }
+
+    /// <summary>
+    /// ⚠️ **回执的 `CommandId` 必须原样带回命令 id，不是会话 id。**
+    ///
+    /// <para>契约：命令 id 由头生成，核心**原样带回**——头靠它把「我发过的那条」对上。
+    /// 而 `TryFind` 原先在 miss 时直接 `Reject(sessionId, …)`，把**会话 id** 当成了
+    /// `CommandId` 回出去。今天无害（线上的回执用帧自己的 id），但契约是错的，
+    /// 且这是本轮修复给 `setAxis` 带来的一处相对回退（改前它是 `Reject(id, …)`）。</para>
+    /// </summary>
+    [Fact]
+    public async Task SetAxis_OnAnUnknownSession_EchoesTheCommandIdNotTheSessionId()
+    {
+        var (_, d, _, _) = Harness();
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionSetAxis("nope", "safety", "prod"), "cmd-7", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(r.Ack);
+        Assert.Equal("cmd-7", r.Ack.CommandId);
+    }
+
+    /// <summary>
+    /// 在**模型调用的整个窗口**里执行一个钩子，然后按需失败或正常返回。
+    /// ⚠️ 钩子是**同步阻塞**执行的：`session.setAxis` 不拿会话闸，所以它能在整个模型调用里跑
+    /// ——这正是上面两条测试要复现的窗口。
+    /// </summary>
+    private sealed class DuringCallAdapter : IModelAdapter
+    {
+        /// <summary>模型调用的窗口里要做的事（测试在这里发 `session.setAxis`）。</summary>
+        public Func<Task>? DuringCall { get; set; }
+
+        /// <summary>调用末尾是否抛失败（`StepFailure_*` 那条用）。</summary>
+        public bool Fail { get; set; }
+
+        public ResolvedEndpoint? Endpoint => null;
+        public string Protocol => Protocols.ClaudeMessages;
+
+        public Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct)
+        {
+            DuringCall?.Invoke().GetAwaiter().GetResult();
+            if (Fail) throw new ModelCallFailedException("上游 503");
+            return Task.FromResult(new ModelReply
+            {
+                Blocks = [new Block.TextBlock("ok")],
+                StopReason = "end_turn",
+                Refused = false,
+            });
+        }
+    }
 }
