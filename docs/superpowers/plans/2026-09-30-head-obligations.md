@@ -2025,6 +2025,34 @@ public class ClaimCommandTests : IDisposable
     private static List<Claim> ClaimsOf(string work) =>
         new ClaimStore(work).All().ToList();
 }
+
+/// <summary>
+/// ⚠️ **核心重启后，会话在盘上、不在内存激活表里。**
+/// `claim` 走 `TryGetActivated` 时会回一句**假话**——「没有会话 '…'」，而它存在。
+/// ⚠️ **这是 T3 那个缺陷的原样重演**（`9c3bd0d` 修过 `session.setAxis` 同一处），
+/// 所以测试的形状照抄那条：**让会话只存在于磁盘上**，再调。
+///
+/// <para>⚠️ **"重启"用一个新 `CoreHost` 表达**（指向同一个数据根），
+/// 因为新宿主天然有一张空的激活表。**别**用别的办法模拟——
+/// 激活表是私有的，而"新宿主"正是真实的重启语义。</para>
+/// </summary>
+[Fact]
+public async Task Acquire_OnASessionThatIsOnlyOnDisk_IsFoundNotReportedMissing()
+{
+    var (_, d, _) = Harness();
+    var sid = NewSession(d);                // 用一个宿主建会话……
+
+    // ……然后换一个**新宿主**指向同一个数据根：它的激活表是空的，
+    // 于是这个会话此刻**只存在于磁盘上**——核心重启后的真实形态。
+    var restarted = new CoreHost(_root, _work);
+    var d2 = new CommandDispatcher(restarted, new EventBus(),
+        h => new Stepper(restarted.Store, new Fakes.FakeAdapter()));
+
+    var r = await d2.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+
+    // ⚠️ 缺陷下这里是 `Rejected`（「没有会话 '…'」）——而会话明明在盘上。
+    Assert.IsType<Ack.Accepted>(r.Ack);
+}
 ```
 
 在 `ControlServerTests.cs` 追加：
@@ -2128,8 +2156,12 @@ public sealed class ClaimStore(string workingDirectory)
 ```csharp
     private DispatchResult HandleClaimAcquire(CoreCommand.ClaimAcquire c, string id)
     {
-        if (!_host.TryGetActivated(c.SessionId, out var handle))
-            return Reject(id, $"没有会话 '{c.SessionId}'。");
+        // ⚠️ **找会话走 `TryFind`，不是只看激活表。** 核心重启之后会话**在盘上、不在内存里**，
+        // 只看激活表会回一句**假话**——「没有会话 '…'」，而它存在，只是没被激活。
+        // ⚠️ **这是 T3 那个缺陷的原样重演**：`HandleSessionSetAxis` 修过一次
+        // （`9c3bd0d`，`TryGetActivated` → `TryFind`），这里是两个**新**处理器又写回去了。
+        // ⇒ 纪律：`CommandDispatcher` 里**任何**「按 id 取会话」都必须走 `TryFind`。
+        if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
         var store = new ClaimStore(handle.Spec.WorkingDirectory);
         var path = Claims.Normalize(c.Path, handle.Spec.WorkingDirectory);
@@ -2156,8 +2188,8 @@ public sealed class ClaimStore(string workingDirectory)
 
     private DispatchResult HandleClaimRelease(CoreCommand.ClaimRelease c, string id)
     {
-        if (!_host.TryGetActivated(c.SessionId, out var handle))
-            return Reject(id, $"没有会话 '{c.SessionId}'。");
+        // ⚠️ 同上：`TryFind`，不是 `TryGetActivated`。
+        if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
         var store = new ClaimStore(handle.Spec.WorkingDirectory);
         var path = Claims.Normalize(c.Path, handle.Spec.WorkingDirectory);
