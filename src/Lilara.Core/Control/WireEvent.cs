@@ -22,6 +22,8 @@ namespace Lilara.Core.Control;
 [JsonDerivedType(typeof(MessageAppended), "message.appended")]
 [JsonDerivedType(typeof(StateChanged), "session.state")]
 [JsonDerivedType(typeof(AxisChanged), "axis.changed")]
+[JsonDerivedType(typeof(ClaimAcquired), "claim.acquired")]
+[JsonDerivedType(typeof(ClaimReleased), "claim.released")]
 [JsonDerivedType(typeof(Error), "error")]
 public abstract record WireEvent
 {
@@ -58,6 +60,11 @@ public abstract record WireEvent
     /// 头据此更新显示；若是 `safety` 或 `permission`，还要重算跨轴告警。
     /// </summary>
     public sealed record AxisChanged(string SessionId, string Axis, string Value) : WireEvent;
+
+    /// <summary>⚠️ 发到**项目流**（`03` §5）——「谁在动哪些文件」跨会话才有意义。</summary>
+    public sealed record ClaimAcquired(string SessionId, string Path) : WireEvent;
+
+    public sealed record ClaimReleased(string SessionId, string Path) : WireEvent;
 
     /// <summary>
     /// ⚠️ **业务失败走这里，不走回执**（`03` §3）：模型 400 / 上游 503 / 提供商失联

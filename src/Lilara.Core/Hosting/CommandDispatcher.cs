@@ -63,6 +63,9 @@ public sealed class CommandDispatcher(
             case CoreCommand.SessionSetAxis x:
                 return HandleSessionSetAxis(x, commandId);
 
+            case CoreCommand.ClaimAcquire a: return HandleClaimAcquire(a, commandId);
+            case CoreCommand.ClaimRelease r: return HandleClaimRelease(r, commandId);
+
             default:
                 return Reject(commandId, $"认不出的命令：{command.GetType().Name}");
         }
@@ -389,6 +392,59 @@ public sealed class CommandDispatcher(
 
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
             new WireEvent.AxisChanged(handle.SessionId, x.Axis, canonical));
+
+        return new DispatchResult(new Ack.Accepted { CommandId = id });
+    }
+
+    private DispatchResult HandleClaimAcquire(CoreCommand.ClaimAcquire c, string id)
+    {
+        // ⚠️ **找会话走 `TryFind`，不是只看激活表。** 核心重启之后会话**在盘上、不在内存里**，
+        // 只看激活表会回一句**假话**——「没有会话 '…'」，而它存在，只是没被激活。
+        // ⚠️ **这是 T3 那个缺陷的原样重演**：`HandleSessionSetAxis` 修过一次
+        // （`9c3bd0d`，`TryGetActivated` → `TryFind`），这里是两个**新**处理器又写回去了。
+        // ⇒ 纪律：`CommandDispatcher` 里**任何**「按 id 取会话」都必须走 `TryFind`。
+        if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
+
+        var store = new ClaimStore(handle.Spec.WorkingDirectory);
+        var path = Claims.Normalize(c.Path, handle.Spec.WorkingDirectory);
+
+        // ⚠️ **冲突 ⇒ rejected 且点名持有者**（`01` §12.2）。这句话是「你的工作集会被作废」
+        // 在界面上唯一能被看见的地方——只回一句「已被占用」，用户不知道去找谁。
+        var clash = Claims.FindConflict(store.All(), c.SessionId, path);
+        if (clash is not null)
+            return Reject(id, $"'{path}' 已被会话 {clash.SessionId} 占用。");
+
+        var all = store.All().ToList();
+        if (all.Any(x => x.SessionId == c.SessionId && x.Path == path))
+            return new DispatchResult(new Ack.Accepted { CommandId = id });   // 幂等
+
+        all.Add(new Claim(c.SessionId, handle.ProjectKey, path, DateTimeOffset.UtcNow));
+        store.Save(all);
+
+        // ⚠️ **项目流**：声明是跨会话的（`03` §5）
+        _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
+            new WireEvent.ClaimAcquired(c.SessionId, path));
+
+        return new DispatchResult(new Ack.Accepted { CommandId = id });
+    }
+
+    private DispatchResult HandleClaimRelease(CoreCommand.ClaimRelease c, string id)
+    {
+        // ⚠️ 同上：`TryFind`，不是 `TryGetActivated`。
+        if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
+
+        var store = new ClaimStore(handle.Spec.WorkingDirectory);
+        var path = Claims.Normalize(c.Path, handle.Spec.WorkingDirectory);
+
+        var all = store.All().ToList();
+        // ⚠️ **逃生口**（`03` §3）：不检查占用者是不是自己——模型失控时，
+        // 用户要能从一个**别的**会话里把锁摘掉。
+        var removed = all.RemoveAll(x => x.Path == path);
+        if (removed == 0) return new DispatchResult(new Ack.Accepted { CommandId = id });
+
+        store.Save(all);
+        _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
+            new WireEvent.ClaimReleased(c.SessionId, path));
 
         return new DispatchResult(new Ack.Accepted { CommandId = id });
     }

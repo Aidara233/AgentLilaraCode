@@ -206,6 +206,27 @@ public sealed class ControlServer(
             AlertSafety = Session.Axes.AlertSafety,
             AlertFrom = Session.Axes.AlertFrom,
         }, WireJson.Options));
+
+        // ⚠️ **没有声明时返回 `[]`**（`03` §6）。「这个项目没人声明任何东西」
+        // 是合法且最常见的形态——回 404 会让头以为端点写错了。
+        //
+        // ⚠️ **声明的落点是工作目录**（`01` §8：可分享的项目信息），而数据根里
+        // 只存了会话——所以得先找一个会话问它的工作目录。没有会话时无从问起，如实回空数组。
+        //
+        // ⚠️ **这里能用 `SelectMany`**：`TryFind` 是 `ControlServer` 的私有方法，
+        // 而 `ProjectDirs()` 给的是 `projects/` 下的**目录名**——那正是 `projectKey`。
+        app.MapGet("/claims", () =>
+        {
+            var claims = ProjectKeys()
+                .SelectMany(pk => host.Store.ListSessions(pk))
+                .Select(id => TryFind(id, out var h) ? h : null)
+                .Where(h => h is not null)
+                .SelectMany(h => new ClaimStore(h!.Spec.WorkingDirectory).All())
+                .Distinct()
+                .ToList();
+
+            return Results.Json(claims, WireJson.Options);
+        });
     }
 
     /// <summary>
@@ -445,6 +466,13 @@ public sealed class ControlServer(
                 payload.GetProperty("sessionId").GetString()!,
                 payload.GetProperty("axis").GetString()!,
                 payload.GetProperty("value").GetString()!),
+            // ⚠️ 与 `session.setAxis` 同一条纪律：线上解析是命令的**第三条线**。
+            // ⚠️ **只有 release，没有 acquire**——`03` §3 的命令表里资源那节只有 release，
+            // 且 §8.2 把它归入「止血」（头在核心/控制台不响应时的逃生口）。
+            // 头的认领动作走控制台（T8），头自己**从不发** `claim.acquire`。
+            "claim.release" => new CoreCommand.ClaimRelease(
+                payload.GetProperty("sessionId").GetString()!,
+                payload.GetProperty("path").GetString()!),
             "provider.upsert" => new CoreCommand.ProviderUpsert(
                 payload.GetProperty("id").GetString()!,
                 payload.GetProperty("apiKey").GetString()!,

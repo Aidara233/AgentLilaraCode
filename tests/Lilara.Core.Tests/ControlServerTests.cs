@@ -484,4 +484,55 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Equal("prod", doc.RootElement.GetProperty("alertSafety").GetString());
         Assert.Equal("authorized", doc.RootElement.GetProperty("alertFrom").GetString());
     }
+
+    /// <summary>
+    /// ⚠️ **没有 `claims.json` 时返回 `[]`，不是 404 也不是 500**——
+    /// 「这个项目没人声明任何东西」是合法且**最常见**的形态。
+    /// </summary>
+    [Fact]
+    public async Task Claims_WithNoClaimsFile_IsAnEmptyArray()
+    {
+        var r = await Client.GetAsync(Http("/claims"));
+
+        Assert.Equal(System.Net.HttpStatusCode.OK, r.StatusCode);
+        Assert.Equal("[]", (await r.Content.ReadAsStringAsync()).Trim());
+    }
+
+    /// <summary>
+    /// ⚠️ **走真 WS，不是直接调 dispatcher。** 后者在接线缺失时会**照样绿**——
+    /// 它绕过的正是本条要钉的那一层。实现前这条必须红，且红的方式应当是
+    /// 「认不出的命令 'claim.release'」。
+    /// </summary>
+    [Fact]
+    public async Task WebSocket_ClaimRelease_ReachesTheDispatcher()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        // ⚠️ 先占上。`claim.acquire` **不在**线上命令表里（`03` §3 资源那节只有 release），
+        // 所以这里直接走 dispatcher——认领是控制台/模型的动作，头**从不发**它。
+        await _dispatcher.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c2", false, CancellationToken.None);
+        Assert.NotEmpty(new ClaimStore(_work).All());
+
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        // ⚠️ **用拼接而不是 `$$"""`**：内插原始字符串里，载荷末尾的 `}}}` 会被当成内插洞的收尾
+        // （`CS9007`）——见 `WebSocket_AcksCommandsAndStreamsEvents` 的同款注释。
+        await SendAsync(ws, "{\"kind\":\"command\",\"id\":\"a1\",\"payload\":{\"kind\":\"claim.release\","
+            + "\"sessionId\":\"" + sid + "\",\"path\":\"src\"}}");
+
+        var ack = await ReceiveAsync(ws);
+        Assert.Equal("ack", ack.GetProperty("kind").GetString());
+        // ⚠️ **理由必须惰性取**：`WireJson.Options` 的 `WhenWritingNull` 把成功回执的 `reason`
+        // 整个省略（camelCase），`ack.GetProperty("reason")` 会**抛 KeyNotFoundException**。
+        // 而 `Assert.True` 的消息串是**无条件先求值**的——直接拼进去，成功那条路也照样炸。
+        // ⇒ 用 `TryGetProperty`，它在两种形态下都不抛。
+        Assert.True(ack.GetProperty("accepted").GetBoolean(),
+            "认不出这条命令——`ParseCommand` 的 switch 漏了它："
+            + (ack.TryGetProperty("reason", out var why) ? why.GetString() : "(无 reason 字段)"));
+
+        // ⚠️ 判据是「**命令真的生效了**」，不只是「回执说 accepted」——
+        // 回执可以说 accepted 而语义根本没跑（那正是「形状对但接不上」的形态）。
+        Assert.Empty(new ClaimStore(_work).All());
+    }
 }

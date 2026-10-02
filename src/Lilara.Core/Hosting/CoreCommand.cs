@@ -35,6 +35,12 @@ public abstract record CoreCommand
     /// ⚠️ 取值校验在 dispatcher（**线上也要吃**），控制台只做文本拆词。
     /// </summary>
     public sealed record SessionSetAxis(string SessionId, string Axis, string Value) : CoreCommand;
+
+    /// <summary>占用一片区域（`01` §12.2）。路径可以是相对的，按会话的工作目录解析。</summary>
+    public sealed record ClaimAcquire(string SessionId, string Path) : CoreCommand;
+
+    /// <summary>释放。⚠️ 这是「模型失控时的逃生口」（`03` §3）——所以它**不检查**占用者是不是自己。</summary>
+    public sealed record ClaimRelease(string SessionId, string Path) : CoreCommand;
 }
 
 /// <summary>
