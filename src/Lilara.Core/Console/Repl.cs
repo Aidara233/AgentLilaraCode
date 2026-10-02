@@ -153,6 +153,18 @@ public sealed class Repl(
                     if (Current is not null && Current.SessionId == set.SessionId) PrintStatus();
                     break;
 
+                // ⚠️ 声明**成功了要吭一声**：`claim` 的 `Ack.Accepted.Reply` 是 **null**，
+                // 于是落进 `default: PrintReply(null)` ⇒ **一声不吭**。
+                // 用户分不清「占了」与「没反应」——而这正是「静默成功」最坏的地方：
+                // 他下一步会在一个自以为占上的地方工作。
+                case CoreCommand.ClaimAcquire acquire:
+                    _out.WriteLine($"✓ 已占 {string.Join("、", acquire.Scope)}");
+                    break;
+
+                case CoreCommand.ClaimRelease release:
+                    _out.WriteLine($"✓ 已释放 {string.Join("、", release.Scope)}");
+                    break;
+
                 default:
                     PrintReply(result.Reply);
                     break;

@@ -529,4 +529,21 @@ public class ReplTests : IDisposable
 
         Assert.Contains("没有声明", _out.ToString());
     }
+
+    /// <summary>
+    /// ⚠️ **`claim` 成功时要吭一声。** `Ack.Accepted.Reply` 是 null ⇒ 不加分支就落进
+    /// `default: PrintReply(null)` ⇒ **静默成功**，用户分不清「占了」与「没反应」，
+    /// 下一步会在一个自以为占上的地方工作。
+    /// ⚠️ `NewHarness()` 已经把 `repl.Current` 设好了，所以 `claim src` 走命令通道能成功。
+    /// </summary>
+    [Fact]
+    public async Task Claim_OnSuccess_SaysWhatWasTaken()
+    {
+        var (repl, _, _) = NewHarness();
+
+        await repl.ExecuteAsync("claim src/foo", CancellationToken.None);
+
+        Assert.Contains("已占", _out.ToString());
+        Assert.Contains("src/foo", _out.ToString());
+    }
 }
