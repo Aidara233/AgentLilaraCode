@@ -113,7 +113,7 @@ handle.State.Axes["effort"] = "max" ← 用户刚改的
 | D1 | **义务 3 阻塞** | 权限闸门的前提是工具；工具集从插件宿主派生而插件宿主不存在。做成空壳等于让用户分不清「没待审批」与「闸门坏了」 |
 | D2 | **`WaitingForInput` / `Blocked` 仍是死状态** | 它们的产生者分别是闸门与退避重试，都不存在；本计划**不假装**它们会出现 |
 | D3 | **声明不接写入守卫** | `01` §12.2 的「写入时自动检查」要求有写入路径（工具）；本计划只做「声明主动」那一格 + 冲突可见 |
-| D4 | **声明不做「同一派生树内不阻塞」** | `01` §12.1 的例外需要派生树概念，而 `child.spawned` 不存在。**单会话下该例外不可能触发**；多会话下会**过阻塞**（保守方向，且可见）。写进注释 |
+| D4 | **声明不做「同一派生树内不阻塞」** | `01` §12.1 的例外需要派生树概念，而 `child.spawned` 不存在 ⇒ **没有派生树，那个例外没有输入可作用**。⚠️ **不是「多会话下会过阻塞」**（那个说法是错的）：本计划的声明**不阻塞任何东西**（D3），所以漏做这个例外不可能多拦下一件事——它至多在树内产生一次**误报**冲突（一个多余的可见信号）。等阻塞机制与派生树一并出现时，这个例外要一起补。写进注释 |
 | D5 | **头不重算前缀指纹** | `05` §1 说头应「重新算并显示」。指纹的输入是工具表 ∥ 系统块 ∥ 首要块，前两者现在是空集——算出来是一个常量，**显示一个常量不是可见性** |
 | D6 | **不做 `term.delta` / 附件 / 库 / 控制点 / `dirty.changed`** | 保持既有偏离（见控制面分支的台账） |
 | D7 | **不做长历史分页 / 虚拟滚动 / 多标签页** | `05` §11 的「本文自身待展开」，本计划不含 |
@@ -1632,7 +1632,9 @@ public class ClaimTests
     /// `Replace(AltDirectorySeparatorChar, DirectorySeparatorChar)` **是冗余的**，
     /// 这条测试对**那半句没有区分力**（删掉它这条照样绿）。
     /// 留着它是因为它钉的是**契约**（两种分隔符等价），而契约是对的。
-    /// ⚠️ 拿掉 `GetFullPath` 换成手拼字符串，这条**必须**红。
+    /// ⚠️ **要让它红得连 `Replace` 一起去掉**——实测过：只拿掉 `GetFullPath`
+    /// （保留 `Replace`）这条**照样绿**，因为 `Replace` 仍把 `/` 统一成 `\`；
+    /// 那时唯一红的是 `Normalize_ResolvesDotSegments`。**两处一起去才红。**
     /// </summary>
     [Fact]
     public void Normalize_TreatsBothSeparatorsTheSame()
@@ -1751,8 +1753,10 @@ public sealed record Claim(string SessionId, string ProjectKey, string Path, Dat
 /// 而那个会话看得见这里。</para>
 ///
 /// <para>⚠️ **不做「同一派生树内不阻塞」那个例外**（§12.1）：它需要派生树概念，
-/// 而 `child.spawned` 不存在。单会话下该例外不可能触发；多会话下会**过阻塞**——
-/// 保守方向，且冲突是**可见**的。见计划的 D4。</para>
+/// 而 `child.spawned` 不存在 ⇒ 本计划里根本没有派生树，那个例外**没有输入可作用**。
+/// ⚠️ **别写成「过阻塞」**：见上，本计划的声明**不阻塞任何东西**，所以漏做这个例外
+/// 不可能多拦下一件事——它至多让同一棵树内的一对声明被判成冲突（一次**误报**，
+/// 一个多余的可见信号）。等阻塞机制与派生树一并出现时，这个例外要一起补。见计划的 D4。</para>
 /// </summary>
 public static class Claims
 {
@@ -1776,11 +1780,18 @@ public static class Claims
     /// 写一条跑不了的测试等于没有测试。
     /// ⇒ **记为已知偏离（本任务 D9）**，不是已知正确：两个路径经不同链接指向同一处时，
     /// 判据会**漏报**冲突（方向是漏，不是误报）。修法与判据改写见 T7 之后。</para>
+    ///
+    /// <para>⚠️ **上面那段「跨平台」论证只覆盖大小写这一半，别读成全覆盖。**
+    /// 判据的另一半——分隔符边界——用的是**当次运行时的** <c>Path.DirectorySeparatorChar</c>
+    /// （见 <see cref="Conflicts"/> 的 <c>IsUnder</c>）。所以 Windows 写下的
+    /// <c>claims.json</c>（路径含 `\`）在别的平台上被规范化成 `/` 之后，
+    /// 边界字符对不上，**冲突判不出**。⇒ **这是与 D9 同族的第二处缺口**，
+    /// 不是「已解决」。今天不修：本机只跑 Windows，且写不出跨平台测试（同 D9 的理由）。</para>
     /// </summary>
     public static string Normalize(string path, string workingDirectory)
     {
-        // ⚠️ 相对路径折叠成**绝对**，用的是进程当前目录（`GetFullPath` 的语义）。
-        // `workingDirectory` 只在 `path` 不是绝对路径时用来拼前缀。
+        // ⚠️ 相对路径折叠成绝对：基址是 **`workingDirectory`**（经 `Path.Combine`），
+        // 仅当 `workingDirectory` **本身**是相对路径时，进程当前目录才介入。
         var combined = Path.IsPathRooted(path) ? path : Path.Combine(workingDirectory, path);
 
         // ⚠️ `Path.GetFullPath` 顺手折叠掉 `.` 与 `..`——自己拼字符串做这件事会漏掉
@@ -1799,8 +1810,15 @@ public static class Claims
         // **正确工作**。实测（`IsUnder` 逐字照抄本实现跑的）：
         //   `IsUnder("c:",  "c:\repo")`  → **True**   ← 去尾这一版，判对
         //   `IsUnder("c:\", "c:\repo")`  → **False**  ← 保留反斜杠那一版，判错
-        // ⚠️ 即：保留根的反斜杠会让根路径与它下面的**一切**都判不出冲突——**静默失效**，
+        // ⚠️ **即：保留根的反斜杠会让根路径与它下面的**一切**都判不出冲突——**静默失效**，
         // 正是 `01` §12 要防的。守卫在 `Normalize_RootPath_StillConflictsWithEverythingUnderIt`。
+        //
+        // ⚠️ **但 `c:` 只在这个前提下安全：它不再被送回 `Normalize`。**
+        // `c:` 是 **drive-relative**（`IsPathRooted("c:")` 为真，而
+        // `GetFullPath("c:")` 给的是**进程当前目录所在的盘**）——实测
+        // `Normalize(Normalize(@"C:\"))` 会得到进程 CWD 下的路径，**静默变成另一个目录**。
+        // 今天安全，因为本方法的结果只被**比较**与**落盘**；将来谁加一层
+        // 「读回来再规范化」，这个不动点缺口就会显形。⇒ **别回炉。**
         var trimmed = full.TrimEnd(Path.DirectorySeparatorChar);
         return (trimmed.Length == 0 ? full : trimmed).ToLowerInvariant();
     }
@@ -2105,8 +2123,20 @@ public sealed class ClaimStore(string workingDirectory)
 
         try
         {
-            return System.Text.Json.JsonSerializer.Deserialize<List<Claim>>(
+            var parsed = System.Text.Json.JsonSerializer.Deserialize<List<Claim>>(
                 File.ReadAllText(Path_), Canonical.Json.Options) ?? [];
+
+            // ⚠️ **丢掉 `Path` 为 null 的条目**——这是**回读边界**，不是多余的守卫。
+            // `claims.json` 在**工作目录**里、可分享、**人手可编辑**，而
+            // `Canonical.Json.Options` 没开 `RespectNullableAnnotations` ⇒
+            // `"path": null` 是**合法 JSON**、能反序列化成 `Claim.Path = null`，
+            // **不会**进下面的 `catch (JsonException)`。
+            // ⇒ 不丢的话，`Claims.Conflicts` 里 `child.Length` 直接 **NRE**，
+            // 冒泡出 `HandleClaimAcquire`（T7 没包 try/catch）⇒ **打死核心**——
+            // 与本类注释「坏文件不让它打死核心」**正面冲突**。
+            // ⚠️ 顺带：`WhenWritingNull` 会把 null 的 `path` **整个省略**，
+            // 所以这种坏条目是**稳定**的（写回再读还是它），不会自愈。
+            return parsed.Where(c => c.Path is not null).ToList();
         }
         catch (System.Text.Json.JsonException)
         {
