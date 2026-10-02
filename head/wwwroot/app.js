@@ -17,6 +17,8 @@ let core = "http://127.0.0.1:7788";
 let ws = null;
 let wsReady = false;                // ⚠️ 见 connect()：**只有它才是「可以发帧了吗」的判据**
 let current = null;                 // 当前会话 id（**视图**，不是真相）
+let epoch = 0;                      // ⚠️ 每次 openSession 自增——**同 id 的并发重入靠它区分**
+let creating = null;                // ⚠️ 刚发出的 session.create 的命令 id（只有它是「分配型回执」）
 let currentProject = null;
 const sessions = new Map();         // sessionId -> { projectKey }  ← §6.1：派生索引
 const cursors = new Map();          // topic -> lastSeq           ← §7：每流一个游标
@@ -48,6 +50,7 @@ async function bootstrap() {
     // ⚠️ **先等连接就绪**：`command()` 在 `!wsReady` 时按设计**拒绝发送**，而 `connect()`
     // 返回时握手还没完成 ⇒ 不等的话这条首屏创建是**掷硬币**（见 `connected()`）。
     await connected();
+    creating = "boot-create";
     command("boot-create", { kind: "session.create" });
     return;
   }
@@ -104,10 +107,18 @@ function renderSessions() {
 // ---- 打开会话：先快照、再带高水位订阅（`03` §7 的原子性） ----
 
 async function openSession(id) {
+  // ⚠️ **先领世代号**：`current !== id` **判不出「同 id 的两次并发调用谁更新」**——
+  // 双击同一个会话时两个守卫会**双双通过**，同一份 turns 被 `appendChild` **两遍**
+  //（`#timeline` 的清空在函数开头，而 `renderTurn` 是 `appendChild`，中间隔着 `await`）。
+  // 世代号让**后一次调用作废前一次**，与 id 是什么无关（`A→B→A`、`onopen`/resync 的
+  // `openSession(current)` 撞上用户对同一会话的点击，也都是同一类）。
+  const gen = ++epoch;
+
   // ⚠️ **先等连接就绪**：本函数末尾的 `subscribe()` 在 `!wsReady` 时会**静默返回**，
   // 而它可能是首屏/重连的第一条发送（`bootstrap`→`openSession`、`onopen`→`openSession`）
   // ⇒ 不等的话，会话流可能根本没订上，而页面以为订过了（见 `connected()`）。
   await connected();
+  if (gen !== epoch) return;
   current = id;
   renderSessions();
   $("title").textContent = id;
@@ -116,9 +127,9 @@ async function openSession(id) {
   const state = await (await fetch(`${core}/sessions/${id}/state`)).json();
   const history = await (await fetch(`${core}/sessions/${id}/history`)).json();
 
-  // ⚠️ **快照回来时，用户可能已经点了别的会话**——`#timeline` / `#slots` / 右栏都是**全局节点**，
-  // 继续渲染就会把 A 的 turn 追加进 B **已经清空**的那条时间线里：标题是 B、内容却是 A+B。
-  if (current !== id) return;
+  // ⚠️ **快照回来时，用户可能已经又开了别的会话**（或同一个）——`#timeline` / `#slots` / 右栏
+  // 都是**全局节点**，继续渲染就会把上一次的 turn 追加进已经清空的那条时间线里。
+  if (gen !== epoch) return;
 
   renderSlots(state.slots);
   renderAxes(state.axes);
@@ -127,9 +138,8 @@ async function openSession(id) {
 
   await loadClaims();
 
-  // ⚠️ **再守一次**（上面又是一个 await）。少了它，就会拿**捕获的 `id`**——一个已经不是当前的
-  // 会话——去订会话流。
-  if (current !== id) return;
+  // ⚠️ **又一个 await，再守一次**。少了它，就会拿**捕获的 `id`**去订会话流。
+  if (gen !== epoch) return;
 
   // ⚠️ **用快照带回来的高水位当起点**——「拉快照 → 订阅」之间那段窗口不漏不重的唯一办法。
   subscribe(`session:${id}`, history.highWater);
@@ -417,14 +427,21 @@ function connect() {
     const frame = JSON.parse(e.data);
 
     if (frame.kind === "ack") {
-      if (frame.accepted && frame.sessionId && !sessions.has(frame.sessionId)) {
-        // ⚠️ **`!sessions.has(...)` 这个既有守卫正好把「分配型回执」与「发消息 / 设轴的回执」
-        // 分开**——只有前者会带一个本页还不认识的 `sessionId`。
+      // ⚠️ **判据是「我们刚发的那条 create 的回执」，不是「这个 sessionId 我不认识」。**
+      // 后者错两次：① `send` / `interrupt` / `start` 的回执**也带 `sessionId`**，而
+      // `loadSessions()` 的 `sessions.clear()` 到重填之间有个窗口——落在窗口里的 send 回执
+      // 会**误触一次全量重开**；② 服务端建会话是**先发 `session.created` 再回 ack**，
+      // 两条帧先后不定 ⇒ 靠 `sessions.has` 判断，结果本身就是**不确定的**。
+      if (frame.accepted && frame.id === creating) {
+        creating = null;
         // ⚠️ **建完要打开它**：首屏那条 `boot-create` 原来是建完就 `return`，**没人 `openSession`**
         // ⇒ 中栏空、**右栏五个轴全空**（`renderAxes` 只在 `openSession` 里跑）、`send()` 静默不发，
         // 非刷新一次不可。先 `loadSessions()`（把新会话收进 `sessions`，并订上刚出现的项目流）
         // 再打开它。
-        loadSessions().then(() => openSession(frame.sessionId));
+        // ⚠️ **必须带 `catch`**：reject 时 `openSession` 根本不跑（建的会话停在「建了没打开」，
+        // 正是上面要治的症状换个触发条件），且留下未观测 rejection。
+        loadSessions().then(() => openSession(frame.sessionId))
+                      .catch((e) => renderMeta("✗ " + e.message, "error"));
       }
       if (!frame.accepted) renderMeta("✗ " + frame.reason, "error");
       return;
@@ -521,7 +538,11 @@ function send() {
 
 $("send").onclick = send;
 $("text").onkeydown = (e) => { if (e.key === "Enter") send(); };
-$("new").onclick = () => command(crypto.randomUUID().slice(0, 8), { kind: "session.create" });
+$("new").onclick = () => {
+  const cmdId = crypto.randomUUID().slice(0, 8);
+  creating = cmdId;
+  command(cmdId, { kind: "session.create" });
+};
 $("interrupt").onclick = () => {
   if (current) command(crypto.randomUUID().slice(0, 8), { kind: "session.interrupt", sessionId: current });
 };
