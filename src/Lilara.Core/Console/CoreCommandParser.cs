@@ -43,9 +43,11 @@ public static class CoreCommandParser
         // 少了这一句，`"claimlist"` 也会被切出 `"list"`
         //（`"claimlist"["claim".Length..]` == `"list"`），于是 `claimlist` 被认成查询、
         // 被 `Repl` 拦下印声明列表 ⇒ **用户敲的那行字被吞掉了**（本该当成消息发出去）。
-        // ⚠️ 对照 `Parse` 里那条守卫的写法——它用的是
-        // `trimmed == "claim" || StartsWith("claim ") || StartsWith("claim\t")`，
-        // **同样是「claim 后面得有分隔」**；这里必须与它口径一致。
+        // ⚠️ 对照 `Parse` 里那条入口守卫的写法——它现在是**宽口径**：
+        // `trimmed == "claim" || (trimmed.Length > "claim".Length && char.IsWhiteSpace(trimmed["claim".Length]))`，
+        // **同样是「claim 后面必须有分隔、且分隔用 `char.IsWhiteSpace`」**；这里必须与它口径一致。
+        // ⚠️ **别照抄窄口径**（`' '` / `'\t'`）——那正是 `claim`+NBSP+路径
+        // 「两边都不认 ⇒ 当成消息发出去」那个洞的成因。
         if (t.Length > "claim".Length && !char.IsWhiteSpace(t["claim".Length])) return false;
 
         var words = t["claim".Length..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
@@ -90,18 +92,17 @@ public static class CoreCommandParser
 
         if (IsClaimList(trimmed)) return (null, null);
 
-        // ⚠️ **别去匹配精确的拼写（空格数 / 大小写）——切词。**
-        // 初版用 `trimmed == "claim release"` 与 `StartsWith("claim release ")`：
-        //   · `"claim  release"`（**两个空格**）→ `Trim` 只去**首尾**空白，内部两个空格**留着**
-        //     ⇒ 不匹配 `StartsWith("claim release ")`（第二个字符是空格不是 `r`）
-        //     ⇒ 落进 acquire 分支 ⇒ **静默占一个叫 `release` 的路径**。
-        //   · `"claim Release src"` → 同样落进 acquire ⇒ **静默执行相反的动作**。
-        // ⚠️ 而 `Trim` 能救的只有「尾随空格」那种（`"claim "` → `"claim"` → 命中守卫）——
-        // **恰好是我第一版以为能救的那半**。真洞在 Trim 管不到的地方。
-        if (trimmed == "claim" || trimmed.StartsWith("claim ", StringComparison.Ordinal)
-            || trimmed.StartsWith("claim\t", StringComparison.Ordinal))
+        // ⚠️ **入口判据必须与 `IsClaimList` 的边界口径**一致**：用 `char.IsWhiteSpace`（宽），
+        // 不是 `' '` / `'\t'`（窄）。**
+        // ⚠️ 窄口径下 `claim` + **NBSP**（` `）+ 路径 **两边都不认**：
+        // `IsClaimList` 因谓词不成立返回 false，这里因 `StartsWith("claim ")` 不成立而落空
+        // ⇒ **当成消息发给了模型**。而 NBSP 从**网页复制粘贴**就会带进来——
+        // 正是本任务要根除的那一类，从侧面漏了回来（审阅实测）。
+        if (trimmed == "claim"
+            || (trimmed.Length > "claim".Length && char.IsWhiteSpace(trimmed["claim".Length])))
         {
-            // `Split(null, RemoveEmptyEntries)`：**所有空白**（空格、Tab、连续多个）都算分隔符。
+            // `Split(null, RemoveEmptyEntries)`：**所有空白**（空格、Tab、NBSP、连续多个）
+            // 都算分隔符——与上面的宽边界口径一致。
             var words = trimmed["claim".Length..]
                 .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
 
@@ -112,10 +113,12 @@ public static class CoreCommandParser
             if (words.Length == 0)
                 return (null, "用法：claim <路径> | claim release <路径> | claim list");
 
+            // ⚠️ **这一臂只剩「多词」形态**——单词的 `claim list` 已被上面的
+            // `IsClaimList` 截走（它在词块**之前**）。⇒ 原先的 `(null, null)` 臂
+            // **不可达，是死代码**（审阅实测：删掉它全量仍全绿）。
+            // ⇒ 只留报错那一臂。
             if (string.Equals(words[0], "list", StringComparison.OrdinalIgnoreCase))
-                return words.Length == 1
-                    ? (null, null)                                   // 控制台查询，Repl 拦截
-                    : (null, "用法：claim <路径> | claim release <路径> | claim list");
+                return (null, "用法：claim <路径> | claim release <路径> | claim list");
 
             if (string.Equals(words[0], "release", StringComparison.OrdinalIgnoreCase))
                 return words.Length == 2

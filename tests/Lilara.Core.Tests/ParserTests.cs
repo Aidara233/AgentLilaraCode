@@ -164,6 +164,35 @@ public class ParserTests
         Assert.False(CoreCommandParser.IsClaimList(line));
 
     /// <summary>
+    /// ⚠️ **NBSP（U+00A0）也是空白，别让它漏回「当成消息」。**
+    /// ⚠️ 审阅实测的洞：`IsClaimList` 的边界用 <c>char.IsWhiteSpace</c>（**宽**），
+    /// 而 `Parse` 的词块入口曾用 `StartsWith("claim ")` / `"claim\t"`（**窄**）⇒
+    /// `claim` + **NBSP** + 路径 **两边都不认** ⇒ 落空 ⇒ **当成消息发给了模型**。
+    /// ⚠️ 而 NBSP 从**网页复制粘贴**就会带进来。
+    /// </summary>
+    [Fact]
+    public void Claim_WithANbspSeparator_IsStillTreatedAsTheCommand()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim\u00A0src/foo", "s1");
+
+        Assert.Null(err);
+        Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimAcquire>(cmd).Scope);
+    }
+
+    /// <summary>
+    /// ⚠️ **`list` 那一臂只该剩「报错」**——单词的 `claim list` 已被 `IsClaimList` 在词块**之前**截走。
+    /// ⇒ 它的 `(null, null)` 臂**不可达**（审阅实测：删掉它全量仍全绿 ⇒ 死代码、零覆盖）。
+    /// </summary>
+    [Fact]
+    public void ClaimList_WithExtraWords_IsAnError()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim list extra", "s1");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    /// <summary>
     /// ⚠️ **路径只收一个词；多给了就报错，不猜。**
     /// 初版把多余词**拼进路径**（`"src/foo extra"`）——而控制台**没有引号语法**，
     /// 含空格的路径**无法表达** ⇒ 拼起来是**猜**，猜错的方向是**静默占错地方**。
@@ -193,7 +222,11 @@ public class ParserTests
     /// 这是 `axis set` 少了尾随空格**同一个形状的缺陷**（T5 踩过）：
     /// 前缀判断放行了半个命令，剩下那半截被当成**参数**吃掉——
     /// 而它**不报错**，用户看到的是一个静默的错误动作。
-    /// 判据：`trimmed == "claim release"` 要单独拦，**在 acquire 分支之前**。
+    /// <para>⚠️ **判据已经改了，别照着老话写。** 本注释初版写的是
+    /// 「判据：`trimmed == "claim release"` 要单独拦，**在 acquire 分支之前**」——
+    /// **那是精确匹配时代的话**，而实现现在是**切词**（`Split`），代码里**已经没有那个字面量**。
+    /// 那句会把后来者引回精确匹配的老路 —— 而那正是 `claim  release`（两个空格）漏掉的原因。
+    /// ⇒ 现在的判据是**切词后 `words[0]` 是 `release` 而 `words.Length != 2`**。</para>
     /// </summary>
     [Fact]
     public void ClaimRelease_WithNothing_IsAnError()
