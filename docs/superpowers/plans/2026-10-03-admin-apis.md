@@ -1,0 +1,428 @@
+# 管理面 API 实现计划（批次 0 + 1）
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 把核心的管理面补到「头能配 provider、能看会话全貌」——并把两处安全前提先修掉。
+
+**Architecture:** 沿用既有两条通道，**不发明第三条**：
+- **HTTP 只读快照**（`ControlServer.MapSnapshots`）——读一律走它
+- **WS 命令**（`CoreCommand` → `CommandDispatcher`）——**改**一律走它
+
+**Tech Stack:** .NET 10 · Kestrel · System.Text.Json · xUnit
+
+**Spec:** `docs/03-控制面协议.md` §3/§4/§6 · `docs/01-会话设计.md` §7/§12 · `docs/04-核心设计.md` §1.1
+
+## 用户裁定（本计划的约束来源，2026-10-03）
+
+| # | 裁定 | 对计划的影响 |
+|---|---|---|
+| R-A | **「绝对充足的访问权限，想改啥几乎都行——怎么用那是头的事」** | 覆盖面要全；但**充足的是覆盖面，不是任意性**（不做 `raw.eval` 之类的万能口子） |
+| R-B | **key：能改不能看** | `apiKey` 变成「可写不可读」：`provider.upsert` 的 `apiKey` 改**可选**；`/providers` **永不回传 key**，只回 `hasApiKey` 布尔 |
+| R-C | **改历史：整份原子重写（路径锁内）**，删轮时**重算 `Turn`** | 见批次 2（本计划不含） |
+| R-D | **`claim.acquire` 暂不上线** | 本计划**不**加它；声明仍是「头只读只释放」 |
+
+## ⚠️ 本计划发现的一条**连锁**（它决定了批次 0 的必须性）
+
+> **`apiKey` 可选 + WS 无 Origin 校验 = 任何网页都能把你的流量转走。**
+
+攻击链：任意网页连 `ws://127.0.0.1:7788/ws` → 发 `provider.upsert(id, endpoint:"http://evil/")`
+（**不需要知道 key**）→ 用户下一次发消息时，**他的 key 与整段对话一起发到 `evil`**。
+
+⇒ **Origin 校验从「顺手做的卫生」升级为 `apiKey` 可选的硬前置。** 顺序**不能反**：
+先 Task 2（Origin），再 Task 5（`apiKey` 可选）。
+
+## Global Constraints
+
+继承上一份计划（`2026-09-30-head-obligations.md`）的 G1–G11，逐条仍然有效。本计划新增：
+
+- **G12 密钥单向：可写不可读。** 任何 HTTP 响应不得包含 `ApiKey`；`hasApiKey` 这种**布尔**可以。
+  ⚠️ 判据要能执行：对真实数据根打一遍所有端点，断言响应字节里**不含** key 的前 16 个字符。
+- **G13 命令是**改**的唯一入口。** 新加的编辑能力一律做成 `CoreCommand` + dispatcher 分支 +
+  控制台语法（可选）；**不许**在 HTTP 上加写端点（`03` §1：HTTP 一次性读 / WS 双向）。
+- **G14 四条线一个都不能少。** 加一条命令要同时落四处，**缺一处就是静默失效**：
+  ① `CoreCommand` 记录 ② `CommandDispatcher` 分支 ③ `ControlServer.ParseCommand`（线上）
+  ④ `CoreCommandParser`（控制台，**若该命令该有控制台语法**）。
+  ⚠️ 缺口形状：T3 加 `session.setAxis` 时**漏了 ③**，而计划里没有任何任务认领它。
+- **G15 落盘格式变更必须显式且可迁移。** 加字段要先量它是否改既有金样的字节
+  （`DefaultIgnoreCondition = WhenWritingNull` 是否兜住），把答案写进注释；金样要同步。
+- **G16 校验在 dispatcher，不在前端。** 控制台与头是两个前端；校验放前端 ⇒ 另一个前端绕过。
+  （`Protocol` / `Auth` 已经在 dispatcher 校验——`id` 那次**漏了**，见 Task 1。）
+
+## Review Focus
+
+本计划里**没有任何任务自己的测试会碰**、而最可能咬人的五类输入/条件（按可能性排序）：
+
+1. **`provider id` 里含 `..` / `/` / `\` / 绝对路径 / 空串** —— 用户会手打 provider id。
+   合理预期：**拒绝**并说明合法形状，而不是写到一个奇怪的地方（今天实测：`../escaped` 写进了**数据根**）。
+2. **不带 `Origin` 的 WS 连接**（curl / 测试驱动 / 未来的 CLI 头）—— 合理预期：**放行**（它不是网页）。
+   带 `http://evil.example` 的——**拒绝**。⚠️ 浏览器永远带 `Origin`，所以放行「无 Origin」不削弱这道闸。
+3. **`/state` 的 `spec` 里含盘上写死的怪值**（provider 被手改成未知协议、`modelId` 是空串）——
+   合理预期：**原样交出**（是事实），头的渲染出错是头的事。
+4. **`apiKey` 省略时的 `provider.upsert`**（R-B 的核心用法：只想改协议）——
+   合理预期：**保留旧 key**；而**新 provider 且没给 key** ⇒ 拒绝并说清。
+5. **`GET /providers` 的响应里混进 key**（手滑把 `ApiKey` 加回投影）——
+   合理预期：**测试要红**。这是 G12 的那条可执行判据。
+
+---
+
+## 批次 0 + 1 的落地顺序（依赖决定，不能跳）
+
+```
+T1 provider id 校验        ← 独立；但必须在 T5/T6 之前（它们让配置面开始被头用）
+T2 WS Origin 白名单        ← 独立；但必须在 T5 之前（那条连锁，见上）
+T3 /state 交全 spec        ← 独立
+T4 GET /provider-schema    ← 依赖 T1 的「合法 id 形状」定下来（schema 要把形状交出去）
+T5 apiKey 可选 + hasApiKey ← 依赖 T2；且与 T6 同一次改（同一个端点的两半）
+T6 /providers 补全         ← 依赖 T5（两个改动落在同一处投影上，别分两次动它）
+T7 provider.delete         ← 独立
+```
+
+---
+
+### Task 1: `provider.upsert` 的 `id` 校验（路径穿越）
+
+**Files:**
+- Modify: `src/Lilara.Core/Hosting/CommandDispatcher.cs`（`HandleProviderUpsert`）
+- Test: `tests/Lilara.Core.Tests/ProviderStoreTests.cs` 或新建 `ProviderIdTests.cs`
+
+**Interfaces:**
+- Consumes: 既有 `CommandDispatcher.HandleProviderUpsert`
+- Produces: 一条**可复用的**合法 id 判据（T4 的 schema 要把它交出去）
+
+⚠️ **实测过的缺陷**（不是推得）：控制台敲 `provider set ../escaped --key k`
+⇒ `✓ 提供商 '../escaped' 已保存`，而文件落在 **`<数据根>/escaped.json`**——
+逃出了 `providers/`。成因：`ProviderStore.PathFor(id) => Path.Combine(_root, $"{id}.json")`，
+而 `HandleProviderUpsert` 只校验了 `Protocol` 与 `Auth`，**没校验 `id`**。
+⚠️ 今天只有本机能触发（声明只能从控制台进）；**Task 5 一落地，任何网页都能触发**。
+
+- [ ] **Step 1: 写失败的测试**
+
+```csharp
+[Theory]
+[InlineData("../escaped")]        // 实测过：写到数据根
+[InlineData("..\\escaped")]       // Windows 分隔符
+[InlineData("a/b")]               // 正斜杠
+[InlineData("a\\b")]              // 反斜杠
+[InlineData("/abs")]              // 绝对路径
+[InlineData("C:\\abs")]           // 盘符
+[InlineData("")]                  // 空
+[InlineData("   ")]               // 全空白
+[InlineData(".")]
+[InlineData("..")]
+[InlineData("a\0b")]              // 内嵌 NUL
+public void ProviderUpsert_WithAnUnsafeId_IsRejected(string id)
+{
+    var cmd = new CoreCommand.ProviderUpsert(id, "k", null, null, null, null);
+    var result = _dispatcher.DispatchAsync(cmd, "t1", awaitCompletion: true, CancellationToken.None)
+        .GetAwaiter().GetResult();
+
+    Assert.IsType<Ack.Rejected>(result.Ack);
+}
+
+[Theory]
+[InlineData("local")]
+[InlineData("my-provider")]
+[InlineData("p1")]
+[InlineData("本地")]                // 非 ASCII 合法——别用字符白名单把它挡了
+public void ProviderUpsert_WithASafeId_IsAccepted(string id) { /* Assert.IsType<Ack.Accepted> */ }
+```
+
+- [ ] **Step 2: 跑测试确认红**
+- [ ] **Step 3: 实现**
+
+⚠️ **判据的形状**（写进注释，因为它是 T4 要交出去的那份）：
+**「id 是一个文件名，不是一个路径」**——所以拒绝的是**路径语法**，不是**字符**：
+
+```csharp
+/// <summary>
+/// ⚠️ **id 会变成文件名**（`ProviderStore.PathFor`）⇒ 它必须**不含路径语法**。
+/// 判据是「**它是不是一个单纯的文件名**」，不是「它像不像 ASCII 标识符」——
+/// 后者会把 `本地` 这类合法 id 一起挡掉（实测的教训方向：白名单型判据总会漏掉用户正当的输入）。
+/// ⚠️ 实测坑：`../escaped` 让文件落在**数据根**（`providers/` 之外）。
+/// </summary>
+internal static bool IsSafeProviderId(string id) =>
+    !string.IsNullOrWhiteSpace(id)
+    && id == Path.GetFileName(id)          // ⚠️ 这一句同时挡掉 `..` / `a/b` / `a\b` / `/abs` / `C:\abs`
+    && id.IndexOfAny(Path.GetInvalidFileNameChars()) < 0
+    && id is not "." and not "..";
+```
+
+⚠️ **为什么 `id == Path.GetFileName(id)` 是关键那一句**：`Path.GetFileName("../escaped")` 返回 `escaped`
+⇒ 不相等 ⇒ 拒绝。而 `Path.GetFileName("本地")` 返回 `本地` ⇒ 相等 ⇒ 放行。
+**用 `Path` 自己的词法，而不是自己拼字符类**——同一个仓库里 `Claims.Normalize` 已经吃过
+「自己拼分隔符」的亏。
+⚠️ **但 `Path.GetFileName` 是平台相关的**（这是 .NET 的既有性质）：Windows 上它把
+`a/b` 也当分隔符。**这是我们要的**（数据根可能被同步到别的平台），**但要在注释里写明这一点**，
+并为此补一条针对 `/` 的 `InlineData`（已在上面）。
+
+- [ ] **Step 4: 跑测试确认绿 + 补一条守卫**：把 `IsSafeProviderId` 的调用**去掉**跑一次，
+  确认那 11 条 `InlineData` **全红**（G7：变异必须先确认落上）。
+- [ ] **Step 5: 提交** `fix(core): provider.upsert 校验 id 是「文件名」而非「路径」——实测 ../escaped 曾写到数据根`
+
+---
+
+### Task 2: WS Origin 白名单（`apiKey` 可选的硬前置）
+
+**Files:**
+- Modify: `src/Lilara.Core/Control/ControlServer.cs`（`MapWebSocket`）
+- Modify: `src/Lilara.Core/Control/ControlServer.cs`（构造参数：允许的 origin）
+- Modify: `src/Lilara.Core/Program.cs`（注入，带默认值）
+- Test: `tests/Lilara.Core.Tests/ControlServerTests.cs`
+
+**Interfaces:**
+- Produces: `ControlServer(..., string allowedOrigin)`；默认 `http://127.0.0.1:7790`
+
+⚠️ **判据必须是「放行无 Origin，拒绝别的 Origin」**，不是「要求 Origin」：
+- **浏览器永远带 `Origin`** ⇒ 挡住坏 origin 就达到了目的
+- **curl / 测试驱动 / 未来的 CLI 头不带** ⇒ 要求它就等于把它们一起挡掉
+  （既有 `ControlServerTests` 全是这种客户端——要求 Origin 会让它们**全部**失败，
+  而那**不是**「测试在保护我们」，是「测试被误伤」）
+
+- [ ] **Step 1: 写失败的测试**
+
+```csharp
+[Theory]
+[InlineData(null)]                              // 无 Origin（curl / 测试驱动）⇒ 放行
+[InlineData("http://127.0.0.1:7790")]           // 头自己的 origin ⇒ 放行
+[InlineData("http://evil.example")]             // ⇒ 拒绝
+[InlineData("http://localhost:7790")]           // ⚠️ 同机不同写法：**判定它属于哪一边并写进注释**
+[InlineData("null")]                            // `file://` 页面与沙箱 iframe 的 Origin 字面量是 "null"
+public async Task WebSocket_OriginPolicy(string? origin) { /* 建连 → 断言接受/拒绝 */ }
+```
+
+⚠️ **`"null"` 那条要单独想**：`Origin: null` 是**沙箱 iframe 与 `file://` 页面**发的，
+它们**不是**我们的头 ⇒ **拒绝**。（写成 `InlineData("null")` 并断言拒绝。）
+
+- [ ] **Step 2–4: 红 → 实现 → 绿**
+
+```csharp
+// MapWebSocket 里，AcceptWebSocketAsync 之前：
+// ⚠️ **这是 `apiKey` 可选的硬前置**：网页能改 `endpoint` 就能把流量（连同 key）转走。
+// ⚠️ **放行「无 Origin」，只拒绝「别的 Origin」**——浏览器永远带 Origin（挡坏的就够了），
+//    而 curl / 测试驱动不带（要求它会把它们全部误伤）。
+// ⚠️ 用**索引器**取头（`ctx.Request.Headers["Origin"]`），不用 .NET 10 的强类型属性——
+//    索引器两种写法都吃（大小写不敏感），且**能被 grep 到**。
+var origin = ctx.Request.Headers["Origin"].ToString();
+if (!string.IsNullOrEmpty(origin) && !string.Equals(origin, allowedOrigin, StringComparison.OrdinalIgnoreCase))
+{
+    ctx.Response.StatusCode = (int)HttpStatusCode.Forbidden;
+    return;
+}
+```
+
+⚠️ **`localhost` vs `127.0.0.1` 的裁定要写进注释**（上面的测试用例里有这一条）：
+它们**不是**同一个 origin（浏览器就是这么判的）。头的 `config.json` 交的是
+`http://127.0.0.1:7788`，页面在 `http://127.0.0.1:7790` ⇒ **默认只放行 `127.0.0.1:7790`**。
+⚠️ 若用户改成用 `localhost:7790` 打开页面，**会被拒**——**这是刻意的**：
+放行 `localhost` 等于放行一个**任何本机程序都能抢占的名字**（hosts 文件、DNS）。
+⇒ **失败要能自解释**：拒绝时在响应体里写一句「本核心只接受来自 <allowedOrigin> 的页面」，
+并在核心启动横幅里带上这个值。
+
+- [ ] **Step 5: 提交** `fix(core): WS 校验 Origin——放行无 Origin（curl/测试），拒绝别的网页 origin；apiKey 可选的前置`
+
+---
+
+### Task 3: `/state` 交全 `spec`
+
+**Files:** `src/Lilara.Core/Control/ControlServer.cs`（`/sessions/{id}/state`）· 其测试
+
+⚠️ **控制台 `status` 印四样**（会话 id · `Status`/`Turn` · **模型** · **目录** · 策略），
+而**头只拿得到前两样与策略**——`modelId` / `providerId` / `workingDirectory` / `createdAt` **一个都没有**。
+后果实测过：用户问「怎么切换提供商」，头**答不出来**。
+
+- [ ] **Step 1: 测试**：断言 `/state` 的响应含 `spec.sessionId` / `spec.projectKey` /
+  `spec.workingDirectory` / `spec.createdAt` / `spec.model.{providerId,modelId,protocol,effort,maxTokens}`。
+- [ ] **Step 2–4: 红 → 实现 → 绿**
+
+```csharp
+// 加在匿名对象里（与 Axes / Slots 同级）：
+// ⚠️ **整个 spec 交出去**（`01` §7 的配置分层本就把它当可分享信息）。
+// ⚠️ **不含 key**：key 在 providers/*.json 里，不在 spec 里——所以这里天然安全（G12）。
+Spec = handle.Spec,
+```
+
+⚠️ **别只交一个子集**——「头要什么」是头的事（R-A）。整份 `SessionSpec` 序列化即可。
+⚠️ `WorkingDirectory` 是**本机绝对路径**，交出去意味着它在开放的 CORS 下可读（终审 §Declined #2 记过）。
+**本计划接受**（R-A 的代价），但**要在注释里点名**。
+
+- [ ] **Step 5: 提交** `feat(core): /state 交全 spec（model/provider/目录/时间）——控制台 status 的四个字段头一个都拿不到`
+
+---
+
+### Task 4: `GET /provider-schema`
+
+**Files:** `src/Lilara.Core/Control/ControlServer.cs` · 其测试
+
+⚠️ **它不是「可选的美化」，是「不许手抄」的执行面**：头要渲染配置表单就必须知道
+「合法协议 / 合法 auth / 各协议默认模型」，而这些的真相来源在核心
+（`Protocols.All` / `AuthSchemes` / **`AdapterFactory` 的默认模型**）。
+⚠️ **头已经抄错一次**：`head/wwwroot/index.html` 的引导文案写死 `--protocol claude-messages`
+——而 `claude-messages` 只是**默认值**，不是「唯一能用的」，这正是用户第一次配置时踩的坑。
+
+- [ ] **Step 1: 测试**：断言响应含 `protocols`（= `Protocols.All` 的元素）、
+  `authSchemes`（= api-key / bearer）、以及 T1 定下的 `providerIdRule`（人话一句）。
+- [ ] **Step 2–4: 红 → 实现 → 绿**
+
+```csharp
+// ⚠️ **不交 `defaultModel`——因为它今天没有可信来源。**
+// 我（控制器）写这一节时先写了「从适配器读、别抄命令里的常量」，
+// 然后**核了一遍**：`claude-opus-5` 这个字面量**只出现在 `CommandDispatcher.cs:100` 一处**
+//（`ProviderUpsert` 的兜底），而 `IModelAdapter` **不交**默认模型。
+// ⇒ 它不是「第二份副本」（G10 那种），它是**唯一那份**，住在命令的兜底里。
+// ⇒ 在 schema 里交它 = 要么复制一份（G10），要么**发明**一个来源。
+// **两条都不做**：如实不交。头要预填模型，从 `/providers` 拿**已有那个 provider 的** `defaultModel`——
+// 那是**用户实际在用的值**，比任何全局默认都准。
+app.MapGet("/provider-schema", () => Results.Json(new
+{
+    Protocols = Protocols.All,
+    AuthSchemes = new[] { AuthSchemes.ApiKey, AuthSchemes.Bearer },
+    ProviderIdRule = "单个文件名：不含路径分隔符，不能是 . 或 ..",
+}, WireJson.Options));
+```
+
+- [ ] **Step 5: 提交** `feat(core): GET /provider-schema——头渲染配置表单的真相来源（头已抄错一次协议默认值）`
+
+---
+
+### Task 5: `apiKey` 可选 + `hasApiKey`（**先读那条连锁**）
+
+**Files:**
+- Modify: `src/Lilara.Core/Hosting/CommandDispatcher.cs`（`HandleProviderUpsert`）
+- Modify: `src/Lilara.Core/Hosting/CoreCommand.cs`（`ProviderUpsert.ApiKey` → `string?`）
+- Modify: `src/Lilara.Core/Control/ControlServer.cs`（`ParseCommand` 的 `apiKey` 改可选）
+- Modify: `src/Lilara.Core/Console/CoreCommandParser.cs`（`--key` 不再是必填）
+- Test: 上述各自的测试文件
+
+⚠️ **用户裁定 R-B**：能改不能看。今天 `apiKey` **必填** ⇒ 头改协议必须重发 key，
+而头**读不到 key**（`/providers` 有意不给）⇒ **头永远改不了已有 provider**。
+
+- [ ] **Step 1: 测试**
+
+```csharp
+[Fact] public void ProviderUpsert_WithoutApiKey_KeepsTheStoredOne() { /* 先存 key=A，再不带 key 改协议，断言盘上仍是 A */ }
+[Fact] public void ProviderUpsert_WithoutApiKey_ForANewProvider_IsRejected() { /* 断言 rejected，且理由点名「新 provider 必须给 --key」 */ }
+[Fact] public void ProviderUpsert_WithoutApiKey_StillInvalidatesSteppers() { /* 复用既有 InvalidateSteppers 判据 */ }
+```
+
+⚠️ **第三条不是凑数**：`InvalidateSteppers` 挂在 `HandleProviderUpsert` 的**末尾**，
+而这条路径今天会**提前 return**（`ApiKey` 为 null 时若写成 early-return）⇒
+**改了协议但缓存没失效** = 用旧适配器发新协议。这正是 T7 那轮修过的形状。
+
+- [ ] **Step 2–4: 红 → 实现 → 绿**
+
+```csharp
+// ProviderUpsert 的 ApiKey 改 string?；dispatcher 里：
+var existing = _host.Providers.Load(p.Id);
+// ⚠️ 新 provider **必须**给 key（否则存一个发不出去的配置，比拒绝更糟）；
+//    已有 provider **省略即保留**（R-B：头读不到 key，不该逼它重发）。
+if (p.ApiKey is null && existing is null)
+    return Reject(id, $"新提供商 '{p.Id}' 必须给 --key。");
+// ... Save 时：ApiKey = p.ApiKey ?? existing!.ApiKey,
+```
+
+⚠️ `ApiKey` 在 `ProviderDefinition` 上是 `required`——改成 `required` 保留但**构造时必给值**
+（用 `p.ApiKey ?? existing!.ApiKey`），别把 `required` 去掉（那会让别的构造点静默漏填）。
+
+- [ ] **Step 5: 提交** `feat(core): provider.upsert 的 apiKey 可选（省略=保留旧 key）——头读不到 key，不然永远改不了已有 provider`
+
+---
+
+### Task 6: `GET /providers` 补全（**仍不给 key**）
+
+**Files:** `src/Lilara.Core/Control/ControlServer.cs` · 其测试
+
+⚠️ 与 Task 5 **一起做**：两个改动落在同一个投影上，分两次动它等于两次评审同一个小区域。
+
+- [ ] **Step 1: 测试**（⚠️ 两条都是 G12 的可执行判据）
+
+```csharp
+[Fact] public void Providers_CarriesEverythingButTheKey()
+{ /* 断言 id/protocol/defaultModel/endpoint/authScheme/modality/hasApiKey 都在 */ }
+
+[Fact] public void Providers_NeverLeaksTheKey()
+{ /* ⚠️ 用**真实数据根**（或写入一个含哨兵串的 key）打一遍，
+     断言响应字节里不含那个哨兵的前 16 个字符 */ }
+```
+
+⚠️ **第二条的哨兵写法**：用一个**不可能偶然出现**的串（如 `SENTINEL-8f3a2b1c-DO-NOT-LEAK`）写进 provider，
+跑完断言响应里 `IndexOf(sentinel[..16]) < 0`。**别用「不含 apiKey 字样」这种弱判据**
+（字段改名就失效了）。
+
+- [ ] **Step 2–4: 红 → 实现 → 绿**
+
+```csharp
+app.MapGet("/providers", () =>
+    Results.Json(host.Providers.List().Select(p => new
+    {
+        p.Id, p.Protocol, p.DefaultModel,
+        // ⚠️ **端点与认证方式要交**——端点决定数据发去哪（核心自己每次 `provider set` 都印一行），
+        //    头看不到就无从核对。
+        p.Endpoint, p.AuthScheme, p.Modality,
+        // ⚠️ **key 只回「有没有」，不回「是什么」**（用户裁定 R-B：能改不能看）。
+        //    有了它，表单能显示「已配置」而不是一个空框（空框会让人以为没配、然后重填一遍）。
+        HasApiKey = !string.IsNullOrEmpty(p.ApiKey),
+    }), WireJson.Options));
+```
+
+- [ ] **Step 5: 提交** `feat(core): /providers 补 endpoint/auth/modality/hasApiKey——端点决定数据发去哪，头得能核对；key 仍只回有无`
+
+---
+
+### Task 7: `provider.delete`
+
+**Files:** `CoreCommand.cs` · `CommandDispatcher.cs` · `ControlServer.ParseCommand` · `ProviderStore.cs` · 测试
+
+⚠️ **G14 四条线**：① 记录 ② dispatcher 分支 ③ 线上解析 ④ **要不要控制台语法**？
+
+- [ ] **Step 1: 先裁定 ④ 并在测试里体现**
+
+⚠️ **我的裁定**：**加**控制台语法 `provider delete <id>`，理由是**对称性**——
+`provider set` 有控制台语法，而 `provider delete` 没有会造出「配得进、删不掉」的形状
+（今天就是这样：只能手删文件）。⚠️ **代价（若错）**：`04` §1.1 的「控制台不多一条命令」
+若被判定为连对称的删也算，则应撤掉——但那样 `provider set` 也该只在线上，而它是既有的。
+
+- [ ] **Step 2–4: 红 → 实现 → 绿**
+
+⚠️ **删一个**正被会话引用的** provider 会怎样**？——**不阻止**（R-A：想改啥都行），
+但**要让后果可见**：删完 `InvalidateSteppers()`；被引用的会话下次发消息会走
+`StepperResolver` 的「绑定的提供商已不存在」那条路（**已经实现了**，`Program.cs` 也会在启动时报）。
+⚠️ **别在这里加「先检查有没有会话在用」的闸**——那是家长式干预，
+且 `SessionSpec` 的存在不构成「不能删」的理由（用户可能就是要把一个坏配置删掉）。
+
+- [ ] **Step 5: 提交** `feat(core): provider.delete（命令 + 线上解析 + 控制台语法 + 缓存失效）`
+
+---
+
+## 验证（本批次）
+
+1. `dotnet test` —— **全绿**；既有金样一条不许改断言值（只能加新的）。
+2. `dotnet build -warnaserror` —— 0 警告（核心侧 `TreatWarningsAsErrors`）。
+3. **手工端到端（四个可观测量，逐条记「预期 / 实际」）**：
+   - ① 控制台 `provider set ../escaped --key k` ⇒ **拒绝**，且**数据根下不出现 `escaped.json`**
+   - ② 用带 `Origin: http://evil.example` 的 WS 客户端连 ⇒ **403**；不带 Origin 的 ⇒ **连上**
+   - ③ `GET /sessions/{id}/state` ⇒ 含 `spec.model.modelId` 与 `spec.workingDirectory`
+   - ④ 对**真实数据根**打 `GET /providers`，用 `grep` 断言响应里**没有**那个 key 的片段
+4. **变异确认**（G7）：T1 的 `IsSafeProviderId` 调用、T2 的 origin 分支、T6 的 key 投影，
+   各去掉一次 ⇒ **必须各有一条红**；跑之前先 `grep` 确认变异落上了。
+5. `git`：动手前记下 `master` 的 SHA 当回滚点。
+
+## 明确不做（写进代码注释的偏离）
+
+- **`claim.acquire` 不上线**（用户裁定 R-D）
+- **改历史 / 会话编辑**（R-C 的落点）：**批次 2**，且它需要一个**前提**——
+  `TimelineEvent` 今天**没有稳定 id**（只有 `At`），「编辑某一段」无从指涉
+  ⇒ 那是一个**磁盘格式变更**（落盘加字段 + 金样要动 + 旧文件要迁移），单独立任务
+- **改会话的 provider/model**：批次 2（今天只能重建会话）
+- **`session.delete`**：批次 2
+- **`/projects` 排序、会话列表端点、provider 变更事件、`renderLevel` 可设**：批次 3
+- **原始文件读写（`raw.eval` 之类的万能口子）**：**不做**——充足的是**覆盖面**，不是**任意性**
+  （R-A 的边界：每条命令一个明确语义，才答得出「谁改的、改完还自洽吗」）
+
+## ⚠️ 批次 2 之前必须知道的一条设计后果
+
+**改历史会让前缀缓存整段失效。** 本机网关的响应里**真的带 `prompt_cache_hit_tokens`**
+（实测探到的字段），说明前缀缓存是实的。而**改中间/靠前的轮次** ⇒ 后面所有轮的前缀指纹变
+⇒ **缓存全部失效**、下一轮按未缓存计价。
+⇒ 这是**功能上正确、账上很贵**的操作。核心该把它**说清**（至少注释里点名），
+头要不要在 UI 上提示是头的事。**「截断」（删尾部）比「改中间」便宜得多**——
+若批次 2 只做一件事，做截断。
