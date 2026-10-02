@@ -48,7 +48,9 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         // 用户刚看着一步失败，`status` 却报 Running——而磁盘上从来没写过 Running。
         // 「内存是落盘的镜像」这条不变量在这里也必须成立。
         var persisted = handle.State;
-        handle.State = handle.State with { Status = "Running" };
+        // ⚠️ 走 `UpdateState`（原子读-改-写）：它与 `setAxis` 的读-改-写共用**同一把锁**，
+        // 两条交错时不会互相整份盖掉（终审 I2）。下同。
+        handle.UpdateState(s => s with { Status = "Running" });
 
         ModelReply reply;
         try
@@ -97,7 +99,9 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
             // ⇒ 不保留的话，用户改的轴会被一次失败 / 中断**静默吞掉**：头收到过
             // `axis.changed`、显示新值，而内存回到旧值、下一次请求带旧值发出去；
             // 再下一次成功的步把旧值写回磁盘 ⇒ 用户看到的那个新值**就此消失，且没有报错**。
-            handle.State = persisted with { Axes = handle.State.Axes };
+            // ⚠️ `s.Axes` 是**锁内**读到的那份——用它，不重新读 `handle.State`：
+            // 两条交错时「重新读」会拿到别人的写入，把回滚的基准弄歪（终审 I2）。
+            handle.UpdateState(s => persisted with { Axes = s.Axes });
             throw;
         }
 
@@ -115,12 +119,15 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         // ⚠️ Turn 递增**在拒答分支之外**：拒答是成功返回的、完成的一步，
         // 只是没有内容可写。让它和「抛异常」一样不计数，
         // 会让 state.json 里「拒答过一次」与「从没跑过」无法区分。
-        handle.State = handle.State with
+        // ⚠️ **Turn 自增 + 落盘走 `UpdateStateAndPersist`（同一个临界区）**，不能拆成
+        // `handle.State = …` 与 `handle.SaveState(…)` 两句：`setAxis` 不拿会话闸，
+        // 它的读-改-写能与这里交错，分开写会丢 `Turn` 或把状态卡在 `Running`（终审 I2）。
+        // ⚠️ `persistedStatus` 不传 = 原样落盘：换过之后内存里就是 `Idle`。
+        handle.UpdateStateAndPersist(_store, s => s with
         {
             Status = "Idle",
-            Turn = handle.State.Turn + 1,
-        };
-        handle.SaveState(_store);
+            Turn = s.Turn + 1,
+        });
 
         return reply;
     }

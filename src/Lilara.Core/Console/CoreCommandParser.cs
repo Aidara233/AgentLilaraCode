@@ -69,6 +69,27 @@ public static class CoreCommandParser
     }
 
     /// <summary>
+    /// ⚠️ **「这一行以 `axis set` 打头、`set` 之后是分隔符或行尾」——`axis set` 词块入口的唯一判据。**
+    ///
+    /// <para>与 <see cref="IsClaimVerb"/> **同形**：先按**所有空白**（<c>Split(null, RemoveEmptyEntries)</c>）
+    /// 切词、再逐词比对、**动词大小写不敏感**。</para>
+    ///
+    /// <para>⚠️ **动词大小写不敏感是刻意与 `claim` 对齐的**：动词是**控制台语法**，不是协议标识符
+    ///（协议里叫 `session.setAxis`，带点）。放宽的**只有动词**——轴名与取值仍由
+    /// `Axes.TryParse` 在 dispatcher 里校验并规范化（`Safety` 不是 `safety`，应当拒绝而不是猜）。</para>
+    ///
+    /// <para>⚠️ **词块判据顺带把 `axis settings` 挡在外面**：它的 `words[1]` 是 `settings` 而不是 `set`
+    /// ⇒ 落回「普通消息」，与旧前缀判据带尾随空格的意图一致。</para>
+    /// </summary>
+    private static bool IsAxisSetVerb(string line)
+    {
+        var words = line.Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return words.Length >= 2
+            && string.Equals(words[0], "axis", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(words[1], "set", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// 解析。返回 <c>(command, error)</c>：
     /// 认出的命令非 null；解析失败则 error 非 null；
     /// **两者都是 null** 表示「这不是一条命令形态的行」——调用方按**普通消息**处理。
@@ -89,16 +110,20 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("session interrupt ", StringComparison.Ordinal))
             return (new CoreCommand.SessionInterrupt(trimmed["session interrupt ".Length..].Trim()), null);
 
-        // ⚠️ **前缀判据必须带尾随空格**（`"axis set "` 而不是 `"axis set"`）：
-        // 后者会把 `axis settings` 也吃进来。既有 `session create` 就没带空格，
-        // 于是 `session createX` 会被当成建会话命令——**本计划不跟着犯这个错**。
-        if (trimmed.StartsWith("axis set ", StringComparison.Ordinal))
+        // ⚠️ **动词判据：先切词、再逐词比对（宽口径）——与 `claim` 那块同形，别再走字面前缀。**
+        // 旧写法是 `StartsWith("axis set ", StringComparison.Ordinal)`，它**只认空格**：
+        //   · `axis<TAB>set s1 safety prod`  ⇒ 不认
+        //   · `axis set<NBSP>s1 safety prod` ⇒ 不认（NBSP 从网页复制粘贴就会带进来）
+        // 两条都掉进最后的兜底 `(null, null)` ⇒ **当成消息发给了会话**：
+        // 用户以为设了轴，实际烧了一次模型调用，而轴**没设**。这正是本任务从头防到尾的「静默接管」，
+        // 也是 T8 把 `claim` 的边界改成宽口径时**漏掉的那一半**（T5 的 `axis set` 窄口径）。
+        if (IsAxisSetVerb(trimmed))
             return ParseAxisSet(trimmed);
 
-        // ⚠️ 这一句接的是「光一个 `axis set`」（以及「光一个 `axis`」）——它们**不带尾随空格**，
-        // 所以上面那条前缀判据够不着，会掉到最后的兜底 `(null, null)` ⇒ 被当成消息发给会话。
-        // 用户以为在设轴，实际发了一行字出去：**静默接管**。
-        if (trimmed is "axis set" or "axis")
+        // ⚠️ 「光一个 `axis`」同样不能落回「当成消息」——用户以为在设轴。
+        // （「光一个 `axis set`」已被上面那条截住 ⇒ `ParseAxisSet` 报段数不足。旧版靠一条
+        //   等值判断 `trimmed is "axis set" or "axis"` 接住它俩，词块判据把这条**并进来了**。）
+        if (string.Equals(trimmed, "axis", StringComparison.OrdinalIgnoreCase))
             return (null, "用法：axis set <会话 id> <轴> <值>");
 
         if (trimmed.StartsWith("provider set ", StringComparison.Ordinal))
@@ -168,12 +193,17 @@ public static class CoreCommandParser
     /// **整行**，所以 `parts[0] == "axis"`、`parts[1] == "set"`，三个实参在 2 / 3 / 4）。
     /// 少了不能落回「当成消息」——用户以为设了轴，实际是把这行字发给了会话。那是静默接管。
     ///
-    /// <para>⚠️ 值里不能有空格（`RemoveEmptyEntries` 把空格当分隔符）——这条命令没有 `--` 标志，
+    /// <para>⚠️ **切词用 <c>Split(null, …)</c>（所有空白）**，不是 `Split(' ')`（只认空格）：
+    /// 后者与入口判据**口径不一**时，`axis set&lt;NBSP&gt;s1 safety prod` 会被入口认作命令、
+    /// 却在这里切成一段 ⇒ 报一句**错得离谱**的「用法」；而 `axis&lt;TAB&gt;set …` 更是
+    /// 连入口都进不来。两处都改成宽口径后，Tab / NBSP / 连续多个空格一律等价。</para>
+    ///
+    /// <para>⚠️ 值里不能有空格（`RemoveEmptyEntries` 把空白当分隔符）——这条命令没有 `--` 标志，
     /// 形状就是「三个词」。多出来的词同样落进「不是 5 段」那一支**报错**，不静默取前三个。</para>
     /// </summary>
     private static (CoreCommand?, string?) ParseAxisSet(string line)
     {
-        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length != 5)
             return (null, "用法：axis set <会话 id> <轴> <值>   （轴：" + string.Join("|", Axes.Names)
                 + "；取值见 `status`）");

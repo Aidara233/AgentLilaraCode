@@ -34,11 +34,11 @@ public class ParserTests
     /// 会掉进「不是命令形态 ⇒ 当成消息发出去」那条路——用户以为设了轴，
     /// 实际是把这行字当消息发给了会话。**静默接管**的变体。
     ///
-    /// <para>⚠️ 注意 `"axis set"`（**不带尾随空格**）这一例：`Parse` 的前缀判据是
-    /// <c>"axis set "</c>（带空格），所以这一行**根本不进** `ParseAxisSet`，
-    /// 会掉到最后的兜底 `(null, null)` ⇒ 被当成消息。它必须由 `Parse` 里一条
-    /// **单独的等值判断**接住；`"axis set s1"` / `"axis set s1 safety"` 则走前缀那条、
-    /// 在 `ParseAxisSet` 里因段数不足报错。</para>
+    /// <para>⚠️ **判据已经改了，别照着老话读。** 旧实现里 `"axis set"`（不带尾随空格）**不进**
+    /// `ParseAxisSet`（前缀判据 `"axis set "` 带空格够不着它），要靠 `Parse` 里一条**单独的等值判断**
+    /// 接住。现在入口是**词块判据**（`IsAxisSetVerb`，先切词再逐词比对）⇒ 这三例**都**落进
+    /// `ParseAxisSet`、一律因段数不足报错。这条测试的**断言不变**（三例都不是消息、都报错），
+    /// 变的只是它们走哪条路。</para>
     /// </summary>
     [Theory]
     [InlineData("axis set")]
@@ -60,6 +60,86 @@ public class ParserTests
 
         Assert.Null(cmd);
         Assert.Null(err);   // ⇒ 调用方按普通消息处理
+    }
+
+    /// <summary>
+    /// ⚠️ **`axis set` 的词块判据必须是宽口径，且与 `claim` 同形**（终审 I1）：
+    /// Tab / NBSP / 连续多个空格都算分隔符，**动词大小写不敏感**。
+    ///
+    /// <para>旧写法是 `StartsWith("axis set ", StringComparison.Ordinal)`（**只认字面空格**）
+    /// + `Split(' ')`：`axis&lt;TAB&gt;set …` 与 `axis set&lt;NBSP&gt;…` **入口都不认** ⇒
+    /// 掉进兜底 `(null, null)` ⇒ **当成消息发给了会话**——用户以为设了轴，实际烧了一次模型调用、
+    /// 轴还没设。而 `axis  set …`（两个空格）在修掉 C1 之前落进 claim 词块、修掉之后**同样静默变成消息**。
+    /// ⇒ 这一组一起钉住「宽口径贯通**入口**与**切词**两处」。</para>
+    ///
+    /// <para>⚠️ **NBSP（U+00A0）单列一条 `Fact`**（下面那条）：它从**网页复制粘贴**就会带进来，
+    /// 但它是**不可见字符**，写进 `InlineData` 字面量会有「绿了却什么都没测」的风险。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("axis\tset s1 safety prod")]        // Tab
+    [InlineData("axis  set  s1  safety  prod")]     // 连续多个空格
+    [InlineData("Axis Set s1 safety prod")]         // 动词大小写：与 claim 同口径（不敏感）
+    public void AxisSet_WithWideSeparatorsOrCapitalizedVerb_IsStillTheCommand(string line)
+    {
+        var (cmd, err) = CoreCommandParser.Parse(line);
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.SessionSetAxis>(cmd);
+        Assert.Equal(("s1", "safety", "prod"), (c.SessionId, c.Axis, c.Value));
+    }
+
+    /// <summary>
+    /// ⚠️ **NBSP（U+00A0）也是空白，别让 `axis set` 漏回「当成消息」。**
+    /// 与 `Claim_WithANbspSeparator_…` 同一类：它从**网页复制粘贴**就会带进来，
+    /// 而入口判据若只认 `' '` 就会把这行字原样发给会话（烧一次模型调用、轴没设）。
+    ///
+    /// <para>⚠️ **NBSP 用 `(char)0x00A0` 显式拼**，不写进字面量：字面量里那个字符
+    /// 肉眼分不出，编辑器/工具链一个「规范化空白」就能悄悄换成普通空格，
+    /// 于是测试**绿了却什么都没测**（[[invisible-input-needs-byte-check]]）。</para>
+    /// </summary>
+    [Fact]
+    public void AxisSet_WithAnNbspSeparator_IsStillTheCommand()
+    {
+        var line = "axis set" + (char)0x00A0 + "s1 safety prod";
+
+        var (cmd, err) = CoreCommandParser.Parse(line);
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.SessionSetAxis>(cmd);
+        Assert.Equal(("s1", "safety", "prod"), (c.SessionId, c.Axis, c.Value));
+    }
+
+    /// <summary>
+    /// ⚠️ **光一个 `axis` 不能落回「当成消息」**——用户以为在设轴。
+    /// 「光一个 `axis set`」那条由 `AxisSet_WithTooFewWords_…` 钉住；
+    /// 这条补上单词那一半（旧版靠一条等值判断接住它，词块判据把它并了进来）。
+    /// </summary>
+    [Theory]
+    [InlineData("axis")]
+    [InlineData("  axis  ")]      // 首尾空白
+    [InlineData("AXIS")]          // 动词大小写不敏感 ⇒ 同样报用法，不静默变成消息
+    public void AxisAlone_IsAnError_NotAMessage(string line)
+    {
+        var (cmd, err) = CoreCommandParser.Parse(line);
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    /// <summary>
+    /// ⚠️ 反向守卫：`words[1]` 不是 `set` 时**不许**吃进来。
+    /// `axis settings …` 的 `words[1]` 是 `settings` ⇒ 落回普通消息——这正是旧前缀判据
+    /// 带尾随空格（`"axis set "`）要防的那件事，词块判据以「逐词比对」达成同一效果。
+    /// </summary>
+    [Theory]
+    [InlineData("axis settings s1 safety prod")]
+    [InlineData("axis sete s1 safety prod")]
+    public void AxisWithANonSetSecondWord_FallsThroughToBeingAMessage(string line)
+    {
+        var (cmd, err) = CoreCommandParser.Parse(line);
+
+        Assert.Null(cmd);
+        Assert.Null(err);
     }
 
     /// <summary>

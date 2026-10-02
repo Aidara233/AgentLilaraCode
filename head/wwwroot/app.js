@@ -33,7 +33,20 @@ let axes = {};                      // 当前会话的轴值
 //
 // ⚠️ **幂等是硬要求**：这段每次开页面都跑，所以「项目下有会话就打开它」——
 // 少了它，每开一次浏览器就多一个会话（`01` §8.1）。
-async function bootstrap() {
+//
+// ⚠️ **去重：`bootstrap()` 有两个入口**（首屏的 IIFE 与 `onopen` 的自恢复）。
+// 它**不是**可重入的（会重复 `session.create`），而首屏那两条路可能**几乎同时**触发：
+// `connect()` 在 `CONNECTING(0)` 时就返回了，`onopen` 可能在 IIFE 的 `await bootstrap()` **之前**跑。
+// ⇒ 用**一次性承诺**去重：并发调用拿到**同一个**承诺；**成功**后留着（后续调用是 no-op）；
+// **失败**则清空，让核心起来后的 `onopen` 能**重试**——那正是终审 I4 要的自恢复。
+let bootPromise = null;
+function bootstrap() {
+  if (bootPromise) return bootPromise;
+  bootPromise = runBootstrap().catch((e) => { bootPromise = null; throw e; });
+  return bootPromise;
+}
+
+async function runBootstrap() {
   // ⚠️ **轴表先拉**（G8：头不自带副本）。少了这一步，`AXES` 是空数组
   // ⇒ 右栏一个控件都画不出来，而用户看到的「没有轴」与「头坏了」分不清。
   await loadAxes();
@@ -88,11 +101,12 @@ async function loadSessions() {
   renderSessions();
 
   // ⚠️ **项目流订阅在这里补一次**（第二个入口，见 `connect()` 的时序分析）。
-  // 首屏那条路上 `connect()` 的 `onopen` 跑在 `loadSessions()` 之前 ⇒ 它那行被 `null` 跳过；
-  // 而本函数正处在「`currentProject` 刚刚被填好」的那一刻 ⇒ 由它来订。
+  // 首屏那条路上 `connect()` 的 `onopen` 会因 `currentProject === null` **提前返回**
+  //（它转去补跑 `bootstrap()`，见那里的 I4 注释）⇒ **根本没走到**它那句 `subscribe`；
+  // 而重连那条路上 `onopen` 先显式订一次、本函数末尾再订一次。
   // ⚠️ **重复订阅是安全的**：核心侧 `ControlServer.PumpAsync` 的 `Subscribe` 对同 topic
   // **换掉旧的**（它要的正是这个语义，见那里「重复订阅必须换掉那条旧的」的注释）；
-  // 而 `since: null` = 「只要从现在开始的」⇒ 在任一顺序下都恰好订上一次。
+  // 而 `since: null` = 「只要从现在开始的」⇒ 在任一顺序下都恰好剩下**一条**有效订阅。
   if (currentProject) subscribe(`project:${currentProject}`, null);
 }
 
@@ -406,19 +420,35 @@ function connect() {
     // ⚠️ **第一句就置位**——下面的 `subscribe()` 与 `openSession()` 都同步读它。
     wsReady = true;
     $("status").textContent = "已连接";
-    // ⚠️ **项目流**：会话列表是派生的（§6.1），靠 `session.created` 更新；
-    // 声明也走这条流（`03` §5）。不订它的话，在**控制台**建会话或占区域，
-    // 这个页面看不见，且不会自愈。
+
+    // ⚠️ **`currentProject === null` 就是「核心当时没起来」的信号**（终审 I4）。
+    // 首屏那条路上 `bootstrap()` 的第一句 `loadAxes()` 会 fetch `/axes`；核心不在时它 reject
+    // ⇒ `loadSessions()` 没跑 ⇒ `currentProject` / `current` 都是 null ⇒ 下面两行都跳过、
+    // 页面空白**直到手工刷新**（`05` §2.1：头是独立进程，先开头的场景完全合理）。
+    // ⇒ 在这里补跑一次 `bootstrap()`（它自己去重，见那里的 `bootPromise`）：
+    //   · 首屏「`onopen` 赶在 IIFE 的 `await bootstrap()` 之前」时，两者拿到**同一个**承诺，
+    //     不会各跑一遍（各跑一遍 = 建两个会话）；
+    //   · 核心后起来时，这正是**自恢复**那一步。
+    if (currentProject === null) {
+      bootstrap().catch((e) => renderMeta("✗ 核心没连上：" + (e && e.message ? e.message : e), "error"));
+      return;   // 还没有当前项目/会话，下面两行无从谈起（`current` 也必为 null）
+    }
+
+    // ⚠️ **重连必须重拉会话列表**（终审 I3）：断线窗口里由**控制台**建的会话，靠
+    // `subscribe(project:…, null)` 是**补不回来**的——`since: null` = 「只要从现在起的」，
+    // 新订阅**不补发旧事件**，也不会 resync ⇒ 那个会话在本页**永远不出现**，且不自愈。
     //
-    // ⚠️ **两条路径把它补上，合起来是完备的**：
-    //   ① **首屏**：`connect()` 在 `CONNECTING(0)` 时就跑完了，所以这里的 `currentProject`
-    //      还是 `null`（`loadSessions()` 由 `bootstrap()` 里的 `await` 才跑）⇒ 这一行**跳过**；
-    //      补它的是 `loadSessions()` 末尾自己那句 `subscribe(...)`（见那里）。
-    //   ① **重连**：`currentProject` 已非空 ⇒ 这一行**订上**；且 `openSession(current)`
-    //      会在同一段同步代码里重新 `subscribe` 会话流。
-    // ⇒ **不要靠「WebSocket 比 fetch 慢，所以多半能赢」**——那是掷硬币（首屏实测就是跳过）。
-    //   要的是「任一顺序都订上」：两个入口各自兜住一种顺序。
-    if (currentProject) subscribe(`project:${currentProject}`, null);
+    // ⚠️ 账本曾把「`subscribe()` 重订丢 `since`」判为**良性**，理由是「重订后紧跟一次快照重读」——
+    // 那句只对 `loadSessions()` 末尾那次重订成立；**`onopen` 这次前面没有任何快照拉取**。
+    // ⇒ 那条「良性」的依据是错的（终审翻案），下面这次 `loadSessions()` 就是它真后果的修法。
+    //
+    // ⚠️ 会不会「订两次 / 留旧订阅」？——不会：
+    //   · `loadSessions()` 末尾自己会再 `subscribe` 一次同 topic；服务端
+    //     `ControlServer.PumpAsync` 的 `Subscribe` 对**同 topic 换掉旧的** ⇒ 净剩**一条**。
+    //   · 不会留下旧 pk 的订阅：`currentProject` 只从 `null` 变成**某一个** pk，从不改指。
+    //   · 那次 `loadSessions()` 是**必须**的——它是本页唯一会重拉 `/projects` 的地方。
+    loadSessions();
+    subscribe(`project:${currentProject}`, null);
     if (current) openSession(current);   // 重连一律拉快照重建（§6.2 唯一的降级路径）
   };
 
@@ -560,5 +590,12 @@ $("interrupt").onclick = () => {
 (async () => {
   try { core = (await (await fetch("/config.json")).json()).core; } catch { /* 用默认值 */ }
   connect();
-  await bootstrap();
+  // ⚠️ **失败必须可见**（终审 I4）：核心没起来时 `bootstrap()` 的第一句 `loadAxes()` 就 reject。
+  // 不接的话那是一次**未观测拒绝**——页面停在空白、只在控制台留一条错，用户无从判断。
+  // 接住并打一行到时间线；核心起来后由 `onopen` 的 `currentProject === null` 分支**自动重试**。
+  try {
+    await bootstrap();
+  } catch (e) {
+    renderMeta("✗ 核心没连上（" + (e && e.message ? e.message : e) + "）——连上后会自动重试", "error");
+  }
 })();

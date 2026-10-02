@@ -202,7 +202,62 @@ public sealed record SessionHandle
         };
     }
 
-    public void SaveState(SessionStore store) => store.WriteState(ProjectKey, State);
+    /// <summary>
+    /// ⚠️ **对 <see cref="State"/> 的「读 → 造副本 → 写回」必须走这一把锁。**
+    ///
+    /// <para>为什么：`State` 是**可变字段**（宿主的激活表里存的是这个 handle 的**引用**，
+    /// 所以外形不能换成 `handle = handle with { … }`，见 `CommandDispatcher.HandleSessionSetAxis`
+    /// 的注释）。而 `session.setAxis` 与 `Stepper` 各做一次读-改-写、**互不共享锁**——
+    /// `setAxis` 刻意不拿会话闸（`01` §3.5 要求轴即时生效），而 `Stepper` 拿的那把闸
+    /// **挡不住 `setAxis`**。两条 `handle.State = handle.State with { … }` 交错时，
+    /// **后写的会把先写的整份盖掉**（`SessionState` 是 record，`with` 是从**读到的**旧值造副本）：
+    /// 丢 `Turn`，或把状态**永久卡在 `Running`**（终审 I2）。</para>
+    ///
+    /// <para>把这三步收进一把私有锁里，交错在结构上就不存在了。</para>
+    /// </summary>
+    private readonly object _stateGate = new();
+
+    /// <summary>
+    /// **原子换 `State`**：读、改、写全在 <see cref="_stateGate"/> 里。
+    /// 返回换过之后的那份（就是字段里那份——别在调用点再读一遍，那可能已经是**下一次**改动后的值）。
+    ///
+    /// <para>⚠️ **任何打开 `State` 的读-改-写都必须走这里或 <see cref="UpdateStateAndPersist"/>**，
+    /// 不能写成 `handle.State = handle.State with { … }`——那一句的读与写之间没有临界区。</para>
+    /// </summary>
+    public SessionState UpdateState(Func<SessionState, SessionState> change)
+    {
+        lock (_stateGate) { State = change(State); return State; }
+    }
+
+    /// <summary>
+    /// 原子换 `State` **并落盘**——两步在**同一个临界区**里。
+    /// ⚠️ 少了这一步，「内存对了、盘上还是旧的」这条分叉就会落在两次写之间（终审 I2 的约束 1 / 2）。
+    /// </summary>
+    /// <param name="persistedStatus">
+    /// 落盘时把 `Status` 钉回的值（见下面 <see cref="SaveAxes"/> 的注释：`setAxis` 不拿闸，
+    /// 可能在**整个模型调用**的窗口里发生，那时内存里是 `Running`，而磁盘**从不存 Running**）。
+    /// 传 `null` = 原样落盘（`Stepper` 收尾时内存里本来就是 `Idle`）。
+    /// </param>
+    public SessionState UpdateStateAndPersist(
+        SessionStore store, Func<SessionState, SessionState> change, string? persistedStatus = null)
+    {
+        lock (_stateGate)
+        {
+            State = change(State);
+            store.WriteState(ProjectKey, persistedStatus is null ? State : State with { Status = persistedStatus });
+            return State;
+        }
+    }
+
+    /// <summary>
+    /// 把**当前** `State` 落盘。
+    /// ⚠️ 它只做「写」，不做读-改-写 ⇒ **要改 `State` 请走 <see cref="UpdateStateAndPersist"/>**，
+    /// 别写成 `handle.State = …; handle.SaveState(store);`（那两句之间没有临界区）。
+    /// </summary>
+    public void SaveState(SessionStore store)
+    {
+        lock (_stateGate) store.WriteState(ProjectKey, State);
+    }
 
     /// <summary>
     /// 把轴写进 `state.json`（`session.setAxis` 的写回点，Task 3）。
@@ -225,9 +280,13 @@ public sealed record SessionHandle
     /// ⚠️ 将来若别的内存专有状态真的接上（`WaitingForInput` 等），这里要跟着改——
     /// 判据是「磁盘上合法的是哪些取值」，不是「钉成 Idle」这个动作本身。</para>
     ///
-    /// <para>⚠️ 改轴要走 `handle.State = handle.State with { Axes = … }` 再调这里：
-    /// `SessionState` 是 record，`Axes` 是 `init`，就地改不了。</para>
+    /// <para>⚠️ **改轴请走 <see cref="UpdateStateAndPersist"/>**——它把「改内存 + 落盘」放在
+    /// **同一个临界区**里，并顺带做这里的「钉回 `Idle`」。写成
+    /// `handle.State = handle.State with { Axes = … }` 再调这里，那两句之间没有临界区，
+    /// 正是终审 I2 点名的交错窗口（`Stepper` 的收尾读-改-写会在这里被整份盖掉）。</para>
     /// </summary>
-    public void SaveAxes(SessionStore store) =>
-        store.WriteState(ProjectKey, State with { Status = "Idle" });
+    public void SaveAxes(SessionStore store)
+    {
+        lock (_stateGate) store.WriteState(ProjectKey, State with { Status = "Idle" });
+    }
 }

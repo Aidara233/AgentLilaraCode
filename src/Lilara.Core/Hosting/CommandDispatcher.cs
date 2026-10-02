@@ -380,15 +380,25 @@ public sealed class CommandDispatcher(
         if (handle.State.Axes!.TryGetValue(x.Axis, out var current) && current == canonical)
             return new DispatchResult(new Ack.Accepted { CommandId = id });
 
-        var next = new Dictionary<string, string>(handle.State.Axes!, StringComparer.Ordinal) { [x.Axis] = canonical };
-
-        // ⚠️ **赋的是 `handle.State`，不是换掉 `handle`。** `SessionState` 是 record，
+        // ⚠️ **改内存 + 落盘必须走 `UpdateStateAndPersist`（同一个临界区）**，不能写成
+        // `handle.State = handle.State with { Axes = next }; handle.SaveAxes(store);`——
+        // 那两句之间没有锁，而 `Stepper` 的收尾也做一次「读 `State` → `with` → 写回」
+        // （它拿的会话闸**挡不住 `setAxis`**，因为 `setAxis` 刻意不拿闸）。两条交错时，
+        // 后写的会把先写的**整份**盖掉：丢 `Turn`，或把状态永久卡在 `Running`（终审 I2）。
+        //
+        // ⚠️ **换的是 `handle.State` 这个字段，不是 `handle` 本身。** `SessionState` 是 record，
         // `with` 换出一份带新轴的副本；而 `SessionHandle` 是**可变的活对象**，
         // 宿主的激活表里存的是**它**的引用（`CoreHost._activated`）——
         // 写 `handle = handle with { … }` 或 `new SessionHandle` 会让表里那份指向**旧实例**，
         // 于是 dispatcher 与快照端点各读各的，**状态分叉**（`Repl.Current` 的 setter 同源）。
-        handle.State = handle.State with { Axes = next };
-        handle.SaveAxes(_host.Store);
+        //
+        // ⚠️ `persistedStatus: "Idle"` ＝「钉回磁盘语义」（见 `SessionHandle.SaveAxes` 的注释）：
+        // 本命令不拿会话闸，能在**整个模型调用**里发生，那时内存是 `Running`，而磁盘从不存它。
+        handle.UpdateStateAndPersist(_host.Store, s =>
+        {
+            var next = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal) { [x.Axis] = canonical };
+            return s with { Axes = next };
+        }, persistedStatus: "Idle");
 
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
             new WireEvent.AxisChanged(handle.SessionId, x.Axis, canonical));

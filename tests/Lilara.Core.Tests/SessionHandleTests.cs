@@ -72,6 +72,62 @@ public class SessionHandleTests : IDisposable
         Assert.Equal(3, _store.ReadState(handle.ProjectKey, handle.SessionId).Turn);
     }
 
+    /// <summary>
+    /// ⚠️ **I2 的交错，用「两条 `Task` + `Barrier`」的形状钉住**（终审 I2）。
+    ///
+    /// <para>两个角色各自复刻一处**真实写点**：
+    /// **A = `session.setAxis`**（读 `State` → `with { Axes }` → 写回），
+    /// **B = `Stepper` 收尾**（读 `State` → `with { Status, Turn+1 }` → 写回）。
+    /// 两处**不共享别的锁**——`setAxis` 刻意不拿会话闸（`01` §3.5 要求即时生效），
+    /// 而 `Stepper` 拿的那把闸**挡不住 `setAxis`**。</para>
+    ///
+    /// <para>⚠️ **旧写法（`handle.State = handle.State with { … }`）下这条实测红**：
+    /// 200000 轮里 `Turn` 只剩约 **11.6 万**——**约四成更新被整份盖掉**
+    ///（每一次丢的是一次「后写的把先写的整份替换掉」）。
+    /// 现在两处都走 `UpdateState`（同一把锁）⇒ 两个字段都不丢。</para>
+    ///
+    /// <para>⚠️ **判据必须是「`Turn` 恰好等于轮数」**，不是区间：这两个角色**只**经 `UpdateState`
+    /// 写 `State`、没有别的写点，所以精确值可以要求；用区间会掩盖「丢一点也算过」。</para>
+    /// </summary>
+    [Fact]
+    public void UpdateState_TwoWriters_AxisAndTurn_BothSurvive()
+    {
+        var handle = SessionHandle.Create(_store, @"C:\work", Model());
+
+        const int rounds = 200_000;
+        using var barrier = new Barrier(2);
+
+        // 角色 A：复刻 `session.setAxis` 的读-改-写
+        var setAxisRole = Task.Run(() =>
+        {
+            for (var i = 0; i < rounds; i++)
+            {
+                barrier.SignalAndWait();
+                handle.UpdateState(s => s with
+                {
+                    Axes = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal)
+                    { [Axes.Safety] = i % 2 == 0 ? "dev" : "prod" },
+                });
+            }
+        });
+
+        // 角色 B：复刻 `Stepper` 收尾的读-改-写
+        var stepperRole = Task.Run(() =>
+        {
+            for (var i = 0; i < rounds; i++)
+            {
+                barrier.SignalAndWait();
+                handle.UpdateState(s => s with { Status = "Idle", Turn = s.Turn + 1 });
+            }
+        });
+
+        Task.WaitAll(setAxisRole, stepperRole);
+
+        Assert.Equal(rounds, handle.State.Turn);                        // Turn 一次都没丢
+        Assert.Equal(Axes.Names.Count, handle.State.Axes!.Count);        // 轴表没被盖成残缺的一份
+        Assert.Contains(handle.State.Axes[Axes.Safety], new[] { "dev", "prod" });
+    }
+
     [Fact]
     public void Create_ProducesDistinctSessionIdsPerCall()
     {
