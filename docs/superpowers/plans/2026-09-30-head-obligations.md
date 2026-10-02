@@ -3835,38 +3835,39 @@ Expected：两条都有输出。**若 `index.html` 那条没有**，说明 T9 �
 - [ ] **Step 2: 起核心与头，手工验声明冲突上浮**
 
 Run（两个终端，同 T9），然后：
-1. 控制台 A 建第二个会话：`session create`
-2. `session activate <A>` → `claim src`
-3. `session activate <B>` → 尝试 `claim src` → **核心回 `rejected` 并点名 A**
-4. 在**头**里点一下 B，发一条消息（`session.send` 会激活 B），再在控制台 A 敲 `claim src`
+1. 控制台 A：`provider set …` → `session create` → 记下 **A** 的 id → `claim src` → **期望 `✓ 已占 src`**
+2. 控制台 A：**再** `session create` → 记下 **B** 的 id（`session create` 会把当前会话设成新那个）
+3. 控制台 A：`claim src`（现在这条命令的会话是 **B**）→ **期望 `rejected` 并点名 A**
+4. 起头 → 浏览器开页面 → **左栏列出 A 与 B 两个会话**；**右栏声明区列出 `src`**（属 A）
 
-Expected：第 3 步的拒绝消息里有 A 的 id；第 4 步**照样拒绝**（B 还是当前的）。
+Expected：第 3 步的拒绝消息里有 A 的 id；第 4 步 `src` **仍在**（第 3 步的拒绝**没有**删掉任何东西）。
 
-⚠️ **第 2/3 步的 `<A>`——不要用 `session activate` 去选会话。**
-`session activate <id>` 在控制台里**不设「当前会话」**，而且**一声不吭**：
-`CommandDispatcher.HandleSessionActivate` 的 `Reply` 是 `null`（`PrintReply(null)` 直接 return），
-而它**刻意**不去写 `Repl.Current`——那里的注释写着「激活只是载入内存。它**不许**去写控制台的当前会话……
-头点一下 B 就改掉控制台的当前会话，用户在控制台敲的下一句就会跑到 B 去。两者必须分开」。
-⇒ 控制台的「当前会话」**只有 `session create` 会设**（`Repl.DispatchAsync` 的 switch 里没有 `SessionActivate` 臂）。
-所以第 1 步要用**控制台**建（`session create` 会把它设成当前）；`<A>` 就是那个 id，第 2 步直接用。
-⚠️ **别把这条当缺陷**——那是 T3 的刻意裁定，头与控制台各有各的当前会话。
+⚠️ **两个会话都从控制台建——不要用 `session activate`，也不要指望头建的会话能被控制台操作。**
+- **控制台的「当前会话」只有 `session create` 会设**（`Repl.DispatchAsync` 的 switch 里**没有** `SessionActivate` 臂）。
+- 而 `session activate <id>` 更糟：它**不设当前会话、还一声不吭**——
+  `CommandDispatcher.HandleSessionActivate` 的 `Reply` 是 `null`（`PrintReply(null)` 直接 return），
+  而它**刻意**不去写 `Repl.Current`，那里的注释写着「激活只是载入内存。它**不许**去写控制台的当前会话……
+  头点一下 B 就改掉控制台的当前会话，用户在控制台敲的下一句就会跑到 B 去。**两者必须分开**」。
+  ⇒ **那是 T3 的刻意裁定，不是缺陷。** 别把它当 bug 修，也别在验收里用它。
+- 想让控制台对**头建的**会话发命令，**没有可用的路**：`claim <p>` / `axis set`（无会话 id 的形式）都走
+  `Current`，而设 `Current` 的只有 `session create`。⇒ **别设计需要那条路的验收**。
+- ⚠️ **`ClaimAcquire` 不带会话 id 的语法在控制台里不存在**——`claim src` 一律落到 `Current`。
+  所以「让 B 去占 `src`」这件事，只能**先让 B 成为当前会话**，而那就是第 2 步。
 
-⚠️ **第 4 步为什么必须借头来激活 B**：B 由头建，而头**不会**、也不该去改控制台的当前会话。
-要让控制台能对 B 发命令，唯一的路是让 **B 变成控制台的当前会话**，而那只在
-`Session.Send*` 被控制台**自己**调用时发生 ⇒ 借头制造那一步。
-⚠️ `SessionSend` 的 `Ack.Accepted` 带 `SessionId` ⇒ 控制台会把当前会话设成 B（有先例：
-`CommandDispatcher.HandleSessionActivate` 的注释就是为这个而写的）。
+⚠️ **为什么两个会话能冲突**：`HandleClaimAcquire` 用 `ClaimStore(handle.Spec.WorkingDirectory)`，
+而 `SessionCreate` **不带工作目录**（`HandleSessionCreate` 用 `_host.WorkingDirectory`）
+⇒ A 与 B 的 `WorkingDirectory` **必然相同** ⇒ **同一份 `claims.json`** ⇒
+`Claims.FindConflict`（跳过同会话、比对不同会话）**真的会命中**。
+⚠️ 但同一件事也意味着**右栏会把同一批声明列一遍**（`GET /claims` 按会话枚举，
+而两者指向同一个文件）——**别把它当成两处副本分叉了**。
 
-⚠️ **两个会话共享同一个工作目录与同一份 `claims.json`。**
-`SessionCreate` **不带工作目录**（`HandleSessionCreate` 用 `_host.WorkingDirectory`），
-所以「控制台建的 A」与「头建的 B」的 `WorkingDirectory` **必然相同** ⇒ **同一个 projectKey**
-⇒ **同一份 `claims.json`** ⇒ 第 3 步的互斥**真的会触发**。
-⚠️ 但这也意味着**头里的两个会话会列出同一批声明**（`GET /claims` 按会话枚举，
-而两者指向同一个文件）——验收时别把它当成「两处副本分叉了」。
-
-⚠️ **「确认核心照常工作」有两条路，第 4 步走的是第二条**：
-① 头在 B 上直接 `session.send` → 会**失败**（B 的 provider 解析依赖它自己的会话），
-② 借头的发送把 B 变成控制台的当前会话，再从控制台发。**走 ②**。
+⚠️ **头侧「冲突上浮」在本形态下仍然不可达，且这是设计使然。**
+头的 `renderClaims` 会在「一条路径落在两个**不同**会话下」时把 ⚠ 顶到最上面；
+而同工作目录的两个会话**根本不可能**同时持有一条路径——核心在第 3 步就挡住了。
+⇒ 那是**防御性渲染**：留给将来「声明可以不互斥」的形态（派生树例外之类）。
+⚠️ **不要为了让它可达而放开核心的检查**，也不要为了它去改验收。
+（跨工作目录时它**是**可达的——`/claims` 按 `ProjectKeys()` 跨所有项目枚举，
+每个会话读自己的 `claims.json`、互不检查——但**本核心只有一个工作目录**，所以本机跑不出来。）
 
 ⚠️ **但这不证明头侧的上浮可达。** 头侧上浮是「**一条声明落在两个会话**」的渲染，
 而同一项目内的会话由 `HandleClaimAcquire` 挡住了 ⇒ **同项目内它确实不可达**。
@@ -3936,10 +3937,15 @@ git commit -m "docs(head): 头进程职责注释（它只托管静态资源，�
 3. **端到端手工**：T9 Step 3 的九条 + T10 Step 2 的四条，**逐条真的看到**。
    ⚠️ **逐条先写下预期、再跑、再记下实际看到的**（只看"没崩"不算看到）。
    其中 T10 的冲突那条**三个可观测量都要记**，缺一不算跑过：
-   ① 核心回 `rejected`；② 头在**两个会话下都显示对方的声明**
-   （`GET /claims` 的同一份渲染）；③ 用户自己那条**没有被别人删掉**。
-   ⚠️ ②是**要害**：真阻塞的实现会让双方的声明**互相看不见**——
+   ① 核心回 `rejected` 并**点名 A**；② 头的右栏声明区**仍列出 `src`**（属 A）——
+   即那次拒绝**没有删掉、也没有藏起任何东西**；③ 控制台 `claim list` 里
+   **A 仍持有 `src`，且该路径只有一条声明**。
+   ⚠️ ②③ 是**要害**：真阻塞的实现会让**双方的声明互相看不见**——
    那不是"更安全"，那是**记下了一份用户看不见的状态**，正是 `01` §12 要避免的。
+   ⚠️ **不要去找「两个会话各显示一条、冲突顶到最上面」这个可观测——它今天造不出来**：
+   `HandleClaimAcquire` 在**写入前**就挡住了，同工作目录的两个会话**不可能**同时持有一条路径。
+   头的 `#claim-conflicts` 是**防御性渲染**（留给将来「声明可以不互斥」的形态）。
+   **为了让它可达而放开核心的检查，是拿一个真检查去换一个假验收。**
 4. **变异确认**（G7）：T1 Step 5 与 T6 Step 5 各两条，**跑之前先 grep 确认变异落上了**
 5. `git`：动手前记下 `master` 的 SHA 当回滚点
 
