@@ -2620,6 +2620,37 @@ public void IsClaimList_IsFalseForThingsThatAreNotTheQuery(string line) =>
     Assert.False(CoreCommandParser.IsClaimList(line));
 
 /// <summary>
+/// ⚠️ **NBSP（U+00A0）也是空白，别让它漏回「当成消息」。**
+///
+/// <para>⚠️ 审阅实测的洞：`IsClaimList` 的边界用 <c>char.IsWhiteSpace</c>（**宽**），
+/// 而 `Parse` 的词块入口曾用 `StartsWith("claim ")` / `"claim\t"`（**窄**）⇒
+/// `claim` + **NBSP** + 路径 **两边都不认** ⇒ 落空 ⇒ **当成消息发给了模型**。
+/// ⚠️ 而 NBSP 从**网页复制粘贴**就会带进来——正是本任务要根除的那一类，**从侧面漏了回来**。</para>
+/// </summary>
+[Fact]
+public void Claim_WithANbspSeparator_IsStillTreatedAsTheCommand()
+{
+    var (cmd, err) = CoreCommandParser.Parse("claim src/foo", "s1");
+
+    Assert.Null(err);
+    Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimAcquire>(cmd).Scope);
+}
+
+/// <summary>
+/// ⚠️ **`list` 那一臂只该剩「报错」**——单词的 `claim list` 已被 `IsClaimList` 在词块**之前**截走。
+/// ⇒ 它的 `(null, null)` 臂**不可达**（审阅实测：删掉它全量仍全绿 ⇒ 死代码、零覆盖）。
+/// 这条钉住可达的那一臂（多词）。
+/// </summary>
+[Fact]
+public void ClaimList_WithExtraWords_IsAnError()
+{
+    var (cmd, err) = CoreCommandParser.Parse("claim list extra", "s1");
+
+    Assert.Null(cmd);
+    Assert.NotNull(err);
+}
+
+/// <summary>
 /// ⚠️ **路径只收一个词；多给了就报错，不猜。**
 /// 初版把多余词**拼进路径**（`"src/foo extra"`）——而控制台**没有引号语法**，
 /// 含空格的路径**无法表达** ⇒ 拼起来是**猜**，猜错的方向是**静默占错地方**。
@@ -2646,10 +2677,12 @@ public void Claim_WithNothing_IsAnError()
 
 /// <summary>
 /// ⚠️ **`claim release` 少了路径，不许当成「占一个叫 release 的路径」。**
-/// 这是 `axis set` 少了尾随空格**同一个形状的缺陷**（T5 踩过）：
-/// 前缀判断放行了半个命令，剩下那半截被当成**参数**吃掉——
-/// 而它**不报错**，用户看到的是一个静默的错误动作。
-/// 判据：`trimmed == "claim release"` 要单独拦，**在 acquire 分支之前**。
+///
+/// <para>⚠️ **判据已经改了，别照着老话写。** 本注释初版写的是
+/// 「判据：`trimmed == "claim release"` 要单独拦，**在 acquire 分支之前**」——
+/// **那是精确匹配时代的话**，而实现现在是**切词**（`Split`），代码里**已经没有那个字面量**。
+/// 那句会把后来者引回精确匹配的老路 —— 而那正是 `claim  release`（两个空格）漏掉的原因。
+/// ⇒ 现在的判据是**切词后 `words[0]` 是 `release` 而 `words.Length != 2`**。</para>
 /// </summary>
 [Fact]
 public void ClaimRelease_WithNothing_IsAnError()
@@ -2779,24 +2812,29 @@ Expected: **编译失败**——`CoreCommand.ClaimAcquire` 存在（T7），但
         //   · `"claim Release src"` → 同样落进 acquire ⇒ **静默执行相反的动作**。
         // ⚠️ 而 `Trim` 能救的只有「尾随空格」那种（`"claim "` → `"claim"` → 命中守卫）——
         // **恰好是我第一版以为能救的那半**。真洞在 Trim 管不到的地方。
-        if (trimmed == "claim" || trimmed.StartsWith("claim ", StringComparison.Ordinal)
-            || trimmed.StartsWith("claim\t", StringComparison.Ordinal))
+        // ⚠️ **入口判据必须与 `IsClaimList` 的边界口径**一致**：用 `char.IsWhiteSpace`（宽），
+        // 不是 `' '` / `'\t'`（窄）。**
+        // ⚠️ 窄口径下 `claim` + **NBSP**（` `）+ 路径 **两边都不认**：
+        // `IsClaimList` 因谓词不成立返回 false，这里因 `StartsWith("claim ")` 不成立而落空
+        // ⇒ **当成消息发给了模型**。而 NBSP 从**网页复制粘贴**就会带进来——
+        // 正是本任务要根除的那一类，从侧面漏了回来（审阅实测）。
+        if (trimmed == "claim"
+            || (trimmed.Length > "claim".Length && char.IsWhiteSpace(trimmed["claim".Length])))
         {
-            // `Split(null, RemoveEmptyEntries)`：**所有空白**（空格、Tab、连续多个）都算分隔符。
+            // `Split(null, RemoveEmptyEntries)`：**所有空白**（空格、Tab、NBSP、连续多个）
+            // 都算分隔符——与上面的宽边界口径一致。
             var words = trimmed["claim".Length..]
                 .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
 
-            // ⚠️ **动词大小写不敏感**——与 `Axes.TryParse` 的**取值**同一套理
-            //（「取值是用户手打的，写 `Prod` 是常态」）。动词是**控制台语法**，不是协议标识符
-            //（协议里叫 `claim.release`，带点）。⇒ 让 `claim Release src` 做**对**的事，
-            // 而不是落进 acquire 静默占一个怪路径。
             if (words.Length == 0)
                 return (null, "用法：claim <路径> | claim release <路径> | claim list");
 
+            // ⚠️ **这一臂只剩「多词」形态**——单词的 `claim list` 已被上面的
+            // `IsClaimList` 截走（它在词块**之前**）。⇒ 原先的 `(null, null)` 臂
+            // **不可达，是死代码**（审阅实测：删掉它全量仍全绿）。
+            // ⇒ 只留报错那一臂，并给 `claim list <多余词>` 补一条测试。
             if (string.Equals(words[0], "list", StringComparison.OrdinalIgnoreCase))
-                return words.Length == 1
-                    ? (null, null)                                   // 控制台查询，Repl 拦截
-                    : (null, "用法：claim <路径> | claim release <路径> | claim list");
+                return (null, "用法：claim <路径> | claim release <路径> | claim list");
 
             if (string.Equals(words[0], "release", StringComparison.OrdinalIgnoreCase))
                 return words.Length == 2
@@ -2989,7 +3027,7 @@ Console.WriteLine("  `provider set <id> --key <key>` 配置；`session create` �
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test -v q`
-Expected: 全绿。**本任务新增 22 条 `ParserTests` + 7 条 `ReplTests` = 29 条**（含两轮审阅修复补的）
+Expected: 全绿。**本任务新增 24 条 `ParserTests` + 7 条 `ReplTests` = 31 条**（含两轮审阅修复补的）
 （⚠️ **这个数我数错过两次**：初版说「7 条」而 `Files` 写 `ReplTests`；改为「8」时又少算一条——
 解析器那 6 条放错了文件，且 `claim list` 的显示**根本没有测试**）。
 ⚠️ 分母是执行时的既有基线（**454**），别写死。
