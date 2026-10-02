@@ -2742,6 +2742,15 @@ Expected: **编译失败**——`CoreCommand.ClaimAcquire` 存在（T7），但
         if (t.Length < "claim".Length) return false;
         if (!t.StartsWith("claim", StringComparison.Ordinal)) return false;
 
+        // ⚠️ **`"claim"` 之后必须是空白（或到此为止）——这是词边界，不能省。**
+        // 少了这一句，`"claimlist"` 也会被切出 `"list"`
+        //（`"claimlist"["claim".Length..]` == `"list"`），于是 `claimlist` 被认成查询、
+        // 被 `Repl` 拦下印声明列表 ⇒ **用户敲的那行字被吞掉了**（本该当成消息发出去）。
+        // ⚠️ 对照 `Parse` 里那条守卫的写法——它用的是
+        // `trimmed == "claim" || StartsWith("claim ") || StartsWith("claim	")`，
+        // **同样是「claim 后面得有分隔」**；这里必须与它口径一致。
+        if (t.Length > "claim".Length && !char.IsWhiteSpace(t["claim".Length])) return false;
+
         var words = t["claim".Length..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         return words.Length == 1 && string.Equals(words[0], "list", StringComparison.OrdinalIgnoreCase);
     }
@@ -2980,7 +2989,7 @@ Console.WriteLine("  `provider set <id> --key <key>` 配置；`session create` �
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test -v q`
-Expected: 全绿。**本任务新增 22 条 `ParserTests` + 6 条 `ReplTests` = 28 条**（含两轮审阅修复补的）
+Expected: 全绿。**本任务新增 22 条 `ParserTests` + 7 条 `ReplTests` = 29 条**（含两轮审阅修复补的）
 （⚠️ **这个数我数错过两次**：初版说「7 条」而 `Files` 写 `ReplTests`；改为「8」时又少算一条——
 解析器那 6 条放错了文件，且 `claim list` 的显示**根本没有测试**）。
 ⚠️ 分母是执行时的既有基线（**454**），别写死。
