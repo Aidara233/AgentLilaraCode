@@ -2590,6 +2590,36 @@ public void ClaimList_IsCaseInsensitiveOnTheVerb()
 }
 
 /// <summary>
+/// ⚠️ **`IsClaimList` 与 `Parse` 必须口径一致**——`Repl` 的拦截用的是前者。
+/// 两边不一致时（初版：解析器切词、`Repl` 精确匹配），
+/// `claim LIST` 被解析器认作查询、却被 `Repl` 放行 ⇒ **当成消息发出去**。
+/// ⚠️ 这条**逐例对拍两者**，是"不可能再漂"的守卫。
+/// </summary>
+[Theory]
+[InlineData("claim list")]
+[InlineData("claim  list")]      // 两个空格
+[InlineData("claim\tlist")]      // Tab
+[InlineData("claim LIST")]       // 大写
+[InlineData("claim List")]
+[InlineData("  claim list  ")]   // 首尾空白
+public void IsClaimList_AgreesWithParse_OnEverySpelling(string line)
+{
+    // 解析器认它是「查询」（(null, null)）⇔ 谓词为真
+    Assert.True(CoreCommandParser.IsClaimList(line));
+    Assert.Equal((null, null), CoreCommandParser.Parse(line, "s1"));
+}
+
+/// <summary>⚠️ 反向：**不是**查询的输入，谓词必须为假——否则会把用户的话吞掉。</summary>
+[Theory]
+[InlineData("claim")]
+[InlineData("claim src/foo")]
+[InlineData("claimlist")]         // 没有空格：不是命令
+[InlineData("claim list extra")]
+[InlineData("claims list")]
+public void IsClaimList_IsFalseForThingsThatAreNotTheQuery(string line) =>
+    Assert.False(CoreCommandParser.IsClaimList(line));
+
+/// <summary>
 /// ⚠️ **路径只收一个词；多给了就报错，不猜。**
 /// 初版把多余词**拼进路径**（`"src/foo extra"`）——而控制台**没有引号语法**，
 /// 含空格的路径**无法表达** ⇒ 拼起来是**猜**，猜错的方向是**静默占错地方**。
@@ -2692,6 +2722,31 @@ Expected: **编译失败**——`CoreCommand.ClaimAcquire` 存在（T7），但
 
 ```csharp
     /// <summary>
+    /// ⚠️ **`claim list` 是「控制台的查询」，不是核心命令**（`03` §3：不做 `claim.list`）。
+    /// 解析器对它返回 `(null, null)`（不是错误、也不是命令），**由 `Repl` 拦截并自己处理**。
+    ///
+    /// <para>⚠️ **这个判据必须由 `Repl` 与解析器共用——这是本方法存在的唯一理由。**
+    /// 曾经两边各写一份：解析器切词（大小写不敏感、多空格都算），
+    /// 而 `Repl` 用精确的 <c>trimmed == "claim list"</c> ⇒
+    /// <c>claim LIST</c> / <c>claim\tlist</c> / <c>claim  list</c> 都被解析器认作查询、
+    /// 却被 `Repl` 的守卫**放行** ⇒ 落进 `AsMessage` ⇒ **当成消息发给了模型**。
+    /// 那正是本任务从头到尾在防的「静默落回当成消息」，**换了个入口回来**。</para>
+    ///
+    /// <para>⚠️ **`(null, null)` 这个返回值下游有两支**（"查询"与"不是命令"），
+    /// 而 `Repl` 只接了"查询"那一支——**所以它的判据必须与这里逐字一致**。
+    /// 这就是为什么它必须是**一个公开方法**，而不是两边各写一遍。</para>
+    /// </summary>
+    public static bool IsClaimList(string line)
+    {
+        var t = line.Trim();
+        if (t.Length < "claim".Length) return false;
+        if (!t.StartsWith("claim", StringComparison.Ordinal)) return false;
+
+        var words = t["claim".Length..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return words.Length == 1 && string.Equals(words[0], "list", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// ⚠️ <paramref name="currentSessionId"/> 是**控制台专有**的输入：
     /// `claim src/foo` 里没有会话 id，而核心命令**必须**有（线上协议的 `claim.acquire` 带它）。
     /// ⇒ 由控制台补上「当前会话」。头走线上协议，它自己知道是哪个会话。
@@ -2699,11 +2754,16 @@ Expected: **编译失败**——`CoreCommand.ClaimAcquire` 存在（T7），但
     public static (CoreCommand? Command, string? Error) Parse(string line, string? currentSessionId = null)
 ```
 
+⚠️ **`IsClaimList` 必须排在 `Parse` 的 claim 分支**之前**用**（或就地调用），
+且 `Repl` 的那行守卫改成 `if (CoreCommandParser.IsClaimList(trimmed)) { PrintClaims(); return true; }`。
+⇒ **判据只有一处实现**（G10），两边不可能再漂。
+
 在 `Parse` 里加（放在 `axis set` 之后）：
 
 ```csharp
+        if (IsClaimList(trimmed)) return (null, null);
+
         // ⚠️ **别去匹配精确的拼写（空格数 / 大小写）——切词。**
-        // 初版用 `trimmed == "claim release"` 与 `StartsWith("claim release ")`：
         //   · `"claim  release"`（**两个空格**）→ `Trim` 只去**首尾**空白，内部两个空格**留着**
         //     ⇒ 不匹配 `StartsWith("claim release ")`（第二个字符是空格不是 `r`）
         //     ⇒ 落进 acquire 分支 ⇒ **静默占一个叫 `release` 的路径**。
@@ -2760,7 +2820,11 @@ Expected: **编译失败**——`CoreCommand.ClaimAcquire` 存在（T7），但
 `Repl.cs` —— 调用点改传当前会话，并加 `claim list`：
 
 ```csharp
-        if (trimmed == "claim list") { PrintClaims(); return true; }
+        // ⚠️ **判据与解析器共用**（`IsClaimList`）——两边各写一份时它们漂过：
+        // 解析器切词（大小写不敏感、多空格都算），而这里曾用精确的 `== "claim list"`
+        // ⇒ `claim LIST` / `claim	list` 被解析器认作查询、却被这里放行
+        // ⇒ 落进 `AsMessage` ⇒ **当成消息发给了模型**。
+        if (CoreCommandParser.IsClaimList(trimmed)) { PrintClaims(); return true; }
 ...
         var (parsed, parseError) = CoreCommandParser.Parse(trimmed, Current?.SessionId);
 ```
@@ -2916,7 +2980,7 @@ Console.WriteLine("  `provider set <id> --key <key>` 配置；`session create` �
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test -v q`
-Expected: 全绿。**本任务新增 11 条 `ParserTests` + 6 条 `ReplTests` = 17 条**（含审阅修复轮补的）
+Expected: 全绿。**本任务新增 22 条 `ParserTests` + 6 条 `ReplTests` = 28 条**（含两轮审阅修复补的）
 （⚠️ **这个数我数错过两次**：初版说「7 条」而 `Files` 写 `ReplTests`；改为「8」时又少算一条——
 解析器那 6 条放错了文件，且 `claim list` 的显示**根本没有测试**）。
 ⚠️ 分母是执行时的既有基线（**454**），别写死。
