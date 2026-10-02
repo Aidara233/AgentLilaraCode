@@ -2511,19 +2511,28 @@ git commit -m "feat(core): 声明落盘（工作目录，可分享）+ claim.acq
 - [ ] **Step 1: 写失败的测试**
 
 ```csharp
+/// <summary>
+/// ⚠️ **必须传会话 id。** 不传等价于传 `null`（可选参数的默认值），
+/// 而 `WithSession` 对 `null` **一律报错** ⇒ `err` 非 null、`cmd` 为 null。
+/// ⚠️ **这曾经是一处计划级矛盾**：初版这两条测试写成 `Parse("claim src/foo")`（不传），
+/// 却又断言「产出 `ClaimAcquire`」——而下面的 `Claim_WithoutACurrentSession_IsAnError`
+/// 断言「不传 ⇒ 报错」。**C# 里「省略实参」与「显式传 null」用同一个可选参数、无法区分**
+/// ⇒ **没有任何实现能同时满足这两组断言**。⇒ 修法：这两条补上 `"s1"`（与同文件另两条一致）。
+/// </summary>
 [Fact]
 public void Claim_WithAPath_AcquiresOnTheCurrentSession()
 {
-    var (cmd, err) = CoreCommandParser.Parse("claim src/foo");
+    var (cmd, err) = CoreCommandParser.Parse("claim src/foo", "s1");
 
     Assert.Null(err);
     Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimAcquire>(cmd).Scope);
 }
 
+/// <summary>⚠️ 同样必须传会话 id——理由见上一条。</summary>
 [Fact]
 public void ClaimRelease_WithAPath_Releases()
 {
-    var (cmd, err) = CoreCommandParser.Parse("claim release src/foo");
+    var (cmd, err) = CoreCommandParser.Parse("claim release src/foo", "s1");
 
     Assert.Null(err);
     Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimRelease>(cmd).Scope);
@@ -2730,8 +2739,8 @@ Console.WriteLine("  `axis set <会话> <轴> <值>` 调行为；`claim <路径>
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test -v q`
-Expected: 全绿。**本任务新增 6 条 `ParserTests` + 2 条 `ReplTests` = 8 条**
-（⚠️ 这个数按 brief 实测；初版说「7 条」而 `Files` 却写 `ReplTests`——
+Expected: 全绿。**本任务新增 7 条 `ParserTests` + 2 条 `ReplTests` = 9 条**
+（⚠️ **这个数我数错过两次**：初版说「7 条」而 `Files` 写 `ReplTests`；改为「8」时又少算一条——
 解析器那 6 条放错了文件，且 `claim list` 的显示**根本没有测试**）。
 ⚠️ 分母是执行时的既有基线（**454**），别写死。
 
