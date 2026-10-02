@@ -2580,8 +2580,14 @@ public void Claim_WithACurrentSession_UsesIt()
     var (cmd, err) = CoreCommandParser.Parse("claim src/foo", "s9");
 
     Assert.Null(err);
-    Assert.Equal(("s9", "src/foo"),
-        (Assert.IsType<CoreCommand.ClaimAcquire>(cmd).SessionId, ((CoreCommand.ClaimAcquire)cmd!).Scope));
+    // ⚠️ **别把 `Scope` 塞进元组去比**——它是 `IReadOnlyList<string>`，与字符串字面量
+    // 放同一个元组会**类型对不上**：泛型推断失败，编译器落到 `Equal(DateTime, DateTime)`
+    // 那条候选上报 CS1503（而非"类型不匹配"这种一眼能看懂的消息）。
+    // ⚠️ 这段是**控制器批量改 `scope` 时留下的**：它把 `.Path` 机械换成 `.Scope`，
+    // **没管元组的形状**。⇒ 逐项断言，形状与上面两条测试一致。
+    var acquire = Assert.IsType<CoreCommand.ClaimAcquire>(cmd);
+    Assert.Equal("s9", acquire.SessionId);
+    Assert.Equal(["src/foo"], acquire.Scope);
 }
 ```
 
