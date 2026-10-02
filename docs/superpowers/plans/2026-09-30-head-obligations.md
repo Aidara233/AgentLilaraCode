@@ -49,7 +49,7 @@
 | 1 | 老 `state.json`（**没有** `axes` 键）被读入 | 五轴显示**默认值**，不是空白、不是崩溃 | T4 |
 | 2 | `session.setAxis` 传一个**枚举里没有**的值 | 回 `rejected` 并**列出合法值**；轴值不变 | T2 |
 | 3 | 同一会话**两次同轴**设值 | 第二次是幂等 no-op，**不发事件**（`01` §5：无迁移则无 `axis.changed`） | T2 |
-| 4 | `claim.acquire` 一个**已被别人占用**的路径 | 回 `rejected` 并**点名占它的那个会话**——这是「别人的工作集会被作废」唯一的可见时刻 | T6 |
+| 4 | `claim.acquire` 一个**已被别人占用**的路径 | 回 `rejected` 并**点名占它的那个会话**——这是「别人的工作集会被作废」唯一的可见时刻 | **T7**（不是 T6：`rejected` 是**命令**的产物，而 T6 只产 `Claims.FindConflict`，它返回 `Claim?`、碰不到回执） |
 | 5 | `GET /claims` 时**根本没有 `claims.json`** | 返回 `[]`，不是 404、不是 500（「没有声明」是合法且常见的形态） | T7 |
 | 6 | 头收到 `resync_required` 之后 | 能**重新订阅并复活**（`03` §7 说这是唯一的降级路径） | T10 |
 | 7 | 头连着**零会话**的核心启动 | 走 `05` §2.2 的**引导**（先问提供商、再建会话），而不是空页面 | T9 |
@@ -118,6 +118,7 @@ handle.State.Axes["effort"] = "max" ← 用户刚改的
 | D6 | **不做 `term.delta` / 附件 / 库 / 控制点 / `dirty.changed`** | 保持既有偏离（见控制面分支的台账） |
 | D7 | **不做长历史分页 / 虚拟滚动 / 多标签页** | `05` §11 的「本文自身待展开」，本计划不含 |
 | D8 | **`effort` 的档位仍是两份副本**（`Axes.Table` 与 `ClaudeRequestBuilder.ToEffort` 的 switch） | 执行中由评审发现，控制器裁定**本次不修**：修它要动适配器层（`ClaudeRequestBuilder`），而那是**既有**形态、非本计划引入。⚠️ **但它是 G10 的活标本**——两处手抄同一组档名，`Axes` 加一档而 `ToEffort` 不加 ⇒ 用户在头上下拉选中却被请求层抛异常（`ToEffort` 对未知值是 `_ => throw`）。⇒ **记为已知偏离，不是已知正确**。修法（将来）：让 `ToEffort` 从 `Axes` 取档名，或加一条「`Axes.ValuesOf(Effort)` ⊆ `ToEffort` 的臂」的对拍测试 |
+| D9 | **声明不做符号链接解析** | `01` §12.1 写「Windows 下需处理大小写不敏感**与符号链接**」，本计划只做前半（派 T6 之前实测发现零覆盖）。不是判它不重要：**是本机做不成可验证的测试**——实测 `New-Item -ItemType SymbolicLink` 失败于「此操作需要管理员权限」，而 G7 要求变异先确认落上再跑，一条跑不了的测试等于没有 ⇒ 那种测试会**看起来很绿**。后果方向是**漏报**（两个路径经不同链接指向同一处时不冲突），不是误报。修法：判据换成 `FileSystemInfo.ResolveLinkTarget` 后比较，并在**有权限的**环境补测试 |
 
 ---
 
@@ -1609,23 +1610,53 @@ public class ClaimTests
 {
     private const string Work = @"C:\repo";
 
+    /// <summary>
+    /// ⚠️ **断言必须写小写字面量。** 实测（`Path.GetFullPath(@"C:\repo\src\..\a.cs")` 在 Windows 上
+    /// 返回**原样的大小写**、**不**规范化它——规范化只存在于 `Normalize` 自己的 `ToLowerInvariant`）：
+    /// 写成 `Assert.Equal(@"C:\repo\src\a.cs", …)` 会与实现的 `ToLowerInvariant` 契约冲突，
+    /// **全绿不可能同时成立**。落盘格式是规范化的，所以钉小写才是钉那份契约。
+    /// </summary>
     [Fact]
     public void Normalize_MakesRelativePathsAbsoluteAgainstTheWorkingDirectory() =>
-        Assert.Equal(@"C:\repo\src\a.cs", Claims.Normalize(@"src\a.cs", Work));
+        Assert.Equal(@"c:\repo\src\a.cs", Claims.Normalize(@"src\a.cs", Work));
 
+    /// <summary>⚠️ 大小写不敏感是**无条件**的（实现里是无条件 `ToLowerInvariant`），不是「只在 Windows 上」。</summary>
     [Fact]
     public void Normalize_IsCaseInsensitive_OnTheDriveAndThePath() =>
         Assert.Equal(Claims.Normalize(@"C:\Repo\Src\A.cs", Work), Claims.Normalize(@"c:\repo\src\a.cs", Work));
 
+    /// <summary>
+    /// ⚠️ **这条钉的其实是「输入永远经由 `GetFullPath`」。** 实测：Windows 上
+    /// `GetFullPath` **自己**就把 `/` 归一成 `\`（`C:/repo/src` → `C:\repo\src`），
+    /// `C:\repo\src/` → `C:\repo\src\`——所以实现里那行
+    /// `Replace(AltDirectorySeparatorChar, DirectorySeparatorChar)` **是冗余的**，
+    /// 这条测试对**那半句没有区分力**（删掉它这条照样绿）。
+    /// 留着它是因为它钉的是**契约**（两种分隔符等价），而契约是对的。
+    /// ⚠️ 拿掉 `GetFullPath` 换成手拼字符串，这条**必须**红。
+    /// </summary>
     [Fact]
     public void Normalize_TreatsBothSeparatorsTheSame()
     {
         Assert.Equal(Claims.Normalize(@"src/a.cs", Work), Claims.Normalize(@"src\a.cs", Work));
     }
 
+    /// <summary>⚠️ 同样实测过：`GetFullPath` 顺手折叠 `.` / `..`，所以钉小写。</summary>
     [Fact]
     public void Normalize_ResolvesDotSegments() =>
-        Assert.Equal(@"C:\repo\a.cs", Claims.Normalize(@"src\..\a.cs", Work));
+        Assert.Equal(@"c:\repo\a.cs", Claims.Normalize(@"src\..\a.cs", Work));
+
+    /// <summary>
+    /// ⚠️ **末尾分隔符必须去掉**（`C:\repo\` 与 `C:\repo` 是同一处）。
+    /// 实测 `GetFullPath` 在两种写法下**都保留**末尾分隔符
+    /// （`C:\repo\src\` → `C:\repo\src\`；`C:\repo\src/` → `C:\repo\src\`）
+    /// ——它只在遇到 `.` 段时才把它折掉（`C:\repo\src\.` → `C:\repo\src`）。
+    /// 所以这条**有**区分力：删掉 `TrimEnd` 它就红——
+    /// 且红的方式正是要害：`c:\repo\src\` 的前缀判据多一个字符，
+    /// 于是 `src\` **永远命中不了** `src\a.cs`，冲突判据整体失效。
+    /// </summary>
+    [Fact]
+    public void Normalize_DropsTheTrailingSeparator() =>
+        Assert.Equal(Claims.Normalize(@"C:\repo\src", Work), Claims.Normalize(@"C:\repo\src\", Work));
 
     /// <summary>同一路径 ⇒ 冲突。</summary>
     [Fact]
@@ -1655,6 +1686,22 @@ public class ClaimTests
     [Fact]
     public void UnrelatedPaths_DoNotConflict() =>
         Assert.False(Claims.Conflicts(@"C:\repo\src", @"C:\repo\tests"));
+
+    /// <summary>
+    /// ⚠️ **守卫上面那句 `TrimEnd` 的边界行为。** `GetFullPath(@"C:\")` 返回 `C:\`，去尾后是 `c:`
+    /// ——一个**不是合法路径**的字符串，而它会出现在 `Normalize` 的输出里（声明 `C:\` 时）。
+    /// 看上去像该"顺手修"的怪值，**其实修了就坏**：实测
+    /// `IsUnder("c:", "c:\repo")` → True，而 `IsUnder("c:\", "c:\repo")` → False。
+    /// 所以特例保留根的反斜杠会让**根路径与它下面的一切**都判不出冲突（静默失效）。
+    /// 这条钉住那个方向，防止后来者把 `c:` 清理掉。
+    /// </summary>
+    [Fact]
+    public void Normalize_RootPath_StillConflictsWithEverythingUnderIt()
+    {
+        var root = Claims.Normalize(@"C:\", Work);
+        Assert.True(Claims.Conflicts(root, Claims.Normalize(@"C:\repo\a.cs", Work)));
+        Assert.True(Claims.Conflicts(root, Claims.Normalize(@"C:\repo", Work)));
+    }
 
     /// <summary>⚠️ 自己占的地方不算冲突，否则一个人无法重复声明同一片区域（幂等必需）。</summary>
     [Fact]
@@ -1716,23 +1763,44 @@ public static class Claims
     /// 规范化结果**要落盘**，而同一份声明可能被 Windows 与（将来）别的平台的实例读到；
     /// 两边按不同规则规范化 ⇒ 同一个路径两个字符串 ⇒ 冲突判不出来。</para>
     ///
-    /// <para>⚠️ 用 <see cref="StringComparison.OrdinalIgnoreCase"/> 存成**小写**，
-    /// 而不是「保留原样 + 比较时忽略大小写」：判据是前缀比较，而前缀比较
-    /// 每次都要走对比较器——存成规范形式，判据就是一句 <c>Ordinal</c>。</para>
+    /// <para>⚠️ 存成**规范形式（小写）**，而不是「保留原样 + 比较时忽略大小写」：
+    /// 判据是前缀比较，而前缀比较每次都要走对比较器——存成规范形式，判据就是一句 <c>Ordinal</c>。
+    /// 实现用 <see cref="string.ToLowerInvariant"/>，**不是** `StringComparison.OrdinalIgnoreCase`
+    /// （后者是**比较**用的，存不成小写）。</para>
+    ///
+    /// <para>⚠️ **不做符号链接解析，这是 `01` §12.1 的一处显式缺口。**
+    /// §12.1 写「Windows 下需处理大小写不敏感**与符号链接**」，本计划只做前半。
+    /// 理由不是「不重要」，而是**做不到可验证**：本机实测
+    /// <c>New-Item -ItemType SymbolicLink</c> 失败于「此操作需要管理员权限」，
+    /// 于是任何符号链接测试**无法在开发环境跑**——而 G7 要求变异先确认落上再跑，
+    /// 写一条跑不了的测试等于没有测试。
+    /// ⇒ **记为已知偏离（本任务 D9）**，不是已知正确：两个路径经不同链接指向同一处时，
+    /// 判据会**漏报**冲突（方向是漏，不是误报）。修法与判据改写见 T7 之后。</para>
     /// </summary>
     public static string Normalize(string path, string workingDirectory)
     {
+        // ⚠️ 相对路径折叠成**绝对**，用的是进程当前目录（`GetFullPath` 的语义）。
+        // `workingDirectory` 只在 `path` 不是绝对路径时用来拼前缀。
         var combined = Path.IsPathRooted(path) ? path : Path.Combine(workingDirectory, path);
 
         // ⚠️ `Path.GetFullPath` 顺手折叠掉 `.` 与 `..`——自己拼字符串做这件事会漏掉
         // `a/../../b` 这类多层回溯。它不碰文件系统（不要求路径存在），所以是纯函数。
         var full = Path.GetFullPath(combined);
 
-        // 统一分隔符：Windows 上 `GetFullPath` 已给反斜杠，但用户输入可能是正斜杠。
+        // ⚠️ 统一分隔符。**实测这行在 Windows 上是冗余的**：
+        // `GetFullPath` 自己就把 `/` 归一成 `\`（`C:/repo/src` → `C:\repo\src`），
+        // 删掉它没有任何测试会红。留着是因为它**不改变契约**、且在非 Windows
+        // 上（`DirectorySeparatorChar` 是 `/` 而 `AltDirectorySeparatorChar` 是 `\`）方向正好相反。
         full = full.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
 
-        // ⚠️ 去掉**末尾**分隔符（`C:\repo\src\` 与 `C:\repo\src` 是同一处）。
-        // 不去的话前缀判据会多一个字符，`src\` 就命不中 `src\a.cs`。
+        // ⚠️ **根路径也一律去，这是刻意的，别"顺手修"。** `GetFullPath(@"C:\")` 返回 `C:\`，
+        // 去尾后是 `c:`——那**不是**合法的绝对路径字符串，但本方法的结果**只用于比较与落盘**
+        //（从不送回文件系统：T7 只把它存进 `claims.json` 并拿来判据），而 `c:` 恰好让前缀判据
+        // **正确工作**。实测（`IsUnder` 逐字照抄本实现跑的）：
+        //   `IsUnder("c:",  "c:\repo")`  → **True**   ← 去尾这一版，判对
+        //   `IsUnder("c:\", "c:\repo")`  → **False**  ← 保留反斜杠那一版，判错
+        // ⚠️ 即：保留根的反斜杠会让根路径与它下面的**一切**都判不出冲突——**静默失效**，
+        // 正是 `01` §12 要防的。守卫在 `Normalize_RootPath_StillConflictsWithEverythingUnderIt`。
         var trimmed = full.TrimEnd(Path.DirectorySeparatorChar);
         return (trimmed.Length == 0 ? full : trimmed).ToLowerInvariant();
     }
@@ -1777,11 +1845,20 @@ public static class Claims
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `dotnet test --filter "FullyQualifiedName~ClaimTests" -v q`
-Expected: 通过 11，失败 0
+Expected: 通过 12，失败 0
+
+⚠️ **这个数字按 `[Fact]` 实数过**（原计划写「通过 11」，而那时只有 **10** 个 `[Fact]`——
+又一处没跑就写的数字）。派发前请数一遍 brief 里的 `[Fact]`；对不上就以**实测**为准。
 
 - [ ] **Step 5: 确认变异被抓住（G7）**
 
 把 `IsUnder` 里的 `child[parent.Length] == Path.DirectorySeparatorChar` 删掉（退化成朴素前缀）——`SiblingWithASharedNamePrefix_DoesNotConflict` **必须红**。跑之前先 grep 确认那半句真的没了。
+
+⚠️ **第二条变异**（本次新增，钉根路径那条守卫）：在 `Normalize` 里把
+`var trimmed = full.TrimEnd(Path.DirectorySeparatorChar);` 后面补上
+`if (trimmed.EndsWith(':')) trimmed = full;`（即"顺手修"那个 `c:` 怪值）——
+`Normalize_RootPath_StillConflictsWithEverythingUnderIt` **必须红**。
+⚠️ 先 grep 确认那半句真落上了再跑（G7）——**没落上的变异和"变异存活"输出一模一样**。
 
 - [ ] **Step 6: 提交**
 
@@ -2124,16 +2201,70 @@ public sealed class ClaimStore(string workingDirectory)
         });
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [ ] **Step 4: 接上控制面的 `ParseCommand`（否则线上不可达）**
+
+⚠️ **这一步不是可选的润色。** `ParseCommand` 是命令的**第三条线**——核心语义在
+`CommandDispatcher`、控制台解析在 `CoreCommandParser`、**线上解析在
+`ControlServer.ParseCommand`**。T3（`session.setAxis`）漏过它，代价是那条命令
+**在线上整整不可达**（后来由 Task 4b 补，`b1696b4`）。**本任务重演了同一个形状**：
+计划里 `claim.*` 只在 dispatcher 与（T8 的）控制台两条线上存在，
+头发的帧会落到 `_ => throw new ArgumentException($"认不出的命令 '{kind}'")`。
+
+⚠️ **而 `Review Focus #4` 钉的正是这条线上路径**（冲突回 `rejected` 并点名占用者）——
+接线之前那条焦点**根本无法满足**，因为没有帧能到达 dispatcher。
+
+在 `src/Lilara.Core/Control/ControlServer.cs` 的 `ParseCommand` switch 里，
+紧跟 `"session.setAxis"` 那条之后加：
+
+```csharp
+            // ⚠️ 与 `session.setAxis` 同一条纪律：线上解析是命令的**第三条线**。
+            // 漏了这里，头发的 `claim.acquire` 会静默落到 `_ => throw`——
+            // 而「冲突回 rejected 并点名占用者」那条对外行为**走不到**（无帧可到）。
+            "claim.acquire" => new CoreCommand.ClaimAcquire(
+                payload.GetProperty("sessionId").GetString()!,
+                payload.GetProperty("path").GetString()!),
+            "claim.release" => new CoreCommand.ClaimRelease(
+                payload.GetProperty("sessionId").GetString()!,
+                payload.GetProperty("path").GetString()!),
+```
+
+并**在 `ControlServerTests.cs` 追加一条真正走 WS 的测试**（照
+`WebSocket_SetAxis_ReachesTheDispatcher` 的形状，`b1696b4` 里那条）：
+
+```csharp
+    /// <summary>
+    /// ⚠️ **走真 WS，不是直接调 dispatcher。** 后者在接线缺失时会**照样绿**——
+    /// 它绕过的正是本条要钉的那一层。实现前这条必须红，且红的方式应当是
+    /// 「认不出的命令 'claim.acquire'」。
+    /// </summary>
+    [Fact]
+    public async Task WebSocket_ClaimAcquire_ReachesTheDispatcher()
+    {
+        // …照 WebSocket_SetAxis_ReachesTheDispatcher 的脚手架：
+        // 建会话（直接调 dispatcher）、连 WS、发 {"kind":"claim.acquire", …}、读帧
+        Assert.True(ack.GetProperty("accepted").GetBoolean());
+        // ⚠️ `reason` 用 TryGetProperty 惰性取，别无条件 GetProperty——
+        // 成功回执的 `reason` 被 `WhenWritingNull` **整个省略**，
+        // 无条件求值会在**成功路径**上抛 `KeyNotFoundException`（修好了反而红）。
+    }
+```
+
+- [ ] **Step 4b: 跑接线测试确认它先红**
+
+Run: `dotnet test --filter "FullyQualifiedName~WebSocket_ClaimAcquire_ReachesTheDispatcher" -v q`
+Expected: **失败**，消息含「认不出的命令 'claim.acquire'」——
+若它**通过**了，说明测试没走真 WS，去改测试。
+
+- [ ] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test -v q`
-Expected: 全绿（新增 7 条 + **执行时的既有基线**）
+Expected: 全绿（新增 7 条 + 接线 1 条 + **执行时的既有基线**）
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 提交**
 
 ```bash
 git add src/Lilara.Core/ tests/Lilara.Core.Tests/ClaimCommandTests.cs tests/Lilara.Core.Tests/ControlServerTests.cs
-git commit -m "feat(core): 声明落盘（工作目录，可分享）+ claim.acquire/release + GET /claims（无文件即空数组）"
+git commit -m "feat(core): 声明落盘（工作目录，可分享）+ claim.acquire/release + GET /claims（无文件即空数组）+ ParseCommand 接线（原来线上不可达）"
 ```
 
 ---
@@ -3027,4 +3158,5 @@ git commit -m "feat(head): 引导页区块（补 T9 引用了却不存在的元�
 
 ## 明确不做（写进代码注释的偏离）
 
-见开头的 D1–D7。**其中 D1 是用户裁定**，D2/D3/D4/D5 是本计划的判断，各自在对应文件的注释里点名。
+见开头的 D1–D9。**其中 D1 是用户裁定**，D2/D3/D4/D5/D9 是本计划的判断，各自在对应文件的注释里点名。
+⚠️ D9 是**派 T6 之前**由控制器实测补上的（原表里没有，而 `01` §12.1 明确要求）；D8 是执行中评审发现后追加。
