@@ -3419,16 +3419,31 @@ git commit -m "feat(head): 三栏骨架 + 引导流程 + 五轴面板（义务 4
 
 ---
 
-### Task 10: 头 —— 声明视图与冲突上浮 + 收尾
+### Task 10: 头 —— 收尾（核对 + 手工验收 + 一条注释）
 
 **Files:**
-- Modify: `head/wwwroot/app.js`（⚠️ **增量**——T9 已把整份换成三栏版，
-  本任务只往里**加**声明视图的那几段，**不是**再替换一次）
 - Modify: `head/Program.cs`（加一条注释，代码不动）
 
 **Interfaces:**
 - Consumes: T9 的全部
-- Produces: 页面（无对外接口）
+- Produces: 无（收尾）
+
+⚠️ **本任务原本写的是「声明视图与冲突上浮」+ `Modify: app.js`——那是错的，
+已删。** 实地核过：**T9 的 `app.js` 已经含全部声明视图**——
+`loadClaims` / `renderClaims` / `#claim-conflicts` / `case "claim.acquired"` /
+`case "claim.released"` / `project:` 订阅触发 `loadClaims()` **都在 T9 那一份里**。
+⇒ **T10 没有 app.js 代码可写**，原标题描述的事**在 T9 就做完了**。
+
+⚠️ **裁定：声明视图的代码留在 T9**（不拆到 T10）。
+理由：T9 是**整份替换** `app.js`，声明视图本就在那一份里；
+为凑任务切分而把它拆出去，等于**先写完再挖出来放进另一个任务**——
+那是制造返工，不是分解。**任务边界该切在「评审者能独立否决」处，不是切在行数上。**
+
+**判据（可执行）**：T10 开工前跑
+```
+cd E:/Workspace/AgentLilaraCode && grep -cE 'renderClaims|claim-conflicts' head/wwwroot/app.js head/wwwroot/index.html
+```
+两处都**应当非零**（T9 已经写下它们）。若为 0，说明 T9 没照计划做——**那要去 T9 补，不是在这里写**。
 
 - [ ] **Step 1: 核 `#onboarding` 元素在（T9 已加，别再加一遍）**
 
@@ -3490,13 +3505,17 @@ Expected: 全绿。
 Run: `dotnet build -warnaserror -v q`
 Expected: 0 警告 0 错误。
 
-⚠️ **再手工走一遍 T9 的 9 条**——尤其第 3/5/8 条（它们跨了核心与头的边界，是单测覆盖不到的那类）。
+⚠️ **T9 的 9 条要在本步真的走一遍——而这是它第一次被走。**
+T9 的 Step 3 也写着「手工走一遍」，但**T9 的 Step 4 紧接着就提交了**，
+所以那 9 条**实际上没有在 T9 被验过**（头是纯前端，`dotnet test` 覆盖不到它）。
+⇒ 别把它当成"再走一遍"就略过：**这是那次手工验收的归属地**。
+⚠️ 尤其第 3/5/8 条（跨了核心与头的边界，单测覆盖不到的那类）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
 git add head/
-git commit -m "feat(head): 声明视图与冲突上浮的渲染 + 头部进程职责注释"
+git commit -m "docs(head): 头进程职责注释（它只托管静态资源，不该长大）"
 ```
 
 ---
