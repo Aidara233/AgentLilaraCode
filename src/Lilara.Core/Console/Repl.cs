@@ -137,6 +137,19 @@ public sealed class Repl(
                     _out.WriteLine($"✓ 会话 {accepted.SessionId} 已创建。");
                     break;
 
+                // ⚠️ 轴改了要**立刻重印状态**——策略那一行就在 `PrintStatus` 里，
+                // 而用户在控制台改完轴最想知道的就是「现在是什么」。
+                //
+                // ⚠️ 印的是**命令带的那个会话 id**，不是 `Current`：`axis set` 可以指向
+                // 任意一个已存在的会话。用 `Current!.SessionId` 有两个真缺陷——
+                // ① 改的是别的会话时印错人；② `Current` 为 null（核心起来时没选中会话，
+                // 但盘上有会话可达）时**直接 NRE**，而它不在下面那两个 catch 里，会掀翻 REPL。
+                case CoreCommand.SessionSetAxis set:
+                    _out.WriteLine($"✓ {set.SessionId} 的轴已更新");
+                    // 只有改的**就是**当前会话时重印状态；否则印的是另一个会话的数字，张冠李戴。
+                    if (Current is not null && Current.SessionId == set.SessionId) PrintStatus();
+                    break;
+
                 default:
                     PrintReply(result.Reply);
                     break;
@@ -202,7 +215,15 @@ public sealed class Repl(
         // ⚠️ 走 SessionQueries（先查内存激活表）——直接读磁盘会在步进行中报 Idle。
         var state = SessionQueries.StateOf(_host, Current);
         _out.WriteLine($"会话 {Current.SessionId} · {state.Status} · 第 {state.Turn} 步");
-        _out.WriteLine($"模型 {Current.Spec.Model.ModelId} · effort {Current.Spec.Model.Effort}");
+
+        // ⚠️ **模型来自 spec（建会话时冻结，不会变），effort 来自轴（会变）——两个来源，别混。**
+        // 旧代码这里印的是 `Spec.Model.Effort`，那是**冻结的快照**：`axis set effort` 一改，
+        // 它就和请求里实际发的 effort 分叉——控制台说还是旧值。同一个「设了没用」换到**显示层**。
+        // ⚠️ `!` 与索引器是 `Load` / `Create` 的契约（`CompleteAxes` 保证 `Axes` 非空且五键齐全），
+        // `Stepper` 读 effort 用的是同一套写法。
+        _out.WriteLine($"模型 {Current.Spec.Model.ModelId} · effort {state.Axes![Axes.Effort]}");
+        _out.WriteLine("策略 " + string.Join(" · ",
+            Axes.Names.Select(n => $"{n}={state.Axes!.GetValueOrDefault(n, "?")}")));
         _out.WriteLine($"目录 {Current.Spec.WorkingDirectory}");
     }
 }

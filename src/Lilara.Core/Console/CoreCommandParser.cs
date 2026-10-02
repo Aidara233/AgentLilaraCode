@@ -2,6 +2,7 @@ using Lilara.Core.Adapters;
 using Lilara.Core.Canonical;
 using Lilara.Core.Hosting;
 using Lilara.Core.Providers;
+using Lilara.Core.Session;
 
 namespace Lilara.Core.Console;
 
@@ -34,10 +35,41 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("session interrupt ", StringComparison.Ordinal))
             return (new CoreCommand.SessionInterrupt(trimmed["session interrupt ".Length..].Trim()), null);
 
+        // ⚠️ **前缀判据必须带尾随空格**（`"axis set "` 而不是 `"axis set"`）：
+        // 后者会把 `axis settings` 也吃进来。既有 `session create` 就没带空格，
+        // 于是 `session createX` 会被当成建会话命令——**本计划不跟着犯这个错**。
+        if (trimmed.StartsWith("axis set ", StringComparison.Ordinal))
+            return ParseAxisSet(trimmed);
+
+        // ⚠️ 这一句接的是「光一个 `axis set`」（以及「光一个 `axis`」）——它们**不带尾随空格**，
+        // 所以上面那条前缀判据够不着，会掉到最后的兜底 `(null, null)` ⇒ 被当成消息发给会话。
+        // 用户以为在设轴，实际发了一行字出去：**静默接管**。
+        if (trimmed is "axis set" or "axis")
+            return (null, "用法：axis set <会话 id> <轴> <值>");
+
         if (trimmed.StartsWith("provider set ", StringComparison.Ordinal))
             return ParseProviderSet(trimmed);
 
         return (null, null);
+    }
+
+    /// <summary>
+    /// `axis set &lt;sessionId&gt; &lt;axis&gt; &lt;value&gt;`。
+    /// ⚠️ **token 数必须正好 5**：`axis` + `set` + 会话 + 轴 + 值（调用方传进来的是
+    /// **整行**，所以 `parts[0] == "axis"`、`parts[1] == "set"`，三个实参在 2 / 3 / 4）。
+    /// 少了不能落回「当成消息」——用户以为设了轴，实际是把这行字发给了会话。那是静默接管。
+    ///
+    /// <para>⚠️ 值里不能有空格（`RemoveEmptyEntries` 把空格当分隔符）——这条命令没有 `--` 标志，
+    /// 形状就是「三个词」。多出来的词同样落进「不是 5 段」那一支**报错**，不静默取前三个。</para>
+    /// </summary>
+    private static (CoreCommand?, string?) ParseAxisSet(string line)
+    {
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 5)
+            return (null, "用法：axis set <会话 id> <轴> <值>   （轴：" + string.Join("|", Axes.Names)
+                + "；取值见 `status`）");
+
+        return (new CoreCommand.SessionSetAxis(parts[2], parts[3], parts[4]), null);
     }
 
     /// <summary>

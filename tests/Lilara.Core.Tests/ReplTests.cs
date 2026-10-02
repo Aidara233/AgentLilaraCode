@@ -66,6 +66,31 @@ public class ReplTests : IDisposable
     }
 
     /// <summary>
+    /// 与 <see cref="ReplWithSession"/> 同一套接线，但把 <c>dispatcher</c> 与 <c>handle</c>
+    /// 也交出来：那条 «status 印轴的 effort» 测试要**绕开控制台解析、直接改轴**，
+    /// 好让红/绿只剩「印的是哪一份」这一个变量（否则解析一坏，两个原因一起红）。
+    /// </summary>
+    private (Repl Repl, CommandDispatcher Dispatcher, SessionHandle Session) NewHarness()
+    {
+        _providers.Save(new ProviderDefinition
+        {
+            Id = "claude",
+            Protocol = Protocols.ClaudeMessages,
+            ApiKey = "sk-test-not-a-real-key",
+            DefaultModel = "claude-opus-5",
+            Modality = "vision",
+        });
+
+        var host = new CoreHost(_root, _work);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), _ => new Stepper(_store, _adapter));
+        var repl = new Repl(host, dispatcher, _ => new Stepper(_store, _adapter), _out);
+        var session = SessionHandle.Create(
+            _store, _work, _providers.ToSelection(_providers.Load("claude")!, null, "high", 16000));
+        repl.Current = session;   // setter 会把 handle 登记进宿主激活表
+        return (repl, dispatcher, session);
+    }
+
+    /// <summary>
     /// ⚠️ 控制台没有 `--endpoint` 参数，手写 providers/&lt;id&gt;.json 是配置端点的**唯一**途径。
     /// 整文件覆盖会把它抹掉——于是「程序内配置优先」这一档永远够不着，
     /// 用户被静默退回环境变量那一档，正是裁定要防的那种接管。
@@ -417,6 +442,49 @@ public class ReplTests : IDisposable
         await repl.ExecuteAsync("history", CancellationToken.None);
 
         Assert.Contains("（这一步没有正文输出）", _out.ToString());
+    }
+
+    /// <summary>
+    /// ⚠️ **`session status` 印的必须是轴的当前值，不是 `Spec.Model.Effort`（冻结的快照）。**
+    /// 与 T3 那条同一个病灶、换到**显示层**：用户改了轴、控制台说还是旧值。
+    ///
+    /// <para>⚠️ 判据是**输出文本**。断言 <c>handle.State.Axes["effort"]</c> 对这条缺陷
+    /// **没有区分力**——修复前后它都是新值，因为坏的只是「印哪一份」。</para>
+    /// </summary>
+    [Fact]
+    public async Task Status_PrintsTheAxisEffort_NotTheFrozenSpecOne()
+    {
+        var (repl, dispatcher, session) = NewHarness();
+
+        // ⚠️ 先确认起点**不是** max，否则「印了新值」与「印了旧值」看不出区别。
+        await repl.ExecuteAsync("status", CancellationToken.None);
+        Assert.Contains("effort high", _out.ToString());
+        _out.GetStringBuilder().Clear();
+
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSetAxis(session.SessionId, "effort", "max"), "a1", true, CancellationToken.None);
+
+        await repl.ExecuteAsync("status", CancellationToken.None);
+
+        Assert.Contains("effort max", _out.ToString());
+    }
+
+    /// <summary>
+    /// ⚠️ 控制台改轴要**回一句话 + 立刻重印状态那一行**（策略行）。
+    /// 少了 <c>SessionSetAxis</c> 那条 case，命令会落进 <c>default</c> ⇒
+    /// <c>PrintReply(null)</c> ⇒ **一声不吭**：用户以为改了，什么都没看见。
+    /// 判据是**输出文本**（内部 `State.Axes` 在改完那一刻已经对了，没有区分力）。
+    /// </summary>
+    [Fact]
+    public async Task AxisSet_PrintsAckAndRefreshesStatus()
+    {
+        var (repl, _, session) = NewHarness();
+
+        await repl.ExecuteAsync($"axis set {session.SessionId} effort max", CancellationToken.None);
+
+        var text = _out.ToString();
+        Assert.Contains("轴已更新", text);
+        Assert.Contains("effort max", text);   // 重印的是轴的新值，用户马上看到「现在是什么」
     }
 
     [Theory]
