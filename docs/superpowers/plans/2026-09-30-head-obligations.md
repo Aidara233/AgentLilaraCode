@@ -2596,6 +2596,22 @@ git commit -m "feat(console): claim/claim release/claim list（光一个 claim �
     <button id="interrupt">中断</button>
     <span id="status">未连接</span>
   </div>
+
+  <!-- ⚠️ **引导页**（`05` §2.2）：核心启动后没有任何会话与提供商，而
+       「配置提供商 → 建初始会话」**是头的行为**（策略归头，机制归核心）。
+       ⚠️ 此时**不能做别的**——所以它挡住输入框（见 `showOnboarding`）。
+       ⚠️ **这个元素必须在 T9 里就存在**：T9 的验收第 1 条测的就是「引导页出现」，
+       而 `$("onboarding")` 为 null 时 `showOnboarding()` 会抛
+       `Cannot set properties of null` ⇒ **引导页根本不显示**。
+       （原本它在 T10 才加，而 T10 的验收是 T9 的验收，顺序上倒置了。）
+       ⚠️ 头的「引导」只到「提示你在哪配」为止——不做配置表单，见计划 D5。 -->
+  <div id="onboarding" style="display:none" class="banner">
+    <b>先配置一个提供商。</b>核心启动后是空的——没有提供商不能推进任何会话。<br>
+    在**核心的终端**里执行：<br>
+    <code>provider set &lt;id&gt; --key &lt;key&gt; --protocol claude-messages</code><br>
+    <span class="muted">（头的「引导」目前只到「提示你在哪配」为止——见计划 D5：不做配置表单。）</span>
+  </div>
+
   <div id="timeline"></div>
 
   <!-- ⚠️ **义务 1**：两个头槽位**并排**，且**空的也要显示**（§7.1）。
@@ -3149,31 +3165,28 @@ git commit -m "feat(head): 三栏骨架 + 引导流程 + 五轴面板（义务 4
 **Files:**
 - Modify: `head/wwwroot/app.js`
 - Modify: `head/Program.cs`（加一条注释，代码不动）
-- Modify: `head/wwwroot/index.html`（`#onboarding` 区块）
 
 **Interfaces:**
 - Consumes: T9 的全部
 - Produces: 页面（无对外接口）
 
-- [ ] **Step 1: 补上引导页区块**
+- [ ] **Step 1: 核 `#onboarding` 元素在（T9 已加，别再加一遍）**
 
-⚠️ T9 的 `app.js` 引用了 `$("onboarding")` 而 `index.html` 里**没有这个元素**——
-`showOnboarding()` 会抛 `Cannot set properties of null`。这是 T9 与 T10 之间**真实存在的**接口缺口，
-必须在这里补上（不是「顺手加的」）。
+⚠️ 原先这个元素排在 T10，而 **T9 的 `app.js` 就引用了它** ——
+`$("onboarding")` 为 null 时 `showOnboarding()` 抛 `Cannot set properties of null`，
+于是**引导页根本不显示**，而 T9 的验收第 1 条测的正是「引导页出现」。
+⇒ 已挪进 T9 的 `index.html`（见那条 `⚠️ 这个元素必须在 T9 里就存在`）。
 
-在 `index.html` 的 `<div id="center">` 里、`#top` 之后插入：
+**这一步现在只是核对**，不是新增：
 
-```html
-  <!-- ⚠️ **引导页**（`05` §2.2）：核心启动后没有任何会话与提供商，而
-       「配置提供商 → 建初始会话」**是头的行为**（策略归头，机制归核心）。
-       ⚠️ 此时**不能做别的**——所以它挡住输入框（见 `showOnboarding`）。 -->
-  <div id="onboarding" style="display:none" class="banner">
-    <b>先配置一个提供商。</b>核心启动后是空的——没有提供商不能推进任何会话。<br>
-    在**核心的终端**里执行：<br>
-    <code>provider set &lt;id&gt; --key &lt;key&gt; --protocol claude-messages</code><br>
-    <span class="muted">（头的「引导」目前只到「提示你在哪配」为止——见计划 D5：不做配置表单。）</span>
-  </div>
+```bash
+# 两处都必须命中
+grep -n 'id="onboarding"' head/wwwroot/index.html
+grep -n 'onboarding' head/wwwroot/app.js
 ```
+
+Expected：两条都有输出。**若 `index.html` 那条没有**，说明 T9 没照计划做，补上它
+（内容见 T9 段的 `index.html` 块）。**别在这里重新设计它。**
 
 - [ ] **Step 2: 起核心与头，手工验声明冲突上浮**
 
@@ -3183,9 +3196,20 @@ Run（两个终端，同 T9），然后：
 3. `session activate <B>` → 尝试 `claim src` → **核心回 `rejected` 并点名 A**
 4. 在新会话**发一条消息**（页面点一下那个会话再发）确认核心照常工作
 
-Expected：第 3 步的拒绝消息里有 A 的 id。⚠️ **头侧的冲突上浮在单会话下看不到**——两条声明不能同时存在（核心已经挡住了）。要看到头侧的上浮，需要在**两个浏览器标签**里对同一个核心、两个不同工作目录的项目各占一次……而 `projectKey` 按工作目录算，所以**同一个核心只会有一个项目**。
+Expected：第 3 步的拒绝消息里有 A 的 id。
 
-⇒ **如实记录这个限制**：头侧冲突上浮的代码路径在**当前核心形态下不可达**（核心已经挡住了重叠声明）。它是**防御性渲染**——留给将来「声明可以不互斥」的形态（如派生树例外）。⚠️ **不要为了让它可达而放开核心的检查。**
+⚠️ **但这不证明头侧的上浮可达。** 头侧上浮是「**一条声明落在两个会话**」的渲染，
+而同一项目内的会话由 `HandleClaimAcquire` 挡住了 ⇒ **同项目内它确实不可达**。
+它是**防御性渲染**：留给将来「声明可以不互斥」的形态（如派生树例外）。
+⚠️ **不要为了让它可达而放开核心的检查。**
+
+⚠️ **不过「同一个核心只会有一个项目」这句话是错的，别照着写。** `/claims`
+按 `ProjectKeys()` **跨所有项目**枚举，而每个会话的声明读自**它自己的工作目录**
+（`ClaimStore(h.Spec.WorkingDirectory)`）。`projectKey` 确实按工作目录算，
+但**盘上载入的会话可以来自别的工作目录**（`CommandDispatcher.TryFind` 会扫所有项目目录）。
+⇒ 两个工作目录不同的会话各存一份 `claims.json`、**互不检查**，
+于是「一条声明出现在两个会话下」在**跨项目**时是**可达**的——那正是头上浮的用武之地。
+（只有在「本机只有一个工作目录」的常见情形里它才不可达。）
 
 - [ ] **Step 3: 给 `head/Program.cs` 加一条注释**
 
@@ -3212,7 +3236,7 @@ Expected: 0 警告 0 错误。
 
 ```bash
 git add head/
-git commit -m "feat(head): 引导页区块（补 T9 引用了却不存在的元素）+ 头部进程职责注释"
+git commit -m "feat(head): 声明视图与冲突上浮的渲染 + 头部进程职责注释"
 ```
 
 ---
