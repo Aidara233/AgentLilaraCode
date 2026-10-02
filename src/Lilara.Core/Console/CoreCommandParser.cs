@@ -43,7 +43,8 @@ public static class CoreCommandParser
     }
 
     /// <summary>
-    /// ⚠️ **「这一行以 `claim` 打头、且 `claim` 后面是分隔符或行尾」——词块入口的唯一判据。**
+    /// ⚠️ **「这一行以 `claim` 打头、且 `claim` 后面是分隔符或行尾」——`claim` **词块入口的**唯一判据。**
+    /// （`axis set` 那个入口另有一份，但它**共用同一个 `StartsWithToken`**，见下。）
     ///
     /// <para>⚠️ **它必须被 <see cref="IsClaimList"/> 与 <c>Parse</c> 的 claim 分支共用**
     /// （`Repl` 经 <see cref="IsClaimList"/> 也用到它）。两处曾各写一份，而 `Parse` 那份
@@ -56,37 +57,57 @@ public static class CoreCommandParser
     /// <para>⚠️ 边界用 **<see cref="char.IsWhiteSpace"/>（宽口径）**，不是 `' '` / `'\t'`（窄）：
     /// 窄口径下 `claim` + **NBSP** + 路径会**两边都不认** ⇒ 当成消息发给模型。</para>
     /// </summary>
-    public static bool IsClaimVerb(string line)
+    public static bool IsClaimVerb(string line) => StartsWithToken(line, "claim");
+
+    /// <summary>
+    /// ⚠️ **「这一行以 <paramref name="token"/> 打头、且它后面是分隔符或行尾」——
+    /// `claim` 与 `axis` 两个词块入口共用的**唯一**判据。**
+    ///
+    /// <para>⚠️ **首词大小写不敏感**，与第二词（动词）同一口径：动词是**控制台语法**
+    ///（协议里叫 `claim.release` / `session.setAxis`，都带点），用户手打 `Claim src` / `Axis set …`
+    /// 是常态；而两种写错的方向不对称——**放宽只是多认一条命令（可见），
+    /// 收紧则会让这行字静默变成消息发给模型（烧钱、且不可见）**。</para>
+    ///
+    /// <para>⚠️ **抽出它是因为两个谓词曾经「看起来同形」而其实不同**：
+    /// `IsClaimVerb` 判首词用 `Ordinal`（敏感），`IsAxisSetVerb` 用 `OrdinalIgnoreCase`（不敏感），
+    /// 而两处注释都写着「同形 / 与 claim 对齐」——**那句话当时是假的**。
+    /// ⇒ 这正是本项目反复栽的那个形态：**一份判据的两个副本，注释宣称它们一致，而它们不一致。**
+    /// **共用一个函数才是唯一守得住的「一致」。**</para>
+    /// </summary>
+    private static bool StartsWithToken(string line, string token)
     {
         var t = line.Trim();
-        if (t.Length < "claim".Length) return false;
-        if (!t.StartsWith("claim", StringComparison.Ordinal)) return false;
+        if (t.Length < token.Length) return false;
+        if (!t.StartsWith(token, StringComparison.OrdinalIgnoreCase)) return false;
 
-        // ⚠️ **`"claim"` 之后必须是空白（或到此为止）——这是词边界，不能省。**
-        // 少了这一句，`"claimlist"` 也会被切出 `"list"`（`"claimlist"[5..]` == `"list"`），
-        // 于是 `claimlist` 被认成查询、被 `Repl` 拦下 ⇒ **用户敲的那行字被吞掉了**。
-        return t.Length == "claim".Length || char.IsWhiteSpace(t["claim".Length]);
+        // ⚠️ **`token` 之后必须是空白（或到此为止）——词边界，不能省。**
+        // 少了这一句，`"claimlist"` / `"axisx"` 也会被切出后面的词
+        //（`"claimlist"[5..]` == `"list"`）⇒ 那行字被吞掉，本该当成消息发出去。
+        return t.Length == token.Length || char.IsWhiteSpace(t[token.Length]);
     }
 
     /// <summary>
-    /// ⚠️ **「这一行以 `axis set` 打头、`set` 之后是分隔符或行尾」——`axis set` 词块入口的唯一判据。**
+    /// ⚠️ **「这一行以 `axis` 打头、第二个词是 `set`」——`axis set` 词块入口的唯一判据。**
     ///
-    /// <para>与 <see cref="IsClaimVerb"/> **同形**：先按**所有空白**（<c>Split(null, RemoveEmptyEntries)</c>）
-    /// 切词、再逐词比对、**动词大小写不敏感**。</para>
+    /// <para>⚠️ **首词走共用的 <see cref="StartsWithToken"/>**（与 `claim` 那个谓词**同一份代码**、
+    /// 同一个大小写口径）。原先它自己写了一遍「切词 + `Equals(OrdinalIgnoreCase)`」，
+    /// 于是与 `IsClaimVerb` 的 `Ordinal` **并不真的同形**——而两边注释都写着「同形 / 与 claim 对齐」。
+    /// **共用一个函数才是唯一守得住的「一致」。**</para>
     ///
-    /// <para>⚠️ **动词大小写不敏感是刻意与 `claim` 对齐的**：动词是**控制台语法**，不是协议标识符
-    ///（协议里叫 `session.setAxis`，带点）。放宽的**只有动词**——轴名与取值仍由
-    /// `Axes.TryParse` 在 dispatcher 里校验并规范化（`Safety` 不是 `safety`，应当拒绝而不是猜）。</para>
-    ///
-    /// <para>⚠️ **词块判据顺带把 `axis settings` 挡在外面**：它的 `words[1]` 是 `settings` 而不是 `set`
-    /// ⇒ 落回「普通消息」，与旧前缀判据带尾随空格的意图一致。</para>
+    /// <para>⚠️ **词块判据把 `axis settings` 挡在外面**：`set` 之后切出来的第一个词是
+    /// `settings` 而不是 `set` ⇒ 落回「普通消息」，与旧前缀判据带尾随空格的意图一致。
+    /// ⚠️ 放宽的**只有动词大小写**——轴名与取值仍由 `Axes.TryParse` 在 dispatcher 里校验并规范化
+    ///（`Safety` 不是 `safety`，应当拒绝而不是猜）。</para>
     /// </summary>
     private static bool IsAxisSetVerb(string line)
     {
-        var words = line.Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-        return words.Length >= 2
-            && string.Equals(words[0], "axis", StringComparison.OrdinalIgnoreCase)
-            && string.Equals(words[1], "set", StringComparison.OrdinalIgnoreCase);
+        // ⚠️ **首词走共用的 `StartsWithToken`**（与 `claim` 同一份判据、同一个大小写口径）——
+        // **别再在这里单写一遍**。这正是 B2 那处「看着同形、其实不同形」的修法。
+        if (!StartsWithToken(line, "axis")) return false;
+
+        var words = line.Trim()["axis".Length..]
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return words.Length >= 1 && string.Equals(words[0], "set", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

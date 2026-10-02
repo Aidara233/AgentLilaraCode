@@ -389,4 +389,43 @@ public class ParserTests
         Assert.Null(cmd);
         Assert.Null(err);
     }
+
+    /// <summary>
+    /// ⚠️ **`claim` / `axis` 两个词块的「首词大小写口径」必须一致**——这是一条**对拍测试**。
+    ///
+    /// <para>它们曾是**两份各写一遍的判据**，而且**漂了**：`IsClaimVerb` 判首词用 `Ordinal`
+    ///（敏感）、`IsAxisSetVerb` 用 `OrdinalIgnoreCase`（不敏感），而**两处注释都写着
+    /// 「同形 / 与 claim 对齐」——那句话当时是假的**。
+    /// ⇒ 现在两者共用 `StartsWithToken`（不敏感）；本测试把这条口径**钉死**，
+    /// 免得下一次有人「顺手优化」其中一个时又把它拆开。</para>
+    ///
+    /// <para>⚠️ **方向要说清**：放宽（不敏感）**只是多认一条命令**（可见的报错 / 正确的动作）；
+    /// 收紧则会让 `Claim src` 这类行字**静默变成消息发给模型**（烧钱、不可见）。
+    /// 两种错的方向不对称，所以这里选宽。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("claim src/foo", "s1")]
+    [InlineData("ClAiM src/foo", "s1")]
+    [InlineData("axis set s1 safety prod", null)]
+    [InlineData("AXIS SET s1 safety prod", null)]
+    public void BothVerbEntries_AreCaseInsensitiveOnTheirFirstWord(string line, string? sid)
+    {
+        var (cmd, err) = CoreCommandParser.Parse(line, sid);
+
+        // ⚠️ 大小写变体必须**与它的小写形态完全同解**——不是「不报错就行」，而是**真的产出同一个命令**。
+        Assert.NotNull(cmd);
+        Assert.Null(err);
+    }
+
+    /// <summary>⚠️ 词边界：首词后必须紧跟空白或行尾，否则那行字被吞掉（`claimlist` / `axisx`）。</summary>
+    [Theory]
+    [InlineData("claimlist")]
+    [InlineData("axisx")]
+    public void FirstWordWithoutABoundary_FallsThroughToBeingAMessage(string line)
+    {
+        var (cmd, err) = CoreCommandParser.Parse(line, "s1");
+
+        Assert.Null(cmd);
+        Assert.Null(err);   // ⇒ 当成普通消息
+    }
 }
