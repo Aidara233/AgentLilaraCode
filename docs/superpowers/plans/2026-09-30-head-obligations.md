@@ -2493,10 +2493,16 @@ git commit -m "feat(core): 声明落盘（工作目录，可分享）+ claim.acq
 - Modify: `src/Lilara.Core/Console/CoreCommandParser.cs`
 - Modify: `src/Lilara.Core/Console/Repl.cs`（回执格式 switch + `PrintStatus` + `claim list`）
 - Modify: `src/Lilara.Core/Program.cs:108`
-- Test: `tests/Lilara.Core.Tests/ReplTests.cs`（追加——它才是真正测 `Repl` 的地方）
+- Test: `tests/Lilara.Core.Tests/ParserTests.cs`（**追加**——本任务 7 条里的 6 条都是
+  `CoreCommandParser.Parse` 的测试，那里是它们的归属地；它现在有 T5 的 3 条）
+- Test: `tests/Lilara.Core.Tests/ReplTests.cs`（追加 **1 条**：`claim list` 的显示——
+  它是 `Repl` 的行为，`ParserTests` 测不到）
+
+⚠️ **别把解析器的测试塞进 `ReplTests.cs`**（初版就是这么写的，与 T5 同形）：
+`ReplTests` 要起一个 `Repl` + 宿主，而解析器测试是**纯函数**测试，放那儿是错位置。
 
 **Interfaces:**
-- Consumes: `CoreCommand.ClaimAcquire` / `.ClaimRelease`（T7）
+- Consumes: `CoreCommand.ClaimAcquire` / `.ClaimRelease`（T7，**字段是 `IReadOnlyList<string> Scope`**）
 - Produces: `claim <path>`（占）· `claim release <path>`（放）· `claim list`（列）
   ⚠️ **控制台一次只收一个路径**，但命令的字段是**列表**（`03` §3 的 `scope`）——
   ⇒ 解析器把单个路径**包成单元素列表**（`new ClaimAcquire(sid, [path])`）。
@@ -2581,8 +2587,16 @@ public void Claim_WithACurrentSession_UsesIt()
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `dotnet test --filter "FullyQualifiedName~Claim_" -v q`
-Expected: 红
+Run: `dotnet test -v q`
+Expected: **编译失败**——`CoreCommand.ClaimAcquire` 存在（T7），但
+`CoreCommandParser.Parse` 还**没有 `currentSessionId` 那个重载**，
+而本步的测试传了两个实参 ⇒ `CS1501`（没有那个参数的重载）。
+
+⚠️ **这一步不要用 `--filter`**：编译不过时 filter 没有意义（没有测试能跑）。
+⚠️ 顺带记下：初版这里写的是 `--filter "FullyQualifiedName~Claim_"`，
+**那个表达式会漏掉 3 条**——`ClaimRelease_WithAPath_…` / `ClaimRelease_WithNothing_…`
+（`Claim` 后面是 `R` 不是 `_`）与 `ClaimList_IsNotACoreCommand`。
+⇒ 本任务的 7 条测试**没有一条共有的筛选子串**能覆盖全部；**用全量跑**。
 
 - [ ] **Step 3: 写实现**
 
@@ -2667,16 +2681,59 @@ Expected: 红
 Console.WriteLine("  `axis set <会话> <轴> <值>` 调行为；`claim <路径>` 占区域；`history` 回放；`quit` 退出。");
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [ ] **Step 4: 加 `claim list` 的显示测试（放 `ReplTests.cs`）**
+
+⚠️ **本任务唯一一条 `Repl` 行为**（`claim list` 不走命令通道，是控制台的查询），
+所以它在 `ReplTests.cs`；其余 6 条解析器测试在 `ParserTests.cs`。
+
+```csharp
+    /// <summary>
+    /// ⚠️ **`claim list` 是控制台的查询**（`03` §3：不做 `claim.list` 命令），
+    /// 所以它必须**自己**读 `claims.json` 并印出来——而这条钉的就是那个显示。
+    ///
+    /// <para>⚠️ 用 `NewHarness()`（已有脚手架）：`repl.ExecuteAsync` + `_out`。
+    /// 声明用 `ClaimStore` 直接写（`claim` 命令的认领走 dispatcher，这里只测显示）。</para>
+    /// </summary>
+    [Fact]
+    public async Task ClaimList_PrintsTheClaimsInTheWorkingDirectory()
+    {
+        var (repl, _, session) = NewHarness();
+        new Lilara.Core.Persistence.ClaimStore(session.Spec.WorkingDirectory)
+            .Save([new Lilara.Core.Session.Claim("other", "pk", @"c:\repo\src", DateTimeOffset.UnixEpoch)]);
+
+        await repl.ExecuteAsync("claim list", CancellationToken.None);
+
+        // ⚠️ 断言用**钉专属措辞**（不是"有输出就行"）：会话 id 与路径都要看得见，
+        // 否则「印了一行空表」也算过。
+        Assert.Contains("other", _out.ToString());
+        Assert.Contains("src", _out.ToString());
+    }
+
+    /// <summary>⚠️ 没有声明时印「（没有声明）」，不是空白——空白让用户分不清「没有」与「坏了」。</summary>
+    [Fact]
+    public async Task ClaimList_WithNoClaims_SaysSo()
+    {
+        var (repl, _, _) = NewHarness();
+
+        await repl.ExecuteAsync("claim list", CancellationToken.None);
+
+        Assert.Contains("没有声明", _out.ToString());
+    }
+```
+
+- [ ] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test -v q`
-Expected: 全绿
+Expected: 全绿。**本任务新增 6 条 `ParserTests` + 2 条 `ReplTests` = 8 条**
+（⚠️ 这个数按 brief 实测；初版说「7 条」而 `Files` 却写 `ReplTests`——
+解析器那 6 条放错了文件，且 `claim list` 的显示**根本没有测试**）。
+⚠️ 分母是执行时的既有基线（**454**），别写死。
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 提交**
 
 ```bash
-git add src/Lilara.Core/Console/ src/Lilara.Core/Program.cs tests/Lilara.Core.Tests/ReplTests.cs
-git commit -m "feat(console): claim/claim release/claim list（光一个 claim 报错，不落回当成消息）"
+git add src/Lilara.Core/Console/ src/Lilara.Core/Program.cs tests/Lilara.Core.Tests/ParserTests.cs tests/Lilara.Core.Tests/ReplTests.cs
+git commit -m "feat(console): claim/claim release/claim list（光一个 claim 报错，不落回当成消息；claim release 少了路径也报错）"
 ```
 
 ---
