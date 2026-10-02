@@ -2677,6 +2677,23 @@ Expected: **编译失败**——`CoreCommand.ClaimAcquire` 存在（T7），但
         var (parsed, parseError) = CoreCommandParser.Parse(trimmed, Current?.SessionId);
 ```
 
+⚠️ **同时要在回执 switch 里加两条 `claim` 分支**（Files 段早写了「回执格式 switch」，
+而下面原本**没给代码**——T8 实现者因此报「成功时一声不吭」）：
+
+```csharp
+                // ⚠️ 声明**成功了要吭一声**：`claim` 的 `Ack.Accepted.Reply` 是 **null**，
+                // 于是落进 `default: PrintReply(null)` ⇒ **一声不吭**。
+                // 用户分不清「占了」与「没反应」——而这正是「静默成功」最坏的地方：
+                // 他下一步会在一个自以为占上的地方工作。
+                case CoreCommand.ClaimAcquire acquire:
+                    _out.WriteLine($"✓ 已占 {string.Join("、", acquire.Scope)}");
+                    break;
+
+                case CoreCommand.ClaimRelease release:
+                    _out.WriteLine($"✓ 已释放 {string.Join("、", release.Scope)}");
+                    break;
+```
+
 ```csharp
     private void PrintClaims()
     {
@@ -2690,10 +2707,12 @@ Expected: **编译失败**——`CoreCommand.ClaimAcquire` 存在（T7），但
     }
 ```
 
-`Program.cs:108` 横幅补一句：
+`Program.cs:108` 横幅 ⚠️ **是把 `claim` 那句「加进」现有那行，不是换掉它**——
+初版说「补一句」而给的代码是**整行替换**，会把 `provider set … 配置；session create 建会话`
+**挤掉** ⇒ 首次运行的用户在横幅上看不到配置入口：
 
 ```csharp
-Console.WriteLine("  `axis set <会话> <轴> <值>` 调行为；`claim <路径>` 占区域；`history` 回放；`quit` 退出。");
+Console.WriteLine("  `provider set <id> --key <key>` 配置；`session create` 建会话；`axis set <会话> <轴> <值>` 调行为；`claim <路径>` 占区域；`history` 回放；`quit` 退出。");
 ```
 
 - [ ] **Step 4: 加 `claim list` 的显示测试（放 `ReplTests.cs`）**
@@ -2734,12 +2753,29 @@ Console.WriteLine("  `axis set <会话> <轴> <值>` 调行为；`claim <路径>
 
         Assert.Contains("没有声明", _out.ToString());
     }
+
+    /// <summary>
+    /// ⚠️ **`claim` 成功时要吭一声。** `Ack.Accepted.Reply` 是 null ⇒ 不加分支就落进
+    /// `default: PrintReply(null)` ⇒ **静默成功**，用户分不清「占了」与「没反应」，
+    /// 下一步会在一个自以为占上的地方工作。
+    /// ⚠️ `NewHarness()` 已经把 `repl.Current` 设好了，所以 `claim src` 走命令通道能成功。
+    /// </summary>
+    [Fact]
+    public async Task Claim_OnSuccess_SaysWhatWasTaken()
+    {
+        var (repl, _, _) = NewHarness();
+
+        await repl.ExecuteAsync("claim src/foo", CancellationToken.None);
+
+        Assert.Contains("已占", _out.ToString());
+        Assert.Contains("src/foo", _out.ToString());
+    }
 ```
 
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test -v q`
-Expected: 全绿。**本任务新增 7 条 `ParserTests` + 2 条 `ReplTests` = 9 条**
+Expected: 全绿。**本任务新增 7 条 `ParserTests` + 3 条 `ReplTests` = 10 条**
 （⚠️ **这个数我数错过两次**：初版说「7 条」而 `Files` 写 `ReplTests`；改为「8」时又少算一条——
 解析器那 6 条放错了文件，且 `claim list` 的显示**根本没有测试**）。
 ⚠️ 分母是执行时的既有基线（**454**），别写死。
