@@ -205,44 +205,92 @@ public class AxisTests
     }
 
     /// <summary>
-    /// ⚠️ **`null` 轴名 = 未知轴**，三条入口都不许抛。
+    /// ⚠️ **`null` 轴名 = 未知轴**，每一条吃轴名的入口都不许抛。
     ///
-    /// <para>来路是**线上**：`WireJson.Options` 没开 `RespectNullableAnnotations`，
-    /// <c>{"kind":"session.setAxis","axis":null}</c> 能落进 `session.setAxis`；
-    /// 而 `Dictionary` 的 key 不许为 null。修前实测的栈：
-    /// <c>IsKnown(null) ⇒ ContainsKey(null) ⇒ ArgumentNullException「Parameter 'key'」</c>
-    /// （T3 的 `SetAxis_WithANullAxis_IsRejected_NotACrash` 修前就是红的）。</para>
+    /// <para>来路：`WireJson.Options` 没开 `RespectNullableAnnotations`，线上的
+    /// <c>{"kind":"session.setAxis","axis":null}</c> 能落到这里；而 `Dictionary` 的 key 不许为 null。
+    /// 修前实测的栈：<c>IsKnown(null) ⇒ ContainsKey(null) ⇒ ArgumentNullException「Parameter 'key'」</c>
+    /// （T3 的 `SetAxis_WithANullAxis_IsRejected_NotACrash` 修前就是红的）。
+    /// ⚠️ 线上那条路今天**待接**（`ParseCommand` 尚无 `session.setAxis`）——本文件守的是**契约**。</para>
     ///
-    /// <para>⚠️ **这条为什么必须在这里**（而不是只靠 `session.setAxis` 那条命令测试）：
-    /// 命令路径在 `IsKnown` 那一关就返回了，**走不到 `ValuesOf` / `TryParse`**——
-    /// 只靠命令测试的话，那两条的判空**删掉也不会红**。
-    /// 轴名查询一共就这三条（`LegalValuesText` 是 `ValuesOf` 的包装，`Defaults` 不接轴名），
-    /// 契约由本文件守。</para>
+    /// <para>⚠️ **这条为什么必须在这里**（而不是只靠那条命令测试）：命令路径在 `IsKnown`
+    /// 那一关就返回了，**走不到** `ValuesOf` / `TryParse` / `LabelOf` / `InContext`——
+    /// 只靠命令测试的话，那几条的判空**删掉也不会红**。契约由本文件守。</para>
+    ///
+    /// <para>⚠️ **可证的枚举**（不是「一共就这几条」那种全称句）：吃**轴名**的公开入口，
+    /// 逐个列出 `Axes` 的公开面即得六条——
+    /// <c>IsKnown</c> · <c>ValuesOf</c> · <c>LegalValuesText</c> · <c>TryParse</c> ·
+    /// <c>LabelOf</c> · <c>InContext</c>。下面对六条各断言一句；
+    /// 其中 `LegalValuesText` 是 `ValuesOf` 的包装（null ⇒ 空串），
+    /// 另三个不接轴名的成员（`Names` / `Defaults` / 两个 `Alert*` 常量）不在此列。</para>
     /// </summary>
     [Fact]
-    public void NullAxis_IsTreatedAsUnknown_ByAllThreeEntryPoints()
+    public void NullAxis_IsTreatedAsUnknown_ByEveryAxisNameEntryPoint()
     {
         Assert.False(Axes.IsKnown(null));
         Assert.Null(Axes.ValuesOf(null));
+        Assert.Equal("", Axes.LegalValuesText(null));
         Assert.False(Axes.TryParse(null, "dev", out var canonical));
         Assert.Equal("", canonical);            // 与「未知轴」一致，不回吐半截
-        Assert.Equal("", Axes.LegalValuesText(null));
+        Assert.Equal("", Axes.LabelOf(null));   // null 轴名没有标签可回吐
+        Assert.False(Axes.InContext(null));     // 叫不出名字的轴，一律当作「不进上下文」
     }
 
     /// <summary>
-    /// ⚠️ `Labels` 与 `Names` 是同一条要求的两个视图，键集必须一致——
-    /// 少一个键就是头的某一格空白，而用户分不清「没标签」与「头坏了」。
+    /// ⚠️ 每一条轴都有**自己的**中文标签，且**不是回退成档名**——
+    /// 少一个真标签就是头的某一格空白，而用户分不清「没标签」与「头坏了」。
+    ///
+    /// <para>⚠️ 单表重构后，标签与轴名**在同一行**（原来的 `Labels` 字典没了），
+    /// 「两处键集一致」这条约定本身消失了；剩下要守的就是「每行都填了真中文名」。
+    /// 断言 `label != name` 是关键：`LabelOf` 对未知轴原样返回，
+    /// 所以「返回 non-empty」单独还不够——中文名与英文档名不可能相等。</para>
     /// </summary>
     [Fact]
-    public void Labels_CoverExactlyTheSameAxesAsNames()
+    public void EveryAxis_HasItsOwnChineseLabel_NotTheFallbackName()
     {
         foreach (var n in Axes.Names)
         {
             var label = Axes.LabelOf(n);
             Assert.False(string.IsNullOrWhiteSpace(label), $"轴 '{n}' 没有标签");
-            // ⚠️ 断言它**不是回退成档名**：`LabelOf` 对未知轴返回原样，
-            // 所以「返回 non-empty」单独还不够——中文名与英文档名不可能相等。
             Assert.NotEqual(n, label);
         }
+    }
+
+    /// <summary>
+    /// ⚠️ **「只有 `effort` 不进上下文」这句需要守卫，否则它只是一句注释。**
+    ///
+    /// <para>没有这条时，只断言了 `effort` 那侧是 `false`（而在 `InContext` 的默认实现下，
+    /// 连那句都不必写）——**把 `InContext` 写成恒 `false`，全部测试仍然绿**，
+    /// 而头上五个下拉**全被画灰**。所以这里五条轴**各断言一次**，
+    /// 布尔值两个方向都钉住：改恒 `true` ⇒ `effort` 那条红；改恒 `false` ⇒ 前四条红。</para>
+    /// </summary>
+    [Theory]
+    [InlineData(Axes.Initiative, true)]
+    [InlineData(Axes.Permission, true)]
+    [InlineData(Axes.Safety, true)]
+    [InlineData(Axes.Verify, true)]
+    [InlineData(Axes.Effort, false)]
+    public void InContext_IsTrueForEveryAxisExceptEffort(string axis, bool expected) =>
+        Assert.Equal(expected, Axes.InContext(axis));
+
+    /// <summary>
+    /// ⚠️ **`permission` 的档位顺序是契约，不是实现细节。**
+    ///
+    /// <para>头的跨轴告警按 `values.indexOf(当前) >= values.indexOf(alertFrom)` 判「授权及以上」
+    /// 的档位（`01` §3.5）——重排这两档、或在中间插入第 6 档，**头从此给出错误档位**
+    /// 而**一条测试都不会红**。正是 §3.5 要防的那种静默失效，所以这里钉**精确序列**。</para>
+    ///
+    /// <para>⚠️ 同时钉住告警的**两端确实落在这两条轴里**：`AlertFrom` / `AlertSafety` 一旦
+    /// 飘出各自轴的取值集合，`indexOf` / 相等判据会退化成「-1」或「永不相等」——
+    /// 告警静默失灵。三条断言合起来 = 「告警的两端 + 它们的相对顺序」都有守卫。</para>
+    /// </summary>
+    [Fact]
+    public void PermissionValues_KeepTheGateOrder_AndTheAlertEndsAreReal()
+    {
+        Assert.Equal(
+            ["off", "readonly", "investigate", "standard", "authorized", "trusted"],
+            Axes.ValuesOf(Axes.Permission));
+        Assert.Contains(Axes.AlertFrom, Axes.ValuesOf(Axes.Permission)!);
+        Assert.Contains(Axes.AlertSafety, Axes.ValuesOf(Axes.Safety)!);
     }
 }

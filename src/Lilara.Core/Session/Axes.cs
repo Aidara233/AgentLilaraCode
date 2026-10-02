@@ -3,13 +3,14 @@ namespace Lilara.Core.Session;
 /// <summary>
 /// 行为控制轴（`01` §3.5）——**五轴的唯一真相来源**。
 ///
-/// <para>⚠️ 它是一张**表**，不是五个独立的散落判断。轴名、合法值、默认值三样放在一起，
-/// 是因为它们必须同步演进：加一个档而忘了改默认值或错误信息，正是这类表最常见的漂移。
+/// <para>⚠️ 它是一张**表**，不是五个独立的散落判断。轴名、中文名、合法值、默认值、
+/// 进不进上下文**五样放在一起**（见 <see cref="Spec"/>），是因为它们必须同步演进：
+/// 加一个档而忘了改默认值或错误信息，正是这类表最常见的漂移。
 /// 任何别处要用这些值（头的下拉、控制台的解析、错误信息）都**从这张表读**，不许手抄。</para>
 ///
 /// <para>⚠️ **但那是要去的方向，不是现状**，别照着写：
-/// `ClaudeRequestBuilder.ToEffort` 就是一份**手抄的第二副本**（已知，计划 G10 那类，见下
-/// `Effort` 那条）；而那面头的下拉**今天还不存在**（`head/` 里没有任何轴字面量）。</para>
+/// `ClaudeRequestBuilder.ToEffort` 就是一份**手抄的第二副本**（已知，计划 G10 那类，见
+/// <see cref="Effort"/> 那条）；而那面头的下拉**今天还不存在**（`head/` 里没有任何轴字面量）。</para>
 ///
 /// <para>⚠️ **`effort` 在表里，但它不进上下文**（`01` §3.5：纯请求参数）。
 /// 它仍然是一条轴：用户要能改它，机械层（请求参数）也要跟着变。
@@ -23,38 +24,6 @@ public static class Axes
     public const string Verify = "verify";
     public const string Effort = "effort";
 
-    /// <summary>⚠️ 顺序**就是**渲染顺序，别按字母排。</summary>
-    public static readonly IReadOnlyList<string> Names =
-        [Initiative, Permission, Safety, Verify, Effort];
-
-    /// <summary>
-    /// 轴的中文名（`01` §3.5 的表格）。⚠️ **它归核心**（`05` §3：渲染归核心，头只显示）——
-    /// 头的下拉要画 `主动性` / `安全`，而它拿到的只有英文档名。
-    ///
-    /// <para>⚠️ 键是上面那几个 <see langword="const"/>，与 <see cref="Names"/> **同一个来源**：
-    /// 轴名只有一处字面量（那几个常量），这里再抄一份英文串就会漂。
-    /// ⚠️ 与 <see cref="Names"/> **同序**——但那是**读的时候**的要求，
-    /// 本字典的枚举顺序不承担它（头按 `Names` 的顺序取标签，见 `GET /axes`）。</para>
-    /// </summary>
-    private static readonly Dictionary<string, string> Labels = new(StringComparer.Ordinal)
-    {
-        [Initiative] = "主动性",
-        [Permission] = "权限",
-        [Safety] = "安全",
-        [Verify] = "验证强度",
-        [Effort] = "思考强度",
-    };
-
-    /// <summary>轴的中文名。未知轴**原样返回**（与 <see cref="ValuesOf"/> 的「未知 → null」同一套约定）。</summary>
-    public static string LabelOf(string axis) => Labels.GetValueOrDefault(axis, axis);
-
-    /// <summary>
-    /// 这条轴的取值**进不进上下文**（`01` §3.5）。
-    /// ⚠️ 只有 `effort` 是 `false`——它是**纯请求参数**，模型不必被告知自己的推理预算。
-    /// 头据此把它画灰；写进提示词才是错的（那句话是全系统每步都付全价的槽位）。
-    /// </summary>
-    public static bool InContext(string axis) => axis != Effort;
-
     /// <summary>安全轴里代表「生产」的档名（`01` §3.5 的跨轴告警的一端）。</summary>
     public const string AlertSafety = "prod";
 
@@ -62,39 +31,52 @@ public static class Axes
     public const string AlertFrom = "authorized";
 
     /// <summary>
-    /// ⚠️ 值类型是 <see cref="IReadOnlyList{T}"/> 而**不是** `string[]`，且每个值都被
-    /// <see cref="Array.AsReadOnly{T}"/> 包过一层：`Dictionary` 只是阻止**换掉**条目，
-    /// 挡不住调用方拿到数组后**就地改元素**。
+    /// 轴的**全部**静态事实，按渲染顺序排（`01` §3.5 表格的顺序）。
+    /// ⚠️ **单一张表**：轴名 / 中文名 / 合法值 / 默认值 / 进不进上下文**都从这里读**。
+    /// 拆成几个平行容器就会漂——`Names` 有序而 `Dictionary` 枚举序未定义（`01` §9.1：
+    /// 「一次 `Remove` 后新 `Add` 会复用空槽跑到前面」）。
     ///
-    /// <para>后果不是理论上的：改的是**进程级静态表**，`TryParse` / `LegalValuesText`
-    /// 以及**任何从本表读的调用方**会一起变，且**不报错**——那正是这个类声称要消灭的
-    /// 漂移，只是换成了运行期版本。</para>
-    ///
-    /// <para>⚠️ 当时那 7 条测试**兜不住**它，但「兜不住」有边界，别写成全称句：
-    /// 它们每次都重读**同一份已污染的表**，所以只要被改的元素**既不是默认值、
-    /// 也不是哪条断言点名的值**，就一条都不红。改 `safety[0]` 则相反，是抓得到的——
-    /// 默认值 `dev` 会变非法（`Defaults_CoverEveryAxis…` 红）、
-    /// 而 `production` 由非法变合法（`UnknownValue_IsRefused…` 红）。
-    /// ⇒ 结论不是「测试写得差」，而是**靠现有断言兜底不可靠，得靠类型本身挡**。</para>
+    /// <para>⚠️ <see cref="Values"/> 的类型是 <see cref="IReadOnlyList{T}"/> 而**不是** `string[]`，
+    /// 且每个值都被 <see cref="Array.AsReadOnly{T}"/> 包过一层：交出去的是**只读视图**，
+    /// 调用方拿不到可写数组——否则改一处就等于改了**进程级静态表**（`TryParse` /
+    /// `LegalValuesText` 以及**任何从本表读的调用方**会一起变，且**不报错**）。</para>
     /// </summary>
-    private static readonly Dictionary<string, IReadOnlyList<string>> Table = new(StringComparer.Ordinal)
-    {
+    private sealed record Spec(
+        string Name, string Label, IReadOnlyList<string> Values, string Default, bool InContext);
+
+    /// <summary>
+    /// 五轴的**唯一**一张表。顺序**就是**渲染顺序（`01` §3.5 表格），别按字母排。
+    /// </summary>
+    private static readonly IReadOnlyList<Spec> Table =
+    [
         // 主动性 = 循环的停止条件（§3.5）。档名就是**本表定义的**串。
         // 范围要说准：**落盘**（`state.json` 的 `Axes`）与**控制面快照**
         //（`ControlServer` 整份序列化 `SessionState`）携带的轴值都以这里为源
         //（`SessionHandle` 用 `Defaults()` / `TryParse` 播种，见 `SessionHandle.cs:155,165`）。
         // ⚠️ 但**模型请求**那条路**不是**：`ClaudeRequestBuilder.ToEffort` 是一份
         // **手抄的第二副本**（已知，即计划 G10 说的那类）——改这里**改不到它**，两头要一起改。
-        [Initiative] = Array.AsReadOnly<string>(["step", "standard", "goal"]),
+        new(Initiative, "主动性",
+            Array.AsReadOnly<string>(["step", "standard", "goal"]),
+            "step", InContext: true),
 
         // 权限 = 闸门。0..5 单调阶梯，低档是拒绝线、高档是询问线。
-        [Permission] = Array.AsReadOnly<string>(
-            ["off", "readonly", "investigate", "standard", "authorized", "trusted"]),
+        // ⚠️ 档位**顺序是契约**：头的跨轴告警按
+        // `values.indexOf(当前) >= values.indexOf(AlertFrom)` 判「授权及以上」——
+        // 重排或插入第 6 档会让告警静默报错档位（正是 `01` §3.5 要防的那种静默失效）。
+        new(Permission, "权限",
+            Array.AsReadOnly<string>(
+                ["off", "readonly", "investigate", "standard", "authorized", "trusted"]),
+            "standard", InContext: true),
 
         // 安全 = 纯提示。⚠️ 没有「机械兜底」——不设「生产 ⇒ 权限封顶」（§3.5 明说不许）。
-        [Safety] = Array.AsReadOnly<string>(["dev", "staging", "prod"]),
+        // ⚠️ 默认落在**非告警**档（见下 Default 那条注释）。
+        new(Safety, "安全",
+            Array.AsReadOnly<string>(["dev", "staging", "prod"]),
+            "dev", InContext: true),
 
-        [Verify] = Array.AsReadOnly<string>(["none", "self", "strict"]),
+        new(Verify, "验证强度",
+            Array.AsReadOnly<string>(["none", "self", "strict"]),
+            "self", InContext: true),
 
         // ⚠️ 与 `ClaudeRequestBuilder.ToEffort`（`ClaudeRequestBuilder.cs:164-173`，5 条臂
         // 166-170 + 一条 `_ => throw` 在 171）**必须逐值对齐**，但两个方向的后果**不同**，
@@ -106,56 +88,73 @@ public static class Axes
         // ⇒ 两个集合应当**相等**（本表 5 档 = `ToEffort` 的 5 条臂）。
         // ⚠️ `01` §3.5 只写三档（低/中/高），这里取五档是**故意的**：**文档待对齐**；
         // 多出来的两档是 SDK 已有的能力，不是这里新造的。
-        [Effort] = Array.AsReadOnly<string>(["low", "medium", "high", "xhigh", "max"]),
-    };
+        // ⚠️ `effort` 是**唯一** `InContext = false` 的（`01` §3.5：纯请求参数，不进上下文）。
+        new(Effort, "思考强度",
+            Array.AsReadOnly<string>(["low", "medium", "high", "xhigh", "max"]),
+            "high", InContext: false),
+    ];
 
-    private static readonly Dictionary<string, string> DefaultTable = new(StringComparer.Ordinal)
-    {
-        [Initiative] = "step",
-        [Permission] = "standard",
-        // ⚠️ 默认落在**非告警**档。告警条件（`01` §3.5）：`safety==prod`
-        // **且** `permission ∈ {authorized, trusted}`——两轴同时满足才响。
-        // 反过来说：默认权限是 `standard`，所以**即便把这里改成 `prod` 也不会响一声**，
-        // 「设了会吵」不是拒绝它的理由。真正的理由是 §3.5 那句「安全是提醒装置」：
-        // 一个默认就自称生产环境的提醒装置，会在真项目上变成噪音、被用户学会无视。
-        [Safety] = "dev",
-        [Verify] = "self",
-        // ⚠️ 与建会话时的既有默认一致：`CommandDispatcher.HandleSessionCreate`
-        // 调 `ToSelection(provider, null, "high", 16000)`——改这里就得同时改那里，
-        // 否则新会话的轴显示一个值、实际请求参数是另一个。
-        [Effort] = "high",
-    };
+    /// <summary>按轴名找那一行。<see langword="null"/> 与未知轴都返回 <see langword="null"/>。</summary>
+    private static Spec? Find(string? axis) =>
+        axis is null ? null : Table.FirstOrDefault(s => s.Name == axis);
 
     /// <summary>
-    /// ⚠️ **三条入口一律把 <see langword="null"/> 当「未知轴」**（返 false / null / false），
-    /// 所以形参标成 `string?`——这不是防御性编程，是**可达路径**。
+    /// 轴名，**按渲染顺序**（`01` §3.5 表格的顺序）。
+    /// ⚠️ **从 <see cref="Table"/> 派生**，不是另写一份名单——另写就有第二个地方要同步，
+    /// 而顺序不稳等于每步重排。派生之后「标签与轴名同序」这条约定**不再存在**：
+    /// 它们本来就是同一行的两个字段（原本 `Names` 有序、`Labels` 是 `Dictionary`，枚举序未定义）。
+    /// </summary>
+    public static readonly IReadOnlyList<string> Names = Table.Select(s => s.Name).ToList();
+
+    /// <summary>
+    /// 轴的中文名（`01` §3.5 的表格）。⚠️ **它归核心**（`05` §3：渲染归核心，头只显示）——
+    /// 头的下拉要画 `主动性` / `安全`，而它拿到的只有英文档名。
     ///
-    /// <para>来路：`WireJson.Options`（`WireJson.cs:25-32`）**没有**开
+    /// <para>⚠️ **未知轴原样返回**（与 <see cref="ValuesOf"/> 的「未知 → null」同一套约定）；
+    /// **`null` 返回空串**——`null` 是「轴名没给」，没有半截标签可回吐，给空串与「未知轴」同向。</para>
+    /// </summary>
+    public static string LabelOf(string? axis) => Find(axis)?.Label ?? (axis ?? "");
+
+    /// <summary>
+    /// 这条轴的取值**进不进上下文**（`01` §3.5）。
+    /// ⚠️ 只有 `effort` 是 `false`——它是**纯请求参数**，模型不必被告知自己的推理预算。
+    /// 头据此把它画灰；写进提示词才是错的（那句话是全系统每步都付全价的槽位）。
+    ///
+    /// <para>⚠️ **未知轴与 `null` 都返回 `false`**。理由：本方法的唯一用途是判「要不要把它
+    /// 写进提示词」，而一条**叫不出名字**的轴没有可写进上下文的合法取值——宁可**漏写**
+    /// （不注入），不可**错写**。这与 <see cref="IsKnown"/> 的「未知即假」同向：
+    /// 不知道的轴，一律当作「不进上下文」这一侧。</para>
+    /// </summary>
+    public static bool InContext(string? axis) => Find(axis)?.InContext ?? false;
+
+    /// <summary>
+    /// ⚠️ **所有吃轴名的入口一律把 <see langword="null"/> 当「未知轴」**
+    /// （返 false / null / 空串），所以形参标成 `string?`——这不是防御性编程，是**可达性**在契约上的体现。
+    ///
+    /// <para>`null` 的来路：`WireJson.Options`（`WireJson.cs:25-32`）**没有**开
     /// `RespectNullableAnnotations`，所以线上的 <c>{"kind":"session.setAxis","axis":null}</c>
-    /// 会一路落到这里；而 <c>Dictionary</c> 的 **key 不允许为 null**。实测（修前）那条
+    /// 能一路落到这里；而 <c>Dictionary</c> 的 **key 不允许为 null**。实测（修前）那条
     /// <c>SetAxis_WithANullAxis_IsRejected_NotACrash</c> 就是红的，栈是
     /// <c>IsKnown(null) ⇒ ContainsKey(null) ⇒ ArgumentNullException「Parameter 'key'」</c>。
     /// 控制面外层是兜底 <c>catch (Exception)</c>（`ControlServer.cs:323`），连接不会死，
     /// 但用户看到的是「帧形状不对」——而真正的问题是**轴名没给**。</para>
     ///
+    /// <para>⚠️ **线上那条路今天是「待接」，不是「可达」**：`ControlServer.ParseCommand`
+    /// 的 switch 里**没有** `session.setAxis`（已派给另一条线去接）。这里守的是**契约**，
+    /// 不是今天的路径——那条命令一旦接上，这一串判空就是它的第一道关。</para>
+    ///
     /// <para>⚠️ **判在这里而不是各调用方**：本类是「轴名 → 合法值」这个契约的拥有者，
     /// 而 <see cref="ValuesOf"/> 早就声明了「未知 → null」——**null 就是未知的一种**。
-    /// 三条入口今天**只有 <see cref="IsKnown"/> 会被喂到 null**（`session.setAxis` 那条路，
-    /// 见上；另外两条的调用方只传非空轴），但契约不该按调用点拆——
-    /// 把规则留在调用方，下一个调用点就得自己重新记得一遍。
-    /// 顺带那条 <see cref="LegalValuesText"/> 是 <see cref="ValuesOf"/> 的包装，
-    /// 不用单独判（null ⇒ 空串）。</para>
+    /// 吃轴名的入口一共六条——<see cref="IsKnown"/> · <see cref="ValuesOf"/> ·
+    /// <see cref="LegalValuesText"/> · <see cref="TryParse"/> · <see cref="LabelOf"/> ·
+    /// <see cref="InContext"/>——**六条都判**（`LegalValuesText` 是 `ValuesOf` 的包装，
+    /// 不单独判，null ⇒ 空串）。契约不该按调用点拆——把规则留在调用方，
+    /// 下一个调用点就得自己重新记得一遍。</para>
     /// </summary>
-    public static bool IsKnown(string? axis) => axis is not null && Table.ContainsKey(axis);
+    public static bool IsKnown(string? axis) => Find(axis) is not null;
 
-    /// <summary>该轴的合法取值。<see langword="null"/> = 未知轴。返回的是只读视图，改不动。</summary>
-    public static IReadOnlyList<string>? ValuesOf(string? axis)
-    {
-        // ⚠️ 不写成 `axis is not null && Table.TryGetValue(axis, out var v) ? v : null`：
-        // 短路成功时 `v` 有值，短路失败时 `v` **未赋值**（不是 null）⇒ CS0165。
-        if (axis is null) return null;
-        return Table.TryGetValue(axis, out var v) ? v : null;
-    }
+    /// <summary>该轴的合法取值。<see langword="null"/> = 未知轴。返回的是**只读视图**，改不动。</summary>
+    public static IReadOnlyList<string>? ValuesOf(string? axis) => Find(axis)?.Values;
 
     /// <summary>合法值清单（错误信息用）。⚠️ 从表里拼，不手抄。</summary>
     public static string LegalValuesText(string? axis) =>
@@ -166,7 +165,7 @@ public static class Axes
     ///
     /// <para>⚠️ **两半的大小写策略是刻意不同的，别"统一"成一个：**</para>
     /// <list type="bullet">
-    ///   <item><b>axis 敏感</b>（`Table` 用 <see cref="StringComparer.Ordinal"/>）——
+    ///   <item><b>axis 敏感</b>（<see cref="Find"/> 用 `==`，即 `Ordinal`）——
     ///         轴名是协议标识符，`Safety` 不是 `safety`，应当**拒绝**而不是猜。</item>
     ///   <item><b>value 不敏感</b>（<see cref="StringComparison.OrdinalIgnoreCase"/>）——
     ///         取值是用户手打的，写 `Prod` 是常态。</item>
@@ -177,10 +176,9 @@ public static class Axes
     public static bool TryParse(string? axis, string value, out string canonical)
     {
         canonical = "";
-        if (axis is null) return false;   // ⚠️ null 键会让 `Dictionary` 抛，见 IsKnown 的注释
-        if (!Table.TryGetValue(axis, out var values)) return false;
+        if (Find(axis) is not { } spec) return false;   // ⚠️ null 键会让 `Dictionary` 抛，见 IsKnown 的注释
 
-        foreach (var v in values)
+        foreach (var v in spec.Values)
         {
             if (!string.Equals(v, value, StringComparison.OrdinalIgnoreCase)) continue;
             canonical = v;
@@ -189,7 +187,19 @@ public static class Axes
         return false;
     }
 
-    /// <summary>默认值。**每次返回新字典**：调用方要往 handle 上挂，共享可变实例会串会话。</summary>
+    /// <summary>
+    /// 默认值。**每次返回新字典**：调用方要往 handle 上挂，共享可变实例会串会话。
+    ///
+    /// <para>⚠️ 默认值就是 `01` §3.5 表里那个「最没有意外」的档，不是随手挑的。
+    /// 尤其 `safety = dev`：真正的理由是 §3.5 那句「安全是提醒装置」——
+    /// 一个默认就自称生产环境的提醒装置，会在真项目上变成噪音、被用户学会无视。
+    /// （「设了会吵」**不是**理由：默认权限是 `standard`，告警要 `safety==prod`
+    /// **且** `permission ∈ {authorized, trusted}` 两轴同时满足才响，单独改成 `prod` 一声不响。）</para>
+    ///
+    /// <para>⚠️ `effort` 的默认与建会话时的既有默认**必须一致**：
+    /// `CommandDispatcher.HandleSessionCreate` 调 `ToSelection(provider, null, "high", 16000)`
+    /// ——改这里就得同时改那里，否则新会话的轴显示一个值、实际请求参数是另一个。</para>
+    /// </summary>
     public static IReadOnlyDictionary<string, string> Defaults() =>
-        new Dictionary<string, string>(DefaultTable, StringComparer.Ordinal);
+        Table.ToDictionary(s => s.Name, s => s.Default, StringComparer.Ordinal);
 }
