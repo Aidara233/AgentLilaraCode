@@ -3065,9 +3065,15 @@ git commit -m "feat(console): claim/claim release/claim list（光一个 claim �
 
 **判据（可执行）**：替换后跑
 ```
-cd E:/Workspace/AgentLilaraCode && grep -nE 'id="(side|main|compose)"' head/wwwroot/index.html
+cd E:/Workspace/AgentLilaraCode && grep -nE 'id="(side|main)"' head/wwwroot/index.html
 ```
-**应当无输出**（一个都不剩）。
+**应当无输出**（`#side` / `#main` 一个都不剩）。
+
+⚠️ **`compose` 不在判据里**（第一版的判据写作 `id="(side|main|compose)"`，**那是错的**）：
+`#compose` 是**本任务 Step 1 HTML 里就有的活元素**——中栏底部那条输入行（`<div id="compose">` 装
+`#text` / `#send`，CSS 里有 `#compose { border-top… }`）。三栏替换掉的是 `#side` / `#main`（左栏与中栏的**旧骨架**），
+而 `#compose` 是**沿用**的。把活元素写进「应当无输出」的判据里，那条判据就**永远不可能通过**——
+而跑的人会以为自己替换得不干净，去删一个页面正用着的元素。
 
 **Interfaces:**
 - Consumes: `GET /projects` · `GET /projects/{pk}/sessions` · `GET /sessions/{id}/state`（含 `axes` / 三槽）· `GET /sessions/{id}/history` · **`GET /axes`**（T4）· `GET /claims` · **`GET /providers`**（本任务新增）· WS `subscribe` / `command` / `resync_required`
@@ -3272,6 +3278,10 @@ async function bootstrap() {
   // ② 当前项目下有会话？
   if (sessions.size === 0) {
     // ⇒ **由头调** session.create（核心只认命令，谁来调是头的事）
+    // ⚠️ **先等握手就绪**（见 `connected()`）：`command()` 在 `!wsReady` 时按设计拒绝发送，
+    // 而 `connect()` 只是发起握手、返回时 socket 还在 `CONNECTING` ⇒ 不等的话这条命令
+    // 被**静默丢掉**，首次刷新建不出会话，而页面不自愈（下一条刷新又是一样的顺序）。
+    await connected();
     command("boot-create", { kind: "session.create" });
     return;
   }
@@ -3328,6 +3338,10 @@ function renderSessions() {
 // ---- 打开会话：先快照、再带高水位订阅（`03` §7 的原子性） ----
 
 async function openSession(id) {
+  // ⚠️ **先等握手就绪**：本函数末尾的 `subscribe()` 在 `!wsReady` 时会**静默返回**，
+  // 而它可能是首屏/重连的第一条发送（`bootstrap`→`openSession`、`onopen`→`openSession`）
+  // ⇒ 不等的话，会话流可能根本没订上，而页面以为订过了（见 `connected()`）。
+  await connected();
   current = id;
   renderSessions();
   $("title").textContent = id;
@@ -3469,9 +3483,6 @@ function renderAxes(values) {
 /// ⚠️ **跨轴告警**（`01` §3.5 定的那条）：`安全=生产` + `权限≥授权` → 告警。
 /// ⚠️ 它是**纯提示、不联动**——不设「生产 ⇒ 权限封顶」，那是家长式干预且会掩盖
 /// 「安全是建议」这个诚实的定位。
-/// ⚠️ **跨轴告警**（`01` §3.5 定的那条）：`安全=生产` + `权限≥授权` → 告警。
-/// ⚠️ 它是**纯提示、不联动**——不设「生产 ⇒ 权限封顶」，那是家长式干预且会掩盖
-/// 「安全是建议」这个诚实的定位。
 ///
 /// ⚠️ **两头都读核心交的值，不写字面量**：`ALERT_SAFETY` 是安全轴里代表生产的**档名**，
 /// `ALERT_FROM` 是权限轴里「授权及以上」的**起始档**。写字面量的话，
@@ -3552,6 +3563,29 @@ function renderClaims() {
 }
 
 // ---- WS ----
+
+// ⚠️ **握手就绪闸**：`connect()` 只是**发起**握手，它返回时 socket 还在 `CONNECTING`，
+// 而 `wsReady` 仍是 false。
+// ⚠️ 于是「连上之前就发」和「没连上硬发」成了两回事：`subscribe()` / `command()` 的
+// `if (!wsReady)` 挡住了后者（对——那是为了不静默丢帧），却**挡不住前者**。
+// ⚠️ **首屏那条路上有三个发送点**（都在 `connect()` 的同步返回之后、`onopen` 之前）：
+//   ① `loadSessions()` 末尾的项目流 `subscribe`（由它自己兜，见那里）
+//   ② `bootstrap()` 里的 `command("boot-create", …)`　← 本闸兜
+//   ③ `openSession()` 末尾的会话流 `subscribe`　← 本闸兜
+//   ①有第二个入口，②③没有 ⇒ **光加 `wsReady` 不够**：那只是把判据从「读 socket 瞬时状态」
+//   收敛成「显式开关」，还要**等它翻转**才算完。
+// ⚠️ **实测到过这一条**：首次开页面时 `bootstrap` 的 `session.create` 落在 `!wsReady` 上，
+//   时间线只剩「✗ 没连上核心」，左边一个会话都没有，**且不自愈**。
+// ⚠️ **有界（2 秒）**：核心根本不在时照样放行，让调用点走各自的失败路径（报错/空态），
+//   不把页面吊死在这个 await 上。
+function connected() {
+  if (wsReady) return Promise.resolve();
+  return new Promise((resolve) => {
+    const iv = setInterval(() => { if (wsReady) done(); }, 20);
+    const to = setTimeout(done, 2000);
+    function done() { clearInterval(iv); clearTimeout(to); resolve(); }
+  });
+}
 
 function connect() {
   ws = new WebSocket(core.replace("http", "ws") + "/ws");
@@ -3734,7 +3768,12 @@ Expected（逐条对，**每条都要真的看到**）：
 2. 控制台 A 里 `provider set p --key k --protocol claude-messages` → 刷新页面 → 引导页消失
 3. 页面**自动建了一个会话**（`01` §8.1 由头调）——**刷新第二次不再多建**（幂等）
 4. 右栏五个轴都有值，安全轴在最上面
-5. 控制台 A 里 `axis set <会话> safety prod` → 页面右栏**立刻**变成高亮（`axis.changed` 到达）
+5. 控制台 A 里 `axis set <会话> safety prod` → 页面右栏**立刻跟随**（`axis.changed` 到达）
+   ⚠️ **不是「变成高亮」**——单改 `safety` 时**本就不该**有告警：跨轴告警要**两端**同时成立
+   （`安全=生产` **且** `权限≥授权`），而 `权限` 那一刻还是默认的 `standard`。
+   **高亮属于第 ⑦ 条**（补上 `permission=authorized` 之后）。
+   把第 ⑤ 条写成「变红」会让跑的人以为告警坏了，或者更糟——**为了让字面成真而去改告警的判据**，
+   那就把 `01` §3.5 明说的「跨轴」语义改掉了。
 6. 控制台 A 里 `claim src` → 页面右栏**出现**这条声明
 7. 控制台 A 里 `axis set <会话> permission authorized` → **跨轴告警出现**
 8. 底部两个头槽位**并排**、都显示「（空）」；浮动槽显示「核心侧装配器尚未实现」
@@ -3799,9 +3838,35 @@ Run（两个终端，同 T9），然后：
 1. 控制台 A 建第二个会话：`session create`
 2. `session activate <A>` → `claim src`
 3. `session activate <B>` → 尝试 `claim src` → **核心回 `rejected` 并点名 A**
-4. 在新会话**发一条消息**（页面点一下那个会话再发）确认核心照常工作
+4. 在**头**里点一下 B，发一条消息（`session.send` 会激活 B），再在控制台 A 敲 `claim src`
 
-Expected：第 3 步的拒绝消息里有 A 的 id。
+Expected：第 3 步的拒绝消息里有 A 的 id；第 4 步**照样拒绝**（B 还是当前的）。
+
+⚠️ **第 2/3 步的 `<A>`——不要用 `session activate` 去选会话。**
+`session activate <id>` 在控制台里**不设「当前会话」**，而且**一声不吭**：
+`CommandDispatcher.HandleSessionActivate` 的 `Reply` 是 `null`（`PrintReply(null)` 直接 return），
+而它**刻意**不去写 `Repl.Current`——那里的注释写着「激活只是载入内存。它**不许**去写控制台的当前会话……
+头点一下 B 就改掉控制台的当前会话，用户在控制台敲的下一句就会跑到 B 去。两者必须分开」。
+⇒ 控制台的「当前会话」**只有 `session create` 会设**（`Repl.DispatchAsync` 的 switch 里没有 `SessionActivate` 臂）。
+所以第 1 步要用**控制台**建（`session create` 会把它设成当前）；`<A>` 就是那个 id，第 2 步直接用。
+⚠️ **别把这条当缺陷**——那是 T3 的刻意裁定，头与控制台各有各的当前会话。
+
+⚠️ **第 4 步为什么必须借头来激活 B**：B 由头建，而头**不会**、也不该去改控制台的当前会话。
+要让控制台能对 B 发命令，唯一的路是让 **B 变成控制台的当前会话**，而那只在
+`Session.Send*` 被控制台**自己**调用时发生 ⇒ 借头制造那一步。
+⚠️ `SessionSend` 的 `Ack.Accepted` 带 `SessionId` ⇒ 控制台会把当前会话设成 B（有先例：
+`CommandDispatcher.HandleSessionActivate` 的注释就是为这个而写的）。
+
+⚠️ **两个会话共享同一个工作目录与同一份 `claims.json`。**
+`SessionCreate` **不带工作目录**（`HandleSessionCreate` 用 `_host.WorkingDirectory`），
+所以「控制台建的 A」与「头建的 B」的 `WorkingDirectory` **必然相同** ⇒ **同一个 projectKey**
+⇒ **同一份 `claims.json`** ⇒ 第 3 步的互斥**真的会触发**。
+⚠️ 但这也意味着**头里的两个会话会列出同一批声明**（`GET /claims` 按会话枚举，
+而两者指向同一个文件）——验收时别把它当成「两处副本分叉了」。
+
+⚠️ **「确认核心照常工作」有两条路，第 4 步走的是第二条**：
+① 头在 B 上直接 `session.send` → 会**失败**（B 的 provider 解析依赖它自己的会话），
+② 借头的发送把 B 变成控制台的当前会话，再从控制台发。**走 ②**。
 
 ⚠️ **但这不证明头侧的上浮可达。** 头侧上浮是「**一条声明落在两个会话**」的渲染，
 而同一项目内的会话由 `HandleClaimAcquire` 挡住了 ⇒ **同项目内它确实不可达**。
@@ -3816,16 +3881,26 @@ Expected：第 3 步的拒绝消息里有 A 的 id。
 于是「一条声明出现在两个会话下」在**跨项目**时是**可达**的——那正是头上浮的用武之地。
 （只有在「本机只有一个工作目录」的常见情形里它才不可达。）
 
-- [ ] **Step 3: 给 `head/Program.cs` 加一条注释**
+- [ ] **Step 3: 给 `head/Program.cs` 的顶部注释补两句（⚠️ 是**合并**，不是追加）**
 
-在文件顶部注释里追加：
+⚠️ **别整段粘贴。** `head/Program.cs:8-11` **已经有**一段讲同一件事的注释，而 Step 3 原本给的
+那段把它**重说了一遍**（「只做一件事：托管静态资源」「不代理」各出现两次，且相隔十几行）——
+读者会以为其中一句是本文件的历史遗留，或者以为有两套说法。
+
+⇒ 把**已有的那一段**改成下面这版（前三行不动，末尾补三行）：
 
 ```csharp
-// ⚠️ **头进程只做一件事：托管静态资源。** 它**不代理**、不缓存、不理解协议——
-// 页面自己连核心（`05` §1.1：头是可替换件，不该背协议的语义）。
+// ⚠️ **头是独立进程**（05 §2）：它只做一件事——托管那份静态资源。
+// 页面里的 JS **直连核心**（03 §1 的 WS + HTTP），头进程**不代理**。
+// 那样省掉一整层（不必在头里再实现一遍协议、也不必维护两条连接），
+// 而代价只是核心要放开 CORS（已经在做了）。
+// ⚠️ 它**不缓存、不理解协议**——头是可替换件（`05` §1.1），不该背协议的语义。
 // ⚠️ 所以这个文件**不该长大**。要加东西时先问：那是头的事，还是核心的事？
 // （`05` §3：渲染归核心。头只显示。）
 ```
+
+⚠️ 真正**新增**的只有后三行：「不缓存、不理解协议」+ 那句「**不该长大**」与它的判据问句
++「渲染归核心」。**其余都是已有内容，重写一遍就是第二份副本。**
 
 - [ ] **Step 4: 全量验证**
 
