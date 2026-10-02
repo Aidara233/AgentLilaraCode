@@ -3242,6 +3242,7 @@ const $ = (id) => document.getElementById(id);
 
 let core = "http://127.0.0.1:7788";
 let ws = null;
+let wsReady = false;                // ⚠️ 见 connect()：**只有它才是「可以发帧了吗」的判据**
 let current = null;                 // 当前会话 id（**视图**，不是真相）
 let currentProject = null;
 const sessions = new Map();         // sessionId -> { projectKey }  ← §6.1：派生索引
@@ -3301,6 +3302,14 @@ async function loadSessions() {
     for (const id of ids) sessions.set(id, { projectKey: pk });
   }
   renderSessions();
+
+  // ⚠️ **项目流订阅在这里补一次**（第二个入口，见 `connect()` 的时序分析）。
+  // 首屏那条路上 `connect()` 的 `onopen` 跑在 `loadSessions()` 之前 ⇒ 它那行被 `null` 跳过；
+  // 而本函数正处在「`currentProject` 刚刚被填好」的那一刻 ⇒ 由它来订。
+  // ⚠️ **重复订阅是安全的**：核心侧 `ControlServer.PumpAsync` 的 `Subscribe` 对同 topic
+  // **换掉旧的**（它要的正是这个语义，见那里「重复订阅必须换掉那条旧的」的注释）；
+  // 而 `since: null` = 「只要从现在开始的」⇒ 在任一顺序下都恰好订上一次。
+  if (currentProject) subscribe(`project:${currentProject}`, null);
 }
 
 function renderSessions() {
@@ -3339,7 +3348,8 @@ async function openSession(id) {
 }
 
 function subscribe(topic, since) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // ⚠️ 判据是 `wsReady`，**不是 `ws.readyState`**——见 `connect()` 那段。
+  if (!wsReady) return;
   ws.send(JSON.stringify({ kind: "subscribe", topic, since }));
 }
 
@@ -3546,16 +3556,38 @@ function renderClaims() {
 function connect() {
   ws = new WebSocket(core.replace("http", "ws") + "/ws");
 
+  // ⚠️ **`new WebSocket` 是异步的**：这一行返回时 `readyState` 还是 `CONNECTING(0)`。
+  // ⇒ 拿 `readyState === OPEN` 当「能发帧了吗」的判据**是错的**——
+  //   它在建连**之前**判 false（错得明显、反而看得见），但在建连**途中**也判 false，
+  //   于是「按顺序写在 `onopen` 之后」的那行其实**根本没发出去**，而且**静默失败**。
+  // ⚠️ 本文件有三处发送点都在 `onopen` 之后：项目流订阅、`openSession`（内含 `subscribe`）、
+  //   `bootstrap`→`openSession`。**首屏那一处必然静默**（见下面 `onopen` 的时序分析）。
+  // ⇒ **发送凭据交给显式开关**：`connect()` 置 false，`onopen` 第一句置 true，`onclose` 置 false。
+  //   它有唯一的所有者与唯一的判据，不需要读 socket 的瞬时状态。
+  wsReady = false;
+
   ws.onopen = () => {
+    // ⚠️ **第一句就置位**——下面的 `subscribe()` 与 `openSession()` 都同步读它。
+    wsReady = true;
     $("status").textContent = "已连接";
     // ⚠️ **项目流**：会话列表是派生的（§6.1），靠 `session.created` 更新；
     // 声明也走这条流（`03` §5）。不订它的话，在**控制台**建会话或占区域，
     // 这个页面看不见，且不会自愈。
-    if (currentProject) ws.send(JSON.stringify({ kind: "subscribe", topic: `project:${currentProject}` }));
+    //
+    // ⚠️ **两条路径把它补上，合起来是完备的**：
+    //   ① **首屏**：`connect()` 在 `CONNECTING(0)` 时就跑完了，所以这里的 `currentProject`
+    //      还是 `null`（`loadSessions()` 由 `bootstrap()` 里的 `await` 才跑）⇒ 这一行**跳过**；
+    //      补它的是 `loadSessions()` 末尾自己那句 `subscribe(...)`（见那里）。
+    //   ① **重连**：`currentProject` 已非空 ⇒ 这一行**订上**；且 `openSession(current)`
+    //      会在同一段同步代码里重新 `subscribe` 会话流。
+    // ⇒ **不要靠「WebSocket 比 fetch 慢，所以多半能赢」**——那是掷硬币（首屏实测就是跳过）。
+    //   要的是「任一顺序都订上」：两个入口各自兜住一种顺序。
+    if (currentProject) subscribe(`project:${currentProject}`, null);
     if (current) openSession(current);   // 重连一律拉快照重建（§6.2 唯一的降级路径）
   };
 
   ws.onclose = () => {
+    wsReady = false;
     $("status").textContent = "已断开（3 秒后重连）";
     setTimeout(connect, 3000);
   };
@@ -3639,7 +3671,8 @@ function handleEvent(p) {
 // ---- 命令（`03` §3） ----
 
 function command(id, payload) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) { renderMeta("✗ 没连上核心", "error"); return; }
+  // ⚠️ 同 `subscribe`：判据是 `wsReady`。
+  if (!wsReady) { renderMeta("✗ 没连上核心", "error"); return; }
   ws.send(JSON.stringify({ kind: "command", id, payload }));
 }
 
