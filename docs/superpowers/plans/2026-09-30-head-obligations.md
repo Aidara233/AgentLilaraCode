@@ -49,7 +49,7 @@
 | 1 | 老 `state.json`（**没有** `axes` 键）被读入 | 五轴显示**默认值**，不是空白、不是崩溃 | T4 |
 | 2 | `session.setAxis` 传一个**枚举里没有**的值 | 回 `rejected` 并**列出合法值**；轴值不变 | T2 |
 | 3 | 同一会话**两次同轴**设值 | 第二次是幂等 no-op，**不发事件**（`01` §5：无迁移则无 `axis.changed`） | T2 |
-| 4 | `claim.acquire` 一个**已被别人占用**的路径 | 回 `rejected` 并**点名占它的那个会话**——这是「别人的工作集会被作废」唯一的可见时刻 | **T7**（不是 T6：`rejected` 是**命令**的产物，而 T6 只产 `Claims.FindConflict`，它返回 `Claim?`、碰不到回执） |
+| 4 | `claim.acquire` 一个**已被别人占用**的路径 | 回 `rejected` 并**点名占它的那个会话**——这是「别人的工作集会被作废」唯一的可见时刻 | **T7**（不是 T6：`rejected` 是**命令**的产物，而 T6 只产 `Claims.FindConflict`，它返回 `Claim?`、碰不到回执。⚠️ 也**不是 T10**：T10 的验收是**故意**用产生 `rejected` 的路径去演示冲突上浮，该路径**必须**回 `rejected` 才算对） |
 | 5 | `GET /claims` 时**根本没有 `claims.json`** | 返回 `[]`，不是 404、不是 500（「没有声明」是合法且常见的形态） | T7 |
 | 6 | 头收到 `resync_required` 之后 | 能**重新订阅并复活**（`03` §7 说这是唯一的降级路径） | T10 |
 | 7 | 头连着**零会话**的核心启动 | 走 `05` §2.2 的**引导**（先问提供商、再建会话），而不是空页面 | T9 |
@@ -2203,26 +2203,40 @@ public sealed class ClaimStore(string workingDirectory)
 
 - [ ] **Step 4: 接上控制面的 `ParseCommand`（否则线上不可达）**
 
-⚠️ **这一步不是可选的润色。** `ParseCommand` 是命令的**第三条线**——核心语义在
-`CommandDispatcher`、控制台解析在 `CoreCommandParser`、**线上解析在
-`ControlServer.ParseCommand`**。T3（`session.setAxis`）漏过它，代价是那条命令
-**在线上整整不可达**（后来由 Task 4b 补，`b1696b4`）。**本任务重演了同一个形状**：
-计划里 `claim.*` 只在 dispatcher 与（T8 的）控制台两条线上存在，
-头发的帧会落到 `_ => throw new ArgumentException($"认不出的命令 '{kind}'")`。
+⚠️ **这一步只加 `claim.release` 一条——不是 `claim.acquire`。** 依据是 `03` §3 的
+**命令表**（协议是权威）：表里资源那节**只有** `claim.release`，
+并明写「清单查询走 `GET /claims`（§6），**不做 `claim.list` 命令**」。
+`claim.acquire` **不在**线上命令表里。
 
-⚠️ **而 `Review Focus #4` 钉的正是这条线上路径**（冲突回 `rejected` 并点名占用者）——
-接线之前那条焦点**根本无法满足**，因为没有帧能到达 dispatcher。
+⚠️ 理由是**使用场景**，不是「不重要」。`03` §8.2 把 `claim.release` 归入**止血**
+（与 `interrupt` / `approval.respond` 并列），原文：
+
+> 「它存在，是因为头不该是唯一入口：止血（`interrupt` / `claim.release` /
+> `approval.respond`）与引导（`provider.upsert` / `session.create`）恰恰发生在
+> **头最指望不上**的时候。」
+
+⇒ **头需要能在核心/控制台不响应时强制释放声明**——所以这条必须在线。
+
+⚠️ **而 `claim.acquire` 相反**：头**从不发**它（T9 只 `GET /claims` 读、渲染；
+T10 的冲突验收是**在控制台**跑的，见 T10 Step「`session activate <B>` → `claim src`」）。
+「声明主动」是**模型/用户**的动作，由控制台发起。
+⚠️ 且**不加**它的理由压过「对称性」：`03` §3 说命令表只有 `claim.release`，
+而**线上多一条不在协议表里的命令**是一种**未经同意的协议扩展**——
+T3 漏接线是「该有的没接」，这里加 `claim.acquire` 会变成「不该有的加了」，**方向相反**。
+
+⚠️ 不过接线这一步本身**不是可选的润色**：`ParseCommand` 是命令的**第三条线**
+——核心语义在 `CommandDispatcher`、控制台解析在 `CoreCommandParser`、
+**线上解析在 `ControlServer.ParseCommand`**。T3（`session.setAxis`）漏过它，
+代价是那条命令**在线上整整不可达**（后来由 Task 4b 补，`b1696b4`）。
 
 在 `src/Lilara.Core/Control/ControlServer.cs` 的 `ParseCommand` switch 里，
 紧跟 `"session.setAxis"` 那条之后加：
 
 ```csharp
             // ⚠️ 与 `session.setAxis` 同一条纪律：线上解析是命令的**第三条线**。
-            // 漏了这里，头发的 `claim.acquire` 会静默落到 `_ => throw`——
-            // 而「冲突回 rejected 并点名占用者」那条对外行为**走不到**（无帧可到）。
-            "claim.acquire" => new CoreCommand.ClaimAcquire(
-                payload.GetProperty("sessionId").GetString()!,
-                payload.GetProperty("path").GetString()!),
+            // ⚠️ **只有 release，没有 acquire**——`03` §3 的命令表里资源那节只有 release，
+            // 且 §8.2 把它归入「止血」（头在核心/控制台不响应时的逃生口）。
+            // 头的认领动作走控制台（T8），头自己**从不发** `claim.acquire`。
             "claim.release" => new CoreCommand.ClaimRelease(
                 payload.GetProperty("sessionId").GetString()!,
                 payload.GetProperty("path").GetString()!),
@@ -2235,13 +2249,13 @@ public sealed class ClaimStore(string workingDirectory)
     /// <summary>
     /// ⚠️ **走真 WS，不是直接调 dispatcher。** 后者在接线缺失时会**照样绿**——
     /// 它绕过的正是本条要钉的那一层。实现前这条必须红，且红的方式应当是
-    /// 「认不出的命令 'claim.acquire'」。
+    /// 「认不出的命令 'claim.release'」。
     /// </summary>
     [Fact]
-    public async Task WebSocket_ClaimAcquire_ReachesTheDispatcher()
+    public async Task WebSocket_ClaimRelease_ReachesTheDispatcher()
     {
         // …照 WebSocket_SetAxis_ReachesTheDispatcher 的脚手架：
-        // 建会话（直接调 dispatcher）、连 WS、发 {"kind":"claim.acquire", …}、读帧
+        // 建会话（直接调 dispatcher）、连 WS、发 {"kind":"claim.release", …}、读帧
         Assert.True(ack.GetProperty("accepted").GetBoolean());
         // ⚠️ `reason` 用 TryGetProperty 惰性取，别无条件 GetProperty——
         // 成功回执的 `reason` 被 `WhenWritingNull` **整个省略**，
@@ -2251,8 +2265,8 @@ public sealed class ClaimStore(string workingDirectory)
 
 - [ ] **Step 4b: 跑接线测试确认它先红**
 
-Run: `dotnet test --filter "FullyQualifiedName~WebSocket_ClaimAcquire_ReachesTheDispatcher" -v q`
-Expected: **失败**，消息含「认不出的命令 'claim.acquire'」——
+Run: `dotnet test --filter "FullyQualifiedName~WebSocket_ClaimRelease_ReachesTheDispatcher" -v q`
+Expected: **失败**，消息含「认不出的命令 'claim.release'」——
 若它**通过**了，说明测试没走真 WS，去改测试。
 
 - [ ] **Step 5: 跑测试确认通过**
@@ -2264,7 +2278,7 @@ Expected: 全绿（新增 7 条 + 接线 1 条 + **执行时的既有基线**）
 
 ```bash
 git add src/Lilara.Core/ tests/Lilara.Core.Tests/ClaimCommandTests.cs tests/Lilara.Core.Tests/ControlServerTests.cs
-git commit -m "feat(core): 声明落盘（工作目录，可分享）+ claim.acquire/release + GET /claims（无文件即空数组）+ ParseCommand 接线（原来线上不可达）"
+git commit -m "feat(core): 声明落盘（工作目录，可分享）+ claim.acquire/release + GET /claims（无文件即空数组）+ claim.release 接上 ParseCommand（原来线上不可达）"
 ```
 
 ---
@@ -3152,7 +3166,13 @@ git commit -m "feat(head): 引导页区块（补 T9 引用了却不存在的元�
 
 1. `dotnet test` —— 371 基线 + 新增；**既有金样一条都不许改断言值**（只能加新的）
 2. `dotnet build -warnaserror` —— 0 警告（本项目 `TreatWarningsAsErrors`）
-3. **端到端手工**：T9 Step 3 的九条 + T10 Step 2 的四条，**逐条真的看到**
+3. **端到端手工**：T9 Step 3 的九条 + T10 Step 2 的四条，**逐条真的看到**。
+   ⚠️ **逐条先写下预期、再跑、再记下实际看到的**（只看"没崩"不算看到）。
+   其中 T10 的冲突那条**三个可观测量都要记**，缺一不算跑过：
+   ① 核心回 `rejected`；② 头在**两个会话下都显示对方的声明**
+   （`GET /claims` 的同一份渲染）；③ 用户自己那条**没有被别人删掉**。
+   ⚠️ ②是**要害**：真阻塞的实现会让双方的声明**互相看不见**——
+   那不是"更安全"，那是**记下了一份用户看不见的状态**，正是 `01` §12 要避免的。
 4. **变异确认**（G7）：T1 Step 5 与 T6 Step 5 各两条，**跑之前先 grep 确认变异落上了**
 5. `git`：动手前记下 `master` 的 SHA 当回滚点
 
