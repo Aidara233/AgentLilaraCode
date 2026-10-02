@@ -9,6 +9,9 @@ using Microsoft.Extensions.Logging;
 // 页面里的 JS **直连核心**（03 §1 的 WS + HTTP），头进程**不代理**。
 // 那样省掉一整层（不必在头里再实现一遍协议、也不必维护两条连接），
 // 而代价只是核心要放开 CORS（已经在做了）。
+// ⚠️ 它**不缓存、不理解协议**——头是可替换件（`05` §1.1），不该背协议的语义。
+// ⚠️ 所以这个文件**不该长大**。要加东西时先问：那是头的事，还是核心的事？
+// （`05` §3：渲染归核心。头只显示。）
 
 var port = int.TryParse(Environment.GetEnvironmentVariable("LILARA_HEAD_PORT"), out var p) ? p : 7790;
 var core = Environment.GetEnvironmentVariable("LILARA_CORE") ?? "http://127.0.0.1:7788";
