@@ -42,7 +42,13 @@ public sealed class ClaimStore(string workingDirectory)
             // F2 的**形状**，关不掉**同族**。
             return parsed.Where(c => c is not null && c.Path is not null).ToList();
         }
-        catch (System.Text.Json.JsonException)
+        // ⚠️ **必须连 `IOException` 一起接。** `claims.json` 在**工作目录**里、可分享、
+        // 人手可编辑——编辑器开着它、或别的进程以 `FileShare.None` 独占时，
+        // `File.ReadAllText` 抛的是 `IOException`，**不是** `JsonException`。
+        // 只接后者 ⇒ 异常逃出 `All()` ⇒ 冒泡出 `claim list`（它没包 try/catch）⇒ **打死 REPL**。
+        // ⚠️ 这在**正常使用**下就会发生，不需要任何人为破坏——所以它不是「防御性」的凑数，
+        // 是这条读路径**真实会碰到**的第二种失败。
+        catch (Exception ex) when (ex is System.Text.Json.JsonException or IOException)
         {
             // ⚠️ 坏文件不让它打死核心：声明是**辅助**信息（可见性），
             // 而核心的职责是推进会话。宁可这一处暂时瞎，也不能整个进程起不来。

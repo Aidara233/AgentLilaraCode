@@ -89,6 +89,65 @@ public class ParserTests
         Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimRelease>(cmd).Scope);
     }
 
+    /// <summary>
+    /// ⚠️ **词之间可以有多个空格。** 初版用 `trimmed == "claim release"` 守精确单空格，
+    /// 于是 `"claim  release"`（**两个空格**）落进 acquire 分支 ⇒
+    /// **静默占一个叫 `release` 的路径**。
+    /// ⚠️ `Trim()` 只去**首尾**空白，**内部多个空格它管不到**——
+    /// 这条钉的正是 Trim 救不了的那一半。
+    /// </summary>
+    [Fact]
+    public void ClaimRelease_WithExtraSpaces_StillReleases()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim  release  src/foo", "s1");
+
+        Assert.Null(err);
+        Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimRelease>(cmd).Scope);
+    }
+
+    /// <summary>
+    /// ⚠️ **动词大小写不敏感**——`claim Release src` 必须**释放**，不是静默占一个
+    /// 叫 `Release src` 的怪路径。
+    /// ⚠️ 为什么动词该不敏感而 `axis set` 的**轴名**该敏感：后者是**协议标识符**
+    ///（`Axes` 的注释钉过「`Safety` 不是 `safety`，应当拒绝而不是猜」），
+    /// 而这里的主语是**控制台语法**（协议里叫 `claim.release`，带点）。
+    /// ⚠️ 更关键的是**后果不同**：轴名写错 → 报错（可见）；动词写错 →
+    /// 初版会**静默执行相反的动作**（可见性最差的那一档）。
+    /// </summary>
+    [Fact]
+    public void ClaimRelease_IsCaseInsensitiveOnTheVerb()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim Release src/foo", "s1");
+
+        Assert.Null(err);
+        Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimRelease>(cmd).Scope);
+    }
+
+    /// <summary>`claim list` 的动词同样不敏感——别让它静默占一个叫 `LIST` 的路径。</summary>
+    [Fact]
+    public void ClaimList_IsCaseInsensitiveOnTheVerb()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim LIST", "s1");
+
+        Assert.Null(cmd);
+        Assert.Null(err);            // (null, null) = 控制台查询，由 Repl 拦截
+    }
+
+    /// <summary>
+    /// ⚠️ **路径只收一个词；多给了就报错，不猜。**
+    /// 初版把多余词**拼进路径**（`"src/foo extra"`）——而控制台**没有引号语法**，
+    /// 含空格的路径**无法表达** ⇒ 拼起来是**猜**，猜错的方向是**静默占错地方**。
+    /// ⚠️ 与 `axis set` 对多余词的处置**保持一致**（T5：少了值就报错，不落回猜）。
+    /// </summary>
+    [Fact]
+    public void Claim_WithMoreThanOneWord_IsAnError()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim src/foo extra", "s1");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
     /// <summary>⚠️ 光一个 `claim` 不落回「当成消息」——否则用户以为占了，其实是发了个字。</summary>
     [Fact]
     public void Claim_WithNothing_IsAnError()

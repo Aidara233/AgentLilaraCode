@@ -54,27 +54,49 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("provider set ", StringComparison.Ordinal))
             return ParseProviderSet(trimmed);
 
-        // ⚠️ `claim list` 是**控制台的查询**，不是核心命令——返回 (null,null) 让 Repl 拦截。
-        if (trimmed is "claim list") return (null, null);
+        // ⚠️ **别去匹配精确的拼写（空格数 / 大小写）——切词。**
+        // 初版用 `trimmed == "claim release"` 与 `StartsWith("claim release ")`：
+        //   · `"claim  release"`（**两个空格**）→ `Trim` 只去**首尾**空白，内部两个空格**留着**
+        //     ⇒ 不匹配 `StartsWith("claim release ")`（第二个字符是空格不是 `r`）
+        //     ⇒ 落进 acquire 分支 ⇒ **静默占一个叫 `release` 的路径**。
+        //   · `"claim Release src"` → 同样落进 acquire ⇒ **静默执行相反的动作**。
+        // ⚠️ 而 `Trim` 能救的只有「尾随空格」那种（`"claim "` → `"claim"` → 命中守卫）——
+        // **恰好是我第一版以为能救的那半**。真洞在 Trim 管不到的地方。
+        if (trimmed == "claim" || trimmed.StartsWith("claim ", StringComparison.Ordinal)
+            || trimmed.StartsWith("claim\t", StringComparison.Ordinal))
+        {
+            // `Split(null, RemoveEmptyEntries)`：**所有空白**（空格、Tab、连续多个）都算分隔符。
+            var words = trimmed["claim".Length..]
+                .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
 
-        // ⚠️ **`claim release` 少了路径必须单独拦，而且要排在 acquire 之前。**
-        // 不拦的话 `trimmed.StartsWith("claim ")` 会把它接住、`trimmed[6..]` = `"release"`,
-        // 于是用户**静默占了一个叫 `release` 的路径**——不报错、看得出在动，看不出在动错东西。
-        // 与 `axis set`（T5）是**同一个形状**：前缀判断放行半个命令，剩下半截被当参数吃掉。
-        if (trimmed == "claim release")
-            return (null, "用法：claim <路径> | claim release <路径> | claim list");
+            // ⚠️ **动词大小写不敏感**——与 `Axes.TryParse` 的**取值**同一套理
+            //（「取值是用户手打的，写 `Prod` 是常态」）。动词是**控制台语法**，不是协议标识符
+            //（协议里叫 `claim.release`，带点）。⇒ 让 `claim Release src` 做**对**的事，
+            // 而不是落进 acquire 静默占一个怪路径。
+            if (words.Length == 0)
+                return (null, "用法：claim <路径> | claim release <路径> | claim list");
 
-        if (trimmed.StartsWith("claim release ", StringComparison.Ordinal))
-            return WithSession(currentSessionId, trimmed["claim release ".Length..].Trim(),
-                (sid, path) => new CoreCommand.ClaimRelease(sid, [path]));
+            if (string.Equals(words[0], "list", StringComparison.OrdinalIgnoreCase))
+                return words.Length == 1
+                    ? (null, null)                                   // 控制台查询，Repl 拦截
+                    : (null, "用法：claim <路径> | claim release <路径> | claim list");
 
-        if (trimmed.StartsWith("claim ", StringComparison.Ordinal) && trimmed != "claim")
-            return WithSession(currentSessionId, trimmed["claim ".Length..].Trim(),
-                (sid, path) => new CoreCommand.ClaimAcquire(sid, [path]));
+            if (string.Equals(words[0], "release", StringComparison.OrdinalIgnoreCase))
+                return words.Length == 2
+                    ? WithSession(currentSessionId, words[1],
+                        (sid, p) => new CoreCommand.ClaimRelease(sid, [p]))
+                    : (null, "用法：claim release <路径>");
 
-        // ⚠️ 光一个 `claim` ⇒ **报错**，不落回「当成消息」——
-        // 用户以为占了地方，实际是把它当消息发给了会话。
-        if (trimmed == "claim") return (null, "用法：claim <路径> | claim release <路径> | claim list");
+            // ⚠️ **路径只收一个词**——与 `axis set` 对多余词**报错**保持一致
+            //（T5：`axis set s1 safety` 少了值就报错，不猜）。
+            // 控制台**没有引号语法**，所以含空格的路径**无法表达**；
+            // 把多余词拼起来是**猜**，而猜错的方向是**静默占错地方**。
+            // ⇒ 宁可报错（可见），不猜（静默）。
+            return words.Length == 1
+                ? WithSession(currentSessionId, words[0],
+                    (sid, p) => new CoreCommand.ClaimAcquire(sid, [p]))
+                : (null, "路径不能含空格（控制台没有引号语法）。用一个词，或用绝对路径。");
+        }
 
         return (null, null);
 

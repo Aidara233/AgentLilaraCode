@@ -546,4 +546,57 @@ public class ReplTests : IDisposable
         Assert.Contains("已占", _out.ToString());
         Assert.Contains("src/foo", _out.ToString());
     }
+
+    /// <summary>
+    /// ⚠️ **`释放` 的回执分支也要单独钉。** 复审实测：只测 `ClaimAcquire` 那条分支时，
+    /// 把 `ClaimRelease` 的分支删掉**照样全绿**（变异存活）——
+    /// **两条分支必须各有一条测试**，否则「同一修复的两个入口只测了一个」。
+    /// </summary>
+    [Fact]
+    public async Task ClaimRelease_OnSuccess_SaysWhatWasReleased()
+    {
+        var (repl, _, _) = NewHarness();
+        await repl.ExecuteAsync("claim src/foo", CancellationToken.None);   // 先占上
+        _out.GetStringBuilder().Clear();
+
+        await repl.ExecuteAsync("claim release src/foo", CancellationToken.None);
+
+        Assert.Contains("已释放", _out.ToString());
+        Assert.Contains("src/foo", _out.ToString());
+    }
+
+    /// <summary>⚠️ `claim list` 在**没有当前会话**时印人话，不是空白、不是抛。</summary>
+    [Fact]
+    public async Task ClaimList_WithoutACurrentSession_SaysSo()
+    {
+        var (repl, _, _) = NewHarness();
+        repl.Current = null;
+
+        await repl.ExecuteAsync("claim list", CancellationToken.None);
+
+        Assert.Contains("还没有选中会话", _out.ToString());
+    }
+
+    /// <summary>
+    /// ⚠️ **`claims.json` 被别的进程独占时，控制台不许崩。**
+    /// 复审实测：`File.ReadAllText` 对 `FileShare.None` 抛 `IOException`，
+    /// 而 `ClaimStore.All()` 初版只接 `JsonException` ⇒ 异常**逃出 `claim list`**（它没包 try/catch）
+    /// ⇒ **打死 REPL**。⚠️ 这在**正常使用**下就会发生（编辑器打开着那个文件）。
+    /// </summary>
+    [Fact]
+    public async Task ClaimList_WhenTheFileIsLocked_SaysSomethingInsteadOfCrashing()
+    {
+        var (repl, _, session) = NewHarness();
+        var dir = Path.Combine(session.Spec.WorkingDirectory, ".lilara");
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "claims.json");
+
+        // ⚠️ 用 `FileShare.None` 独占——模拟编辑器/别的进程打开着它。
+        using var hold = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+
+        // 不许抛。
+        await repl.ExecuteAsync("claim list", CancellationToken.None);
+
+        Assert.Contains("没有声明", _out.ToString());   // 读不到 ⇒ 当作空
+    }
 }
