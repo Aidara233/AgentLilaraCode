@@ -2407,11 +2407,73 @@ Expected: 全绿。**本任务新增 10 个测试方法 / 11 个用例**，外�
 那是我加了两条测试之后**没更新的旧数**）。派发前数一遍；对不上以**实测**为准。
 ⚠️ **分母是"执行时的既有基线"（当前 435），不是任何写死的数字。**
 
+- [ ] **Step 6b: 补上跨会话的短临界区（`claims.json` 的读-改-写）**
+
+⚠️ **这一条是控制器在 T7 派发后自己发现的洞，属于本任务的范围**（`ClaimStore` 是 T7 的文件）。
+
+`HandleClaimAcquire` / `HandleClaimRelease` 做的是
+`store.All()` → 改列表 → `store.Save()`，**而 `claim.*` 不拿会话闸**
+（正确：闸是**会话粒度**的，而声明是**跨会话**的操作）。
+⚠️ `AtomicFile.Write` 只保证**文件不半截**与**并发写不撞名**——
+**它不保证读-改-写的原子性**。⇒ 两个会话同时 acquire：
+各自读到同一份旧列表、各自写回 ⇒ **后写的盖掉前写的，丢一条声明**，而且**丢得静默**
+（两边都收到 `Accepted`，盘上只剩一条）。
+⚠️ 这比 `setAxis` 不拿闸更严重：`setAxis` 写的是**各自**的 `state.json`，
+claim 写的是**共享的** `claims.json`。
+
+修法照 `HistoryLog` 的既有形态（`HistoryLog.cs:30,42`）——**按路径一把静态锁**：
+
+```csharp
+    // ⚠️ 按路径的锁：`claims.json` 是**跨会话共享**的，而 `claim.*` 不拿会话闸。
+    // 形态照 `HistoryLog.PathLocks`（同一处代码库的既有做法）。
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Lock> PathLocks = new();
+
+    /// <summary>
+    /// ⚠️ **读-改-写必须在同一把锁里**——这是本方法与 `All()`/`Save()` 分开调用的区别。
+    /// 分开调用会让两个会话各自 `All()` → 各自 `Save()` ⇒ **丢更新**（静默）。
+    /// </summary>
+    public void Update(Func<IReadOnlyList<Claim>, IEnumerable<Claim>> change)
+    {
+        lock (PathLocks.GetOrAdd(Path_, _ => new Lock()))
+        {
+            // ⚠️ 在这里重新 `All()`（**锁内**），不是把锁外的快照传进来——
+            // 传进来就等于锁没起作用。
+            Save(change(All()));
+        }
+    }
+```
+
+`HandleClaimAcquire` / `HandleClaimRelease` 改成用 `store.Update(...)`，
+**并把 `FindConflict` 挪进 `Update` 的委托里**（冲突判定与写入必须在同一个临界区，
+否则「查了没冲突 → 别人占了 → 我写进去」照样丢/超占）。
+
+⚠️ **`Save` 保持公开**（端点不用它，但将来可能要），**`All` 保持公开**（读路径无需锁）。
+
+- [ ] **Step 6c: 加一条真的并发测试**
+
+⚠️ **不能用 `Task.Delay` 制造时序**（那是在测试里编造并发，而不是产生并发）。
+用 `Barrier`/`Task.WhenAll` 让两个**真**任务同时进 `DispatchAsync`：
+
+```csharp
+    /// <summary>
+    /// ⚠️ **两个会话并发 acquire 两条不同的路径 ⇒ 两条都必须留下。**
+    /// 没有临界区时这条会**间歇性**红（丢一条），所以断言要跑在一个
+    /// **真的并发**上（`Barrier` 对齐两个任务），不是 `Task.Delay` 错开。
+    /// ⚠️ 这类测试天然间歇——**跑 20 次确认它稳定绿**，别只跑一次。
+    /// </summary>
+    [Fact]
+    public async Task Acquire_FromTwoSessionsConcurrently_KeepsBothClaims()
+    {
+        // 两个会话各占一条**不重叠**的路径，用 Barrier 让两个 DispatchAsync 同时进
+        // ⇒ 断言 claims.json 里有**两条**（缺陷下会出现只有一条）
+    }
+```
+
 - [ ] **Step 7: 提交**
 
 ```bash
 git add src/Lilara.Core/ tests/Lilara.Core.Tests/ClaimCommandTests.cs tests/Lilara.Core.Tests/ControlServerTests.cs
-git commit -m "feat(core): 声明落盘（工作目录，可分享）+ claim.acquire/release 命令 + GET /claims（无文件即空数组）+ claim.release 接上 ParseCommand（原来线上不可达）"
+git commit -m "feat(core): 声明落盘（工作目录，可分享）+ claim.acquire/release 命令 + GET /claims（无文件即空数组）+ claim.release 接上 ParseCommand（原来线上不可达）+ claims.json 的读-改-写进临界区（并发 acquire 会丢更新）"
 ```
 
 ⚠️ **提交消息里的「`claim.acquire/release`」指 `CoreCommand` 的**两个类型**（dispatcher 与 T8 的控制台都要用），
