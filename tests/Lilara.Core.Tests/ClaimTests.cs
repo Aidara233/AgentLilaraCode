@@ -33,7 +33,9 @@ public class ClaimTests
     /// `Replace(AltDirectorySeparatorChar, DirectorySeparatorChar)` **是冗余的**，
     /// 这条测试对**那半句没有区分力**（删掉它这条照样绿）。
     /// 留着它是因为它钉的是**契约**（两种分隔符等价），而契约是对的。
-    /// ⚠️ 拿掉 `GetFullPath` 换成手拼字符串，这条**必须**红。
+    /// ⚠️ **要让它红得连 `Replace` 一起去掉**——实测过：只拿掉 `GetFullPath`
+    /// （保留 `Replace`）这条**照样绿**，因为 `Replace` 仍把 `/` 统一成 `\`；
+    /// 那时唯一红的是 `Normalize_ResolvesDotSegments`。**两处一起去才红。**
     /// </summary>
     [Fact]
     public void Normalize_TreatsBothSeparatorsTheSame()

@@ -18,8 +18,10 @@ public sealed record Claim(string SessionId, string ProjectKey, string Path, Dat
 /// 而那个会话看得见这里。</para>
 ///
 /// <para>⚠️ **不做「同一派生树内不阻塞」那个例外**（§12.1）：它需要派生树概念，
-/// 而 `child.spawned` 不存在。单会话下该例外不可能触发；多会话下会**过阻塞**——
-/// 保守方向，且冲突是**可见**的。见计划的 D4。</para>
+/// 而 `child.spawned` 不存在 ⇒ 本计划里根本没有派生树，那个例外**没有输入可作用**。
+/// ⚠️ **别写成「过阻塞」**：见上，本计划的声明**不阻塞任何东西**，所以漏做这个例外
+/// 不可能多拦下一件事——它至多让同一棵树内的一对声明被判成冲突（一次**误报**，
+/// 一个多余的可见信号）。等阻塞机制与派生树一并出现时，这个例外要一起补。见计划的 D4。</para>
 /// </summary>
 public static class Claims
 {
@@ -43,11 +45,18 @@ public static class Claims
     /// 写一条跑不了的测试等于没有测试。
     /// ⇒ **记为已知偏离（本任务 D9）**，不是已知正确：两个路径经不同链接指向同一处时，
     /// 判据会**漏报**冲突（方向是漏，不是误报）。修法与判据改写见 T7 之后。</para>
+    ///
+    /// <para>⚠️ **上面那段「跨平台」论证只覆盖大小写这一半，别读成全覆盖。**
+    /// 判据的另一半——分隔符边界——用的是**当次运行时的** <c>Path.DirectorySeparatorChar</c>
+    /// （见 <see cref="Conflicts"/> 的 <c>IsUnder</c>）。所以 Windows 写下的
+    /// <c>claims.json</c>（路径含 `\`）在别的平台上被规范化成 `/` 之后，
+    /// 边界字符对不上，**冲突判不出**。⇒ **这是与 D9 同族的第二处缺口**，
+    /// 不是「已解决」。今天不修：本机只跑 Windows，且写不出跨平台测试（同 D9 的理由）。</para>
     /// </summary>
     public static string Normalize(string path, string workingDirectory)
     {
-        // ⚠️ 相对路径折叠成**绝对**，用的是进程当前目录（`GetFullPath` 的语义）。
-        // `workingDirectory` 只在 `path` 不是绝对路径时用来拼前缀。
+        // ⚠️ 相对路径折叠成绝对：基址是 **`workingDirectory`**（经 `Path.Combine`），
+        // 仅当 `workingDirectory` **本身**是相对路径时，进程当前目录才介入。
         var combined = Path.IsPathRooted(path) ? path : Path.Combine(workingDirectory, path);
 
         // ⚠️ `Path.GetFullPath` 顺手折叠掉 `.` 与 `..`——自己拼字符串做这件事会漏掉
@@ -68,6 +77,13 @@ public static class Claims
         //   `IsUnder("c:\", "c:\repo")`  → **False**  ← 保留反斜杠那一版，判错
         // ⚠️ 即：保留根的反斜杠会让根路径与它下面的**一切**都判不出冲突——**静默失效**，
         // 正是 `01` §12 要防的。守卫在 `Normalize_RootPath_StillConflictsWithEverythingUnderIt`。
+        //
+        // ⚠️ **但 `c:` 只在这个前提下安全：它不再被送回 `Normalize`。**
+        // `c:` 是 **drive-relative**（`IsPathRooted("c:")` 为真，而
+        // `GetFullPath("c:")` 给的是**进程当前目录所在的盘**）——实测
+        // `Normalize(Normalize(@"C:\"))` 会得到进程 CWD 下的路径，**静默变成另一个目录**。
+        // 今天安全，因为本方法的结果只被**比较**与**落盘**；将来谁加一层
+        // 「读回来再规范化」，这个不动点缺口就会显形。⇒ **别回炉。**
         var trimmed = full.TrimEnd(Path.DirectorySeparatorChar);
         return (trimmed.Length == 0 ? full : trimmed).ToLowerInvariant();
     }
