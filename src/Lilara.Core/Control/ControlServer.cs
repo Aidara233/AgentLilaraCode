@@ -235,6 +235,12 @@ public sealed class ControlServer(
 
             return Results.Json(claims, WireJson.Options);
         });
+
+        // ⚠️ 头的引导（`05` §2.2）要判断「有没有提供商」——没有就得挡住其余操作。
+        // ⚠️ **`apiKey` 绝不进响应**：它是本机秘密，而头的页面在浏览器里、
+        // 还开着 CORS（`*`）。只回「有没有」，不回「是什么」。
+        app.MapGet("/providers", () =>
+            Results.Json(host.Providers.List().Select(p => new { p.Id, p.Protocol, p.DefaultModel }), WireJson.Options));
     }
 
     /// <summary>
