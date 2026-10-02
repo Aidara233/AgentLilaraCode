@@ -170,7 +170,11 @@ internal static bool IsSafeProviderId(string id) =>
 - Test: `tests/Lilara.Core.Tests/ControlServerTests.cs`
 
 **Interfaces:**
-- Produces: `ControlServer(..., string allowedOrigin)`；默认 `http://127.0.0.1:7790`
+- Produces: `ControlServer(..., string allowedOrigin = "http://127.0.0.1:7790")` ——
+  ⚠️ **必须有默认值**：`ControlServer` 有**两个**构造点（`src/Lilara.Core/Program.cs:74` 与
+  `tests/Lilara.Core.Tests/ControlServerTests.cs:57`），没默认值就会**直接打断既有的那批 WS 测试**
+  （而它们正是这条改动的回归网——打断它们等于自己拆掉安全网）。
+  测试要覆盖**非默认值**时**显式传参**，别去改默认值。
 
 ⚠️ **判据必须是「放行无 Origin，拒绝别的 Origin」**，不是「要求 Origin」：
 - **浏览器永远带 `Origin`** ⇒ 挡住坏 origin 就达到了目的
@@ -265,8 +269,7 @@ Spec = handle.Spec,
 
 ```csharp
 // ⚠️ **不交 `defaultModel`——因为它今天没有可信来源。**
-// 我（控制器）写这一节时先写了「从适配器读、别抄命令里的常量」，
-// 然后**核了一遍**：`claude-opus-5` 这个字面量**只出现在 `CommandDispatcher.cs:100` 一处**
+// 核到的事实：`claude-opus-5` 这个字面量**只出现在 `CommandDispatcher.cs:100` 一处**
 //（`ProviderUpsert` 的兜底），而 `IModelAdapter` **不交**默认模型。
 // ⇒ 它不是「第二份副本」（G10 那种），它是**唯一那份**，住在命令的兜底里。
 // ⇒ 在 schema 里交它 = 要么复制一份（G10），要么**发明**一个来源。
