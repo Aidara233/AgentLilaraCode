@@ -116,12 +116,20 @@ async function openSession(id) {
   const state = await (await fetch(`${core}/sessions/${id}/state`)).json();
   const history = await (await fetch(`${core}/sessions/${id}/history`)).json();
 
+  // ⚠️ **快照回来时，用户可能已经点了别的会话**——`#timeline` / `#slots` / 右栏都是**全局节点**，
+  // 继续渲染就会把 A 的 turn 追加进 B **已经清空**的那条时间线里：标题是 B、内容却是 A+B。
+  if (current !== id) return;
+
   renderSlots(state.slots);
   renderAxes(state.axes);
   setStatus(state.state.status, state.state.turn);
   for (const turn of history.rendered) renderTurn(turn.from, turn.blocks);
 
   await loadClaims();
+
+  // ⚠️ **再守一次**（上面又是一个 await）。少了它，就会拿**捕获的 `id`**——一个已经不是当前的
+  // 会话——去订会话流。
+  if (current !== id) return;
 
   // ⚠️ **用快照带回来的高水位当起点**——「拉快照 → 订阅」之间那段窗口不漏不重的唯一办法。
   subscribe(`session:${id}`, history.highWater);
@@ -329,7 +337,14 @@ function renderClaims() {
     for (const p of set) {
       const el = document.createElement("div");
       el.className = "claim";
-      el.innerHTML = `<span class="who">${sid}</span> ${p}`;
+      // ⚠️ **不用 `innerHTML`**：`p` 是磁盘上 `claims.json` 里的路径，**不是**标记，
+      // 不该被当 HTML 解析（本文件别处——冲突条那行——用的就是 `textContent`，
+      // 只有这里漏了）。结构照旧：`<span class="who">sid</span> 空格 路径`。
+      const who = document.createElement("span");
+      who.className = "who";
+      who.textContent = sid;
+      el.appendChild(who);
+      el.appendChild(document.createTextNode(" " + p));
       box.appendChild(el);
     }
   }
@@ -402,7 +417,15 @@ function connect() {
     const frame = JSON.parse(e.data);
 
     if (frame.kind === "ack") {
-      if (frame.accepted && frame.sessionId && !sessions.has(frame.sessionId)) loadSessions();
+      if (frame.accepted && frame.sessionId && !sessions.has(frame.sessionId)) {
+        // ⚠️ **`!sessions.has(...)` 这个既有守卫正好把「分配型回执」与「发消息 / 设轴的回执」
+        // 分开**——只有前者会带一个本页还不认识的 `sessionId`。
+        // ⚠️ **建完要打开它**：首屏那条 `boot-create` 原来是建完就 `return`，**没人 `openSession`**
+        // ⇒ 中栏空、**右栏五个轴全空**（`renderAxes` 只在 `openSession` 里跑）、`send()` 静默不发，
+        // 非刷新一次不可。先 `loadSessions()`（把新会话收进 `sessions`，并订上刚出现的项目流）
+        // 再打开它。
+        loadSessions().then(() => openSession(frame.sessionId));
+      }
       if (!frame.accepted) renderMeta("✗ " + frame.reason, "error");
       return;
     }
@@ -413,7 +436,11 @@ function connect() {
       renderMeta("（事件跟不上，已重新拉取快照）");
       cursors.delete(frame.topic);
       if (current && frame.topic === `session:${current}`) openSession(current);
-      if (frame.topic.startsWith("project:")) loadClaims();
+      // ⚠️ **两条都要**：`loadClaims()` **不发 subscribe**——重订项目流的只有 `loadSessions()`
+      // 末尾那一句。服务端发 resync 时那条订阅的 channel 已被 `TryComplete()`，此后 `Publish`
+      // **一律跳过它** ⇒ 只刷声明的话项目流**永久静默**（`session.created` / `claim.*` 再也收不到），
+      // 而且**不会自愈**——义务 2 的实时性就这么死掉。
+      if (frame.topic.startsWith("project:")) { loadSessions(); loadClaims(); }
       return;
     }
 
