@@ -78,12 +78,17 @@ public static class Claims
         // ⚠️ 即：保留根的反斜杠会让根路径与它下面的**一切**都判不出冲突——**静默失效**，
         // 正是 `01` §12 要防的。守卫在 `Normalize_RootPath_StillConflictsWithEverythingUnderIt`。
         //
-        // ⚠️ **但 `c:` 只在这个前提下安全：它不再被送回 `Normalize`。**
-        // `c:` 是 **drive-relative**（`IsPathRooted("c:")` 为真，而
-        // `GetFullPath("c:")` 给的是**进程当前目录所在的盘**）——实测
-        // `Normalize(Normalize(@"C:\"))` 会得到进程 CWD 下的路径，**静默变成另一个目录**。
-        // 今天安全，因为本方法的结果只被**比较**与**落盘**；将来谁加一层
-        // 「读回来再规范化」，这个不动点缺口就会显形。⇒ **别回炉。**
+        // ⚠️ **关于 `c:` 的一条事实——本机实测，别照抄别的环境的结论。**
+        // `GetFullPath("c:")` 给的是**该盘自己的当前目录**（默认 `C:\`），
+        // **不是**进程当前目录。实测：把进程 CWD 从 C 盘换到 `E:\` 之后，
+        // `GetFullPath("c:")` **仍是 `C:\`**。
+        // ⇒ `c:` 在默认情形下**是不动点**（`Normalize("c:")` 还是 `c:`）；
+        // 但它依赖的「该盘当前目录」是**进程级可变状态**（谁都能 `SetCurrentDirectory`）。
+        // ⇒ 既别**指望**它稳定，也别把它**回炉**。
+        // ⚠️ 这段话是**改过的**：初版写成「`GetFullPath("c:")` 给的是进程当前目录所在的盘」
+        // ＋「回炉会静默变成另一个目录」——两句都不对（前者错在语义，后者在本环境为假），
+        // 而且证据是从一个 `%TEMP%`（在 C 盘）的临时工程里**转抄**的。
+        // **别人的实测不是你的实测。**
         var trimmed = full.TrimEnd(Path.DirectorySeparatorChar);
         return (trimmed.Length == 0 ? full : trimmed).ToLowerInvariant();
     }
