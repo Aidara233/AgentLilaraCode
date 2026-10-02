@@ -60,10 +60,22 @@ public sealed class ClaimStore(string workingDirectory)
     public void Save(IEnumerable<Claim> claims) =>
         AtomicFile.Write(Path_, System.Text.Json.JsonSerializer.Serialize(claims.ToList(), Canonical.Json.Options));
 
-    // ⚠️ **按路径的锁**，形态照 `HistoryLog.PathLocks`（同一处代码库的既有做法）。
-    // `claims.json` 是**跨会话共享**的，而 `claim.*` **不拿会话闸**
-    //（对：闸是**会话粒度**的，声明是**跨会话**的操作）。
+    // ⚠️ **按路径的锁**，形态**取自** `HistoryLog.PathLocks`（同一处代码库的既有做法）。
+    // ⚠️ **但键必须规范化，`HistoryLog` 那处是 `Path.GetFullPath(path)`**——
+    // 初版我直接键在 `Path_` 上，**漏了规范化**，于是同一个项目里两个**只有大小写不同**
+    // 的工作目录会拿到**两把不同的锁**，丢更新照样发生。
+    // ⚠️ 实测（复审者，真命令路径）：**100/100 轮丢一条**，盘上 100 而不是 200；
+    // 同字符串对照 0/100。⇒ 键里必须有 `ToLowerInvariant`——
+    // 与 `Claims.Normalize` 的大小写策略一致（`01` §12.1：Windows 大小写不敏感）。
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Lock> PathLocks = new();
+
+    /// <summary>锁的键：**规范化**（绝对 + 小写）。⚠️ 别只 `GetFullPath`——它不改大小写。</summary>
+    private string LockKey => System.IO.Path.GetFullPath(Path_).ToLowerInvariant();
+
+    /// <summary>`Update` 的产出：**这次调用真的加了什么、真的删了什么**。</summary>
+    /// <param name="Added">新增的条目（调用方**只该为这些**发事件）。</param>
+    /// <param name="Removed">删掉的条目（同上）。</param>
+    public sealed record Updated(IReadOnlyList<Claim> Added, IReadOnlyList<Claim> Removed);
 
     /// <summary>
     /// ⚠️ **把「读 → 改 → 写」放进同一把锁里** —— 这是本方法与
@@ -76,25 +88,39 @@ public sealed class ClaimStore(string workingDirectory)
     ///
     /// <para>⚠️ **实测过**（审阅者，8 会话并发占互不重叠的路径）：带 `Barrier` **40/40 轮只剩 1 条**；
     /// 无 `Barrier` **30/30 轮丢更新 + 19/30 轮抛 `UnauthorizedAccessException`**
-    /// （`AtomicFile` 的重试耗尽后 rethrow ⇒ 逃出 `DispatchAsync`）。
-    /// 后者是本方法**顺带**修掉的第二个症状。</para>
+    /// （`AtomicFile` 的重试耗尽后 rethrow ⇒ 逃出 `DispatchAsync`）。</para>
     ///
     /// <para>⚠️ **读必须在锁内**（就是这里的 `All()`）——把锁外的快照传进来等于锁没起作用。
     /// 调用方的**判据**（如 `FindConflict`）也要放进 <paramref name="change"/> 里，
     /// 否则「查了没冲突 → 别人占了 → 我写进去」照样超占。</para>
     ///
-    /// <returns>⚠️ **这次调用有没有真的改变列表**——调用方据此决定发不发事件
-    /// （`01` §5：无迁移则无事件）。返回值由**比较前后**得出，不是由调用方自己猜。</returns>
+    /// <para>⚠️ **<paramref name="change"/> 的契约：恰好在锁内被调用一次、同步。**
+    /// 调用方**可以**从它里面往外写变量（如「有没有冲突」）——今天的两个处理器就是这么做的。
+    /// ⚠️ 若将来改成可能调用多次（重试），那两个调用方**会出错**，必须一起改。</para>
+    ///
+    /// <returns>
+    /// ⚠️ **真的加了什么、删了什么**（按 `Claim` 的**值** diff，`record` ⇒ 值相等）。
+    /// 调用方据此决定**为哪些路径**发事件——`01` §5：**无迁移则无事件**。
+    /// ⚠️ 初版返回一个 `bool`（"有没有变"），于是调用方只能**猜**哪些路径变了，
+    /// 猜的结果是「为 scope 里每条都发事件」，包括**没被删掉**的那些。
+    /// </returns>
     /// </summary>
-    public bool Update(Func<IReadOnlyList<Claim>, IEnumerable<Claim>> change)
+    public Updated Update(Func<IReadOnlyList<Claim>, IEnumerable<Claim>> change)
     {
-        lock (PathLocks.GetOrAdd(Path_, _ => new Lock()))
+        lock (PathLocks.GetOrAdd(LockKey, _ => new Lock()))
         {
             var before = All();
             var after = change(before).ToList();
-            if (before.SequenceEqual(after)) return false;   // `Claim` 是 record ⇒ 值相等
+
+            // 按值 diff。⚠️ 用 `Except` 而不是比索引：`record` 的值相等让这件事成立，
+            // 且**与顺序无关**——顺序变了但成员没变时不该发事件。
+            var added = after.Except(before).ToList();
+            var removed = before.Except(after).ToList();
+
+            if (added.Count == 0 && removed.Count == 0) return new Updated([], []);
+
             Save(after);
-            return true;
+            return new Updated(added, removed);
         }
     }
 }

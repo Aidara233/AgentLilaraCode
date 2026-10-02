@@ -419,7 +419,7 @@ public sealed class CommandDispatcher(
         // ⚠️ **读-改-写必须在 `store.Update` 的**同一把锁**里**（见它的注释）：
         // 两个会话同时 acquire 时，分开的 `All()`/`Save()` 会**丢更新**（静默）。
         Claim? clash = null;
-        store.Update(current =>
+        var updated = store.Update(current =>
         {
             var list = current.ToList();
 
@@ -452,10 +452,12 @@ public sealed class CommandDispatcher(
         if (clash is not null)
             return Reject(id, $"'{clash.Path}' 已被会话 {clash.SessionId} 占用。");
 
-        // ⚠️ **项目流**：声明是跨会话的（`03` §5）
-        foreach (var path in paths)
+        // ⚠️ **只为**真的新增的**发事件**（`01` §5：无迁移则无事件）。
+        // 初版是「为 `paths` 里每条都发」——于是**幂等重占也发事件**（复审实测：第二次相同
+        // acquire 多出一条事件），头据此把没有的变化渲染成有。
+        foreach (var claim in updated.Added)
             _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
-                new WireEvent.ClaimAcquired(c.SessionId, path));
+                new WireEvent.ClaimAcquired(c.SessionId, claim.Path));
 
         return new DispatchResult(new Ack.Accepted { CommandId = id });
     }
@@ -471,21 +473,19 @@ public sealed class CommandDispatcher(
         // ⚠️ **逃生口**（`03` §3）：不检查占用者是不是自己——模型失控时，
         // 用户要能从一个**别的**会话里把锁摘掉。
         // ⚠️ 同样在 `Update` 的锁里（读-改-写不可分）。
-        var removed = store.Update(current =>
+        var updated = store.Update(current =>
         {
             var list = current.ToList();
             foreach (var path in paths) list.RemoveAll(x => x.Path == path);
             return list;
         });
 
-        // ⚠️ **只有真删掉了才发事件**（`01` §5：无迁移则无事件）。
-        // 判据是**整条命令有没有改变任何东西**，不是"逐条比较"——
-        // 一条没删上也发事件会让头把没有的变化渲染成有。
-        if (!removed) return new DispatchResult(new Ack.Accepted { CommandId = id });
-
-        foreach (var path in paths)
+        // ⚠️ **只为真正被删掉的发事件**（`01` §5）。
+        // 初版是「为 scope 里每条都发」——复审实测 `["q1","never-held"]` 发了**2 条**事件，
+        // 其中一条路径**根本没被删**（它本来就不在）。那与这段自己引的「无迁移则无事件」矛盾。
+        foreach (var claim in updated.Removed)
             _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
-                new WireEvent.ClaimReleased(c.SessionId, path));
+                new WireEvent.ClaimReleased(c.SessionId, claim.Path));
 
         return new DispatchResult(new Ack.Accepted { CommandId = id });
     }

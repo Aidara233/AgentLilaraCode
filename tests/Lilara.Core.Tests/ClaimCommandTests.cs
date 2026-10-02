@@ -344,6 +344,94 @@ public class ClaimCommandTests : IDisposable
         Assert.Equal(2, ClaimsOf(_work).Count);
     }
 
+    /// <summary>
+    /// ⚠️ **幂等重占不得发事件**（`01` §5：无迁移则无事件）。
+    ///
+    /// <para>⚠️ 复审实测到的缺陷：`Acquire` **丢弃**了 `Update` 的返回值、**无条件**为
+    /// `scope` 里每条路径发 `ClaimAcquired` ⇒ 第二次占同一条**也发事件**（多出一条），
+    /// 头据此把**没有的变化**渲染成有。</para>
+    /// </summary>
+    [Fact]
+    public async Task Acquire_TwicePublishesOnlyOnce()
+    {
+        var (_, d, bus) = Harness();
+        var sid = NewSession(d);
+        var pk = Lilara.Core.Projects.ProjectKey.FromPath(_work);
+        using var sub = bus.Subscribe(EventBus.ProjectTopic(pk));
+
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
+        Assert.True(sub.Reader.TryRead(out _), "第一次必须发（那是一次真迁移）");
+
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c2", false, CancellationToken.None);
+
+        // ⚠️ 第二次**什么都没变**（幂等）⇒ **不该有事件**。
+        Assert.False(sub.Reader.TryRead(out _), "幂等重占不许发事件——无迁移则无事件");
+    }
+
+    /// <summary>
+    /// ⚠️ **`Release` 只为真正被删掉的路径发事件。**
+    ///
+    /// <para>⚠️ 复审实测到的缺陷：初版为 scope 里**每条**发 `ClaimReleased` ——
+    /// `["src","never-held"]` 发了**两条**，而 `never-held` **根本没被删**（它本就不在）。
+    /// 那与同一段代码自己引的「无迁移则无事件」**直接矛盾**。</para>
+    /// </summary>
+    [Fact]
+    public async Task Release_PublishesOnlyForPathsActuallyRemoved()
+    {
+        var (_, d, bus) = Harness();
+        var sid = NewSession(d);
+        var pk = Lilara.Core.Projects.ProjectKey.FromPath(_work);
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c0", false, CancellationToken.None);
+        using var sub = bus.Subscribe(EventBus.ProjectTopic(pk));
+
+        // 一条真在、一条从没占过
+        await d.DispatchAsync(new CoreCommand.ClaimRelease(sid, ["src", "never-held"]), "c1", false, CancellationToken.None);
+
+        Assert.True(sub.Reader.TryRead(out var p), "真删掉的那条必须发");
+        Assert.EndsWith("src", Assert.IsType<WireEvent.ClaimReleased>(p.Payload).Path);
+        Assert.False(sub.Reader.TryRead(out _), "从没占过的那条不许发——它没有被删掉");
+    }
+
+    /// <summary>
+    /// ⚠️ **锁的键必须规范化（含大小写）**，否则并发保护**在真实路径上失效**。
+    ///
+    /// <para>⚠️ 复审实测：同一项目里两个**只有大小写不同**的工作目录
+    ///（`…\ClaimWork` 与 `…\claimwork`）⇒ 未规范化的键 ⇒ **两把不同的锁**
+    /// ⇒ **100/100 轮丢一条**；同字符串对照 0/100。</para>
+    ///
+    /// <para>⚠️ **本测试必须真并发**：控制器第一版写成「串联两次 `Update`」——
+    /// 那种写法下第二个**总会**读到第一个写的文件（文件已落盘），**与锁无关**，
+    /// 于是「去掉 `ToLowerInvariant`」这个变异**照样绿**（实测：变异存活）。
+    /// ⇒ 用 `Barrier` 让两个 `Update` **同时**进临界区，各跑多轮。</para>
+    /// </summary>
+    [Fact]
+    public async Task Update_OnPathsDifferingOnlyByCase_StillSerializes()
+    {
+        // ⚠️ 只差大小写的两个工作目录。`ClaimStore` 的 `Path_` **不**由它规范化
+        //（它只 `Combine`），所以这正是「键没规范化」会露出来的地方。
+        var upper = new ClaimStore(Path.Combine(_work, "CaseDir"));
+        var lower = new ClaimStore(Path.Combine(_work, "casedir"));
+
+        for (var round = 0; round < 30; round++)
+        {
+            var cu = new Claim("su", "pk", $"c:\\x\\u{round}", DateTimeOffset.UnixEpoch);
+            var cl = new Claim("sl", "pk", $"c:\\x\\l{round}", DateTimeOffset.UnixEpoch);
+
+            using var barrier = new Barrier(2);
+            var t1 = Task.Run(() => { barrier.SignalAndWait(); return upper.Update(cur => cur.Append(cu)); });
+            var t2 = Task.Run(() => { barrier.SignalAndWait(); return lower.Update(cur => cur.Append(cl)); });
+
+            var both = await Task.WhenAll(t1, t2);
+
+            // ⚠️ 同一把锁 ⇒ 第二次看得见第一次写的 ⇒ 两条都在。
+            // 两把锁 ⇒ 两个 `All()` 都读到旧的 ⇒ 各写一条 ⇒ **丢一条**。
+            Assert.Single(both[0].Added);
+            Assert.Single(both[1].Added);
+            // ⚠️ 按值的累计断言：30 轮下来应当有 60 条。缺陷下会少一大截。
+            Assert.Equal(2 * (round + 1), upper.All().Count);
+        }
+    }
+
     private static List<Claim> ClaimsOf(string work) =>
         new ClaimStore(work).All().ToList();
 }
