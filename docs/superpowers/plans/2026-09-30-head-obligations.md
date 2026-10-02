@@ -1282,6 +1282,102 @@ git commit -m "feat(core): 快照带五轴与三个槽；GET /axes（头不再�
 
 ---
 
+### Task 4b: 控制面的 `ParseCommand` 接上 `session.setAxis`（**评审发现的计划级空洞**）
+
+**Files:**
+- Modify: `src/Lilara.Core/Control/ControlServer.cs`（`ParseCommand` 的 switch）
+- Test: `tests/Lilara.Core.Tests/ControlServerTests.cs`（追加）
+
+**Interfaces:**
+- Consumes: `CoreCommand.SessionSetAxis`（T3）
+- Produces: 线上可用的 `session.setAxis` 帧
+
+> ### ⚠️ 这个任务原本**不存在**——`ParseCommand` 里没有它，而**全计划 grep `ParseCommand` 零命中**
+>
+> T3 的审阅者发现：`ControlServer.ParseCommand`（`ControlServer.cs:430`）的 switch 有
+> `session.create` / `activate` / `interrupt` / `start` / `send` / `provider.upsert`，
+> **没有 `session.setAxis`** ⇒ 落到 `_ => throw new ArgumentException($"认不出的命令 '{kind}'")`
+> ⇒ 被包成「命令形状不对」。
+>
+> **后果**：① 头（T9）发的第一条轴命令**永远失败**——用户拨下拉，看起来没反应；
+> ② `Axes.cs:131` 那句「线上帧可达（`WireJson.Options` 没开 `RespectNullableAnnotations`）」
+> **是假的**——它验了两端（`WireJson` 与兜底 catch），**漏了中间那一环**。
+>
+> ⚠️ 这正是本项目反复付代价的那类：**因果链只验了看着像的两端**。
+> 而这一次它同时暴露了一个**分发机制**的问题：我的计划把命令分成了 T3（核心侧语义）
+> 与 T5（控制台解析），**而线上解析是第三条线，没人认领**。
+
+- [ ] **Step 1: 写失败的测试**
+
+```csharp
+/// <summary>
+/// ⚠️ **线上的 `session.setAxis` 必须真的能到 dispatcher。**
+/// T3 只在**类型**层加了命令，`ParseCommand` 的 switch 没跟上 ⇒ 帧落到 `_ => throw`
+/// ⇒ 头（`05` §7.4 的轴下拉）发出来的东西全被回「命令形状不对」。
+/// ⚠️ 这条测试走**真的 WS**，不是直接调 dispatcher——后者会在实现缺失时照样绿。
+/// </summary>
+[Fact]
+public async Task WebSocket_SetAxis_ReachesTheDispatcher()
+{
+    var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+    var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+    using var ws = new ClientWebSocket();
+    await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+    await SendAsync(ws, "{\"kind\":\"command\",\"id\":\"a1\",\"payload\":{\"kind\":\"session.setAxis\","
+        + "\"sessionId\":\"" + sid + "\",\"axis\":\"safety\",\"value\":\"prod\"}}");
+
+    var ack = await ReceiveAsync(ws);
+    Assert.Equal("ack", ack.GetProperty("kind").GetString());
+    Assert.True(ack.GetProperty("accepted").GetBoolean(),
+        "认不出这条命令——`ParseCommand` 的 switch 漏了它：" + ack.GetProperty("reason").GetString());
+
+    // ⚠️ 判据是「**命令真的生效了**」，不只是「回执说 accepted」——
+    // 回执可以说 accepted 而语义根本没跑（那正是「形状对但接不上」的形态）。
+    var state = await Client.GetStringAsync(Http($"/sessions/{sid}/state"));
+    using var doc = JsonDocument.Parse(state);
+    Assert.Equal("prod", doc.RootElement.GetProperty("axes").GetProperty("safety").GetString());
+}
+```
+
+- [ ] **Step 2: 跑测试确认它失败**
+
+Run: `dotnet test --filter "FullyQualifiedName~WebSocket_SetAxis" -v q`
+Expected: 红——`accepted` 是 `false`，理由里是「认不出的命令 'session.setAxis'」
+
+- [ ] **Step 3: 写实现**
+
+`ControlServer.ParseCommand` 的 switch 里加一条（放在 `session.send` 之后）：
+
+```csharp
+            // ⚠️ **线上解析是命令的第三条线**（核心语义在 dispatcher、控制台解析在 `CoreCommandParser`）——
+            // 少一条这条命令就只在别的两条线上存在，而头发的帧会静默落到 `_ => throw`。
+            // T3 加命令时漏了这里，而**计划里没有任何任务认领它**（全计划 grep `ParseCommand` 零命中）。
+            "session.setAxis" => new CoreCommand.SessionSetAxis(
+                payload.GetProperty("sessionId").GetString()!,
+                payload.GetProperty("axis").GetString()!,
+                payload.GetProperty("value").GetString()!),
+```
+
+⚠️ **顺手清掉 `Axes.cs` 里那句假话**：把「线上帧可达」改成
+「线上**待接**（`ParseCommand` 尚无此命令；这里守的是契约，不是今天的路径）」——
+或者在本任务把它接上之后，改成可证的形状（命令已接上，注释也照样要能核）。
+⚠️ **同时改 `tests/Lilara.Core.Tests/AxisCommandTests.cs` 与 `AxisTests.cs` 里那两处同一句。**
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `dotnet test -v q`（**全量**，理由同 T4）
+Expected: 全绿。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add src/Lilara.Core/Control/ControlServer.cs src/Lilara.Core/Session/Axes.cs tests/Lilara.Core.Tests/
+git commit -m "fix(core): 控制面 ParseCommand 接上 session.setAxis（原来线上不可达——头发的轴命令全被回「认不出」）"
+```
+
+---
+
 ### Task 5: 控制台的 `axis set`
 
 **Files:**
