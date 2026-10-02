@@ -599,4 +599,23 @@ public class ReplTests : IDisposable
 
         Assert.Contains("没有声明", _out.ToString());   // 读不到 ⇒ 当作空
     }
+
+    /// <summary>
+    /// ⚠️ **`claim LIST` 不许被当成消息发出去。** 这正是本任务反复要防的「静默落回当成消息」：
+    /// 解析器认它是查询、而 `Repl` 的守卫曾用精确匹配 ⇒ 放行 ⇒ 消息真的发给了模型。
+    /// ⚠️ 判据是「**适配器没被调用**」——那才是"没落回消息"的直接证据。
+    /// </summary>
+    [Fact]
+    public async Task ClaimList_InAnyUpperCase_IsNotSentAsAMessage()
+    {
+        var (repl, _, session) = NewHarness();
+        new Lilara.Core.Persistence.ClaimStore(session.Spec.WorkingDirectory)
+            .Save([new Lilara.Core.Session.Claim("other", "pk", @"c:\repo\src", DateTimeOffset.UnixEpoch)]);
+
+        await repl.ExecuteAsync("claim LIST", CancellationToken.None);
+
+        Assert.Contains("other", _out.ToString());   // 真的印了声明列表
+        // ⚠️ 这一条才是上面 doc-comment 说的那个「直接证据」：拦下来了 ⇒ 没有命令被派发 ⇒ 适配器没被碰。
+        Assert.Empty(_adapter.Calls);
+    }
 }

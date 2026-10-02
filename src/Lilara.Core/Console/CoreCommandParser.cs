@@ -19,6 +19,40 @@ namespace Lilara.Core.Console;
 public static class CoreCommandParser
 {
     /// <summary>
+    /// ⚠️ **`claim list` 是「控制台的查询」，不是核心命令**（`03` §3：不做 `claim.list`）。
+    /// 解析器对它返回 `(null, null)`（不是错误、也不是命令），**由 `Repl` 拦截并自己处理**。
+    ///
+    /// <para>⚠️ **这个判据必须由 `Repl` 与解析器共用——这是本方法存在的唯一理由。**
+    /// 曾经两边各写一份：解析器切词（大小写不敏感、多空格都算），
+    /// 而 `Repl` 用精确的 <c>trimmed == "claim list"</c> ⇒
+    /// <c>claim LIST</c> / <c>claim\tlist</c> / <c>claim  list</c> 都被解析器认作查询、
+    /// 却被 `Repl` 的守卫**放行** ⇒ 落进 `AsMessage` ⇒ **当成消息发给了模型**。
+    /// 那正是本任务从头到尾在防的「静默落回当成消息」，**换了个入口回来**。</para>
+    ///
+    /// <para>⚠️ **`(null, null)` 这个返回值下游有两支**（"查询"与"不是命令"），
+    /// 而 `Repl` 只接了"查询"那一支——**所以它的判据必须与这里逐字一致**。
+    /// 这就是为什么它必须是**一个公开方法**，而不是两边各写一遍。</para>
+    /// </summary>
+    public static bool IsClaimList(string line)
+    {
+        var t = line.Trim();
+        if (t.Length < "claim".Length) return false;
+        if (!t.StartsWith("claim", StringComparison.Ordinal)) return false;
+
+        // ⚠️ **`"claim"` 之后必须是空白（或到此为止）——这是词边界，不能省。**
+        // 少了这一句，`"claimlist"` 也会被切出 `"list"`
+        //（`"claimlist"["claim".Length..]` == `"list"`），于是 `claimlist` 被认成查询、
+        // 被 `Repl` 拦下印声明列表 ⇒ **用户敲的那行字被吞掉了**（本该当成消息发出去）。
+        // ⚠️ 对照 `Parse` 里那条守卫的写法——它用的是
+        // `trimmed == "claim" || StartsWith("claim ") || StartsWith("claim\t")`，
+        // **同样是「claim 后面得有分隔」**；这里必须与它口径一致。
+        if (t.Length > "claim".Length && !char.IsWhiteSpace(t["claim".Length])) return false;
+
+        var words = t["claim".Length..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return words.Length == 1 && string.Equals(words[0], "list", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// 解析。返回 <c>(command, error)</c>：
     /// 认出的命令非 null；解析失败则 error 非 null；
     /// **两者都是 null** 表示「这不是一条命令形态的行」——调用方按**普通消息**处理。
@@ -53,6 +87,8 @@ public static class CoreCommandParser
 
         if (trimmed.StartsWith("provider set ", StringComparison.Ordinal))
             return ParseProviderSet(trimmed);
+
+        if (IsClaimList(trimmed)) return (null, null);
 
         // ⚠️ **别去匹配精确的拼写（空格数 / 大小写）——切词。**
         // 初版用 `trimmed == "claim release"` 与 `StartsWith("claim release ")`：

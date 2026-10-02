@@ -76,9 +76,11 @@ public sealed class Repl(
         // 查询走快照那一层（03 §8.1：控制台只用「命令 + 快照」两层）。
         if (trimmed == "history") { PrintHistory(); return true; }
         if (trimmed == "status") { PrintStatus(); return true; }
-        // ⚠️ `claim list` 也是控制台的查询（`03` §3：不做 `claim.list` 命令）——
-        // 所以它**不经过** `CoreCommandParser.Parse`（那里对它是 (null,null)）。
-        if (trimmed == "claim list") { PrintClaims(); return true; }
+        // ⚠️ **判据与解析器共用**（`IsClaimList`）——两边各写一份时它们漂过：
+        // 解析器切词（大小写不敏感、多空格都算），而这里曾用精确的 `== "claim list"`
+        // ⇒ `claim LIST` / `claim\tlist` 被解析器认作查询、却被这里放行
+        // ⇒ 落进 `AsMessage` ⇒ **当成消息发给了模型**。
+        if (CoreCommandParser.IsClaimList(trimmed)) { PrintClaims(); return true; }
 
         var (parsed, parseError) = CoreCommandParser.Parse(trimmed, Current?.SessionId);
         if (parseError is not null) { _out.WriteLine(parseError); return true; }

@@ -134,6 +134,36 @@ public class ParserTests
     }
 
     /// <summary>
+    /// ⚠️ **`IsClaimList` 与 `Parse` 必须口径一致**——`Repl` 的拦截用的是前者。
+    /// 两边不一致时（初版：解析器切词、`Repl` 精确匹配），
+    /// `claim LIST` 被解析器认作查询、却被 `Repl` 放行 ⇒ **当成消息发出去**。
+    /// ⚠️ 这条**逐例对拍两者**，是"不可能再漂"的守卫。
+    /// </summary>
+    [Theory]
+    [InlineData("claim list")]
+    [InlineData("claim  list")]      // 两个空格
+    [InlineData("claim\tlist")]      // Tab
+    [InlineData("claim LIST")]       // 大写
+    [InlineData("claim List")]
+    [InlineData("  claim list  ")]   // 首尾空白
+    public void IsClaimList_AgreesWithParse_OnEverySpelling(string line)
+    {
+        // 解析器认它是「查询」（(null, null)）⇔ 谓词为真
+        Assert.True(CoreCommandParser.IsClaimList(line));
+        Assert.Equal((null, null), CoreCommandParser.Parse(line, "s1"));
+    }
+
+    /// <summary>⚠️ 反向：**不是**查询的输入，谓词必须为假——否则会把用户的话吞掉。</summary>
+    [Theory]
+    [InlineData("claim")]
+    [InlineData("claim src/foo")]
+    [InlineData("claimlist")]         // 没有空格：不是命令
+    [InlineData("claim list extra")]
+    [InlineData("claims list")]
+    public void IsClaimList_IsFalseForThingsThatAreNotTheQuery(string line) =>
+        Assert.False(CoreCommandParser.IsClaimList(line));
+
+    /// <summary>
     /// ⚠️ **路径只收一个词；多给了就报错，不猜。**
     /// 初版把多余词**拼进路径**（`"src/foo extra"`）——而控制台**没有引号语法**，
     /// 含空格的路径**无法表达** ⇒ 拼起来是**猜**，猜错的方向是**静默占错地方**。
