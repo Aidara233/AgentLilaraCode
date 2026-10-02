@@ -211,7 +211,9 @@ public class AxisTests
     /// <c>{"kind":"session.setAxis","axis":null}</c> 能落到这里；而 `Dictionary` 的 key 不许为 null。
     /// 修前实测的栈：<c>IsKnown(null) ⇒ ContainsKey(null) ⇒ ArgumentNullException「Parameter 'key'」</c>
     /// （T3 的 `SetAxis_WithANullAxis_IsRejected_NotACrash` 修前就是红的）。
-    /// ⚠️ 线上那条路今天**待接**（`ParseCommand` 尚无 `session.setAxis`）——本文件守的是**契约**。</para>
+    /// ⚠️ 线上那条路**已接**（`ControlServer.ParseCommand` 有 `session.setAxis`，`b1696b4`）——
+    /// 这里曾经写「待接」，那句在接上之后就成了假的（与 `Axes.cs` 里同源的那句**一起**陈旧）。
+    /// ⇒ **别在这里复述 `ParseCommand` 的细节**：那种句子会腐。本文件守的是**契约**。</para>
     ///
     /// <para>⚠️ **这条为什么必须在这里**（而不是只靠那条命令测试）：命令路径在 `IsKnown`
     /// 那一关就返回了，**走不到** `ValuesOf` / `TryParse` / `LabelOf` / `InContext`——

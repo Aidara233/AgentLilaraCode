@@ -139,9 +139,12 @@ public static class Axes
     /// 控制面外层是兜底 <c>catch (Exception)</c>（`ControlServer.cs:323`），连接不会死，
     /// 但用户看到的是「帧形状不对」——而真正的问题是**轴名没给**。</para>
     ///
-    /// <para>⚠️ **线上那条路今天是「待接」，不是「可达」**：`ControlServer.ParseCommand`
-    /// 的 switch 里**没有** `session.setAxis`（已派给另一条线去接）。这里守的是**契约**，
-    /// 不是今天的路径——那条命令一旦接上，这一串判空就是它的第一道关。</para>
+    /// <para>⚠️ **线上那条路已经接上了**：`ControlServer.ParseCommand` 有 `session.setAxis`
+    /// （`b1696b4`），所以 `{"kind":"session.setAxis","axis":null}` 真的能落到这里。
+    /// ⚠️ 本段曾经写「**待接**，`ParseCommand` 尚无此命令」——那句在接上之后就成了**假的**，
+    /// 而它与 `AxisTests.cs` 里同源的那一句**一起**陈旧了：**两处文字描述同一个代码事实，
+    /// 代码一改，两处都没跟上**（G10 换个位置又出现一次）。
+    /// ⇒ 别再在这里复述 `ParseCommand` 的细节：**那种句子会腐**。要核就去看那个 switch。</para>
     ///
     /// <para>⚠️ **判在这里而不是各调用方**：本类是「轴名 → 合法值」这个契约的拥有者，
     /// 而 <see cref="ValuesOf"/> 早就声明了「未知 → null」——**null 就是未知的一种**。
