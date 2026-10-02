@@ -2326,6 +2326,22 @@ public void Claim_WithNothing_IsAnError()
     Assert.NotNull(err);
 }
 
+/// <summary>
+/// ⚠️ **`claim release` 少了路径，不许当成「占一个叫 release 的路径」。**
+/// 这是 `axis set` 少了尾随空格**同一个形状的缺陷**（T5 踩过）：
+/// 前缀判断放行了半个命令，剩下那半截被当成**参数**吃掉——
+/// 而它**不报错**，用户看到的是一个静默的错误动作。
+/// 判据：`trimmed == "claim release"` 要单独拦，**在 acquire 分支之前**。
+/// </summary>
+[Fact]
+public void ClaimRelease_WithNothing_IsAnError()
+{
+    var (cmd, err) = CoreCommandParser.Parse("claim release", "s1");
+
+    Assert.Null(cmd);
+    Assert.NotNull(err);
+}
+
 /// <summary>`claim list` 不是核心命令，是控制台的查询——返回 (null, null) 由 Repl 拦截。</summary>
 [Fact]
 public void ClaimList_IsNotACoreCommand() =>
@@ -2386,6 +2402,13 @@ Expected: 红
 ```csharp
         // ⚠️ `claim list` 是**控制台的查询**，不是核心命令——返回 (null,null) 让 Repl 拦截。
         if (trimmed is "claim list") return (null, null);
+
+        // ⚠️ **`claim release` 少了路径必须单独拦，而且要排在 acquire 之前。**
+        // 不拦的话 `trimmed.StartsWith("claim ")` 会把它接住、`trimmed[6..]` = `"release"`,
+        // 于是用户**静默占了一个叫 `release` 的路径**——不报错、看得出在动，看不出在动错东西。
+        // 与 `axis set`（T5）是**同一个形状**：前缀判断放行半个命令，剩下半截被当参数吃掉。
+        if (trimmed == "claim release")
+            return (null, "用法：claim <路径> | claim release <路径> | claim list");
 
         if (trimmed.StartsWith("claim release ", StringComparison.Ordinal))
             return WithSession(currentSessionId, trimmed["claim release ".Length..].Trim(),
