@@ -89,9 +89,64 @@ public sealed class CommandDispatcher(
     /// </summary>
     internal static bool IsSafeProviderId(string id) =>
         !string.IsNullOrWhiteSpace(id)
-        && id == Path.GetFileName(id)          // ⚠️ 这一句同时挡掉 `..` / `a/b` / `a\b` / `/abs` / `C:\abs`
+        // ⚠️ 这一句挡的是**路径语法**：`a/b` / `a\b` / `/abs` / `C:\abs` / `../escaped`
+        //    （`Path.GetFileName("../escaped")` = `escaped` ≠ `../escaped` ⇒ 拒绝）。
+        && id == Path.GetFileName(id)
         && id.IndexOfAny(Path.GetInvalidFileNameChars()) < 0
-        && id is not "." and not "..";
+        // ⚠️ **`.` 与 `..` 由这一句挡，不是上一句**——实测 `Path.GetFileName("..")` 就是 `..`、
+        //    `Path.GetFileName(".")` 就是 `.` ⇒ 上一句对它们是**放行**。
+        //    ⚠️ **它不冗余，别删**：删掉就把 `.` / `..` 放回来了（注释把守卫从代码里删掉的那种缺陷）。
+        //    ⚠️ 代价实测：`PathFor("..")` 得到 `...json`（段里没有分隔符）⇒ 今天仍落在 `providers/` 内，
+        //    不构成穿越——它是**纵深防御**；但 `PathFor` 一旦不拼 `.json`，它立刻变成穿越。
+        && id is not "." and not ".."
+        // ⚠️ 设备名另算：`NUL` 词法上是个完全合法的文件名，上面几条一条都抓不到它——见其注释。
+        && !IsWindowsDeviceName(id);
+
+    /// <summary>
+    /// ⚠️ **Windows 设备名：真二进制里是「未捕获异常掀翻常驻进程」**——实测（真二进制 + 临时数据根）：
+    /// <list type="bullet">
+    /// <item>`provider set COM1 --key k` ⇒ 未捕获 `FileNotFoundException`（`\\.\COM1`）⇒ **REPL 直接死**，
+    ///   后续命令不再执行；盘上无文件。</item>
+    /// <item>`provider set NUL --key k` ⇒ 未捕获 `UnauthorizedAccessException`（`\\.\NUL`）⇒ **同样掀翻进程**。</item>
+    /// </list>
+    /// ⚠️ 别把这条记成「回 ✓ 而盘上无文件」——那是**裸** `File.WriteAllText(<dir>/"NUL.json", …)` 的行为
+    /// （实测确实不抛、`GetFiles` 看不见、`File.Exists` 为 false）。`ProviderStore.Save` 走的是
+    /// `AtomicFile`（先写 `.tmp` 再 `Move`），**路径不同、结局不同**：`Move` 找不到那个 `.tmp` ⇒ 抛。
+    /// **探针 ≠ 被测物，要验证就调那个函数。**
+    ///
+    /// <para>⚠️ **取「第一个点之前」那一段，不是 `Path.GetFileNameWithoutExtension`。**
+    /// 实测 `NUL.txt.txt.json` 同样静默消失，而 `GetFileNameWithoutExtension` 给出 `NUL.txt.txt`
+    /// ⇒ 会**放行**它。判据要盖过系统的怪癖，不是刚好合上它。</para>
+    ///
+    /// <para>⚠️ 判定 = **大小写不敏感**（实测 `nul.json` 一样消失）+ `TrimEnd()`（`NUL  .json` 也消失）
+    /// + **相等、不是前缀**——实测 `NULx` / `COM1x` / `COM10` / `LPT10` / `console` / `connect`
+    /// 都是**正常文件**，前缀型会把这一大片正当 id 一起误杀；保留表只有 **1–9**
+    /// （`COM0` / `LPT0` / `COM10` / `LPT10` 实测都能正常写入）。</para>
+    ///
+    /// <para>⚠️ **Linux 上 `NUL` 是正常文件名，这里照样拒绝**——与 `/` 那条同一套理
+    /// （数据根可能被同步到别的平台），**这是刻意的**。</para>
+    /// </summary>
+    private static bool IsWindowsDeviceName(string id)
+    {
+        // 「第一个点之前」+ 去尾随空白：`NUL.` / `NUL  .json` / `NUL.txt.txt.json` 都归到 `NUL`。
+        var dot = id.IndexOf('.');
+        var stem = (dot < 0 ? id : id[..dot]).TrimEnd();
+
+        if (stem.Equals("CON", StringComparison.OrdinalIgnoreCase)
+            || stem.Equals("PRN", StringComparison.OrdinalIgnoreCase)
+            || stem.Equals("AUX", StringComparison.OrdinalIgnoreCase)
+            || stem.Equals("NUL", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // ⚠️ **相等**，不是前缀（实测 `COM1x` 正常写入）；且只有 **1–9** 是保留的
+        //    （`COM0` / `LPT0` / `COM10` / `LPT10` 实测都能正常写入）。
+        if (stem.Length != 4) return false;
+        var head = stem[..3];
+        if (!head.Equals("COM", StringComparison.OrdinalIgnoreCase)
+            && !head.Equals("LPT", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return stem[3] is >= '1' and <= '9';
+    }
 
     private DispatchResult HandleProviderUpsert(CoreCommand.ProviderUpsert p, string id)
     {
@@ -101,7 +156,8 @@ public sealed class CommandDispatcher(
         // 放前端会被另一个绕过（本项目的规范，G16）。
         if (!IsSafeProviderId(p.Id))
             return Reject(id, $"提供商 id '{p.Id}' 不合法：它会变成 providers/ 下的文件名，"
-                + "必须是**非空**且**不含路径语法**（分隔符 / `..` / 非法字符）的单纯文件名。");
+                + "必须是**非空**、**不含路径语法**（分隔符 / `..` / 非法字符）、"
+                + "且**不是 Windows 设备名**（`NUL` / `CON` / `COM1` …）的单纯文件名。");
 
         // ⚠️ 语义校验在这里，不在控制台——否则线上能写进坏值。
         if (p.Protocol is not null && !Protocols.All.Contains(p.Protocol))

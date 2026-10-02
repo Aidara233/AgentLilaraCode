@@ -52,6 +52,12 @@ public class ProviderIdTests : IDisposable
     [InlineData(".")]
     [InlineData("..")]
     [InlineData("a\0b")]              // 内嵌 NUL
+    [InlineData("NUL")]               // ⚠️ Windows 设备名：写入**静默消失**（回 ✓ 而盘上无文件）
+    [InlineData("nul")]               // ⚠️ 设备名判定**大小写不敏感**（实测一样消失）
+    [InlineData("CON.json")]          // ⚠️ 要**去掉扩展名再比**（`PathFor` 还会再拼一个 `.json`）
+    [InlineData("NUL.txt.txt.json")]  // ⚠️ 实测同样静默消失；`GetFileNameWithoutExtension` 会放行它
+    [InlineData("NUL  .json")]        // ⚠️ 尾随**空格**再带扩展名——`TrimEnd` 那一半
+    [InlineData("COM1.json")]         // ⚠️ 这一族走的是**抛异常**（FileNotFoundException），不是静默
     public async Task ProviderUpsert_WithAnUnsafeId_IsRejected(string id)
     {
         var cmd = new CoreCommand.ProviderUpsert(id, "k", null, null, null, null);
@@ -60,6 +66,22 @@ public class ProviderIdTests : IDisposable
         var result = await _dispatcher.DispatchAsync(cmd, "t1", awaitCompletion: true, CancellationToken.None);
 
         Assert.IsType<Ack.Rejected>(result.Ack);
+    }
+
+    /// <summary>
+    /// ⚠️ 上一条理论只断言「回 rejected」——但这条缺陷的**危害是「文件落到错地方」**：
+    /// 闸若被挪到写入**之后**，ack 仍会是 rejected，而文件**已经写出去了**。
+    /// ⚠️ `_root` **就是数据根**：`PathFor("../escaped")` = `<数据根>/providers/../escaped.json`
+    /// = `<数据根>/escaped.json` ⇒ 断言它**没落**。
+    /// </summary>
+    [Fact]
+    public async Task ProviderUpsert_WithAPathTraversingId_LeavesNothingInTheDataRoot()
+    {
+        var cmd = new CoreCommand.ProviderUpsert("../escaped", "k", null, null, null, null);
+        var result = await _dispatcher.DispatchAsync(cmd, "t1", awaitCompletion: true, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(result.Ack);
+        Assert.False(File.Exists(Path.Combine(_root, "escaped.json")));
     }
 
     /// <summary>
@@ -72,6 +94,9 @@ public class ProviderIdTests : IDisposable
     [InlineData("my-provider")]
     [InlineData("p1")]
     [InlineData("本地")]                // 非 ASCII 合法——别用字符白名单把它挡了
+    [InlineData("NULx")]               // ⚠️ **反向对照**：前缀型判据会误杀它（实测是正常文件）
+    [InlineData("COM1x")]              // ⚠️ 反向对照：同上（实测正常写入）
+    [InlineData("COM10")]              // ⚠️ 反向对照：保留表只有 1–9（实测 `COM10.json` 正常写入）
     public async Task ProviderUpsert_WithASafeId_IsAccepted(string id)
     {
         var cmd = new CoreCommand.ProviderUpsert(id, "k", null, null, null, null);
@@ -95,6 +120,15 @@ public class ProviderIdTests : IDisposable
     [InlineData("", false)]
     [InlineData("   ", false)]
     [InlineData("a\0b", false)]
+    [InlineData("NUL", false)]          // ⚠️ Windows 设备名：写入会**静默消失**
+    [InlineData("nul", false)]          // 大小写不敏感
+    [InlineData("CON.json", false)]     // 去掉扩展名再比
+    [InlineData("NUL.txt.txt.json", false)]   // 第一个点之前那段才是判据（不是 GetFileNameWithoutExtension）
+    [InlineData("NUL  .json", false)]         // 尾随空格 ⇒ TrimEnd
+    [InlineData("COM1.json", false)]          // 1–9 那一族（走抛异常）
+    [InlineData("NULx", true)]                // ⚠️ 反向：前缀型会误杀
+    [InlineData("COM1x", true)]               // ⚠️ 反向
+    [InlineData("COM10", true)]               // ⚠️ 反向：只有 1–9
     [InlineData("local", true)]
     [InlineData("my-provider", true)]
     [InlineData("本地", true)]
