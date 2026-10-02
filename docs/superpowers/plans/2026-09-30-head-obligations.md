@@ -2375,7 +2375,16 @@ Expected: **失败**，消息含「认不出的命令 'claim.release'」——
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test -v q`
-Expected: 全绿（新增 7 条 + 接线 1 条 + **执行时的既有基线**）
+Expected: 全绿。**本任务新增 10 个测试方法 / 11 个用例**，外加接线 1 条：
+- `ClaimCommandTests`（8 个方法 / 9 个用例）：`Acquire_Writes…` · `Acquire_Publishes…` ·
+  `Acquire_OfAnOccupied…` · `Acquire_Twice…` · `Release_Removes…` · `Release_OfSomethingNotHeld…` ·
+  **`Acquire_OnASessionThatIsOnlyOnDisk_…`**（控制器补：`TryFind` 那条） ·
+  **`Acquire_WithAHandEditedBadClaimsFile_…`**（控制器补：`[Theory]` 2 个坏文件形状）
+- `ControlServerTests`（2 个方法）：`Claims_WithNoClaimsFile_…` · **`WebSocket_ClaimRelease_…`**（接线）
+
+⚠️ **这个数按 brief 里实测 `[Fact]` / `[Theory]` 得到的**（原计划写「新增 7 条 + 接线 1 条」，
+那是我加了两条测试之后**没更新的旧数**）。派发前数一遍；对不上以**实测**为准。
+⚠️ **分母是"执行时的既有基线"（当前 435），不是任何写死的数字。**
 
 - [ ] **Step 6: 提交**
 
