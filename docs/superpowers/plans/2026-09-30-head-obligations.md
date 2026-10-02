@@ -94,7 +94,7 @@ handle.State.Axes["effort"] = "max" ← 用户刚改的
 | `src/Lilara.Core/Control/WireEvent.cs` | 加 `AxisChanged` / `ClaimAcquired` / `ClaimReleased` |
 | `src/Lilara.Core/Control/ControlServer.cs` | 加 `GET /claims`；`/sessions/{id}/state` 带三轴 + 类型化槽位 |
 | `src/Lilara.Core/Console/CoreCommandParser.cs` | `axis set` / `claim` 两个子命令 |
-| `src/Lilara.Core/Program.cs` | 启动横幅补一行用法（G8：不引入 help 框架） |
+| `src/Lilara.Core/Program.cs` | 启动横幅补一行用法（G8：不引入 help 框架）——⚠️ **归 T8**，与 `claim` 那行一起加（执行时发现它原来在 T5 的 Files 表里当孤儿：brief 零命中 ⇒ 实现者看不到） |
 
 **重写（头）**
 
@@ -1388,6 +1388,9 @@ git commit -m "fix(core): 控制面 ParseCommand 接上 session.setAxis（原来
   它们测的是 `CoreCommandParser` 而不是 `Repl`）· `tests/Lilara.Core.Tests/ReplTests.cs`（追加
   ——**显示**是 `Repl` 的事，那条 effort 测试就该落在这里）
 
+⚠️ **启动横幅那行不在本任务**——它在 **T8**（T8 本来就要改 `Program.cs:108` 加 `claim`，
+两行一起加）。执行时发现它在 T5 的 Files 表里**当了个孤儿**：brief 里零命中（零命中 ⇒ 实现者根本看不到它）。
+
 **Interfaces:**
 - Consumes: `CoreCommand.SessionSetAxis`（T3）
 - Produces: 控制台子命令 `axis set <sessionId> <axis> <value>`
@@ -1471,17 +1474,22 @@ Expected: `AxisSet_ParsesThreeWords` 红（返回的是 `(null, null)` ⇒ 被�
 ```csharp
     /// <summary>
     /// `axis set &lt;sessionId&gt; &lt;axis&gt; &lt;value&gt;`
-    /// ⚠️ **段数必须正好四段**（含 `axis`）。少了不能落回「当成消息」——
+    /// ⚠️ **段数必须正好五段**（`axis` + `set` + 会话 + 轴 + 值）。少了不能落回「当成消息」——
     /// 用户以为设了轴，实际是把这行字发给了会话。那是静默接管。
+    ///
+    /// <para>⚠️ **原来是四段、取 `parts[1..3]`——那是控制器的错**（执行时实现者核出）。
+    /// `"axis set s1 safety prod".Split(' ')` 是 **5** 段（`axis` 与 `set` 各一段），
+    /// 所以按四段写，**计划里自己的那条测试输入永远绿不了**。
+    /// ⇒ 标尺是**测试输入**，不是我想的那个数字。</para>
     /// </summary>
     private static (CoreCommand?, string?) ParseAxisSet(string line)
     {
         var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length != 4)
+        if (parts.Length != 5)
             return (null, "用法：axis set <会话 id> <轴> <值>   （轴：" + string.Join("|", Axes.Names)
                 + "；取值见 `status`）");
 
-        return (new CoreCommand.SessionSetAxis(parts[1], parts[2], parts[3]), null);
+        return (new CoreCommand.SessionSetAxis(parts[2], parts[3], parts[4]), null);
     }
 ```
 
@@ -1490,9 +1498,14 @@ Expected: `AxisSet_ParsesThreeWords` 红（返回的是 `(null, null)` ⇒ 被�
 ```csharp
                 // ⚠️ 轴改了要**立刻重印策略那一行**——它就在 `status` 里，
                 // 而用户在控制台改完轴最想知道的就是「现在是什么」。
-                case CoreCommand.SessionSetAxis:
-                    _out.WriteLine($"✓ {Current!.SessionId} 的轴已更新");
-                    PrintStatus();
+                case CoreCommand.SessionSetAxis set:
+                    _out.WriteLine($"✓ {set.SessionId} 的轴已更新");
+                    // ⚠️ **只在改的就是当前会话时才重印**，否则印的是**别的**会话的状态（张冠李戴）。
+                    // ⚠️ **用 `set.SessionId` 而不是 `Current!`**（控制器的错，执行时核出）：
+                    // `axis set` 可以指向任意已有会话，而 `Current` 可以是 null
+                    // ⇒ `Current!.SessionId` 会 **NRE**，而那个 `try` 只 catch 两种业务异常
+                    // ⇒ **异常掀翻整个 REPL 循环**（常驻进程）。
+                    if (Current is not null && Current.SessionId == set.SessionId) PrintStatus();
                     break;
 ```
 
@@ -1533,8 +1546,12 @@ Expected: `AxisSet_ParsesThreeWords` 红（返回的是 `(null, null)` ⇒ 被�
 >     var (repl, dispatcher, session) = NewHarness();   // 照 ReplTests 既有约定
 >
 >     // ⚠️ 先确认起点**不是** max，否则「印了新值」与「印了旧值」看不出区别。
->     var before = _out.ToString();
->     Assert.Contains("effort high", before);
+>     // ⚠️ **必须先真敲一次 `status`**（控制器的错，执行时核出）：
+>     // `StringWriter` 刚构造出来是**空的**，直接 `var before = _out.ToString()` 再断言
+>     // ⇒ **无条件红**（那条断言测的是「缓冲区非空」，不是「基线是 high」）。
+>     _out.GetStringBuilder().Clear();
+>     await repl.ExecuteAsync("status", CancellationToken.None);
+>     Assert.Contains("effort high", _out.ToString());
 >
 >     await dispatcher.DispatchAsync(
 >         new CoreCommand.SessionSetAxis(session.SessionId, "effort", "max"), "a1", true, CancellationToken.None);
