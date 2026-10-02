@@ -2741,9 +2741,30 @@ git commit -m "feat(console): claim/claim release/claim list（光一个 claim �
 ### Task 9: 头 —— 三栏骨架 + 引导 + 五轴
 
 **Files:**
-- Modify: `head/wwwroot/index.html`
-- Modify: `head/wwwroot/app.js`
+- Modify: `head/wwwroot/index.html`（⚠️ **全量替换**——见下面的「全量替换」条）
+- Modify: `head/wwwroot/app.js`（⚠️ **全量替换**——见下面的「全量替换」条）
 - Modify: `src/Lilara.Core/Control/ControlServer.cs`（**新增 `GET /providers`**，见下面的 ⚠️）
+
+⚠️ **「全量替换」不是「Modify」——这两份文件现在是控制面分支留下的两栏版本。**
+
+| 现在的形状（`20663ba` 那版） | 本任务之后 |
+|---|---|
+| `index.html`：`#side` + `#main`（两栏）、`#compose` | `#left` / `#center` / `#right`（三栏） |
+| `app.js`：`loadSessions` / `renderSessions` / `openSession` / `renderTurn` / `renderMeta` / `renderSlots` … | **全部重写**：`loadProjects` / `loadAxes` / `loadClaims` / `renderAxes` / `renderAlert` / `renderOnboarding` / `bootstrap` … |
+
+⚠️ **Step 1 的标题就是「换掉 `index.html`」，而下面的代码块是**完整文件**——
+所以这两步是**整份替换**，不是往现有文件里插。**
+⇒ **旧的两栏元素（`#side` / `#main` / `#compose`）不要留在文件里**：
+它们没有任何 JS 引用，是**死代码**，而"页面上还有一块看不见的东西"在调试时极具误导性。
+⇒ **旧的 `app.js` 函数名与本任务的新函数可能重名**（`loadSessions`、`subscribe`、`command`…）——
+函数声明会**后来者覆盖先前的**，于是旧的那份成了**永远不被调用的死代码**。
+**同名的旧函数要删掉**，别让两份实现并存在同一个文件里。
+
+**判据（可执行）**：替换后跑
+```
+cd E:/Workspace/AgentLilaraCode && grep -nE 'id="(side|main|compose)"' head/wwwroot/index.html
+```
+**应当无输出**（一个都不剩）。
 
 **Interfaces:**
 - Consumes: `GET /projects` · `GET /projects/{pk}/sessions` · `GET /sessions/{id}/state`（含 `axes` / 三槽）· `GET /sessions/{id}/history` · **`GET /axes`**（T4）· `GET /claims` · **`GET /providers`**（本任务新增）· WS `subscribe` / `command` / `resync_required`
@@ -3395,7 +3416,8 @@ git commit -m "feat(head): 三栏骨架 + 引导流程 + 五轴面板（义务 4
 ### Task 10: 头 —— 声明视图与冲突上浮 + 收尾
 
 **Files:**
-- Modify: `head/wwwroot/app.js`
+- Modify: `head/wwwroot/app.js`（⚠️ **增量**——T9 已把整份换成三栏版，
+  本任务只往里**加**声明视图的那几段，**不是**再替换一次）
 - Modify: `head/Program.cs`（加一条注释，代码不动）
 
 **Interfaces:**
