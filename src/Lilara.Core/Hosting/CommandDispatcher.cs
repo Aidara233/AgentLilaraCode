@@ -412,29 +412,42 @@ public sealed class CommandDispatcher(
         var store = new ClaimStore(handle.Spec.WorkingDirectory);
 
         // ⚠️ **`scope` 是列表（`01` §12.4）⇒ 先整体校验，再整体写入**：
-        // 任一条与他人冲突就**整条命令回 rejected**，不部分写入——
+        // 任一条与他人冲突就**整条命令回 rejected**，**一个都不写**——
         // 部分写入会让用户看到"占了一半"，而命令语义是"占这片区域"。
         var paths = c.Scope.Select(p => Claims.Normalize(p, handle.Spec.WorkingDirectory)).ToList();
 
         // ⚠️ **读-改-写必须在 `store.Update` 的**同一把锁**里**（见它的注释）：
         // 两个会话同时 acquire 时，分开的 `All()`/`Save()` 会**丢更新**（静默）。
         Claim? clash = null;
-        var accepted = store.Update(current =>
-            {
-                var list = current.ToList();
-                foreach (var path in paths)
-                {
-                    // ⚠️ **冲突 ⇒ rejected 且点名持有者**（`01` §12.2）。这句话是「你的工作集会被作废」
-                    // 在界面上唯一能被看见的地方——只回一句「已被占用」，用户不知道去找谁。
-                    clash = Claims.FindConflict(list, c.SessionId, path);
-                    if (clash is not null) return list;          // 整条拒绝，一个都不写
+        store.Update(current =>
+        {
+            var list = current.ToList();
 
-                    // 幂等：自己已经占着这条就跳过
-                    if (list.Any(x => x.SessionId == c.SessionId && x.Path == path)) continue;
-                    list.Add(new Claim(c.SessionId, handle.ProjectKey, path, DateTimeOffset.UtcNow));
-                }
-                return list;
-            });
+            // ⚠️ **本次新增先攒在 `additions` 里，最后才合并进 `list`。**
+            // 初版是「边判边 `list.Add`」，于是多元素 scope 时：
+            // 第 1 条 `Add` 进去、第 2 条冲突 ⇒ `return list` 返回的是**已含第 1 条的**列表
+            // ⇒ `Update` 判「变了」⇒ **把第 1 条写了进去**。
+            // 那时「一个都不写」只对**单元素** scope 成立——而注释当时声称的是无条件成立。
+            var additions = new List<Claim>();
+            foreach (var path in paths)
+            {
+                // ⚠️ 判据要看「已有 **+ 本次已接受的**」：同一 scope 里写两条相互重叠的路径
+                //（如 `["src", "src/a.cs"]`）也必须在**命令内部**自洽，否则会自己和自己冲突。
+                var against = list.Concat(additions);
+
+                // ⚠️ **冲突 ⇒ rejected 且点名持有者**（`01` §12.2）。这句话是「你的工作集会被作废」
+                // 在界面上唯一能被看见的地方——只回一句「已被占用」，用户不知道去找谁。
+                clash = Claims.FindConflict(against, c.SessionId, path);
+                if (clash is not null) return list;      // ⚠️ 返回**原始** `list`（不含任何 additions）
+
+                // 幂等：自己已经占着这条（含同一 scope 里重复写两次）就跳过
+                if (against.Any(x => x.SessionId == c.SessionId && x.Path == path)) continue;
+                additions.Add(new Claim(c.SessionId, handle.ProjectKey, path, DateTimeOffset.UtcNow));
+            }
+
+            list.AddRange(additions);
+            return list;
+        });
 
         if (clash is not null)
             return Reject(id, $"'{clash.Path}' 已被会话 {clash.SessionId} 占用。");

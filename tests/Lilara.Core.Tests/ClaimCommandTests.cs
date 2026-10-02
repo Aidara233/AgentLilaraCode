@@ -299,6 +299,51 @@ public class ClaimCommandTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// ⚠️ **多元素 `scope` 里有一条冲突 ⇒ 整条命令一个都不写。**
+    ///
+    /// <para>⚠️ 这是控制器在**修复并发时自己引入**的缺陷：初版是「边判边 `list.Add`」，
+    /// 于是 `["other", "src/a.cs"]` 会把 `other` **先写进去**再拒绝——
+    /// 那时「一个都不写」只对**单元素** scope 成立，而注释声称的是无条件成立。</para>
+    ///
+    /// <para>⚠️ **这条测试必须用多元素 scope**：单元素下初版也"恰好"是对的，
+    /// 没有区分力。冲突的那条要排在**后面**——排前面就不会触发那个早退分支。</para>
+    /// </summary>
+    [Fact]
+    public async Task Acquire_WithAMultiElementScope_WhereOneConflicts_WritesNothing()
+    {
+        var (_, d, _) = Harness();
+        var a = NewSession(d);
+        var b = NewSession(d);
+
+        await d.DispatchAsync(new CoreCommand.ClaimAcquire(a, ["src"]), "c1", false, CancellationToken.None);
+
+        // B 要占两条，**第二条**与 A 的 `src` 冲突（第一条本身合法、不与任何东西冲突）
+        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(b, ["other", "src/a.cs"]), "c2", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(r.Ack);
+        // ⚠️ 要害：`other` **不能**被写进去——盘上应当**只有 A 那一条**。
+        var all = ClaimsOf(_work);
+        Assert.Single(all);
+        Assert.Equal(a, all[0].SessionId);
+    }
+
+    /// <summary>
+    /// ⚠️ **同一 scope 里两条相互重叠的路径 ⇒ 命令内部自洽**（不自己和自己冲突）。
+    /// `["src", "src/a.cs"]` 是合法的一次"占这片区域"，不该回 rejected。
+    /// </summary>
+    [Fact]
+    public async Task Acquire_WithAScopeThatOverlapsItself_IsAccepted()
+    {
+        var (_, d, _) = Harness();
+        var a = NewSession(d);
+
+        var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(a, ["src", "src/a.cs"]), "c1", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.Equal(2, ClaimsOf(_work).Count);
+    }
+
     private static List<Claim> ClaimsOf(string work) =>
         new ClaimStore(work).All().ToList();
 }
