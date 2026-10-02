@@ -2252,7 +2252,7 @@ public sealed class ClaimStore(string workingDirectory)
         if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
         var store = new ClaimStore(handle.Spec.WorkingDirectory);
-        var path = Claims.Normalize(c.Path, handle.Spec.WorkingDirectory);
+        var paths = c.Scope.Select(p => Claims.Normalize(p, handle.Spec.WorkingDirectory)).ToList();
 
         // ⚠️ **冲突 ⇒ rejected 且点名持有者**（`01` §12.2）。这句话是「你的工作集会被作废」
         // 在界面上唯一能被看见的地方——只回一句「已被占用」，用户不知道去找谁。
@@ -2280,7 +2280,7 @@ public sealed class ClaimStore(string workingDirectory)
         if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
         var store = new ClaimStore(handle.Spec.WorkingDirectory);
-        var path = Claims.Normalize(c.Path, handle.Spec.WorkingDirectory);
+        var paths = c.Scope.Select(p => Claims.Normalize(p, handle.Spec.WorkingDirectory)).ToList();
 
         var all = store.All().ToList();
         // ⚠️ **逃生口**（`03` §3）：不检查占用者是不是自己——模型失控时，
@@ -2498,6 +2498,9 @@ git commit -m "feat(core): 声明落盘（工作目录，可分享）+ claim.acq
 **Interfaces:**
 - Consumes: `CoreCommand.ClaimAcquire` / `.ClaimRelease`（T7）
 - Produces: `claim <path>`（占）· `claim release <path>`（放）· `claim list`（列）
+  ⚠️ **控制台一次只收一个路径**，但命令的字段是**列表**（`03` §3 的 `scope`）——
+  ⇒ 解析器把单个路径**包成单元素列表**（`new ClaimAcquire(sid, [path])`）。
+  ⚠️ **别把命令的字段改回 `string`**：那是线上协议的字段名与形状（T7 已按 `scope` 落地）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -2508,7 +2511,7 @@ public void Claim_WithAPath_AcquiresOnTheCurrentSession()
     var (cmd, err) = CoreCommandParser.Parse("claim src/foo");
 
     Assert.Null(err);
-    Assert.Equal("src/foo", Assert.IsType<CoreCommand.ClaimAcquire>(cmd).Path);
+    Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimAcquire>(cmd).Scope);
 }
 
 [Fact]
@@ -2517,7 +2520,7 @@ public void ClaimRelease_WithAPath_Releases()
     var (cmd, err) = CoreCommandParser.Parse("claim release src/foo");
 
     Assert.Null(err);
-    Assert.Equal("src/foo", Assert.IsType<CoreCommand.ClaimRelease>(cmd).Path);
+    Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimRelease>(cmd).Scope);
 }
 
 /// <summary>⚠️ 光一个 `claim` 不落回「当成消息」——否则用户以为占了，其实是发了个字。</summary>
@@ -2572,7 +2575,7 @@ public void Claim_WithACurrentSession_UsesIt()
 
     Assert.Null(err);
     Assert.Equal(("s9", "src/foo"),
-        (Assert.IsType<CoreCommand.ClaimAcquire>(cmd).SessionId, ((CoreCommand.ClaimAcquire)cmd!).Path));
+        (Assert.IsType<CoreCommand.ClaimAcquire>(cmd).SessionId, ((CoreCommand.ClaimAcquire)cmd!).Scope));
 }
 ```
 
@@ -2616,11 +2619,11 @@ Expected: 红
 
         if (trimmed.StartsWith("claim release ", StringComparison.Ordinal))
             return WithSession(currentSessionId, trimmed["claim release ".Length..].Trim(),
-                (sid, path) => new CoreCommand.ClaimRelease(sid, path));
+                (sid, path) => new CoreCommand.ClaimRelease(sid, [path]));
 
         if (trimmed.StartsWith("claim ", StringComparison.Ordinal) && trimmed != "claim")
             return WithSession(currentSessionId, trimmed["claim ".Length..].Trim(),
-                (sid, path) => new CoreCommand.ClaimAcquire(sid, path));
+                (sid, path) => new CoreCommand.ClaimAcquire(sid, [path]));
 
         // ⚠️ 光一个 `claim` ⇒ **报错**，不落回「当成消息」——
         // 用户以为占了地方，实际是把它当消息发给了会话。
