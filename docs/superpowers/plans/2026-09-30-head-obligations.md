@@ -1813,12 +1813,17 @@ public static class Claims
         // ⚠️ **即：保留根的反斜杠会让根路径与它下面的**一切**都判不出冲突——**静默失效**，
         // 正是 `01` §12 要防的。守卫在 `Normalize_RootPath_StillConflictsWithEverythingUnderIt`。
         //
-        // ⚠️ **但 `c:` 只在这个前提下安全：它不再被送回 `Normalize`。**
-        // `c:` 是 **drive-relative**（`IsPathRooted("c:")` 为真，而
-        // `GetFullPath("c:")` 给的是**进程当前目录所在的盘**）——实测
-        // `Normalize(Normalize(@"C:\"))` 会得到进程 CWD 下的路径，**静默变成另一个目录**。
-        // 今天安全，因为本方法的结果只被**比较**与**落盘**；将来谁加一层
-        // 「读回来再规范化」，这个不动点缺口就会显形。⇒ **别回炉。**
+        // ⚠️ **关于 `c:` 的一条事实——本机实测，别照抄别的环境的结论。**
+        // `GetFullPath("c:")` 给的是**该盘自己的当前目录**（默认 `C:\`），
+        // **不是**进程当前目录。实测：把进程 CWD 从 C 盘换到 `E:\` 之后，
+        // `GetFullPath("c:")` **仍是 `C:\`**。
+        // ⇒ `c:` 在默认情形下**是不动点**（`Normalize("c:")` 还是 `c:`）；
+        // 但它依赖的「该盘当前目录」是**进程级可变状态**（谁都能 `SetCurrentDirectory`）。
+        // ⇒ 既别**指望**它稳定，也别把它**回炉**。
+        // ⚠️ 这段话是**改过的**：初版写成「`GetFullPath("c:")` 给的是进程当前目录所在的盘」
+        // ＋「回炉会静默变成另一个目录」——两句都不对（前者错在语义，后者在本环境为假），
+        // 而且证据是从一个 `%TEMP%`（在 C 盘）的临时工程里**转抄**的。
+        // **别人的实测不是你的实测。**
         var trimmed = full.TrimEnd(Path.DirectorySeparatorChar);
         return (trimmed.Length == 0 ? full : trimmed).ToLowerInvariant();
     }
@@ -2045,6 +2050,36 @@ public class ClaimCommandTests : IDisposable
 }
 
 /// <summary>
+/// ⚠️ **`claims.json` 是用户可写、可分享的输入，坏它不能打死核心。**
+/// 两种**合法 JSON** 的坏形状，两种都会让 `Claims.Conflicts` 抛 `NullReferenceException`
+/// （`child.Length` 对 null），而它们**都不进** `catch (JsonException)`：
+/// <list type="bullet">
+///   <item>`"path": null` —— 反序列化成 `Claim.Path = null`；</item>
+///   <item>`[null]`（**数组元素**为 null）—— 列表里出现 null 项。</item>
+/// </list>
+/// ⚠️ 这两种是**同族**，不是同一种：只过滤 `Path is null` 关掉的是前者的**形状**，
+/// 后者会在**过滤那一行本身**抛（`c.Path` 对 `c == null`）。⇒ 判据必须是
+/// `c is not null && c.Path is not null`。
+/// </summary>
+[Theory]
+[InlineData("""[{"sessionId":"s1","projectKey":"pk","path":null,"at":"2026-01-01T00:00:00+00:00"}]""")]
+[InlineData("""[null]""")]
+public async Task Acquire_WithAHandEditedBadClaimsFile_SurvivesInsteadOfKillingTheCore(string badJson)
+{
+    var (_, d, _) = Harness();
+    var sid = NewSession(d);
+
+    // 手写一份坏 claims.json（模拟「可分享、人手可编辑」那个真实来路）
+    Directory.CreateDirectory(Path.Combine(_work, ".lilara"));
+    File.WriteAllText(Path.Combine(_work, ".lilara", "claims.json"), badJson);
+
+    var r = await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, "src"), "c1", false, CancellationToken.None);
+
+    // 坏条目被丢掉 ⇒ 这条命令**照常成功**，而不是把核心抛死。
+    Assert.IsType<Ack.Accepted>(r.Ack);
+}
+
+/// <summary>
 /// ⚠️ **核心重启后，会话在盘上、不在内存激活表里。**
 /// `claim` 走 `TryGetActivated` 时会回一句**假话**——「没有会话 '…'」，而它存在。
 /// ⚠️ **这是 T3 那个缺陷的原样重演**（`9c3bd0d` 修过 `session.setAxis` 同一处），
@@ -2136,7 +2171,13 @@ public sealed class ClaimStore(string workingDirectory)
             // 与本类注释「坏文件不让它打死核心」**正面冲突**。
             // ⚠️ 顺带：`WhenWritingNull` 会把 null 的 `path` **整个省略**，
             // 所以这种坏条目是**稳定**的（写回再读还是它），不会自愈。
-            return parsed.Where(c => c.Path is not null).ToList();
+            //
+            // ⚠️ **`c is not null` 那半句是必须的，别删。** `[null]`（**数组元素**为 null）
+            // 也是合法 JSON、也能手写进文件，而 `List<Claim>` 反序列化会给出**含 null 的列表**
+            // ⇒ `c.Path` 对 `c == null` 直接 **NRE**，**且抛在这一行本身**，
+            // 同样逃出下面那个 `catch (JsonException)`。只过滤 `Path is null` 关掉的是
+            // F2 的**形状**，关不掉**同族**。
+            return parsed.Where(c => c is not null && c.Path is not null).ToList();
         }
         catch (System.Text.Json.JsonException)
         {
