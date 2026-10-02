@@ -2190,10 +2190,17 @@ public sealed class ClaimStore(string workingDirectory)
             // F2 的**形状**，关不掉**同族**。
             return parsed.Where(c => c is not null && c.Path is not null).ToList();
         }
-        catch (System.Text.Json.JsonException)
+        catch (Exception ex) when (ex is System.Text.Json.JsonException or IOException)
         {
             // ⚠️ 坏文件不让它打死核心：声明是**辅助**信息（可见性），
             // 而核心的职责是推进会话。宁可这一处暂时瞎，也不能整个进程起不来。
+            //
+            // ⚠️ **必须连 `IOException` 一起接**（复审实测：文件被 `FileShare.None` 独占时
+            // `File.ReadAllText` 抛 `IOException`）。初版只接 `JsonException` ⇒
+            // 那种情况下异常**既逃出 `CommandDispatcher`**（它没包 try/catch，
+            // ⇒ 打死核心）**又逃出 T8 新开的 `claim list`**（同样没包）。
+            // ⚠️ 而 `IOException` 在**正常使用**下就会发生：编辑器和别的进程
+            // 打开 `claims.json` 时就会。**这不是理论边角。**
             //
             // ⚠️ **这里是静默的，而且这是已知的缺口，不是疏忽。** 初版注释写「别静默：
             // 写一条核心告警」——**那句描述的是本类做不到的事**：`ClaimStore` 只拿得到
@@ -2538,6 +2545,65 @@ public void ClaimRelease_WithAPath_Releases()
     Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimRelease>(cmd).Scope);
 }
 
+/// <summary>
+/// ⚠️ **词之间可以有多个空格。** 初版用 `trimmed == "claim release"` 守精确单空格，
+/// 于是 `"claim  release"`（**两个空格**）落进 acquire 分支 ⇒
+/// **静默占一个叫 `release` 的路径**。
+/// ⚠️ `Trim()` 只去**首尾**空白，**内部多个空格它管不到**——
+/// 这条钉的正是 Trim 救不了的那一半。
+/// </summary>
+[Fact]
+public void ClaimRelease_WithExtraSpaces_StillReleases()
+{
+    var (cmd, err) = CoreCommandParser.Parse("claim  release  src/foo", "s1");
+
+    Assert.Null(err);
+    Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimRelease>(cmd).Scope);
+}
+
+/// <summary>
+/// ⚠️ **动词大小写不敏感**——`claim Release src` 必须**释放**，不是静默占一个
+/// 叫 `Release src` 的怪路径。
+/// ⚠️ 为什么动词该不敏感而 `axis set` 的**轴名**该敏感：后者是**协议标识符**
+///（`Axes` 的注释钉过「`Safety` 不是 `safety`，应当拒绝而不是猜」），
+/// 而这里的主语是**控制台语法**（协议里叫 `claim.release`，带点）。
+/// ⚠️ 更关键的是**后果不同**：轴名写错 → 报错（可见）；动词写错 →
+/// 初版会**静默执行相反的动作**（可见性最差的那一档）。
+/// </summary>
+[Fact]
+public void ClaimRelease_IsCaseInsensitiveOnTheVerb()
+{
+    var (cmd, err) = CoreCommandParser.Parse("claim Release src/foo", "s1");
+
+    Assert.Null(err);
+    Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimRelease>(cmd).Scope);
+}
+
+/// <summary>`claim list` 的动词同样不敏感——别让它静默占一个叫 `LIST` 的路径。</summary>
+[Fact]
+public void ClaimList_IsCaseInsensitiveOnTheVerb()
+{
+    var (cmd, err) = CoreCommandParser.Parse("claim LIST", "s1");
+
+    Assert.Null(cmd);
+    Assert.Null(err);            // (null, null) = 控制台查询，由 Repl 拦截
+}
+
+/// <summary>
+/// ⚠️ **路径只收一个词；多给了就报错，不猜。**
+/// 初版把多余词**拼进路径**（`"src/foo extra"`）——而控制台**没有引号语法**，
+/// 含空格的路径**无法表达** ⇒ 拼起来是**猜**，猜错的方向是**静默占错地方**。
+/// ⚠️ 与 `axis set` 对多余词的处置**保持一致**（T5：少了值就报错，不落回猜）。
+/// </summary>
+[Fact]
+public void Claim_WithMoreThanOneWord_IsAnError()
+{
+    var (cmd, err) = CoreCommandParser.Parse("claim src/foo extra", "s1");
+
+    Assert.Null(cmd);
+    Assert.NotNull(err);
+}
+
 /// <summary>⚠️ 光一个 `claim` 不落回「当成消息」——否则用户以为占了，其实是发了个字。</summary>
 [Fact]
 public void Claim_WithNothing_IsAnError()
@@ -2636,27 +2702,49 @@ Expected: **编译失败**——`CoreCommand.ClaimAcquire` 存在（T7），但
 在 `Parse` 里加（放在 `axis set` 之后）：
 
 ```csharp
-        // ⚠️ `claim list` 是**控制台的查询**，不是核心命令——返回 (null,null) 让 Repl 拦截。
-        if (trimmed is "claim list") return (null, null);
+        // ⚠️ **别去匹配精确的拼写（空格数 / 大小写）——切词。**
+        // 初版用 `trimmed == "claim release"` 与 `StartsWith("claim release ")`：
+        //   · `"claim  release"`（**两个空格**）→ `Trim` 只去**首尾**空白，内部两个空格**留着**
+        //     ⇒ 不匹配 `StartsWith("claim release ")`（第二个字符是空格不是 `r`）
+        //     ⇒ 落进 acquire 分支 ⇒ **静默占一个叫 `release` 的路径**。
+        //   · `"claim Release src"` → 同样落进 acquire ⇒ **静默执行相反的动作**。
+        // ⚠️ 而 `Trim` 能救的只有「尾随空格」那种（`"claim "` → `"claim"` → 命中守卫）——
+        // **恰好是我第一版以为能救的那半**。真洞在 Trim 管不到的地方。
+        if (trimmed == "claim" || trimmed.StartsWith("claim ", StringComparison.Ordinal)
+            || trimmed.StartsWith("claim\t", StringComparison.Ordinal))
+        {
+            // `Split(null, RemoveEmptyEntries)`：**所有空白**（空格、Tab、连续多个）都算分隔符。
+            var words = trimmed["claim".Length..]
+                .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
 
-        // ⚠️ **`claim release` 少了路径必须单独拦，而且要排在 acquire 之前。**
-        // 不拦的话 `trimmed.StartsWith("claim ")` 会把它接住、`trimmed[6..]` = `"release"`,
-        // 于是用户**静默占了一个叫 `release` 的路径**——不报错、看得出在动，看不出在动错东西。
-        // 与 `axis set`（T5）是**同一个形状**：前缀判断放行半个命令，剩下半截被当参数吃掉。
-        if (trimmed == "claim release")
-            return (null, "用法：claim <路径> | claim release <路径> | claim list");
+            // ⚠️ **动词大小写不敏感**——与 `Axes.TryParse` 的**取值**同一套理
+            //（「取值是用户手打的，写 `Prod` 是常态」）。动词是**控制台语法**，不是协议标识符
+            //（协议里叫 `claim.release`，带点）。⇒ 让 `claim Release src` 做**对**的事，
+            // 而不是落进 acquire 静默占一个怪路径。
+            if (words.Length == 0)
+                return (null, "用法：claim <路径> | claim release <路径> | claim list");
 
-        if (trimmed.StartsWith("claim release ", StringComparison.Ordinal))
-            return WithSession(currentSessionId, trimmed["claim release ".Length..].Trim(),
-                (sid, path) => new CoreCommand.ClaimRelease(sid, [path]));
+            if (string.Equals(words[0], "list", StringComparison.OrdinalIgnoreCase))
+                return words.Length == 1
+                    ? (null, null)                                   // 控制台查询，Repl 拦截
+                    : (null, "用法：claim <路径> | claim release <路径> | claim list");
 
-        if (trimmed.StartsWith("claim ", StringComparison.Ordinal) && trimmed != "claim")
-            return WithSession(currentSessionId, trimmed["claim ".Length..].Trim(),
-                (sid, path) => new CoreCommand.ClaimAcquire(sid, [path]));
+            if (string.Equals(words[0], "release", StringComparison.OrdinalIgnoreCase))
+                return words.Length == 2
+                    ? WithSession(currentSessionId, words[1],
+                        (sid, p) => new CoreCommand.ClaimRelease(sid, [p]))
+                    : (null, "用法：claim release <路径>");
 
-        // ⚠️ 光一个 `claim` ⇒ **报错**，不落回「当成消息」——
-        // 用户以为占了地方，实际是把它当消息发给了会话。
-        if (trimmed == "claim") return (null, "用法：claim <路径> | claim release <路径> | claim list");
+            // ⚠️ **路径只收一个词**——与 `axis set` 对多余词**报错**保持一致
+            //（T5：`axis set s1 safety` 少了值就报错，不猜）。
+            // 控制台**没有引号语法**，所以含空格的路径**无法表达**；
+            // 把多余词拼起来是**猜**，而猜错的方向是**静默占错地方**。
+            // ⇒ 宁可报错（可见），不猜（静默）。
+            return words.Length == 1
+                ? WithSession(currentSessionId, words[0],
+                    (sid, p) => new CoreCommand.ClaimAcquire(sid, [p]))
+                : (null, "路径不能含空格（控制台没有引号语法）。用一个词，或用绝对路径。");
+        }
 
         return (null, null);
 
@@ -2770,12 +2858,65 @@ Console.WriteLine("  `provider set <id> --key <key>` 配置；`session create` �
         Assert.Contains("已占", _out.ToString());
         Assert.Contains("src/foo", _out.ToString());
     }
+
+    /// <summary>
+    /// ⚠️ **`释放` 的回执分支也要单独钉。** 复审实测：只测 `ClaimAcquire` 那条分支时，
+    /// 把 `ClaimRelease` 的分支删掉**照样全绿**（变异存活）——
+    /// **两条分支必须各有一条测试**，否则「同一修复的两个入口只测了一个」。
+    /// </summary>
+    [Fact]
+    public async Task ClaimRelease_OnSuccess_SaysWhatWasReleased()
+    {
+        var (repl, _, _) = NewHarness();
+        await repl.ExecuteAsync("claim src/foo", CancellationToken.None);   // 先占上
+        _out.GetStringBuilder().Clear();
+
+        await repl.ExecuteAsync("claim release src/foo", CancellationToken.None);
+
+        Assert.Contains("已释放", _out.ToString());
+        Assert.Contains("src/foo", _out.ToString());
+    }
+
+    /// <summary>⚠️ `claim list` 在**没有当前会话**时印人话，不是空白、不是抛。</summary>
+    [Fact]
+    public async Task ClaimList_WithoutACurrentSession_SaysSo()
+    {
+        var (repl, _, _) = NewHarness();
+        repl.Current = null;
+
+        await repl.ExecuteAsync("claim list", CancellationToken.None);
+
+        Assert.Contains("还没有选中会话", _out.ToString());
+    }
+
+    /// <summary>
+    /// ⚠️ **`claims.json` 被别的进程独占时，控制台不许崩。**
+    /// 复审实测：`File.ReadAllText` 对 `FileShare.None` 抛 `IOException`，
+    /// 而 `ClaimStore.All()` 初版只接 `JsonException` ⇒ 异常**逃出 `claim list`**（它没包 try/catch）
+    /// ⇒ **打死 REPL**。⚠️ 这在**正常使用**下就会发生（编辑器打开着那个文件）。
+    /// </summary>
+    [Fact]
+    public async Task ClaimList_WhenTheFileIsLocked_SaysSomethingInsteadOfCrashing()
+    {
+        var (repl, _, session) = NewHarness();
+        var dir = Path.Combine(session.Spec.WorkingDirectory, ".lilara");
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "claims.json");
+
+        // ⚠️ 用 `FileShare.None` 独占——模拟编辑器/别的进程打开着它。
+        using var hold = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+
+        // 不许抛。
+        await repl.ExecuteAsync("claim list", CancellationToken.None);
+
+        Assert.Contains("没有声明", _out.ToString());   // 读不到 ⇒ 当作空
+    }
 ```
 
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test -v q`
-Expected: 全绿。**本任务新增 7 条 `ParserTests` + 3 条 `ReplTests` = 10 条**
+Expected: 全绿。**本任务新增 11 条 `ParserTests` + 6 条 `ReplTests` = 17 条**（含审阅修复轮补的）
 （⚠️ **这个数我数错过两次**：初版说「7 条」而 `Files` 写 `ReplTests`；改为「8」时又少算一条——
 解析器那 6 条放错了文件，且 `claim list` 的显示**根本没有测试**）。
 ⚠️ 分母是执行时的既有基线（**454**），别写死。
