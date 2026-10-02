@@ -122,9 +122,11 @@ public sealed class ControlServer(
                     // 只跑 Step 4 那三条筛选的话看不到（本条不在筛选里）。
                     HighWater = highWater,
 
-                    // ⚠️ **轴必须进快照**（`05` §11 #4）：`axis.changed` 只在订阅**之后**才有，
+                    // ⚠️ **轴进快照必须走顶层这个 `axes`**（`05` §11 #4）：`axis.changed` 只在订阅**之后**才有，
                     // 头刚打开页面时无事件可等。少了它，五个下拉全是空的——
                     // 而「空」与「默认值」在视觉上分不出来。
+                    // ⚠️ **`state.axes` 是同一份**（`SessionState` 整个序列化出去时带的）；头读**顶层**这个。
+                    // 两个键承载同一份数据是刻意的——顶层是为头的便利而放，但**它们是同一个引用**，不会分叉。
                     // ⚠️ 轴只有一份，住在 `State` 里（`SessionHandle` 上不该有第二份——两份会分叉）。
                     // `State.Axes` 的类型仍带 `?`，那是为**磁盘迁移**留的（见 `SessionState` 的注释）；
                     // 而这把 `handle` 必经 `Load` / `Create`：`TryFind` 要么从激活表拿
@@ -436,6 +438,13 @@ public sealed class ControlServer(
             "session.send" => new CoreCommand.SessionSend(
                 payload.GetProperty("sessionId").GetString()!,
                 payload.GetProperty("blocks").Deserialize<List<Canonical.Block>>(WireJson.Options)!),
+            // ⚠️ **线上解析是命令的第三条线**（核心语义在 dispatcher、控制台解析在 `CoreCommandParser`）——
+            // 少一条这条命令就只在别的两条线上存在，而头发的帧会静默落到 `_ => throw`。
+            // T3 加命令时漏了这里，而**计划里没有任何任务认领它**（全计划 grep `ParseCommand` 零命中）。
+            "session.setAxis" => new CoreCommand.SessionSetAxis(
+                payload.GetProperty("sessionId").GetString()!,
+                payload.GetProperty("axis").GetString()!,
+                payload.GetProperty("value").GetString()!),
             "provider.upsert" => new CoreCommand.ProviderUpsert(
                 payload.GetProperty("id").GetString()!,
                 payload.GetProperty("apiKey").GetString()!,

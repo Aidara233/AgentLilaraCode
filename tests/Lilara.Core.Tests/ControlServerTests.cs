@@ -218,6 +218,43 @@ public class ControlServerTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// ⚠️ **线上的 `session.setAxis` 必须真的能到 dispatcher。**
+    /// T3 只在**类型**层加了命令，`ParseCommand` 的 switch 没跟上 ⇒ 帧落到 `_ => throw`
+    /// ⇒ 头（`05` §7.4 的轴下拉）发出来的东西全被回「命令形状不对」。
+    /// ⚠️ 这条测试走**真的 WS**，不是直接调 dispatcher——后者会在实现缺失时照样绿。
+    /// </summary>
+    [Fact]
+    public async Task WebSocket_SetAxis_ReachesTheDispatcher()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        // ⚠️ **用拼接而不是 `$$"""`**：内插原始字符串里，载荷末尾的 `}}}` 会被当成内插洞的收尾
+        // （`CS9007`）——见 `WebSocket_AcksCommandsAndStreamsEvents` 的同款注释。
+        await SendAsync(ws, "{\"kind\":\"command\",\"id\":\"a1\",\"payload\":{\"kind\":\"session.setAxis\","
+            + "\"sessionId\":\"" + sid + "\",\"axis\":\"safety\",\"value\":\"prod\"}}");
+
+        var ack = await ReceiveAsync(ws);
+        Assert.Equal("ack", ack.GetProperty("kind").GetString());
+        // ⚠️ **理由必须惰性取**：`WireJson.Options` 的 `WhenWritingNull` 把成功回执的 `reason`
+        // 整个省略（camelCase），`ack.GetProperty("reason")` 会**抛 KeyNotFoundException**。
+        // 而 `Assert.True` 的消息串是**无条件先求值**的——直接拼进去，成功那条路也照样炸
+        // （这是本测试第一版真踩到的：从「认不出命令」修好之后，失败点挪到了这行）。
+        // ⇒ 用 `TryGetProperty`，它在两种形态下都不抛。
+        Assert.True(ack.GetProperty("accepted").GetBoolean(),
+            "认不出这条命令——`ParseCommand` 的 switch 漏了它："
+            + (ack.TryGetProperty("reason", out var why) ? why.GetString() : "(无 reason 字段)"));
+
+        // ⚠️ 判据是「**命令真的生效了**」，不只是「回执说 accepted」——
+        // 回执可以说 accepted 而语义根本没跑（那正是「形状对但接不上」的形态）。
+        var state = await Client.GetStringAsync(Http($"/sessions/{sid}/state"));
+        using var doc = JsonDocument.Parse(state);
+        Assert.Equal("prod", doc.RootElement.GetProperty("axes").GetProperty("safety").GetString());
+    }
+
+    /// <summary>
     /// ⚠️ **头断连不影响任何东西**（`03` §1 判据 1）：断开之后核心照常收命令。
     /// </summary>
     [Fact]
