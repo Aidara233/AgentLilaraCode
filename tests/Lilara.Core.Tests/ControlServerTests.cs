@@ -273,14 +273,37 @@ public class ControlServerTests : IAsyncLifetime
     private static async Task SendAsync(WebSocket ws, string json) =>
         await ws.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, true, CancellationToken.None);
 
+    /// <summary>
+    /// 收**一整帧**文本消息并解析。
+    ///
+    /// <para>⚠️ **不能只收一次就解析。** `ClientWebSocket.ReceiveAsync` 在
+    /// 「**有数据可用**」时就返回，**不保证**这一帧收完整了——语义如此，不是猜测。
+    /// 负载下 Kestrel 把一帧拆成两次 TCP 写出，`result.Count` 就是**半个帧**，
+    /// `JsonDocument.Parse` 会抛 `JsonException`。</para>
+    ///
+    /// <para>⚠️ **观测到的事实**（不是从语义推的）：`WebSocket_SetAxis_ReachesTheDispatcher`
+    /// 在全量跑时**偶发失败一次**，而**错开单跑 5/5 全绿** ⇒ 负载相关，与逻辑无关。
+    /// ⚠️ 分片本身**没有**被独立复现过——修的是**由 `ReceiveAsync` 语义推得**的隐患；
+    /// 若将来又见偶发，先怀疑别处。</para>
+    ///
+    /// <para>⚠️ **8 个调用点全都期望完整帧**（`grep -c EndOfMessage` = 0，无人依赖部分帧语义）
+    /// ⇒ 收满再接是**严格更正确**，不是行为变更。</para>
+    /// </summary>
     private static async Task<JsonElement> ReceiveAsync(WebSocket ws)
     {
-        var buffer = new byte[64 * 1024];
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var result = await ws.ReceiveAsync(buffer, cts.Token);
+        using var ms = new MemoryStream();
+        var buffer = new byte[64 * 1024];
 
-        Assert.Equal(WebSocketMessageType.Text, result.MessageType);
-        return JsonDocument.Parse(Encoding.UTF8.GetString(buffer, 0, result.Count)).RootElement.Clone();
+        while (true)
+        {
+            var result = await ws.ReceiveAsync(buffer, cts.Token);
+            Assert.Equal(WebSocketMessageType.Text, result.MessageType);
+            ms.Write(buffer, 0, result.Count);
+            if (result.EndOfMessage) break;   // ⚠️ 这一句是修的全部要害
+        }
+
+        return JsonDocument.Parse(Encoding.UTF8.GetString(ms.ToArray())).RootElement.Clone();
     }
 
     /// <summary>
