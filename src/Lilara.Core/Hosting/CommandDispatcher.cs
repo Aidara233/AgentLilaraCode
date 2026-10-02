@@ -71,8 +71,38 @@ public sealed class CommandDispatcher(
         }
     }
 
+    /// <summary>
+    /// ⚠️ **id 会变成文件名**（`ProviderStore.PathFor(id) => Path.Combine(_root, $"{id}.json")`）
+    /// ⇒ 它必须**不含路径语法**。判据是「**它是不是一个单纯的文件名**」，
+    /// 不是「它像不像 ASCII 标识符」——后者会把 `本地` 这类合法 id 一起挡掉
+    /// （实测的教训方向：白名单型判据总会漏掉用户正当的输入）。
+    /// ⚠️ 实测坑：`../escaped` 让文件落在**数据根**（`providers/` 之外）——
+    /// 控制台曾回「已保存」，而文件根本没进 `providers/`。
+    ///
+    /// <para>⚠️ **`Path.GetFileName` 是平台相关的**（.NET 的既有性质，不是本项目的选择）：
+    /// Windows 上它把 `a/b` 也当分隔符 ⇒ 拒绝；这正是**要的**（数据根可能被同步到别的平台）。
+    /// ⇒ 因此补了一条针对 `/` 的用例，且**用 `Path` 自己的词法**、不自己拼字符类——
+    /// 同一个仓库里 `Claims.Normalize` 已经吃过「自己拼分隔符」的亏。</para>
+    ///
+    /// <para>⚠️ **`internal static` 是刻意的**：T4 的 provider-schema 要把它**交出去**
+    /// 作为 id 的规则，所以它必须能被单独引用；本项目的测试也直接钉它的真值表。</para>
+    /// </summary>
+    internal static bool IsSafeProviderId(string id) =>
+        !string.IsNullOrWhiteSpace(id)
+        && id == Path.GetFileName(id)          // ⚠️ 这一句同时挡掉 `..` / `a/b` / `a\b` / `/abs` / `C:\abs`
+        && id.IndexOfAny(Path.GetInvalidFileNameChars()) < 0
+        && id is not "." and not "..";
+
     private DispatchResult HandleProviderUpsert(CoreCommand.ProviderUpsert p, string id)
     {
+        // ⚠️ **id 先过闸，且必须在 Protocol / Auth 之前**：它是最底层的那一条——
+        // 一个坏 id 会让**后面所有**校验都变得没有意义（文件压根落错地方）。
+        // ⚠️ 判据住在 dispatcher，不在控制台——控制台与头是两个前端，
+        // 放前端会被另一个绕过（本项目的规范，G16）。
+        if (!IsSafeProviderId(p.Id))
+            return Reject(id, $"提供商 id '{p.Id}' 不合法：它会变成 providers/ 下的文件名，"
+                + "必须是**非空**且**不含路径语法**（分隔符 / `..` / 非法字符）的单纯文件名。");
+
         // ⚠️ 语义校验在这里，不在控制台——否则线上能写进坏值。
         if (p.Protocol is not null && !Protocols.All.Contains(p.Protocol))
             return Reject(id, $"未知协议 '{p.Protocol}'。支持：{string.Join(" / ", Protocols.All)}");
