@@ -2056,6 +2056,10 @@ public class ClaimCommandTests : IDisposable
         new ClaimStore(work).All().ToList();
 }
 
+// ⚠️ **下面两个方法在 `ClaimCommandTests` 类**内**——T7 执行时它们曾被排到类的 `}` 之外，
+// 于是引用了 `Harness()` / `_root` / `_work` 这些实例成员却不在类里 ⇒ CS0116 编不过。
+// 实现者把它俩移了进来（唯一自洽的读法）。**别再把它们挪出去。**
+
 /// <summary>
 /// ⚠️ **`claims.json` 是用户可写、可分享的输入，坏它不能打死核心。**
 /// 两种**合法 JSON** 的坏形状，两种都会让 `Claims.Conflicts` 抛 `NullReferenceException`
@@ -2190,7 +2194,13 @@ public sealed class ClaimStore(string workingDirectory)
         {
             // ⚠️ 坏文件不让它打死核心：声明是**辅助**信息（可见性），
             // 而核心的职责是推进会话。宁可这一处暂时瞎，也不能整个进程起不来。
-            // ⚠️ 返回空而不是抛——但**别静默**：写一条核心告警。
+            //
+            // ⚠️ **这里是静默的，而且这是已知的缺口，不是疏忽。** 初版注释写「别静默：
+            // 写一条核心告警」——**那句描述的是本类做不到的事**：`ClaimStore` 只拿得到
+            // 一个工作目录字符串，**没有 `EventBus`、没有 logger**，它没有任何告警出口。
+            // ⇒ 真要做可见性告警，得把出口**注入进来**（改构造函数签名 ⇒ 改 `ClaimStore`
+            // 的全部调用点）。**代价与收益不成比例**：声明是辅助信息，而"坏文件被忽略了"
+            // 这件事本身不阻塞任何动作。⇒ 记为**已知偏离**，留待将来需要时连告警出口一起加。
             return [];
         }
     }
@@ -2311,9 +2321,38 @@ public sealed class ClaimStore(string workingDirectory)
         });
 ```
 
-- [ ] **Step 4: 接上控制面的 `ParseCommand`（否则线上不可达）**
+- [ ] **Step 4: 先写接线测试，跑一次确认它红（此时接线还不存在）**
 
-⚠️ **这一步只加 `claim.release` 一条——不是 `claim.acquire`。** 依据是 `03` §3 的
+⚠️ **顺序是「测试 → 红 → 接线 → 绿」，别倒过来。** T7 执行时计划把这两步写成
+「Step 4 接线、Step 4b 确认先红」——**自相矛盾**（接完线还怎么"先"红）。
+实现者按目的执行（先红、后接线），判据是对的；这里把顺序写正。
+
+先加测试（不接线）：
+
+```csharp
+    /// <summary>
+    /// ⚠️ **走真 WS，不是直接调 dispatcher。** 后者在接线缺失时会**照样绿**——
+    /// 它绕过的正是本条要钉的那一层。
+    /// </summary>
+    [Fact]
+    public async Task WebSocket_ClaimRelease_ReachesTheDispatcher()
+    {
+        // …照 WebSocket_SetAxis_ReachesTheDispatcher 的脚手架：
+        // 建会话（直接调 dispatcher）、连 WS、发 {"kind":"claim.release", …}、读帧
+        Assert.True(ack.GetProperty("accepted").GetBoolean());
+        // ⚠️ `reason` 用 TryGetProperty 惰性取，别无条件 GetProperty——
+        // 成功回执的 `reason` 被 `WhenWritingNull` **整个省略**，
+        // 无条件求值会在**成功路径**上抛 `KeyNotFoundException`（修好了反而红）。
+    }
+```
+
+Run: `dotnet test --filter "FullyQualifiedName~WebSocket_ClaimRelease_ReachesTheDispatcher" -v q`
+Expected: **失败**，消息含「**认不出的命令 'claim.release'**」——
+若它**通过**了，说明测试没走真 WS（或接线已经在了），去改测试。
+
+- [ ] **Step 5: 接上 `ParseCommand`（只加 `claim.release`）**
+
+⚠️ **只加 `claim.release` 一条——不是 `claim.acquire`。** 依据是 `03` §3 的
 **命令表**（协议是权威）：表里资源那节**只有** `claim.release`，
 并明写「清单查询走 `GET /claims`（§6），**不做 `claim.list` 命令**」。
 `claim.acquire` **不在**线上命令表里。
@@ -2352,34 +2391,9 @@ T3 漏接线是「该有的没接」，这里加 `claim.acquire` 会变成「不
                 payload.GetProperty("path").GetString()!),
 ```
 
-并**在 `ControlServerTests.cs` 追加一条真正走 WS 的测试**（照
-`WebSocket_SetAxis_ReachesTheDispatcher` 的形状，`b1696b4` 里那条）：
+（⚠️ **接线测试已在 Step 4 里先写好并跑红过了**——本步只加这四行 case，然后进 Step 6。）
 
-```csharp
-    /// <summary>
-    /// ⚠️ **走真 WS，不是直接调 dispatcher。** 后者在接线缺失时会**照样绿**——
-    /// 它绕过的正是本条要钉的那一层。实现前这条必须红，且红的方式应当是
-    /// 「认不出的命令 'claim.release'」。
-    /// </summary>
-    [Fact]
-    public async Task WebSocket_ClaimRelease_ReachesTheDispatcher()
-    {
-        // …照 WebSocket_SetAxis_ReachesTheDispatcher 的脚手架：
-        // 建会话（直接调 dispatcher）、连 WS、发 {"kind":"claim.release", …}、读帧
-        Assert.True(ack.GetProperty("accepted").GetBoolean());
-        // ⚠️ `reason` 用 TryGetProperty 惰性取，别无条件 GetProperty——
-        // 成功回执的 `reason` 被 `WhenWritingNull` **整个省略**，
-        // 无条件求值会在**成功路径**上抛 `KeyNotFoundException`（修好了反而红）。
-    }
-```
-
-- [ ] **Step 4b: 跑接线测试确认它先红**
-
-Run: `dotnet test --filter "FullyQualifiedName~WebSocket_ClaimRelease_ReachesTheDispatcher" -v q`
-Expected: **失败**，消息含「认不出的命令 'claim.release'」——
-若它**通过**了，说明测试没走真 WS，去改测试。
-
-- [ ] **Step 5: 跑测试确认通过**
+- [ ] **Step 6: 跑测试确认通过**
 
 Run: `dotnet test -v q`
 Expected: 全绿。**本任务新增 10 个测试方法 / 11 个用例**，外加接线 1 条：
@@ -2393,12 +2407,15 @@ Expected: 全绿。**本任务新增 10 个测试方法 / 11 个用例**，外�
 那是我加了两条测试之后**没更新的旧数**）。派发前数一遍；对不上以**实测**为准。
 ⚠️ **分母是"执行时的既有基线"（当前 435），不是任何写死的数字。**
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 7: 提交**
 
 ```bash
 git add src/Lilara.Core/ tests/Lilara.Core.Tests/ClaimCommandTests.cs tests/Lilara.Core.Tests/ControlServerTests.cs
-git commit -m "feat(core): 声明落盘（工作目录，可分享）+ claim.acquire/release + GET /claims（无文件即空数组）+ claim.release 接上 ParseCommand（原来线上不可达）"
+git commit -m "feat(core): 声明落盘（工作目录，可分享）+ claim.acquire/release 命令 + GET /claims（无文件即空数组）+ claim.release 接上 ParseCommand（原来线上不可达）"
 ```
+
+⚠️ **提交消息里的「`claim.acquire/release`」指 `CoreCommand` 的**两个类型**（dispatcher 与 T8 的控制台都要用），
+**不表示两条都在线上**——线上只有 `claim.release`（见 Step 5）。
 
 ---
 
