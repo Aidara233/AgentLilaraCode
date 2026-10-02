@@ -61,4 +61,92 @@ public class ParserTests
         Assert.Null(cmd);
         Assert.Null(err);   // ⇒ 调用方按普通消息处理
     }
+
+    /// <summary>
+    /// ⚠️ **必须传会话 id。** 不传等价于传 `null`（可选参数的默认值），
+    /// 而 `WithSession` 对 `null` **一律报错** ⇒ `err` 非 null、`cmd` 为 null。
+    /// ⚠️ **这曾经是一处计划级矛盾**：初版这两条测试写成 `Parse("claim src/foo")`（不传），
+    /// 却又断言「产出 `ClaimAcquire`」——而下面的 `Claim_WithoutACurrentSession_IsAnError`
+    /// 断言「不传 ⇒ 报错」。**C# 里「省略实参」与「显式传 null」用同一个可选参数、无法区分**
+    /// ⇒ **没有任何实现能同时满足这两组断言**。⇒ 修法：这两条补上 `"s1"`（与同文件另两条一致）。
+    /// </summary>
+    [Fact]
+    public void Claim_WithAPath_AcquiresOnTheCurrentSession()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim src/foo", "s1");
+
+        Assert.Null(err);
+        Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimAcquire>(cmd).Scope);
+    }
+
+    /// <summary>⚠️ 同样必须传会话 id——理由见上一条。</summary>
+    [Fact]
+    public void ClaimRelease_WithAPath_Releases()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim release src/foo", "s1");
+
+        Assert.Null(err);
+        Assert.Equal(["src/foo"], Assert.IsType<CoreCommand.ClaimRelease>(cmd).Scope);
+    }
+
+    /// <summary>⚠️ 光一个 `claim` 不落回「当成消息」——否则用户以为占了，其实是发了个字。</summary>
+    [Fact]
+    public void Claim_WithNothing_IsAnError()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    /// <summary>
+    /// ⚠️ **`claim release` 少了路径，不许当成「占一个叫 release 的路径」。**
+    /// 这是 `axis set` 少了尾随空格**同一个形状的缺陷**（T5 踩过）：
+    /// 前缀判断放行了半个命令，剩下那半截被当成**参数**吃掉——
+    /// 而它**不报错**，用户看到的是一个静默的错误动作。
+    /// 判据：`trimmed == "claim release"` 要单独拦，**在 acquire 分支之前**。
+    /// </summary>
+    [Fact]
+    public void ClaimRelease_WithNothing_IsAnError()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim release", "s1");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    /// <summary>`claim list` 不是核心命令，是控制台的查询——返回 (null, null) 由 Repl 拦截。</summary>
+    [Fact]
+    public void ClaimList_IsNotACoreCommand() =>
+        Assert.Equal((null, null), CoreCommandParser.Parse("claim list"));
+
+    /// <summary>
+    /// ⚠️ **`claim` 没有当前会话时报错，而不是产出一个空会话 id 的命令**。
+    /// 空 id 会让 dispatcher 回「没有会话 ''」——用户看到的是引号里空空的，
+    /// 不知道问题出在「没选会话」上。
+    /// </summary>
+    [Fact]
+    public void Claim_WithoutACurrentSession_IsAnError()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim src/foo", currentSessionId: null);
+
+        Assert.Null(cmd);
+        Assert.Contains("session", err!);
+    }
+
+    [Fact]
+    public void Claim_WithACurrentSession_UsesIt()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("claim src/foo", "s9");
+
+        Assert.Null(err);
+        // ⚠️ **别把 `Scope` 塞进元组去比**——它是 `IReadOnlyList<string>`，与字符串字面量
+        // 放同一个元组会**类型对不上**：泛型推断失败，编译器落到 `Equal(DateTime, DateTime)`
+        // 那条候选上报 CS1503（而非"类型不匹配"这种一眼能看懂的消息）。
+        // ⚠️ 这段是**控制器批量改 `scope` 时留下的**：它把 `.Path` 机械换成 `.Scope`，
+        // **没管元组的形状**。⇒ 逐项断言，形状与上面两条测试一致。
+        var acquire = Assert.IsType<CoreCommand.ClaimAcquire>(cmd);
+        Assert.Equal("s9", acquire.SessionId);
+        Assert.Equal(["src/foo"], acquire.Scope);
+    }
 }

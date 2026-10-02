@@ -105,7 +105,7 @@ var repl = new Repl(host, dispatcher, host.StepperFor, Console.Out)
 // 紧跟在「你绑的那个已经没了」后面，纯属误导。这条落点上没有「本会话的端点」可报。
 if (!boundProviderMissing) PrintEndpoint(host, resume);
 
-Console.WriteLine("  `provider set <id> --key <key>` 配置；`session create` 建会话；`history` 回放；`quit` 退出。");
+Console.WriteLine("  `axis set <会话> <轴> <值>` 调行为；`claim <路径>` 占区域；`history` 回放；`quit` 退出。");
 
 while (true)
 {

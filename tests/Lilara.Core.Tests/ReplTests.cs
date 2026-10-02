@@ -496,4 +496,37 @@ public class ReplTests : IDisposable
     {
         Assert.Equal(expected, Repl.IsProviderSetCommand(line));
     }
+
+    /// <summary>
+    /// ⚠️ **`claim list` 是控制台的查询**（`03` §3：不做 `claim.list` 命令），
+    /// 所以它必须**自己**读 `claims.json` 并印出来——而这条钉的就是那个显示。
+    ///
+    /// <para>⚠️ 用 `NewHarness()`（已有脚手架）：`repl.ExecuteAsync` + `_out`。
+    /// 声明用 `ClaimStore` 直接写（`claim` 命令的认领走 dispatcher，这里只测显示）。</para>
+    /// </summary>
+    [Fact]
+    public async Task ClaimList_PrintsTheClaimsInTheWorkingDirectory()
+    {
+        var (repl, _, session) = NewHarness();
+        new Lilara.Core.Persistence.ClaimStore(session.Spec.WorkingDirectory)
+            .Save([new Lilara.Core.Session.Claim("other", "pk", @"c:\repo\src", DateTimeOffset.UnixEpoch)]);
+
+        await repl.ExecuteAsync("claim list", CancellationToken.None);
+
+        // ⚠️ 断言用**钉专属措辞**（不是"有输出就行"）：会话 id 与路径都要看得见，
+        // 否则「印了一行空表」也算过。
+        Assert.Contains("other", _out.ToString());
+        Assert.Contains("src", _out.ToString());
+    }
+
+    /// <summary>⚠️ 没有声明时印「（没有声明）」，不是空白——空白让用户分不清「没有」与「坏了」。</summary>
+    [Fact]
+    public async Task ClaimList_WithNoClaims_SaysSo()
+    {
+        var (repl, _, _) = NewHarness();
+
+        await repl.ExecuteAsync("claim list", CancellationToken.None);
+
+        Assert.Contains("没有声明", _out.ToString());
+    }
 }

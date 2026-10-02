@@ -76,8 +76,11 @@ public sealed class Repl(
         // 查询走快照那一层（03 §8.1：控制台只用「命令 + 快照」两层）。
         if (trimmed == "history") { PrintHistory(); return true; }
         if (trimmed == "status") { PrintStatus(); return true; }
+        // ⚠️ `claim list` 也是控制台的查询（`03` §3：不做 `claim.list` 命令）——
+        // 所以它**不经过** `CoreCommandParser.Parse`（那里对它是 (null,null)）。
+        if (trimmed == "claim list") { PrintClaims(); return true; }
 
-        var (parsed, parseError) = CoreCommandParser.Parse(trimmed);
+        var (parsed, parseError) = CoreCommandParser.Parse(trimmed, Current?.SessionId);
         if (parseError is not null) { _out.WriteLine(parseError); return true; }
 
         // ⚠️ 不是命令形态 ⇒ 它是**一条消息**，发给当前会话。这是控制台的主用法。
@@ -225,5 +228,16 @@ public sealed class Repl(
         _out.WriteLine("策略 " + string.Join(" · ",
             Axes.Names.Select(n => $"{n}={state.Axes!.GetValueOrDefault(n, "?")}")));
         _out.WriteLine($"目录 {Current.Spec.WorkingDirectory}");
+    }
+
+    private void PrintClaims()
+    {
+        // ⚠️ 声明落在**工作目录**（`01` §8），所以要有一个会话来问它的工作目录。
+        if (Current is null) { _out.WriteLine("还没有选中会话。"); return; }
+
+        var claims = new ClaimStore(Current.Spec.WorkingDirectory).All();
+        if (claims.Count == 0) { _out.WriteLine("（没有声明）"); return; }
+
+        foreach (var c in claims) _out.WriteLine($"{c.SessionId}  {c.Path}");
     }
 }

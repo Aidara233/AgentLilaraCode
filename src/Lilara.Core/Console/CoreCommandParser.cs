@@ -22,8 +22,12 @@ public static class CoreCommandParser
     /// 解析。返回 <c>(command, error)</c>：
     /// 认出的命令非 null；解析失败则 error 非 null；
     /// **两者都是 null** 表示「这不是一条命令形态的行」——调用方按**普通消息**处理。
+    ///
+    /// <para>⚠️ <paramref name="currentSessionId"/> 是**控制台专有**的输入：
+    /// `claim src/foo` 里没有会话 id，而核心命令**必须**有（线上协议的 `claim.acquire` 带它）。
+    /// ⇒ 由控制台补上「当前会话」。头走线上协议，它自己知道是哪个会话。</para>
     /// </summary>
-    public static (CoreCommand? Command, string? Error) Parse(string line)
+    public static (CoreCommand? Command, string? Error) Parse(string line, string? currentSessionId = null)
     {
         var trimmed = line.Trim();
 
@@ -50,7 +54,35 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("provider set ", StringComparison.Ordinal))
             return ParseProviderSet(trimmed);
 
+        // ⚠️ `claim list` 是**控制台的查询**，不是核心命令——返回 (null,null) 让 Repl 拦截。
+        if (trimmed is "claim list") return (null, null);
+
+        // ⚠️ **`claim release` 少了路径必须单独拦，而且要排在 acquire 之前。**
+        // 不拦的话 `trimmed.StartsWith("claim ")` 会把它接住、`trimmed[6..]` = `"release"`,
+        // 于是用户**静默占了一个叫 `release` 的路径**——不报错、看得出在动，看不出在动错东西。
+        // 与 `axis set`（T5）是**同一个形状**：前缀判断放行半个命令，剩下半截被当参数吃掉。
+        if (trimmed == "claim release")
+            return (null, "用法：claim <路径> | claim release <路径> | claim list");
+
+        if (trimmed.StartsWith("claim release ", StringComparison.Ordinal))
+            return WithSession(currentSessionId, trimmed["claim release ".Length..].Trim(),
+                (sid, path) => new CoreCommand.ClaimRelease(sid, [path]));
+
+        if (trimmed.StartsWith("claim ", StringComparison.Ordinal) && trimmed != "claim")
+            return WithSession(currentSessionId, trimmed["claim ".Length..].Trim(),
+                (sid, path) => new CoreCommand.ClaimAcquire(sid, [path]));
+
+        // ⚠️ 光一个 `claim` ⇒ **报错**，不落回「当成消息」——
+        // 用户以为占了地方，实际是把它当消息发给了会话。
+        if (trimmed == "claim") return (null, "用法：claim <路径> | claim release <路径> | claim list");
+
         return (null, null);
+
+        static (CoreCommand?, string?) WithSession(
+            string? sid, string path, Func<string, string, CoreCommand> make) =>
+            sid is null
+                ? (null, "还没有选中会话。先 `session create` 或 `session activate <id>`。")
+                : (make(sid, path), null);
     }
 
     /// <summary>
