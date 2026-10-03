@@ -270,6 +270,45 @@ public class ControlServerTests : IAsyncLifetime
         Assert.IsType<Ack.Accepted>(r.Ack);
     }
 
+    /// <summary>
+    /// ⚠️ **WS 的 Origin 白名单**——它是**`apiKey` 可选的硬前置**：网页能改 `endpoint`
+    /// 就能把流量（连同 key）转走，**且不需要知道 key**。
+    ///
+    /// <para>⚠️ **判据是「放行无 Origin，拒绝别的 origin」，不是「要求 Origin」**：
+    /// 浏览器发的握手**永远带 `Origin`**（挡住坏 origin 就达到了目的），
+    /// 而 curl / 测试驱动 / 未来的 CLI 头**不带**——要求它等于把它们**全部**误伤，
+    /// 而下面那批既有 WS 测试正是这条改动的**回归网**（误伤它们 = 自己拆掉安全网）。</para>
+    /// </summary>
+    [Theory]
+    [InlineData(null)]                     // 无 Origin（curl / 测试驱动）⇒ 放行
+    [InlineData("http://127.0.0.1:7790")]  // 头自己的 origin ⇒ 放行
+    [InlineData("http://evil.example")]    // ⇒ 拒绝
+    [InlineData("http://localhost:7790")]  // ⚠️ 同机不同写法：**拒绝**——见下
+    [InlineData("null")]                   // `file://` 页面与沙箱 iframe 的 Origin 字面量是 "null"
+    public async Task WebSocket_OriginPolicy(string? origin)
+    {
+        using var socket = new ClientWebSocket();
+        // ⚠️ **设备端没有「带 Origin 的握手」这个 API，只能手设头**——
+        // `SetRequestHeader` 这条路**实测过**（.NET 10）：设了服务端 `ctx.Request.Headers["Origin"]`
+        // 收得到；**不设则该头根本不存在**（读出来是空串，不是 null）⇒ 判据里「放行无 Origin」就是这条。
+        if (origin is not null) socket.Options.SetRequestHeader("Origin", origin);
+
+        var connect = socket.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        if (origin is null or "http://127.0.0.1:7790")
+        {
+            await connect;                                    // 放行 ⇒ 握上手
+            Assert.Equal(WebSocketState.Open, socket.State);
+        }
+        else
+        {
+            // ⚠️ 握手被拒时 `ConnectAsync` 抛 `WebSocketException`（服务端回了 403）。
+            // ⚠️ **`localhost:7790` 在拒绝之列是刻意的**：它与 `127.0.0.1:7790` **不是同一个 origin**
+            // （浏览器就是这么判的），且放行 `localhost` 等于放行一个**任何本机程序都能抢占的名字**
+            // （hosts 文件 / DNS）。
+            await Assert.ThrowsAnyAsync<WebSocketException>(() => connect);
+        }
+    }
+
     private static async Task SendAsync(WebSocket ws, string json) =>
         await ws.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, true, CancellationToken.None);
 

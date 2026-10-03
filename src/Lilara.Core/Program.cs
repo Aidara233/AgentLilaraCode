@@ -77,6 +77,11 @@ try
 {
     api = await controlServer.StartAsync(CancellationToken.None);
     Console.WriteLine($"  控制面 {controlServer.Url}（头连这个；只监听本机）");
+    // ⚠️ **WS 只接受这个 origin 的页面**（见 `ControlServer.MapWebSocket` 的注释）。
+    // 印出来是为了**失败能自解释**：页面从别的 origin（例如 `localhost:7790`）打开时会被拒，
+    // 用户得能看见被接受的到底是哪一个——否则只能瞎猜。
+    // ⚠️ 这里读的是**同一个常量**（`DefaultAllowedOrigin`），不是抄一份字面量。
+    Console.WriteLine($"  WS 只接受来自 {ControlServer.DefaultAllowedOrigin} 的页面；其它 origin 的网页会被拒。");
 }
 catch (Exception ex)
 {

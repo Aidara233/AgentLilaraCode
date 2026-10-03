@@ -22,9 +22,22 @@ namespace Lilara.Core.Control;
 /// 头是无状态的。⇒ WS 收到命令**立刻回 ack**，步在后台跑，结果经事件流出。</para>
 /// </summary>
 public sealed class ControlServer(
-    CoreHost host, CommandDispatcher dispatcher, EventBus bus, int port)
+    CoreHost host, CommandDispatcher dispatcher, EventBus bus, int port,
+    string allowedOrigin = ControlServer.DefaultAllowedOrigin)
 {
     public const int DefaultPort = 7788;
+
+    /// <summary>
+    /// ⚠️ 默认只放行**头自己的 origin**（`head/Program.cs:17` 默认端口 **7790**）。
+    ///
+    /// <para>⚠️ **`localhost:7790` 不在内，这是刻意的**：它与 `127.0.0.1:7790`
+    /// **不是同一个 origin**（浏览器就是这么判的），且放行 `localhost` 等于放行一个
+    /// **任何本机程序都能抢占的名字**（hosts 文件 / DNS）——端口也一样，所以
+    /// 这里**不做** `127.0.0.1:*` 那种通配。</para>
+    ///
+    /// <para>⚠️ 参数默认值与启动横幅**共用这一个常量**（否则两处副本会分叉）。</para>
+    /// </summary>
+    internal const string DefaultAllowedOrigin = "http://127.0.0.1:7790";
 
     /// <summary>⚠️ 只监听本机（`03` §10「鉴权最小」：核心是本设备唯一的，本机进程即可信）。</summary>
     public const string BindAddress = "127.0.0.1";
@@ -262,6 +275,30 @@ public sealed class ControlServer(
 
     private void MapWebSocket(WebApplication app) => app.Map("/ws", async (HttpContext ctx) =>
     {
+        // ⚠️ **Origin 白名单是 `apiKey` 可选的硬前置**：网页能改 `endpoint` 就能把流量
+        // （连同 key 与整段对话）转到攻击者主机——**且不需要知道 key**。
+        //
+        // ⚠️ **判据是「放行无 Origin，拒绝别的 origin」，不是「要求 Origin」**：
+        // 浏览器发的握手**永远带 `Origin`**（挡住坏 origin 就达到了目的），
+        // 而 curl / 测试驱动 / 未来的 CLI 头**不带**——要求它会把它们**全部**误伤，
+        // 而那批既有 WS 测试正是这条改动的**回归网**。
+        //
+        // ⚠️ 用**索引器**取头（`ctx.Request.Headers["Origin"]`，大小写不敏感），
+        // 不用 .NET 10 的强类型属性——索引器两种写法都吃，且**能被 grep 到**。
+        // ⚠️ **`localhost:7790` 与 `127.0.0.1:7790` 不是同一个 origin**（浏览器就是这么判的）
+        // ⇒ 用户改用 `localhost:7790` 打开页面**会被拒**，**这是刻意的**：放行 `localhost`
+        // 等于放行一个**任何本机程序都能抢占的名字**（hosts 文件 / DNS）。
+        var origin = ctx.Request.Headers["Origin"].ToString();
+        if (!string.IsNullOrEmpty(origin)
+            && !string.Equals(origin, allowedOrigin, StringComparison.OrdinalIgnoreCase))
+        {
+            // ⚠️ **失败要能自解释**：浏览器里用户只会看到「连不上」，得让响应体说清楚
+            // 被接受的是哪个页面——否则他无从改出正确的访问方式（启动横幅里也印了同一个值）。
+            ctx.Response.StatusCode = (int)HttpStatusCode.Forbidden;
+            await ctx.Response.WriteAsync($"本核心只接受来自 {allowedOrigin} 的页面。");
+            return;
+        }
+
         if (!ctx.WebSockets.IsWebSocketRequest)
         {
             ctx.Response.StatusCode = (int)HttpStatusCode.BadRequest;
