@@ -116,6 +116,13 @@ T7 provider.delete         ← 独立
 [InlineData("NUL.txt.txt.json")]  // ⚠️ 同样是设备；`GetFileNameWithoutExtension` 会【放行】它
 [InlineData("NUL  .json")]        // ⚠️ 尾随空格再带扩展名 ⇒ 判据要 TrimEnd
 [InlineData("COM1.json")]         // ⚠️ 同族，抛 FileNotFoundException('\\.\COM1')
+[InlineData("PRN")]               // ⚠️ 覆盖缺口：原先没有任何用例碰 PRN / AUX 分支 ⇒ 删掉那两行**变异存活**
+[InlineData("AUX")]
+[InlineData("LPT9")]              // ⚠️ 下边界那一族也要有一条
+[InlineData("COM\u00B9")]         // ⚠️ 上标 ¹（U+00B9）也算数字——实测抛异常
+[InlineData("LPT\u00B3")]         // ⚠️ 上标 ³（U+00B3）
+[InlineData("CONIN$")]            // ⚠️ 带 `$` 的伪设备；**裸 `CONIN` 是正常文件，别加**
+[InlineData("CONOUT$")]
 public void ProviderUpsert_WithAnUnsafeId_IsRejected(string id)
 {
     var cmd = new CoreCommand.ProviderUpsert(id, "k", null, null, null, null);
@@ -191,28 +198,37 @@ internal static bool IsSafeProviderId(string id) =>
 2. **`TrimEnd()`**：`NUL ` / `NUL  .json` 一样是设备名（实测）。
 3. ⚠️ **相等，不是前缀**——实测 `NULx` / `COM1x` / `COM10` / `LPT10` / `console` / `connect`
    **全是正常文件**，前缀型会把这一大片正当 id 一起误杀。
-   保留表只有 **`CON` `PRN` `AUX` `NUL`** ∪ **`COM1`–`COM9`** ∪ **`LPT1`–`LPT9`**；
-   `COM0` / `LPT0` / `COM10` / `LPT10` **实测都能正常写入**，不是设备名。
+4. ⚠️ **表本身还得补两处**（复审点名风险 + 控制器复现）：
+   - **`CONIN$` / `CONOUT$`** —— 带 `$`，不在任何常见名单里。⚠️ 裸 `CONIN` / `CONOUT` 是**正常文件**，别顺手加。
+   - **`¹²³`（U+00B9 / U+00B2 / U+00B3）也算数字** —— Windows 认这一组上标：
+     实测 `COM¹` 抛异常，而 `COM⁴` / `COM⁵` / `COM⁹`（U+2074…）与全角 `COM１`（U+FF11）、
+     阿拉伯-印度 `COM١` **都是正常文件** ⇒ **只加上标那三个，别扩到别的「数字」写法**。
 
 ```csharp
-var dot = id.IndexOf('.');
-var stem = (dot < 0 ? id : id[..dot]).TrimEnd();
-if (stem.Equals("CON", StringComparison.OrdinalIgnoreCase)
- || stem.Equals("PRN", StringComparison.OrdinalIgnoreCase)
- || stem.Equals("AUX", StringComparison.OrdinalIgnoreCase)
- || stem.Equals("NUL", StringComparison.OrdinalIgnoreCase)) return true;
-if (stem.Length != 4) return false;                       // ⚠️ COM10 / LPT10 不是设备名
-var head = stem[..3];
-if (!head.Equals("COM", StringComparison.OrdinalIgnoreCase)
- && !head.Equals("LPT", StringComparison.OrdinalIgnoreCase)) return false;
-return stem[3] is >= '1' and <= '9';                      // ⚠️ COM0 / LPT0 也不是
+private static bool IsWindowsDeviceName(string id)
+{
+    var dot = id.IndexOf('.');
+    var stem = (dot < 0 ? id : id[..dot]).TrimEnd();
+
+    foreach (var d in new[] { "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$" })
+        if (stem.Equals(d, StringComparison.OrdinalIgnoreCase)) return true;
+
+    // ⚠️ 相等、不是前缀；只有 **1–9 与 ¹²³**（COM0 / COM10 / COM⁴ 实测都是正常文件）
+    if (stem.Length != 4) return false;
+    var head = stem[..3];
+    if (!head.Equals("COM", StringComparison.OrdinalIgnoreCase)
+     && !head.Equals("LPT", StringComparison.OrdinalIgnoreCase)) return false;
+    return stem[3] is (>= '1' and <= '9') or '¹' or '²' or '³';
+}
 ```
 
 ⚠️ **平台后果要写明**：Linux 上 `NUL` 是完全正常的文件名，这里**照样拒绝**——
 与 `/` 那条同一套理（数据根可能被同步到别的平台），**这是刻意的**。
 
 - [ ] **Step 4: 跑测试确认绿 + 补一条守卫**：把 `IsSafeProviderId` 的调用**去掉**跑一次，
-  确认那 **17** 条 `InlineData` **全红**（G7：变异必须先确认落上）。
+  确认那 **24** 条 `InlineData` **全红**（G7：变异必须先确认落上）。
+  ⚠️ 还要跑**第二次变异**：只删 `IsWindowsDeviceName` 里 `PRN` / `AUX` 那两行 ——
+  补上的 `PRN` / `AUX` 用例必须红（复审发现：原先那两条分支**零覆盖**，删掉是**变异存活**）。
 - [ ] **Step 5: 提交** `fix(core): provider.upsert 校验 id 是「文件名」而非「路径」——实测 ../escaped 曾写到数据根`
 
 #### ⚠️ 补丁轮 T1b（同一处文件，紧随 T1）
@@ -365,7 +381,7 @@ app.MapGet("/provider-schema", () => Results.Json(new
 {
     Protocols = Protocols.All,
     AuthSchemes = new[] { AuthSchemes.ApiKey, AuthSchemes.Bearer },
-    ProviderIdRule = "单个文件名：不含路径分隔符，不能是 . 或 ..，也不能是 NUL/CON/COM1 这类 Windows 设备名",
+    ProviderIdRule = "单个文件名：不含路径分隔符，不能是 . 或 ..，也不是 CON/NUL/COM1/CONIN$ 这类 Windows 设备名",
 }, WireJson.Options));
 ```
 
