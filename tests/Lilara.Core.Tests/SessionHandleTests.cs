@@ -90,7 +90,7 @@ public class SessionHandleTests : IDisposable
     /// 写 `State`、没有别的写点，所以精确值可以要求；用区间会掩盖「丢一点也算过」。</para>
     /// </summary>
     [Fact]
-    public void UpdateState_TwoWriters_AxisAndTurn_BothSurvive()
+    public async Task UpdateState_TwoWriters_AxisAndTurn_BothSurvive()
     {
         var handle = SessionHandle.Create(_store, @"C:\work", Model());
 
@@ -121,7 +121,13 @@ public class SessionHandleTests : IDisposable
             }
         });
 
-        Task.WaitAll(setAxisRole, stepperRole);
+        // ⚠️ **`await Task.WhenAll`，不是 `Task.WaitAll`**——后者在本项目里是一条
+        // **编译错误**（xUnit1031：测试方法不得用阻塞式 task 操作，`-warnaserror` 下即 error）。
+        // ⚠️ 断言与轮数（200_000）**一字未动**：这条测试的意图是「两个写者交错 20 万轮、
+        // `Turn` 一次都不丢」，换掉等待方式不改变那个意图。
+        // ⚠️ **别改回 `Task.WaitAll`**：`dotnet build` 增量时分析器不重跑，
+        // 于是「0 警告」在改回去之后**照样打印得出来**——而全量构建是红的。
+        await Task.WhenAll(setAxisRole, stepperRole);
 
         Assert.Equal(rounds, handle.State.Turn);                        // Turn 一次都没丢
         Assert.Equal(Axes.Names.Count, handle.State.Axes!.Count);        // 轴表没被盖成残缺的一份
