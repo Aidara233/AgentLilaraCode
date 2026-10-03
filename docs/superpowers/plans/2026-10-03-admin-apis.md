@@ -488,6 +488,17 @@ app.MapGet("/providers", () =>
 
 - [ ] **Step 2–4: 红 → 实现 → 绿**
 
+⚠️ **`id` 必须过同一个闸 `IsSafeProviderId`——这条比 T1 更要紧，因为删是破坏性的。**
+`Delete(id)` 会走同一个 `PathFor(id)`：`delete ../escaped` ⇒ `<数据根>/escaped.json` **被删掉**
+（`providers/` 之外的东西）；`delete NUL` ⇒ `File.Delete` 同样抛未捕获异常掀翻进程。
+⇒ **复用那个谓词**（它已经是 `internal static`）：判据一处、两处调用（G10）。
+⇒ 测试必须**断言「那个文件没被删掉」**，不能只断言 ack——
+**删是不可逆的**，而 ack 对了文件已经没了的那种错，用户挽不回来。
+
+⚠️ **删一个不存在的 provider**：**拒绝**（`Rejected`，理由点名那个 id），**不是幂等成功**。
+理由：本项目一路在收「静默的成功」——`provider delet local`（拼错）若回 ✓，
+用户以为删掉了、其实没删，而下一次发消息用的还是那个凭据。
+
 ⚠️ **删一个**正被会话引用的** provider 会怎样**？——**不阻止**（R-A：想改啥都行），
 但**要让后果可见**：删完 `InvalidateSteppers()`；被引用的会话下次发消息会走
 `StepperResolver` 的「绑定的提供商已不存在」那条路（**已经实现了**，`Program.cs` 也会在启动时报）。
@@ -501,14 +512,19 @@ app.MapGet("/providers", () =>
 ## 验证（本批次）
 
 1. `dotnet test` —— **全绿**；既有金样一条不许改断言值（只能加新的）。
-2. `dotnet build -warnaserror` —— 0 警告（核心侧 `TreatWarningsAsErrors`）。
+2. `dotnet build -warnaserror **--no-incremental**` —— **0 警告 0 错误、exit 0**。
+   ⚠️ **`--no-incremental` 不能省**：增量构建**不重跑分析器**，于是它打印的「0 个警告」
+   与「真跑过且干净」**逐字相同**——实测量过同一条命令增量绿、全量红。
+   ⚠️ 除了 `src`（`TreatWarningsAsErrors=true`），**测试项目也要干净**：
+   它没有那个属性，诊断平时只是 warning，**靠这条命令行开关才升格**。
 3. **手工端到端（四个可观测量，逐条记「预期 / 实际」）**：
    - ① 控制台 `provider set ../escaped --key k` ⇒ **拒绝**，且**数据根下不出现 `escaped.json`**
    - ② 用带 `Origin: http://evil.example` 的 WS 客户端连 ⇒ **403**；不带 Origin 的 ⇒ **连上**
    - ③ `GET /sessions/{id}/state` ⇒ 含 `spec.model.modelId` 与 `spec.workingDirectory`
    - ④ 对**真实数据根**打 `GET /providers`，用 `grep` 断言响应里**没有**那个 key 的片段
-4. **变异确认**（G7）：T1 的 `IsSafeProviderId` 调用、T2 的 origin 分支、T6 的 key 投影，
-   各去掉一次 ⇒ **必须各有一条红**；跑之前先 `grep` 确认变异落上了。
+4. **变异确认**（G7）：T1 的 `IsSafeProviderId` 调用（含 `IsWindowsDeviceName` 的 **`PRN`/`AUX` 那条单独杀一次**）、
+   T2 的 origin 分支、T6 的 key 投影、**T7 的 id 闸**，各去掉一次 ⇒ **必须各有一条红**；
+   跑之前先 `grep` 确认变异落上了，跑完再 grep 确认还原。
 5. `git`：动手前记下 `master` 的 SHA 当回滚点。
 
 ## 明确不做（写进代码注释的偏离）
