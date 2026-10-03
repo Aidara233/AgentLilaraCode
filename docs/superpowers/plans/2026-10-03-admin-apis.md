@@ -110,6 +110,12 @@ T7 provider.delete         ← 独立
 [InlineData(".")]
 [InlineData("..")]
 [InlineData("a\0b")]              // 内嵌 NUL
+[InlineData("NUL")]               // ⚠️ Windows 设备名：`ProviderStore.Save` 抛异常 ⇒ 掀翻常驻进程
+[InlineData("nul")]               // ⚠️ 设备名判定必须**大小写不敏感**
+[InlineData("CON.json")]          // ⚠️ 带扩展名一样是设备
+[InlineData("NUL.txt.txt.json")]  // ⚠️ 同样是设备；`GetFileNameWithoutExtension` 会【放行】它
+[InlineData("NUL  .json")]        // ⚠️ 尾随空格再带扩展名 ⇒ 判据要 TrimEnd
+[InlineData("COM1.json")]         // ⚠️ 同族，抛 FileNotFoundException('\\.\COM1')
 public void ProviderUpsert_WithAnUnsafeId_IsRejected(string id)
 {
     var cmd = new CoreCommand.ProviderUpsert(id, "k", null, null, null, null);
@@ -142,22 +148,83 @@ public void ProviderUpsert_WithASafeId_IsAccepted(string id) { /* Assert.IsType<
 /// </summary>
 internal static bool IsSafeProviderId(string id) =>
     !string.IsNullOrWhiteSpace(id)
-    && id == Path.GetFileName(id)          // ⚠️ 这一句同时挡掉 `..` / `a/b` / `a\b` / `/abs` / `C:\abs`
+    && id == Path.GetFileName(id)          // ⚠️ 挡的是**路径语法**：`a/b` / `a\b` / `/abs` / `C:\abs` / `../escaped`
     && id.IndexOfAny(Path.GetInvalidFileNameChars()) < 0
-    && id is not "." and not "..";
+    && id is not "." and not ".."          // ⚠️ **`.` 与 `..` 由这一句挡**，不是上一句——见下
+    && !IsWindowsDeviceName(id);           // ⚠️ `NUL` / `CON` / `COM1`…：未捕获异常，见下
 ```
 
-⚠️ **为什么 `id == Path.GetFileName(id)` 是关键那一句**：`Path.GetFileName("../escaped")` 返回 `escaped`
-⇒ 不相等 ⇒ 拒绝。而 `Path.GetFileName("本地")` 返回 `本地` ⇒ 相等 ⇒ 放行。
-**用 `Path` 自己的词法，而不是自己拼字符类**——同一个仓库里 `Claims.Normalize` 已经吃过
-「自己拼分隔符」的亏。
-⚠️ **但 `Path.GetFileName` 是平台相关的**（这是 .NET 的既有性质）：Windows 上它把
+⚠️ **`id == Path.GetFileName(id)` 挡的是路径语法，`..` 不归它管——这两句别搞混。**
+`Path.GetFileName("../escaped")` 返回 `escaped` ⇒ 不相等 ⇒ 拒绝 ✓；
+但 `Path.GetFileName("..")` 返回 `..`、`Path.GetFileName(".")` 返回 `.` ⇒ **相等 ⇒ 放行**。
+挡掉 `.` / `..` 的是**最后那句**。⚠️ 计划初版把 `..` 记在了这一句名下，
+而实现逐字照抄 ⇒ **注释与代码说的不是一件事**。
+⛔ **别把最后那句当冗余删掉**（它的注释已经这样误导过一次）。
+⚠️ 代价实测：`PathFor("..")` 得到 `...json`，仍在 `providers/` 内 ⇒ **今天不构成穿越**；
+但 `PathFor` 一旦不拼 `.json` 后缀，它立刻就变成穿越。**这是纵深防御，不是修复。**
+
+⚠️ **`Path.GetFileName` 是平台相关的**（.NET 的既有性质）：Windows 上它把
 `a/b` 也当分隔符。**这是我们要的**（数据根可能被同步到别的平台），**但要在注释里写明这一点**，
 并为此补一条针对 `/` 的 `InlineData`（已在上面）。
 
+⚠️ **Windows 设备名必须挡——它不属于上面任何一类，而后果是「未捕获异常掀翻常驻进程」。**
+判据「是不是一个单纯的文件名」**抓不到它**：`NUL` 词法上完全合法。
+
+⚠️ **别用裸 `File.WriteAllText` 探它的后果——那不是被测物。** 实测两条路结局不同：
+
+| 探针 | `NUL` | `COM1` |
+|---|---|---|
+| 裸 `File.WriteAllText(<dir>/"NUL.json", …)` | 不抛，但 `GetFiles`/`File.Exists` 都看不见 ⇒ 像「静默消失」 | 抛 `FileNotFoundException` |
+| **`ProviderStore.Save`（`AtomicFile`：写 `.tmp` 再 `Move`）** | 抛 `UnauthorizedAccessException('\\.\NUL')` | 抛 `FileNotFoundException('\\.\COM1')` |
+
+⇒ **真正会发生的是后者**：命令从 dispatcher 抛出**未捕获异常**，
+而 `DispatchAsync` 没有 try/catch、`Repl.DispatchAsync` 只接 `DispatchException` / `ModelCallFailedException`
+⇒ **常驻进程直接死，后续命令不再执行**。
+（这是**真二进制实测**的，实现者量的：敲 `provider set NUL --key k` ⇒ 进程掀翻、退出非 0。)
+⚠️ **这一条本身是本计划的教训样本**：我第一版处方里把它写成了「回 ✓ 而盘上无文件」——
+**探针 ≠ 被测物，要验证就调那个函数。**
+
+⚠️ **判据要严过系统的怪癖，不是刚好合上它。** 三个坑：
+
+1. **取「第一个点之前」那一段，不是 `Path.GetFileNameWithoutExtension`**：
+   后者把 `NUL.txt.txt.json` 变成 `NUL.txt.txt` ⇒ **放行**，而它同样是设备名。
+2. **`TrimEnd()`**：`NUL ` / `NUL  .json` 一样是设备名（实测）。
+3. ⚠️ **相等，不是前缀**——实测 `NULx` / `COM1x` / `COM10` / `LPT10` / `console` / `connect`
+   **全是正常文件**，前缀型会把这一大片正当 id 一起误杀。
+   保留表只有 **`CON` `PRN` `AUX` `NUL`** ∪ **`COM1`–`COM9`** ∪ **`LPT1`–`LPT9`**；
+   `COM0` / `LPT0` / `COM10` / `LPT10` **实测都能正常写入**，不是设备名。
+
+```csharp
+var dot = id.IndexOf('.');
+var stem = (dot < 0 ? id : id[..dot]).TrimEnd();
+if (stem.Equals("CON", StringComparison.OrdinalIgnoreCase)
+ || stem.Equals("PRN", StringComparison.OrdinalIgnoreCase)
+ || stem.Equals("AUX", StringComparison.OrdinalIgnoreCase)
+ || stem.Equals("NUL", StringComparison.OrdinalIgnoreCase)) return true;
+if (stem.Length != 4) return false;                       // ⚠️ COM10 / LPT10 不是设备名
+var head = stem[..3];
+if (!head.Equals("COM", StringComparison.OrdinalIgnoreCase)
+ && !head.Equals("LPT", StringComparison.OrdinalIgnoreCase)) return false;
+return stem[3] is >= '1' and <= '9';                      // ⚠️ COM0 / LPT0 也不是
+```
+
+⚠️ **平台后果要写明**：Linux 上 `NUL` 是完全正常的文件名，这里**照样拒绝**——
+与 `/` 那条同一套理（数据根可能被同步到别的平台），**这是刻意的**。
+
 - [ ] **Step 4: 跑测试确认绿 + 补一条守卫**：把 `IsSafeProviderId` 的调用**去掉**跑一次，
-  确认那 11 条 `InlineData` **全红**（G7：变异必须先确认落上）。
+  确认那 **17** 条 `InlineData` **全红**（G7：变异必须先确认落上）。
 - [ ] **Step 5: 提交** `fix(core): provider.upsert 校验 id 是「文件名」而非「路径」——实测 ../escaped 曾写到数据根`
+
+#### ⚠️ 补丁轮 T1b（同一处文件，紧随 T1）
+
+评审抓出一条**注释与代码说的不是一件事**：那句 `id == Path.GetFileName(id)` 的注释把 `..`
+记在它名下，而实测 `Path.GetFileName("..") == ".."` ⇒ 挡掉 `..` 的是**最后那句**。
+⛔ 后果：下一个「清理者」会把它当冗余删掉，而**那正是纵深防御那一层**。
+⇒ **注释改对**（`..` 归最后一句；这一句只说路径语法）。
+⇒ **顺带把设备名并进谓词**（上面 Step 1/Step 3 已改）：`NUL` 会被 `ProviderStore.Save`
+   抛成**未捕获异常、掀翻常驻进程**，
+   而「静默的 ✓」是本项目一直在收的那一族。
+⇒ 计划自己的文本也要改（实现者照抄了它）——**已在本文件里改掉**。
 
 ---
 
@@ -279,7 +346,7 @@ app.MapGet("/provider-schema", () => Results.Json(new
 {
     Protocols = Protocols.All,
     AuthSchemes = new[] { AuthSchemes.ApiKey, AuthSchemes.Bearer },
-    ProviderIdRule = "单个文件名：不含路径分隔符，不能是 . 或 ..",
+    ProviderIdRule = "单个文件名：不含路径分隔符，不能是 . 或 ..，也不能是 NUL/CON/COM1 这类 Windows 设备名",
 }, WireJson.Options));
 ```
 
