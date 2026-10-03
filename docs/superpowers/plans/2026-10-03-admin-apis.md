@@ -256,9 +256,28 @@ return stem[3] is >= '1' and <= '9';                      // ⚠️ COM0 / LPT0 
 [InlineData(null)]                              // 无 Origin（curl / 测试驱动）⇒ 放行
 [InlineData("http://127.0.0.1:7790")]           // 头自己的 origin ⇒ 放行
 [InlineData("http://evil.example")]             // ⇒ 拒绝
-[InlineData("http://localhost:7790")]           // ⚠️ 同机不同写法：**判定它属于哪一边并写进注释**
+[InlineData("http://localhost:7790")]           // ⚠️ 同机不同写法：**拒绝**——见下
 [InlineData("null")]                            // `file://` 页面与沙箱 iframe 的 Origin 字面量是 "null"
-public async Task WebSocket_OriginPolicy(string? origin) { /* 建连 → 断言接受/拒绝 */ }
+public async Task WebSocket_OriginPolicy(string? origin)
+{
+    using var socket = new ClientWebSocket();
+    // ⚠️ **设备端没有「带 Origin 的握手」这个 API，只能手设头**——
+    // `SetRequestHeader` 这条路**实测过**（.NET 10）：设了服务端 `ctx.Request.Headers["Origin"]`
+    // 收得到；**不设则该头根本不存在**（读出来是空串，不是 null）⇒ 判据里「放行无 Origin」就是这条。
+    if (origin is not null) socket.Options.SetRequestHeader("Origin", origin);
+
+    var connect = socket.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+    if (origin is null or "http://127.0.0.1:7790")
+    {
+        await connect;                                    // 放行 ⇒ 握上手
+        Assert.Equal(WebSocketState.Open, socket.State);
+    }
+    else
+    {
+        // ⚠️ 握手被拒时 `ConnectAsync` 抛 `WebSocketException`（服务端回了 403）。
+        await Assert.ThrowsAnyAsync<WebSocketException>(() => connect);
+    }
+}
 ```
 
 ⚠️ **`"null"` 那条要单独想**：`Origin: null` 是**沙箱 iframe 与 `file://` 页面**发的，
