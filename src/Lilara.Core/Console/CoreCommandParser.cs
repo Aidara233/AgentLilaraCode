@@ -179,7 +179,7 @@ public static class CoreCommandParser
         return (new CoreCommand.SessionSetAxis(parts[2], parts[3], parts[4]), null);
     }
 
-    // `provider set <id> [--key <k>] [--model <m>] [--protocol <p>] [--endpoint <u>] [--auth <a>]`
+    // `provider set <id> [--key <k>] [--model <m>] [--protocol <p>] [--endpoint <u>] [--auth <a>] [--models a,b,c]`
     // 这里只管拆词：省略 --key ⇒ null，语义是「保留旧 key」；
     // 「新 provider 省 key 要拒」的守卫在 dispatcher，不在这里。
     private static (CoreCommand?, string?) ParseProviderSet(string line)
@@ -188,6 +188,7 @@ public static class CoreCommandParser
         var id = parts[2];
 
         string? key = null, model = null, protocol = null, endpoint = null, auth = null;
+        IReadOnlyList<string>? models = null;
 
         // 从 3 起每次跳两格（标志与值成对；parts[1] == "set"）。
         // 守卫是「值长得像标志位」而非「位置上像」：--key --model m 里 key 缺值必须报错，
@@ -211,13 +212,19 @@ public static class CoreCommandParser
                 case "--endpoint": endpoint = value; break;
                 case "--auth": auth = value; break;
 
+                // 清单用逗号分隔：`--models a,b,c`。⚠️ 空串 ⇒ 空清单（= 清空），**不是** null（= 保留）。
+                // 「空串 = 清空」这条与端点的 `""` 语义一致，别把它也当成「没给」而静默保留旧清单。
+                case "--models":
+                    models = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                    break;
+
                 // 未知标志必须拒绝：拼错的 --protcol 会被静默吞掉、照常保存并回 ✓，协议悄悄落成默认。
                 default: return (null, $"未知参数 '{parts[i]}'。");
             }
         }
 
         // 这里不要求 --key：「新 provider 省 key 要拒」的语义在 dispatcher，别在这里再写一遍。
-        return (new CoreCommand.ProviderUpsert(id, key, model, protocol, endpoint, auth), null);
+        return (new CoreCommand.ProviderUpsert(id, key, model, protocol, endpoint, auth) { Models = models }, null);
     }
 
     // `provider delete <id>`：id 合法性由 dispatcher 判（控制台与头共用同一条判据），

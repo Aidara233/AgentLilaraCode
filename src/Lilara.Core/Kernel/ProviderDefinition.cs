@@ -15,6 +15,19 @@ public sealed record ProviderDefinition
 
     public required string DefaultModel { get; init; }
 
+    /// <summary>
+    /// 这个提供商**可选的**模型清单（头把会话的模型画成下拉，选项就从这里来）。
+    ///
+    /// <para>⚠️ **加法式可空**：既有的 `providers/*.json` 没有这个键，缺失即反序列化成 `null`
+    /// （与 <see cref="Endpoint"/> / <see cref="AuthScheme"/> 同一个先例）。磁盘格式不动。</para>
+    ///
+    /// <para>⚠️ **与 <see cref="DefaultModel"/> 的关系**：那一个仍是「没指定时用哪个」，
+    /// 这一份是「有哪些可挑」。清单**可以**不含 <see cref="DefaultModel"/>——
+    /// 没有强制包含的理由，读的一方（头）把当前值补进选项即可。
+    /// `null` 或空 = 「没声明清单」⇒ 头退回一个普通文本框。**不是**「没有模型可用」。</para>
+    /// </summary>
+    public IReadOnlyList<string>? Models { get; init; }
+
     // 模态能力声明：是提供商配置的一部分，不是适配器的运行时契约。最小闭环用不到。
     public required string Modality { get; init; }
 

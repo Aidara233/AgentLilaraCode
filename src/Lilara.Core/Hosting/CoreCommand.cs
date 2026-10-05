@@ -19,7 +19,17 @@ public abstract record CoreCommand
     /// </summary>
     public sealed record ProviderUpsert(
         string Id, string? ApiKey, string? Model, string? Protocol, string? Endpoint, string? Auth)
-        : CoreCommand;
+        : CoreCommand
+    {
+        /// <summary>
+        /// 可选的**模型清单**（头把会话的模型画成下拉，选项从这里来）。
+        ///
+        /// <para>⚠️ 它是**加法式的 init 属性、不是位置参数**：`null` = 本次没提到 = **保留旧清单**，
+        /// 与其余五个字段同一条语义。做成位置参数会逼着每一个构造点（含十来条既有测试）
+        /// 都写一个它并不关心的 `null`，而那种「为了编译而写的参数」正是最容易写错的地方。</para>
+        /// </summary>
+        public IReadOnlyList<string>? Models { get; init; }
+    }
 
     /// <summary>
     /// 删掉一个提供商定义（移除 `<数据根>/providers/&lt;id&gt;.json`）。

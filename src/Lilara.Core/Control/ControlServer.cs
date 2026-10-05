@@ -209,6 +209,8 @@ public sealed class ControlServer(
                 p.Id, p.Protocol, p.DefaultModel,
                 // 端点 / 认证方式 / modality 是配置的一部分，要交出去（头看不到就无从核对）。
                 p.Endpoint, p.AuthScheme, p.Modality,
+                // 模型清单：会话视图把模型画成下拉，选项就从这里来。null = 没声明（头退回文本框）。
+                p.Models,
                 // key 只回 HasApiKey（能改不能看）：表单能显示「已配置」而不是空框。
                 HasApiKey = p.HasApiKey,
             }), WireJson.Options));
@@ -218,7 +220,8 @@ public sealed class ControlServer(
         app.MapGet("/provider-schema", () => Results.Json(new
         {
             Protocols = Protocols.All,
-            AuthSchemes = new[] { AuthSchemes.ApiKey, AuthSchemes.Bearer },
+            // ⚠️ 从 `AuthSchemes.All` 读，**不是**手写的 `new[] { … }`——那份加常量时不会跟上。
+            AuthSchemes = AuthSchemes.All,
             ProviderIdRule = "单个文件名：不含路径分隔符，不能是 . 或 ..，也不是 CON/NUL/COM1/CONIN$ 这类 Windows 设备名",
         }, WireJson.Options));
     }
@@ -455,7 +458,12 @@ public sealed class ControlServer(
                 // 而线上的「省略」就是键不存在，语义是「保留旧 key」（用 GetProperty 会让头永远改不了已有 provider）。
                 // Opt 只认字符串 ⇒ 非字符串值被静默当成没给；与 model/protocol/endpoint/auth 四个兄弟字段一致。
                 Opt(payload, "apiKey"),
-                Opt(payload, "model"), Opt(payload, "protocol"), Opt(payload, "endpoint"), Opt(payload, "auth")),
+                Opt(payload, "model"), Opt(payload, "protocol"), Opt(payload, "endpoint"), Opt(payload, "auth"))
+            {
+                // 模型清单是**数组**，Opt 只认字符串 ⇒ 单独一个助手。
+                // 键缺失 / 不是数组 / 数组里有非字符串 ⇒ null（= 保留旧清单），与兄弟字段同一条语义。
+                Models = OptStringList(payload, "models"),
+            },
             // 同 provider.upsert / claim.release：线上解析是第三条线。
             "provider.delete" => new CoreCommand.ProviderDelete(
                 payload.GetProperty("id").GetString()!),
@@ -467,6 +475,22 @@ public sealed class ControlServer(
 
         static string? Opt(JsonElement e, string name) =>
             e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+        // 字符串数组版。⚠️ 与 `Opt` 一样「只认形状对的」：键缺失 / 不是数组 / 元素不是字符串 ⇒ null。
+        // 元素不是字符串这一条**不**报错而是整份当没给——与 `Opt` 的取舍一致（`provider.upsert`
+        // 的兄弟字段都是这个粒度），且「头传了半份清单」这种形状不会比「没传」更可信。
+        static IReadOnlyList<string>? OptStringList(JsonElement e, string name)
+        {
+            if (!e.TryGetProperty(name, out var v) || v.ValueKind != JsonValueKind.Array) return null;
+
+            var list = new List<string>();
+            foreach (var item in v.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.String) return null;
+                list.Add(item.GetString()!);
+            }
+            return list;
+        }
     }
 
     private bool TryFind(string sessionId, out SessionHandle handle)

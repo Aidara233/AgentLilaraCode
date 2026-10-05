@@ -191,6 +191,8 @@ public sealed class CommandDispatcher(
             Modality = existing?.Modality ?? "vision",
             Endpoint = p.Endpoint ?? existing?.Endpoint,
             AuthScheme = string.IsNullOrEmpty(p.Auth) ? existing?.AuthScheme : p.Auth,
+            // 加法式清单：没提到就保留旧的那份（与其余字段同一条「省略 = 保留」）。
+            Models = p.Models ?? existing?.Models,
         });
 
         // 失效点必须在这里，不能挂在控制台的字符串判据 `IsProviderSetCommand` 上——

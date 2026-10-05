@@ -202,13 +202,13 @@ public class ProviderStoreTests : IDisposable
 
         Assert.Equal(
             ["ApiKey:String", "AuthScheme:String", "DefaultModel:String", "Endpoint:String",
-             "HasApiKey:Boolean", "Id:String", "Modality:String", "Protocol:String"],
+             "HasApiKey:Boolean", "Id:String", "Modality:String", "Models:IReadOnlyList`1", "Protocol:String"],
             DeclaredShape(typeof(ProviderDefinition)));
 
         // HasApiKey 刻意不在这条里——它带 [JsonIgnore]。
         Assert.Equal(
             ["ApiKey:String", "AuthScheme:String", "DefaultModel:String", "Endpoint:String",
-             "Id:String", "Modality:String", "Protocol:String"],
+             "Id:String", "Modality:String", "Models:IReadOnlyList`1", "Protocol:String"],
             PersistedShape(typeof(ProviderDefinition)));
     }
 }

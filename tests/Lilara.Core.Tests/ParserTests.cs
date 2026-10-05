@@ -426,4 +426,24 @@ public class ParserTests
         Assert.Null(cmd);
         Assert.Null(err);
     }
+
+    // `--models a,b,c` → 清单。头的模型下拉靠它。
+    [Fact]
+    public void ProviderSet_WithModels_ParsesTheCommaSeparatedList()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("provider set p --key k --models a,b,c");
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.ProviderUpsert>(cmd);
+        Assert.Equal(["a", "b", "c"], c.Models);
+    }
+
+    // 省略 --models ⇒ null（= 保留旧清单），与其余五个字段同一条语义。
+    [Fact]
+    public void ProviderSet_WithoutModels_LeavesItNull()
+    {
+        var (cmd, _) = CoreCommandParser.Parse("provider set p --key k");
+
+        Assert.Null(((CoreCommand.ProviderUpsert)cmd!).Models);
+    }
 }

@@ -768,4 +768,40 @@ public class CommandDispatcherTests : IDisposable
 
         Assert.IsType<Ack.Rejected>(r.Ack);
     }
+
+    // ---- provider 的模型清单（头的模型下拉靠它） ----
+
+    [Fact]
+    public async Task ProviderUpsert_WithModels_PersistsThem()
+    {
+        var (host, d) = NewHarness();
+
+        await d.DispatchAsync(
+            new CoreCommand.ProviderUpsert("p", "k", null, null, null, null)
+            {
+                Models = ["a", "b"],
+            }, "x", false, CancellationToken.None);
+
+        Assert.Equal(["a", "b"], host.Providers.Load("p")!.Models);
+    }
+
+    // 「省略 = 保留」也要覆盖新字段——漏了它的话，改端点会把模型清单静默清空。
+    [Fact]
+    public async Task ProviderUpsert_WithoutModels_KeepsTheExistingList()
+    {
+        var (host, d) = NewHarness();
+
+        await d.DispatchAsync(
+            new CoreCommand.ProviderUpsert("p", "k", null, null, null, null) { Models = ["a", "b"] },
+            "x1", false, CancellationToken.None);
+
+        // 第二次只改端点，**不提** models。
+        await d.DispatchAsync(
+            new CoreCommand.ProviderUpsert("p", null, null, null, "http://x.invalid", null),
+            "x2", false, CancellationToken.None);
+
+        var saved = host.Providers.Load("p")!;
+        Assert.Equal("http://x.invalid", saved.Endpoint);
+        Assert.Equal(["a", "b"], saved.Models);   // 没被静默清掉
+    }
 }
