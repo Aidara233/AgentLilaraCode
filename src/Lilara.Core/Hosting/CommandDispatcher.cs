@@ -120,8 +120,18 @@ public sealed class CommandDispatcher(
     ///
     /// <para>⚠️ 判定 = **大小写不敏感**（实测 `nul.json` 一样消失）+ `TrimEnd()`（`NUL  .json` 也消失）
     /// + **相等、不是前缀**——实测 `NULx` / `COM1x` / `COM10` / `LPT10` / `console` / `connect`
-    /// 都是**正常文件**，前缀型会把这一大片正当 id 一起误杀；保留表只有 **1–9**
+    /// 都是**正常文件**，前缀型会把这一大片正当 id 一起误杀；保留表只有 **1–9 与 `¹²³`**
     /// （`COM0` / `LPT0` / `COM10` / `LPT10` 实测都能正常写入）。</para>
+    ///
+    /// <para>⚠️ **`CONIN$` / `CONOUT$` 是伪设备；裸 `CONIN` / `CONOUT` 是正常文件**——
+    /// 实测（`ProviderStore.Save`）：前者抛 `IOException` / `UnauthorizedAccessException`，
+    /// 后者正常写入。⇒ 只挡带 `$` 的那两个，**别顺手把裸名字也挡了**（那是误杀）。</para>
+    ///
+    /// <para>⚠️ **`¹` `²` `³`（U+00B9 / B2 / B3）也算数字，但别的「数字」写法不算**——
+    /// 实测 `COM¹` 抛异常，而 `COM⁴` `COM⁵` `COM⁹`（U+2074…）、全角 `COM１`（U+FF11）、
+    /// 阿拉伯-印度 `COM١`（U+0661）**都是正常文件**。
+    /// ⇒ **只加这三个，别扩**。按「数字」的直觉去扩，会把判据开得比系统**宽**——
+    /// 而那是另一个方向的错（与「前缀型」同一族：误杀）。</para>
     ///
     /// <para>⚠️ **Linux 上 `NUL` 是正常文件名，这里照样拒绝**——与 `/` 那条同一套理
     /// （数据根可能被同步到别的平台），**这是刻意的**。</para>
@@ -135,17 +145,20 @@ public sealed class CommandDispatcher(
         if (stem.Equals("CON", StringComparison.OrdinalIgnoreCase)
             || stem.Equals("PRN", StringComparison.OrdinalIgnoreCase)
             || stem.Equals("AUX", StringComparison.OrdinalIgnoreCase)
-            || stem.Equals("NUL", StringComparison.OrdinalIgnoreCase))
+            || stem.Equals("NUL", StringComparison.OrdinalIgnoreCase)
+            // ⚠️ 带 `$` 的伪设备：**裸 `CONIN` / `CONOUT` 是正常文件**，别顺手加。
+            || stem.Equals("CONIN$", StringComparison.OrdinalIgnoreCase)
+            || stem.Equals("CONOUT$", StringComparison.OrdinalIgnoreCase))
             return true;
 
-        // ⚠️ **相等**，不是前缀（实测 `COM1x` 正常写入）；且只有 **1–9** 是保留的
-        //    （`COM0` / `LPT0` / `COM10` / `LPT10` 实测都能正常写入）。
+        // ⚠️ **相等**，不是前缀（实测 `COM1x` 正常写入）；数字只有 **1–9 与 `¹²³`**
+        //    （`COM0` / `LPT0` / `COM10` / `LPT10` / `COM⁴` 实测都能正常写入）。
         if (stem.Length != 4) return false;
         var head = stem[..3];
         if (!head.Equals("COM", StringComparison.OrdinalIgnoreCase)
             && !head.Equals("LPT", StringComparison.OrdinalIgnoreCase))
             return false;
-        return stem[3] is >= '1' and <= '9';
+        return stem[3] is (>= '1' and <= '9') or '¹' or '²' or '³';
     }
 
     private DispatchResult HandleProviderUpsert(CoreCommand.ProviderUpsert p, string id)

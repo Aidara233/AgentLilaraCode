@@ -58,6 +58,11 @@ public class ProviderIdTests : IDisposable
     [InlineData("NUL.txt.txt.json")]  // ⚠️ 实测同样静默消失；`GetFileNameWithoutExtension` 会放行它
     [InlineData("NUL  .json")]        // ⚠️ 尾随**空格**再带扩展名——`TrimEnd` 那一半
     [InlineData("COM1.json")]         // ⚠️ 这一族走的是**抛异常**（FileNotFoundException），不是静默
+    [InlineData("PRN")]               // ⚠️ 覆盖缺口：原先无任何用例碰 PRN/AUX 分支 ⇒ 删掉那两行**变异存活**
+    [InlineData("AUX")]
+    [InlineData("LPT9")]              // ⚠️ 下边界那一族也要有一条
+    [InlineData("CONIN$")]            // ⚠️ 带 `$` 的伪设备；**裸 `CONIN` 是正常文件，别顺手加**
+    [InlineData("CONOUT$")]
     public async Task ProviderUpsert_WithAnUnsafeId_IsRejected(string id)
     {
         var cmd = new CoreCommand.ProviderUpsert(id, "k", null, null, null, null);
@@ -97,6 +102,9 @@ public class ProviderIdTests : IDisposable
     [InlineData("NULx")]               // ⚠️ **反向对照**：前缀型判据会误杀它（实测是正常文件）
     [InlineData("COM1x")]              // ⚠️ 反向对照：同上（实测正常写入）
     [InlineData("COM10")]              // ⚠️ 反向对照：保留表只有 1–9（实测 `COM10.json` 正常写入）
+    [InlineData("COM0")]               // ⚠️ 反向对照：**下边界** 0 不是设备名（`PRN`/`AUX` 那类分支的边界）
+    [InlineData("LPT0")]
+    [InlineData("CONIN")]              // ⚠️ 反向对照：**裸** `CONIN` 是正常文件（只有 `CONIN$` 才是伪设备）
     public async Task ProviderUpsert_WithASafeId_IsAccepted(string id)
     {
         var cmd = new CoreCommand.ProviderUpsert(id, "k", null, null, null, null);
@@ -120,18 +128,80 @@ public class ProviderIdTests : IDisposable
     [InlineData("", false)]
     [InlineData("   ", false)]
     [InlineData("a\0b", false)]
-    [InlineData("NUL", false)]          // ⚠️ Windows 设备名：写入会**静默消失**
+    [InlineData("NUL", false)]          // ⚠️ Windows 设备名：未捕获异常**掀翻常驻进程**（不是静默）
     [InlineData("nul", false)]          // 大小写不敏感
     [InlineData("CON.json", false)]     // 去掉扩展名再比
     [InlineData("NUL.txt.txt.json", false)]   // 第一个点之前那段才是判据（不是 GetFileNameWithoutExtension）
     [InlineData("NUL  .json", false)]         // 尾随空格 ⇒ TrimEnd
     [InlineData("COM1.json", false)]          // 1–9 那一族（走抛异常）
+    [InlineData("PRN", false)]                // ⚠️ PRN / AUX 两条分支原先**零覆盖**（删掉即变异存活）
+    [InlineData("AUX", false)]
+    [InlineData("LPT9", false)]               // 下边界那一族
+    [InlineData("CONIN$", false)]             // 带 `$` 的伪设备
+    [InlineData("CONOUT$", false)]
     [InlineData("NULx", true)]                // ⚠️ 反向：前缀型会误杀
     [InlineData("COM1x", true)]               // ⚠️ 反向
     [InlineData("COM10", true)]               // ⚠️ 反向：只有 1–9
+    [InlineData("COM0", true)]                // ⚠️ 反向：下边界
+    [InlineData("LPT0", true)]
+    [InlineData("CONIN", true)]               // ⚠️ 反向：裸 CONIN 正常（只有带 `$` 的才是伪设备）
     [InlineData("local", true)]
     [InlineData("my-provider", true)]
     [InlineData("本地", true)]
     public void IsSafeProviderId_PinsThePredicateItself(string id, bool expected) =>
         Assert.Equal(expected, CommandDispatcher.IsSafeProviderId(id));
+
+    /// <summary>
+    /// ⚠️ **上标 `¹` `³`（U+00B9 / U+00B3）也算设备名的「数字」——而别的「数字」写法不算。**
+    ///
+    /// <para>复审点名风险抓出的缺口：判据原先用字面量范围 `'1'..'9'`，于是
+    /// `COM¹` / `LPT³` **被放行**——而实测它们与 `COM1` 一样抛未捕获异常**掀翻常驻进程**
+    /// （`ProviderStore.Save` → `AtomicFile` 的 `.tmp` 写入在 `try` **之外** ⇒ 直接冒出去）。</para>
+    ///
+    /// <para>⚠️ **只加上标这三个，别扩**：实测 `COM⁴` `COM⁵` `COM⁹`（U+2074…）、全角 `COM１`（U+FF11）、
+    /// 阿拉伯-印度 `COM١`（U+0661）**都是正常文件**。按「数字」的直觉去扩，会把判据开得比系统宽——
+    /// 那是另一个方向的错（见本测试的反向那半）。</para>
+    ///
+    /// <para>⚠️ **这里用 `(char)0x00B9` 拼进字符串，不写进 `InlineData` 字面量**：上标是**易混淆字符**，
+    /// 字面量会在某个环节被工具链规范化成普通数字 —— 于是测试**绿了却什么都没测**。
+    /// 本项目吃过这个亏（`ParserTests` 的 NBSP 那两条就是这么防的）。
+    /// ⇒ **不可见的输入要用字节核**；这里由构造方式保证，不赌肉眼与工具链。**</para>
+    /// </summary>
+    [Fact]
+    public void IsSafeProviderId_RejectsSuperscriptDigits_ButNotOtherDigitForms()
+    {
+        var sup1 = new string((char)0x00B9, 1);   // ¹
+        var sup3 = new string((char)0x00B3, 1);   // ³
+
+        // 设备名（实测走 AtomicFile 抛异常 ⇒ 必须拒）
+        Assert.False(CommandDispatcher.IsSafeProviderId("COM" + sup1));
+        Assert.False(CommandDispatcher.IsSafeProviderId("LPT" + sup3));
+
+        // ⚠️ 反向：别的「数字」写法**不是**设备名（实测都正常写入）⇒ 必须放行
+        Assert.True(CommandDispatcher.IsSafeProviderId("COM" + (char)0x2074));  // ⁴
+        Assert.True(CommandDispatcher.IsSafeProviderId("COM" + (char)0xFF11));  // １ 全角
+        Assert.True(CommandDispatcher.IsSafeProviderId("COM" + (char)0x0661));  // ١ 阿拉伯-印度
+    }
+
+    /// <summary>
+    /// ⚠️ **`CONIN$` / `CONOUT$` 是伪设备，而裸 `CONIN` / `CONOUT` 是正常文件。**
+    ///
+    /// <para>实测走 `ProviderStore.Save`（`AtomicFile`）：`CONIN$` 抛 `IOException`、
+    /// `CONOUT$` 抛 `UnauthorizedAccessException` ⇒ 未捕获 ⇒ **掀翻常驻进程**；
+    /// 而 `CONIN` / `CONOUT`（无 `$`）**正常写入**。</para>
+    ///
+    /// <para>⚠️ **反向那半更要紧**：把 `CONIN` 也挡掉会误杀一个完全正当的名字——
+    /// 而判据收窄得过头时，**症状是「少挡了」而不是「多挡了」**，没人会发现。
+    /// ⇒ 两端一起钉。</para>
+    /// </summary>
+    [Fact]
+    public void IsSafeProviderId_RejectsTheDollarPseudoDevices_ButNotTheBareNames()
+    {
+        Assert.False(CommandDispatcher.IsSafeProviderId("CONIN$"));
+        Assert.False(CommandDispatcher.IsSafeProviderId("CONOUT$"));
+
+        // ⚠️ 反向：裸名字两个都是**正常文件**（实测）⇒ 必须放行
+        Assert.True(CommandDispatcher.IsSafeProviderId("CONIN"));
+        Assert.True(CommandDispatcher.IsSafeProviderId("CONOUT"));
+    }
 }
