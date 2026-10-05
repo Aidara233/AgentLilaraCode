@@ -1,7 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 
-namespace Lilara.Core.Projects;
+namespace Lilara.Core.Kernel;
 
 // projectKey = 工作目录规范化后的指纹。
 // Project 是涌现的、不是声明的：一个文件夹天然就是一个 project。

@@ -1,7 +1,7 @@
 using Lilara.Core.Adapters;
 using Lilara.Core.Hosting;
 using Lilara.Core.Adapters.Claude;
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 using Lilara.Core.Console;
 using Lilara.Core.Persistence;
 using Lilara.Core.Providers;
@@ -474,7 +474,7 @@ public class ReplTests : IDisposable
     {
         var (repl, _, session) = NewHarness();
         new Lilara.Core.Persistence.ClaimStore(session.Spec.WorkingDirectory)
-            .Save([new Lilara.Core.Session.Claim("other", "pk", @"c:\repo\src", DateTimeOffset.UnixEpoch)]);
+            .Save([new Lilara.Core.Kernel.Claim("other", "pk", @"c:\repo\src", DateTimeOffset.UnixEpoch)]);
 
         await repl.ExecuteAsync("claim list", CancellationToken.None);
 
@@ -559,7 +559,7 @@ public class ReplTests : IDisposable
     {
         var (repl, _, session) = NewHarness();
         new Lilara.Core.Persistence.ClaimStore(session.Spec.WorkingDirectory)
-            .Save([new Lilara.Core.Session.Claim("other", "pk", @"c:\repo\src", DateTimeOffset.UnixEpoch)]);
+            .Save([new Lilara.Core.Kernel.Claim("other", "pk", @"c:\repo\src", DateTimeOffset.UnixEpoch)]);
 
         await repl.ExecuteAsync("claim LIST", CancellationToken.None);
 

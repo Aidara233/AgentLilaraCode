@@ -1,5 +1,5 @@
 using System.Text.Json;
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 using Lilara.Core.Persistence;
 
 namespace Lilara.Core.Providers;

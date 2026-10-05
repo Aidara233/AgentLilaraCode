@@ -2,8 +2,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using Lilara.Core.Adapters;
-using Lilara.Core.Projects;
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 using Lilara.Core.Control;
 using Lilara.Core.Hosting;
 using Lilara.Core.Persistence;
@@ -438,7 +437,7 @@ public class ControlServerTests : IAsyncLifetime
     [Fact]
     public async Task SessionCreate_PublishesSessionCreatedOnTheProjectTopic()
     {
-        var pk = Projects.ProjectKey.FromPath(_work);
+        var pk = Kernel.ProjectKey.FromPath(_work);
         using var sub = _bus.Subscribe(EventBus.ProjectTopic(pk));
 
         await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);

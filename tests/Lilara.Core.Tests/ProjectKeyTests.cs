@@ -1,4 +1,4 @@
-using Lilara.Core.Projects;
+using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Tests;
 

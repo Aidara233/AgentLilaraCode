@@ -1,7 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using Lilara.Core.Canonical;
-using Lilara.Core.Records;
+using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Adapters.OpenAi;
 

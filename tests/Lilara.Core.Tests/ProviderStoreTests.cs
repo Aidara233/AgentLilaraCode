@@ -1,3 +1,4 @@
+using Lilara.Core.Kernel;
 using Lilara.Core.Adapters;
 using Lilara.Core.Providers;
 
@@ -175,7 +176,7 @@ public class ProviderStoreTests : IDisposable
         Assert.False(File.Exists(bad));
     }
 
-    // ProviderStore.Save 直接用 Canonical.Json.Options 序列化本类型（没有 IgnoreReadOnlyProperties），
+    // ProviderStore.Save 直接用 Kernel.Json.Options 序列化本类型（没有 IgnoreReadOnlyProperties），
     // 加派生属性会多出键、静默变更磁盘格式（T6 的 hasApiKey 就是这么进的盘）。
     // 两份清单缺一不可，都按 Name:Type 整串 Ordinal 定序（反射属性顺序不保证）：
     // ① 声明的属性（加属性即红）；② 会被写盘的属性（摘掉 [JsonIgnore] 即红——① 盖不住的那一格）。

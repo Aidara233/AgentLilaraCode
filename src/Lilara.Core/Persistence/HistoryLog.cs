@@ -1,8 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
-using Lilara.Core.Canonical;
-using Lilara.Core.Records;
+using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Persistence;
 

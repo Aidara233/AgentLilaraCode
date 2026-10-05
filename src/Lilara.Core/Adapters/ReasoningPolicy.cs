@@ -1,6 +1,6 @@
-using Lilara.Core.Adapters;
+using Lilara.Core.Kernel;
 
-namespace Lilara.Core.Canonical;
+namespace Lilara.Core.Adapters;
 
 // 各协议能不能承载推理——一个显式的地方，而不是散在三个适配器里的 if。
 // Claude：能承载（要求 signature）；Chat / Responses：完全不暴露推理 → 不能承载，丢且不伪造。

@@ -1,5 +1,5 @@
 using System.Text.Json;
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Adapters.OpenAi;
 

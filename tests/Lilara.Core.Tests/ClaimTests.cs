@@ -1,3 +1,4 @@
+using Lilara.Core.Kernel;
 using Lilara.Core.Session;
 
 namespace Lilara.Core.Tests;

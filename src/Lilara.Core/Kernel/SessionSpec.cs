@@ -1,4 +1,4 @@
-namespace Lilara.Core.Persistence;
+namespace Lilara.Core.Kernel;
 
 // 会话持有的模型选择：解析结果的快照 + 指向定义的引用。
 public sealed record ModelSelection

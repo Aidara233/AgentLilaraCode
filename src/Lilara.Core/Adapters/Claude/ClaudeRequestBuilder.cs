@@ -1,7 +1,6 @@
 using Anthropic.Models.Messages;
-using Lilara.Core.Canonical;
-using Lilara.Core.Records;
-using CanonicalBlock = Lilara.Core.Canonical.Block;
+using Lilara.Core.Kernel;
+using CanonicalBlock = Lilara.Core.Kernel.Block;
 
 namespace Lilara.Core.Adapters.Claude;
 

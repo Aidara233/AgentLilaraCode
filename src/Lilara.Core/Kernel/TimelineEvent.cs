@@ -1,7 +1,7 @@
 using System.Text.Json.Serialization;
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 
-namespace Lilara.Core.Records;
+namespace Lilara.Core.Kernel;
 
 // 发言者。最小闭环只有这两种。
 public enum Speaker
@@ -28,5 +28,5 @@ public abstract record TimelineEvent
     // 同 Json.StableSerialize 的陷阱：推断成具体子类会丢掉判别式 "kind"，
     // 而且写的时候静默、直到反序列化才炸。事件泵广播它，写错的帧要到解析才发现。
     public static string StableSerialize(TimelineEvent value) =>
-        System.Text.Json.JsonSerializer.Serialize(value, Canonical.Json.Options);
+        System.Text.Json.JsonSerializer.Serialize(value, Kernel.Json.Options);
 }

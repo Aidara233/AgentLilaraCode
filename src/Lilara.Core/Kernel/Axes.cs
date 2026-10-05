@@ -1,4 +1,4 @@
-namespace Lilara.Core.Session;
+namespace Lilara.Core.Kernel;
 
 /// <summary>
 /// 行为控制轴（`01` §3.5）——**五轴的唯一真相来源**。

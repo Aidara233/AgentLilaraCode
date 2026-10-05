@@ -2,7 +2,7 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace Lilara.Core.Canonical;
+namespace Lilara.Core.Kernel;
 
 // 落盘与回读共用的 JSON 设置。
 public static class Json

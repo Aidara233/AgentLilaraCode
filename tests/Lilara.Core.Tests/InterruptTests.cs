@@ -1,5 +1,5 @@
 using Lilara.Core.Adapters;
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 using Lilara.Core.Control;
 using Lilara.Core.Hosting;
 using Lilara.Core.Persistence;

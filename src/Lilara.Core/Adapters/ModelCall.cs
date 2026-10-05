@@ -1,5 +1,4 @@
-using Lilara.Core.Canonical;
-using Lilara.Core.Records;
+using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Adapters;
 

@@ -1,3 +1,4 @@
+using Lilara.Core.Kernel;
 using Lilara.Core.Providers;
 
 namespace Lilara.Core.Adapters.OpenAi;

@@ -1,4 +1,4 @@
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 using Lilara.Core.Persistence;
 
 namespace Lilara.Core.Session;
@@ -84,7 +84,7 @@ public sealed record SessionHandle
 
     public static SessionHandle Create(SessionStore store, string workingDirectory, ModelSelection model)
     {
-        var projectKey = Projects.ProjectKey.FromPath(workingDirectory);
+        var projectKey = Kernel.ProjectKey.FromPath(workingDirectory);
         var spec = new SessionSpec
         {
             SessionId = Guid.NewGuid().ToString("N")[..12],

@@ -1,4 +1,4 @@
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 using Lilara.Core.Control;
 using Lilara.Core.Persistence;
 using System.Text.Json;

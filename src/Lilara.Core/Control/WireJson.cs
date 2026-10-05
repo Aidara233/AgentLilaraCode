@@ -4,7 +4,7 @@ using System.Text.Json.Serialization;
 
 namespace Lilara.Core.Control;
 
-// 线上的 JSON 设置。与 Canonical.Json.Options 刻意分开：共用会让 wire 的 converter
+// 线上的 JSON 设置。与 Kernel.Json.Options 刻意分开：共用会让 wire 的 converter
 // 污染落盘契约，并把磁盘契约与线上契约锁死在同一份演进上。
 public static class WireJson
 {

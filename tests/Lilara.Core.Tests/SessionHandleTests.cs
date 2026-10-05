@@ -1,3 +1,4 @@
+using Lilara.Core.Kernel;
 using Lilara.Core.Adapters;
 using Lilara.Core.Persistence;
 using Lilara.Core.Session;
@@ -126,7 +127,7 @@ public class SessionHandleTests : IDisposable
     public void Create_LeavesNoListableButUnloadableSessionIfItDiesMidway()
     {
         // 模拟「崩在两次写之间」；只调 Create() 测不出顺序，必须手工造出中间态。
-        var projectKey = Lilara.Core.Projects.ProjectKey.FromPath(@"C:\work");
+        var projectKey = Lilara.Core.Kernel.ProjectKey.FromPath(@"C:\work");
         var mid = _store.SessionDirectory(projectKey, "999999999999");
 
         // 只写 state，不写 spec —— 正是「先 state 后 spec」崩溃后的残骸。

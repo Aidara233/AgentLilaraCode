@@ -1,8 +1,7 @@
 using Lilara.Core.Adapters;
 using Lilara.Core.Control;
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 using Lilara.Core.Persistence;
-using Lilara.Core.Records;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
 

@@ -1,5 +1,5 @@
 using System.Text.Json.Serialization;
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Control;
 

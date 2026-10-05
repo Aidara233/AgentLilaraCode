@@ -1,3 +1,4 @@
+using Lilara.Core.Kernel;
 using Lilara.Core.Adapters;
 using Lilara.Core.Control;
 using Lilara.Core.Hosting;
@@ -59,7 +60,7 @@ public class ClaimCommandTests : IDisposable
     {
         var (_, d, bus) = Harness();
         var sid = NewSession(d);
-        var pk = Lilara.Core.Projects.ProjectKey.FromPath(_work);
+        var pk = Lilara.Core.Kernel.ProjectKey.FromPath(_work);
         using var sub = bus.Subscribe(EventBus.ProjectTopic(pk));
 
         await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
@@ -107,7 +108,7 @@ public class ClaimCommandTests : IDisposable
         var sid = NewSession(d);
         await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
 
-        using var sub = bus.Subscribe(EventBus.ProjectTopic(Lilara.Core.Projects.ProjectKey.FromPath(_work)));
+        using var sub = bus.Subscribe(EventBus.ProjectTopic(Lilara.Core.Kernel.ProjectKey.FromPath(_work)));
         var r = await d.DispatchAsync(new CoreCommand.ClaimRelease(sid, ["src"]), "c2", false, CancellationToken.None);
 
         Assert.IsType<Ack.Accepted>(r.Ack);
@@ -122,7 +123,7 @@ public class ClaimCommandTests : IDisposable
     {
         var (_, d, bus) = Harness();
         var sid = NewSession(d);
-        using var sub = bus.Subscribe(EventBus.ProjectTopic(Lilara.Core.Projects.ProjectKey.FromPath(_work)));
+        using var sub = bus.Subscribe(EventBus.ProjectTopic(Lilara.Core.Kernel.ProjectKey.FromPath(_work)));
 
         var r = await d.DispatchAsync(new CoreCommand.ClaimRelease(sid, ["never"]), "c1", false, CancellationToken.None);
 
@@ -284,7 +285,7 @@ public class ClaimCommandTests : IDisposable
     {
         var (_, d, bus) = Harness();
         var sid = NewSession(d);
-        var pk = Lilara.Core.Projects.ProjectKey.FromPath(_work);
+        var pk = Lilara.Core.Kernel.ProjectKey.FromPath(_work);
         using var sub = bus.Subscribe(EventBus.ProjectTopic(pk));
 
         await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c1", false, CancellationToken.None);
@@ -302,7 +303,7 @@ public class ClaimCommandTests : IDisposable
     {
         var (_, d, bus) = Harness();
         var sid = NewSession(d);
-        var pk = Lilara.Core.Projects.ProjectKey.FromPath(_work);
+        var pk = Lilara.Core.Kernel.ProjectKey.FromPath(_work);
         await d.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c0", false, CancellationToken.None);
         using var sub = bus.Subscribe(EventBus.ProjectTopic(pk));
 

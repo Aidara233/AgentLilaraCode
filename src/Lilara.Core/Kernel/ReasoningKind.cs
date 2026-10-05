@@ -1,4 +1,4 @@
-namespace Lilara.Core.Canonical;
+namespace Lilara.Core.Kernel;
 
 // 推理块的形态。单一来源——ReasoningBlock.Kind、ReasoningPolicy、适配器都读这里。
 // 这些字符串会落盘，改动即数据迁移。

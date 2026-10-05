@@ -1,4 +1,4 @@
-namespace Lilara.Core.Adapters;
+namespace Lilara.Core.Kernel;
 
 // 协议标识：单一来源。
 // 这些字符串会落盘（spec.json 的 model.protocol、providers/*.json 的 protocol），改动即数据迁移——

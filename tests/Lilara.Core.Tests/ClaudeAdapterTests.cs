@@ -1,3 +1,4 @@
+using Lilara.Core.Kernel;
 using System.Net;
 using Anthropic.Exceptions;
 using Lilara.Core.Adapters;

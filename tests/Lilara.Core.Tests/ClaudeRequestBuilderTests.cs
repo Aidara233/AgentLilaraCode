@@ -1,11 +1,10 @@
 using System.Text.Json;
 using Lilara.Core.Adapters;
 using Lilara.Core.Adapters.Claude;
-using Lilara.Core.Canonical;
-using Lilara.Core.Records;
+using Lilara.Core.Kernel;
 using Anthropic.Models.Messages;
 using AnthropicRole = Anthropic.Models.Messages.Role;
-using CanonicalBlock = Lilara.Core.Canonical.Block;
+using CanonicalBlock = Lilara.Core.Kernel.Block;
 
 namespace Lilara.Core.Tests;
 

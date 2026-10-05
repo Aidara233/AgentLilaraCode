@@ -1,6 +1,6 @@
 using Lilara.Core.Adapters;
 using Lilara.Core.Persistence;
-using Lilara.Core.Records;
+using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Session;
 
@@ -38,7 +38,7 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
     /// `state.json` 最后写——崩在中间只让 turn 偏小，历史不损坏。</para>
     /// </summary>
     public async Task<ModelReply> StepAsync(
-        SessionHandle handle, IReadOnlyList<Canonical.Block> blocks, CancellationToken ct)
+        SessionHandle handle, IReadOnlyList<Kernel.Block> blocks, CancellationToken ct)
     {
         // 「now 冻结在步开始」（00 §2.5）——同一步内重复渲染必须逐字节相同
         var at = DateTimeOffset.UtcNow;
@@ -144,7 +144,7 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
     /// </summary>
     public Task<ModelReply> StepAsync(SessionHandle handle, string userText, CancellationToken ct)
     {
-        var blocks = new List<Canonical.Block> { new Canonical.Block.TextBlock(userText) };
+        var blocks = new List<Kernel.Block> { new Kernel.Block.TextBlock(userText) };
 
         // ⚠️ 与 dispatcher 同一条次序：**先追加再入队**，然后取空。
         _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent

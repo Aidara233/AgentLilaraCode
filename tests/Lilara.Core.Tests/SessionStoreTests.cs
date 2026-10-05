@@ -1,7 +1,6 @@
 using Lilara.Core.Adapters;
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 using Lilara.Core.Persistence;
-using Lilara.Core.Records;
 
 namespace Lilara.Core.Tests;
 

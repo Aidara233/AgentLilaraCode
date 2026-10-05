@@ -1,8 +1,7 @@
 using Lilara.Core.Adapters;
-using Lilara.Core.Canonical;
+using Lilara.Core.Kernel;
 using Lilara.Core.Hosting;
 using Lilara.Core.Persistence;
-using Lilara.Core.Records;
 using Lilara.Core.Session;
 
 namespace Lilara.Core.Console;

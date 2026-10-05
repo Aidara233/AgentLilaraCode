@@ -1,5 +1,6 @@
 using Lilara.Core.Adapters.Claude;
 using Lilara.Core.Adapters.OpenAi;
+using Lilara.Core.Kernel;
 using Lilara.Core.Providers;
 
 namespace Lilara.Core.Adapters;

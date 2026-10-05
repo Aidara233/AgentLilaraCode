@@ -5,6 +5,7 @@ using System.Text.Json;
 using Lilara.Core.Adapters;
 using Lilara.Core.Control;
 using Lilara.Core.Hosting;
+using Lilara.Core.Kernel;
 using Lilara.Core.Persistence;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
@@ -149,15 +150,15 @@ public sealed class ControlServer(
         // ⇒ values 的顺序（= 档位序）也是契约的一部分，别排序。
         app.MapGet("/axes", () => Results.Json(new
         {
-            Axes = Session.Axes.Names.Select(n => new
+            Axes = Kernel.Axes.Names.Select(n => new
             {
                 Name = n,
-                Label = Session.Axes.LabelOf(n),
-                Values = Session.Axes.ValuesOf(n),
-                InContext = Session.Axes.InContext(n),
+                Label = Kernel.Axes.LabelOf(n),
+                Values = Kernel.Axes.ValuesOf(n),
+                InContext = Kernel.Axes.InContext(n),
             }),
-            AlertSafety = Session.Axes.AlertSafety,
-            AlertFrom = Session.Axes.AlertFrom,
+            AlertSafety = Kernel.Axes.AlertSafety,
+            AlertFrom = Kernel.Axes.AlertFrom,
         }, WireJson.Options));
 
         // 没有声明时回 []（「没人声明」是合法且最常见的形态）。
@@ -198,12 +199,12 @@ public sealed class ControlServer(
     }
 
     // 一条事件的可渲染形态（核心渲染，头只显示）。
-    private static object Render(Records.TimelineEvent evt)
+    private static object Render(Kernel.TimelineEvent evt)
     {
-        var m = (Records.TimelineEvent.MessageEvent)evt;
+        var m = (Kernel.TimelineEvent.MessageEvent)evt;
         return new
         {
-            From = m.From == Records.Speaker.User ? "user" : "model",
+            From = m.From == Kernel.Speaker.User ? "user" : "model",
             At = m.At,
             Blocks = m.Blocks,
         };
@@ -405,7 +406,7 @@ public sealed class ControlServer(
             "session.start" => new CoreCommand.SessionStart(payload.GetProperty("sessionId").GetString()!),
             "session.send" => new CoreCommand.SessionSend(
                 payload.GetProperty("sessionId").GetString()!,
-                payload.GetProperty("blocks").Deserialize<List<Canonical.Block>>(WireJson.Options)!),
+                payload.GetProperty("blocks").Deserialize<List<Kernel.Block>>(WireJson.Options)!),
             // 线上解析是命令的第三条线（dispatcher / CoreCommandParser / 这里）——
             // 少一条，头发的帧会静默落到 `_ => throw`。
             "session.setAxis" => new CoreCommand.SessionSetAxis(

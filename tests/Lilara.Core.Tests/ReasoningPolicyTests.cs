@@ -1,4 +1,5 @@
-using Lilara.Core.Canonical;
+using Lilara.Core.Adapters;
+using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Tests;
 

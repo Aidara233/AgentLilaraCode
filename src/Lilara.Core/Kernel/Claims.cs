@@ -1,4 +1,4 @@
-namespace Lilara.Core.Session;
+namespace Lilara.Core.Kernel;
 
 /// <summary>一条声明（`01` §12.2）。</summary>
 /// <param name="Path">**已规范化**的绝对路径。别把原始输入存进来——判据会当场失效。</param>

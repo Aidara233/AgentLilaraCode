@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace Lilara.Core.Canonical;
+namespace Lilara.Core.Kernel;
 
 // 时间线上每个事件的载荷是一串块。最小闭环有文本块与推理块两种；
 // 图片 / 工具调用 / 工具结果按同样方式追加 [JsonDerivedType] 即可。

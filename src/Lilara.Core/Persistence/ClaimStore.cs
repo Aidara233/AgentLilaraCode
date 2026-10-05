@@ -1,4 +1,4 @@
-using Lilara.Core.Session;
+using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Persistence;
 
@@ -15,7 +15,7 @@ public sealed class ClaimStore(string workingDirectory)
         try
         {
             var parsed = System.Text.Json.JsonSerializer.Deserialize<List<Claim>>(
-                File.ReadAllText(Path_), Canonical.Json.Options) ?? [];
+                File.ReadAllText(Path_), Kernel.Json.Options) ?? [];
 
             // 丢掉 Path 为 null 的条目：Json.Options 没开 RespectNullableAnnotations，
             // 所以 "path": null（乃至数组元素 null：[null]）都是合法 JSON、不进下面的 catch，
@@ -32,7 +32,7 @@ public sealed class ClaimStore(string workingDirectory)
     }
 
     public void Save(IEnumerable<Claim> claims) =>
-        AtomicFile.Write(Path_, System.Text.Json.JsonSerializer.Serialize(claims.ToList(), Canonical.Json.Options));
+        AtomicFile.Write(Path_, System.Text.Json.JsonSerializer.Serialize(claims.ToList(), Kernel.Json.Options));
 
     // 按路径的锁。键必须规范化到小写——Windows 大小写不敏感，两个只差大小写的
     // 工作目录必须拿到同一把锁，否则丢更新。

@@ -1,3 +1,4 @@
+using Lilara.Core.Kernel;
 using Lilara.Core.Session;
 
 namespace Lilara.Core.Tests;
@@ -96,16 +97,16 @@ public class AxisTests
         try
         {
             var store = new Lilara.Core.Persistence.SessionStore(root);
-            var pk = Lilara.Core.Projects.ProjectKey.FromPath(@"C:\work");
-            store.WriteState(pk, new Lilara.Core.Persistence.SessionState
+            var pk = Lilara.Core.Kernel.ProjectKey.FromPath(@"C:\work");
+            store.WriteState(pk, new Lilara.Core.Kernel.SessionState
             {
                 SessionId = "s1", Status = "Idle", Turn = 0, Pending = [],   // 刻意不设 Axes
             });
-            store.WriteSpec(pk, new Lilara.Core.Persistence.SessionSpec
+            store.WriteSpec(pk, new Lilara.Core.Kernel.SessionSpec
             {
                 SessionId = "s1", ProjectKey = pk, WorkingDirectory = @"C:\work",
                 CreatedAt = DateTimeOffset.UnixEpoch,
-                Model = new Lilara.Core.Persistence.ModelSelection
+                Model = new Lilara.Core.Kernel.ModelSelection
                 {
                     ProviderId = "p", ModelId = "m", Protocol = "claude-messages",
                     Effort = "low", MaxTokens = 16000,
@@ -135,8 +136,8 @@ public class AxisTests
         try
         {
             var store = new Lilara.Core.Persistence.SessionStore(root);
-            var pk = Lilara.Core.Projects.ProjectKey.FromPath(@"C:\work");
-            store.WriteState(pk, new Lilara.Core.Persistence.SessionState
+            var pk = Lilara.Core.Kernel.ProjectKey.FromPath(@"C:\work");
+            store.WriteState(pk, new Lilara.Core.Kernel.SessionState
             {
                 SessionId = "s1", Status = "Idle", Turn = 0, Pending = [],
                 // 5 条轴里只有 2 条：既不全、又合法
@@ -146,11 +147,11 @@ public class AxisTests
                     [Axes.Effort] = "max",
                 },
             });
-            store.WriteSpec(pk, new Lilara.Core.Persistence.SessionSpec
+            store.WriteSpec(pk, new Lilara.Core.Kernel.SessionSpec
             {
                 SessionId = "s1", ProjectKey = pk, WorkingDirectory = @"C:\work",
                 CreatedAt = DateTimeOffset.UnixEpoch,
-                Model = new Lilara.Core.Persistence.ModelSelection
+                Model = new Lilara.Core.Kernel.ModelSelection
                 {
                     ProviderId = "p", ModelId = "m", Protocol = "claude-messages",
                     Effort = "low", MaxTokens = 16000,   // 与磁盘上那份故意不同

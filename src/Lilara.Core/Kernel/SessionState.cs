@@ -1,4 +1,4 @@
-namespace Lilara.Core.Persistence;
+namespace Lilara.Core.Kernel;
 
 // 每步原子重写。
 public sealed record SessionState
