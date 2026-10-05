@@ -4,20 +4,17 @@
 <meta charset="utf-8">
 <title>LILARA 头</title>
 <style>
-  /* ⚠️ **三栏是 `05` §5 的选择**（不是义务）。它按「阅读 vs 并行」分工：
-     中栏保证日常阅读，右栏偿还并行债。
-     ⚠️ **右栏恒常占位、不收起、不浮出**（§5 明说）：浮出的东西你要先注意到它浮出了，
-     而那正好抵消了它存在的意义。 */
+  /* 三栏：中栏保证阅读，右栏偿还并行债。右栏恒常占位、不收起。 */
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.6 system-ui, "Segoe UI", sans-serif; display: flex; height: 100vh; }
 
-  /* 左栏：项目 / 会话树。⛔ 不做声明树内 ⚠——§7.2 说树里的 ⚠ 会被忽略，冲突要上浮到右栏。 */
+  /* 左栏：项目 / 会话树。声明冲突上浮到右栏，不在树里标。 */
   #left { width: 240px; border-right: 1px solid #ddd; overflow: auto; padding: 8px; background: #fafafa; }
 
-  /* 中栏：专注会话。时间线是**要读**的东西，所以它拿最大的地方。 */
+  /* 中栏：时间线，占最大地方。 */
   #center { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 
-  /* 右栏：注意力。⚠️ **恒常占位**——不收起（§5）。 */
+  /* 右栏：注意力。恒常占位，不收起。 */
   #right { width: 320px; border-left: 1px solid #ddd; overflow: auto; padding: 8px; background: #fafafa; }
 
   #top { padding: 8px 12px; border-bottom: 1px solid #ddd; display: flex; gap: 12px; align-items: center; }
@@ -37,25 +34,22 @@
   #status { margin-left: auto; font-size: 12px; color: #666; }
   h4 { margin: 12px 0 4px; font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: .05em; }
 
-  /* ⚠️ 义务 1：两个头槽位**并排**（`05` §4 明说「不是折叠在一个详情里」）——
-     归位错误（人设同时出现在系统与首要）**只在并排时看得出来**。 */
+  /* 两个头槽位并排，不折叠——归位错误只在并排时看得出来。 */
   #slots { border-top: 1px solid #ddd; padding: 8px 12px; font-size: 12px; display: flex; gap: 16px; }
   .slot { flex: 1; min-width: 0; }
   .slot b { display: block; color: #333; margin-bottom: 2px; }
   .slot .body { color: #666; white-space: pre-wrap; max-height: 4.8em; overflow: auto; }
 
-  /* ⚠️ 义务 4：安全轴**不许收进「更多设置」**（`05` §4）——它的全部价值是「用户忘了
-     说这是生产环境」时能提醒，藏起来等于取消它。所以它就在右栏最上面，加粗。 */
+  /* 安全轴固定在右栏最上、加粗，不许收进「更多设置」——藏起来等于取消它。 */
   #safety-row { padding: 6px; border-radius: 4px; }
   #safety-row.alert { background: #ffecec; border: 1px solid #e88; }
   #alert { color: #b00; font-size: 12px; margin-top: 4px; }
   .axis { display: flex; align-items: center; gap: 6px; margin: 3px 0; font-size: 12px; }
   .axis label { width: 68px; color: #555; }
   .axis select { flex: 1; font: inherit; font-size: 12px; }
-  .axis.effort { opacity: .55; }   /* ⚠️ effort 不进上下文（01 §3.5）——视觉上标出来 */
+  .axis.effort { opacity: .55; }   /* effort 不进上下文——视觉上标出来 */
 
-  /* ⚠️ 浮动槽（`01` §3.2）：它是**头槽位之后的那个槽**，五轴的显示落点。
-     ⚠️ 有界是它的硬约束——这里用 max-height 兑现，别让它长成第二个时间线。 */
+  /* 浮动槽：五轴的显示落点。有界是硬约束——别让它长成第二个时间线。 */
   #floating { border-top: 1px solid #ddd; padding: 6px 12px; font-size: 12px; color: #666; max-height: 6em; overflow: auto; }
   .claim { font-size: 12px; padding: 3px 0; border-bottom: 1px dotted #eee; }
   .claim .who { color: #888; }
@@ -75,14 +69,7 @@
     <span id="status">未连接</span>
   </div>
 
-  <!-- ⚠️ **引导页**（`05` §2.2）：核心启动后没有任何会话与提供商，而
-       「配置提供商 → 建初始会话」**是头的行为**（策略归头，机制归核心）。
-       ⚠️ 此时**不能做别的**——所以它挡住输入框（见 `showOnboarding`）。
-       ⚠️ **这个元素必须在 T9 里就存在**：T9 的验收第 1 条测的就是「引导页出现」，
-       而 `$("onboarding")` 为 null 时 `showOnboarding()` 会抛
-       `Cannot set properties of null` ⇒ **引导页根本不显示**。
-       （原本它在 T10 才加，而 T10 的验收是 T9 的验收，顺序上倒置了。）
-       ⚠️ 头的「引导」只到「提示你在哪配」为止——不做配置表单，见计划 D5。 -->
+  <!-- 核心启动后无会话无提供商时显示它，并挡住输入框。 -->
   <div id="onboarding" style="display:none" class="banner">
     <b>先配置一个提供商。</b>核心启动后是空的——没有提供商不能推进任何会话。<br>
     在**核心的终端**里执行：<br>
@@ -92,17 +79,13 @@
 
   <div id="timeline"></div>
 
-  <!-- ⚠️ **义务 1**：两个头槽位**并排**，且**空的也要显示**（§7.1）。
-       裸核心连系统提示词都没有（`04` §1.3）是**合法形态**，
-       但用户要能看见「它真的是空的」，而不是以为头坏了。 -->
+  <!-- 义务 1：两个槽位并排，空的也要显示。 -->
   <div id="slots">
     <div class="slot"><b>系统提示词（义务 1）</b><div class="body muted" id="slot-system">（空）</div></div>
     <div class="slot"><b>首要提示词（义务 1）</b><div class="body muted" id="slot-premier">（空）</div></div>
   </div>
 
-  <!-- ⚠️ **浮动槽**（`01` §3.2 的**尾槽位**）：义务 4 的落点。
-       ⚠️ 它的内容是**头拼的**（`05` §3 的分工：轴的值核心给，怎么排是显示）。
-       核心的 `slots.floating` 现在是空的——核心还没有装配器。 -->
+  <!-- 浮动槽：义务 4 的落点。 -->
   <div id="floating"><b>浮动</b> <span id="floating-body">（核心侧装配器尚未实现）</span></div>
 
   <div id="compose">
@@ -112,10 +95,10 @@
 </div>
 
 <div id="right">
-  <!-- ⚠️ **义务 4**：安全轴在最上面，且跨轴告警就长在它下面。 -->
+  <!-- 义务 4：安全轴在最上面，跨轴告警在它下面。 -->
   <h4>安全轴（义务 4）</h4>
   <div id="safety-row">
-    <!-- ⚠️ 标签**留空**：由 `renderAxes` 从核心交的 `label` 填（`05` §3：渲染归核心）。 -->
+    <!-- 标签留空：由 renderAxes 从核心交的 label 填。 -->
     <div class="axis"><label id="ax-safety-label"></label><select id="ax-safety"></select></div>
     <div id="alert"></div>
   </div>
@@ -123,9 +106,6 @@
   <h4>行为控制轴</h4>
   <div id="axes"></div>
 
-  <!-- ⚠️ **义务 3 明说阻塞**：与其显示一个永远为空的「待决策」让用户分不清
-       「没有待审批」与「闸门坏了」，不如**明说核心侧还没有闸门**。
-       闸门的前提是工具，而工具集从插件宿主派生、插件宿主不存在（`01` §9.1）。 -->
   <h4>待决策（义务 3）</h4>
   <div class="banner" id="approvals-blocked">
     ⛔ <b>核心侧尚未实现。</b>审批流需要权限闸门，而闸门的前提是「工具」——
@@ -134,7 +114,7 @@
   </div>
 
   <h4>声明（义务 2）</h4>
-  <!-- ⚠️ 冲突在这里，**不在树里**（§7.2：树里的 ⚠ 会被忽略）。 -->
+  <!-- 声明冲突在这里，不在树里。 -->
   <div id="claim-conflicts"></div>
   <div id="claims"></div>
 </div>

@@ -28,11 +28,7 @@ public class ClaudeRequestBuilderTests
         Timeline = timeline,
     };
 
-    /// <summary>
-    /// 取出消息的内容块列表。
-    /// ⚠️ 构造期**总是**块列表——单条文本的 string 快路径已经去掉了，
-    /// 因为推理块必须和文本块一起按顺序回放，快路径表达不了这件事。
-    /// </summary>
+    // 取出消息的内容块列表；推理块必须与文本块按顺序一起回放，string 快路径表达不了。
     private static IReadOnlyList<ContentBlockParam> BlocksOf(MessageParam m)
     {
         Assert.True(m.Content.TryPickContentBlockParams(out var blocks));
@@ -87,10 +83,7 @@ public class ClaudeRequestBuilderTests
         Assert.Equal(["一", "二", "三"], texts);
     }
 
-    /// <summary>
-    /// ⚠️ 00 §5 铁律：推理块**逐字回传**（含签名），顺序不能乱。
-    /// 这是多轮 tool use 的前提，也是严格上游的硬要求。
-    /// </summary>
+    // 推理块逐字回传（含签名）且顺序不能乱——严格上游的硬要求。
     [Fact]
     public void Build_ReplaysReasoningBlocksVerbatimBeforeText()
     {
@@ -110,7 +103,7 @@ public class ClaudeRequestBuilderTests
         var blocks = BlocksOf(p.Messages[1]);
         Assert.Equal(2, blocks.Count);
 
-        // 签名一个字符都不能动
+        // 签名一个字符都不能动。
         Assert.True(blocks[0].TryPickThinking(out var thinking));
         Assert.Equal("想想", thinking!.Thinking);
         Assert.Equal("sig-==", thinking.Signature);
@@ -119,11 +112,7 @@ public class ClaudeRequestBuilderTests
         Assert.Equal("答案", text!.Text);
     }
 
-    /// <summary>
-    /// 拒答不写模型事件，于是「问 → 拒答 → 再问」在时间线上是**连着两条 user**。
-    /// API 参考自相矛盾（README 说同角色会被合并；错误表把 `roles must alternate`
-    /// 列为 400）——不赌歧义，构造期自己合并成一条。
-    /// </summary>
+    // 拒答不写模型事件，于是时间线上会连着两条 user；API 参考自相矛盾，故构造期自己合并成一条。
     [Fact]
     public void Build_MergesAdjacentSameRoleEvents()
     {
@@ -141,7 +130,7 @@ public class ClaudeRequestBuilderTests
         Assert.Equal("二", second!.Text);
     }
 
-    /// <summary>合并只发生在**相邻**处——中间隔着模型回话的两条 user 不能并。</summary>
+    // 合并只发生在相邻处。
     [Fact]
     public void Build_DoesNotMergeAcrossADifferentRole()
     {
@@ -153,7 +142,7 @@ public class ClaudeRequestBuilderTests
         Assert.Equal(3, p.Messages.Count);
     }
 
-    /// <summary>纯函数（00 §5 铁律 1）：同一份输入必须构造出逐字节相同的请求。</summary>
+    // 同一份输入必须构造出逐字节相同的请求。
     [Fact]
     public void Build_IsPure()
     {
@@ -171,7 +160,7 @@ public class ClaudeRequestBuilderTests
     [Fact]
     public void Build_OmitsSystemWhenThereAreNoSystemBlocks()
     {
-        // 04 §1.3：裸核心连系统提示词都没有
+        // 裸核心连系统提示词都没有。
         var p = ClaudeRequestBuilder.Build(Request(Msg(Speaker.User, "hi")));
 
         Assert.Null(p.System);
@@ -187,7 +176,7 @@ public class ClaudeRequestBuilderTests
 
         var p = ClaudeRequestBuilder.Build(request);
 
-        // MessageCreateParamsSystem 是 union（string | 块列表），只能 TryPick 出来
+        // MessageCreateParamsSystem 是 union（string | 块列表），只能 TryPick 出来。
         Assert.True(p.System!.TryPickTextBlockParams(out var systemBlocks));
         Assert.Equal("你是助手", systemBlocks![0].Text);
     }
@@ -210,7 +199,7 @@ public class ClaudeRequestBuilderTests
     [Fact]
     public void Build_RejectsUnknownEffortInsteadOfSilentlyDowngrading()
     {
-        // ⚠️ 静默降级会把 "xhihg" 这种拼写错误变成 High——最难查的一类 bug
+        // 静默降级会把拼写错误（如 "xhihg"）变成 High——最难查的一类 bug。
         var request = Request(Msg(Speaker.User, "hi")) with { Effort = "xhihg" };
 
         Assert.Throws<ArgumentException>(() => ClaudeRequestBuilder.Build(request));
@@ -227,7 +216,7 @@ public class ClaudeRequestBuilderTests
     [Fact]
     public void Build_ThrowsOnEmptyTimeline()
     {
-        // Review Focus #1：空 messages 会被 API 以 400 拒绝，必须早失败
+        // 空 messages 会被 API 以 400 拒绝，必须早失败。
         var ex = Assert.Throws<ArgumentException>(
             () => ClaudeRequestBuilder.Build(Request()));
 
@@ -237,8 +226,7 @@ public class ClaudeRequestBuilderTests
     [Fact]
     public void Build_ThrowsOnMessageWithNoBlocks()
     {
-        // 与空时间线同类：Content = [] 会被 API 400 拒绝，也必须早失败。
-        // Blocks 是普通 required 列表，没有非空不变量，所以真能走到这里
+        // Content = [] 会被 API 400 拒绝；Blocks 是普通 required 列表，没有非空不变量，能真走到这里。
         var empty = new TimelineEvent.MessageEvent
         {
             At = DateTimeOffset.UnixEpoch,

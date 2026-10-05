@@ -7,29 +7,18 @@ namespace Lilara.Core.Tests;
 
 public class WireFormatTests
 {
-    /// <summary>
-    /// ⚠️ **G3 的核心断言**：wire 的 options 与磁盘的 options 必须是**两个不同的实例**。
-    ///
-    /// <para>不是洁癖：`Json.Options.Converters` 是**可变的 `List`** 挂在共享静态实例上。
-    /// 哪个人为了 wire 往上加一个 converter，就**同时改了落盘格式**——
-    /// 而 `history.jsonl` 只追加、永不重写，改一次就是一次数据迁移。
-    /// 这条测试让那次「顺手共用」立刻红。</para>
-    /// </summary>
+    // wire 与磁盘的 options 必须是两个不同实例——Converters 是可变 List，
+    // 共用会让 wire 的改动同时改掉落盘格式（而 history.jsonl 只追加、永不重写）。
     [Fact]
     public void WireOptions_AreNotTheSameInstanceAsDiskOptions()
     {
         Assert.NotSame(Json.Options, WireJson.Options);
 
-        // ⚠️ 而且 `Converters` 也必须是各自独立的列表——
-        // 共享同一个 List 实例的话，「两个 options 对象」只是表象。
+        // Converters 也必须是各自独立的 List，否则「两个 options 对象」只是表象。
         Assert.NotSame(Json.Options.Converters, WireJson.Options.Converters);
     }
 
-    /// <summary>
-    /// ⚠️ 两边的**策略值**目前是一致的（camelCase / 枚举按名 / 丢 null）。
-    /// 钉住它是为了让「哪天有人只改了一边」立刻显形——
-    /// 那时要么是有意的契约分叉（应当同时更新这条测试并写明理由），要么是个 bug。
-    /// </summary>
+    // 两边策略值目前一致；钉住它是为了「哪天有人只改了一边」立刻显形。
     [Fact]
     public void WireOptions_CurrentlyMirrorTheDiskPolicies()
     {
@@ -38,7 +27,7 @@ public class WireFormatTests
         Assert.Equal(Json.Options.Converters.Count, WireJson.Options.Converters.Count);
     }
 
-    /// <summary>⚠️ 事件必须带判别式——头靠它分派。</summary>
+    // 事件必须带判别式——头靠它分派。
     [Fact]
     public void WireEvent_CarriesItsDiscriminator()
     {
@@ -47,11 +36,7 @@ public class WireFormatTests
         Assert.Contains("\"kind\":\"session.step.begin\"", json);
     }
 
-    /// <summary>
-    /// ⚠️ `axis.changed` 的判别式（`session.setAxis` 的产物）。
-    /// 形状与其余事件一致是**头能不能分派**的全部依据——漏了注册时它不会报错，
-    /// 只会序列化成 `{}`（基类没有属性），而头直到解析才发现。
-    /// </summary>
+    // axis.changed 的判别式；漏了注册不会报错，只会序列化成 {}（基类没有属性）。
     [Fact]
     public void WireEvent_AxisChangedCarriesItsDiscriminatorAndValues()
     {
@@ -62,11 +47,7 @@ public class WireFormatTests
         Assert.Contains("\"value\":\"max\"", json);
     }
 
-    /// <summary>
-    /// ⚠️ **嵌套块的判别式也要在**——`WireEvent` 的载荷里带 `IReadOnlyList&lt;Block&gt;`，
-    /// 而块自己的多态判别式同样取自静态声明类型（这里是 `Block`，正好对）。
-    /// 少了它，头收到一串没有类型的块，渲染不出来。
-    /// </summary>
+    // 嵌套 Block 的判别式取自静态声明类型，少了它头收到一串没有类型的块。
     [Fact]
     public void WireEvent_NestedBlocksKeepTheirDiscriminator()
     {
@@ -78,10 +59,7 @@ public class WireFormatTests
         Assert.Contains("\"text\":\"你好\"", json);
     }
 
-    /// <summary>
-    /// ⚠️ 推理块的无签名形状在 wire 上必须与磁盘**同形**（`signature` 键整个不出现）。
-    /// 头将来要显示推理摘要，形状不一致会让它读到 null 而不是「没有这个键」。
-    /// </summary>
+    // 无签名推理块在 wire 上必须与磁盘同形（signature 键整个不出现），否则头读到 null 而不是「没有这个键」。
     [Fact]
     public void WireEvent_ReasoningBlockWithoutSignature_OmitsTheKey()
     {
@@ -92,7 +70,7 @@ public class WireFormatTests
         Assert.DoesNotContain("signature", json);
     }
 
-    /// <summary>信封：`seq` 与 `topic` 是**流**的属性，与载荷分开。</summary>
+    // 信封：seq 与 topic 是流的属性，与载荷分开。
     [Fact]
     public void Frame_IsATransportEnvelopeAroundAPayload()
     {
@@ -105,11 +83,7 @@ public class WireFormatTests
         Assert.Contains("\"kind\":\"session.state\"", json);   // 载荷自己的判别式仍在
     }
 
-    /// <summary>
-    /// ⚠️ 回执**只有两类**（`03` §3）。这条钉住「业务失败不许挤进来」：
-    /// `Accepted=false` 的 `Reason` 语义是「**命令本身不合法**」，
-    /// 不是「这次调用失败了」——后者走 `WireEvent.Error`。
-    /// </summary>
+    // 回执只有两类；Accepted=false 的 Reason 是「命令本身不合法」，不是「这次调用失败」（后者走 WireEvent.Error）。
     [Theory]
     [InlineData(true)]
     [InlineData(false)]

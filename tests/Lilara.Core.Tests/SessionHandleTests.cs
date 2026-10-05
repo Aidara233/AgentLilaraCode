@@ -52,8 +52,7 @@ public class SessionHandleTests : IDisposable
 
         var loaded = SessionHandle.Load(_store, created.ProjectKey, created.SessionId);
 
-        // ⚠️ 不能写 Assert.Equal(created.State, loaded.State)：Pending 是集合，
-        // record 的自动相等对集合成员用引用相等，那条断言必挂。
+        // record 自动相等对集合成员用引用相等，故不能整记录比较 Pending。
         Assert.Equal(created.Spec, loaded.Spec);
         Assert.Equal(created.State.SessionId, loaded.State.SessionId);
         Assert.Equal(created.State.Status, loaded.State.Status);
@@ -72,23 +71,7 @@ public class SessionHandleTests : IDisposable
         Assert.Equal(3, _store.ReadState(handle.ProjectKey, handle.SessionId).Turn);
     }
 
-    /// <summary>
-    /// ⚠️ **I2 的交错，用「两条 `Task` + `Barrier`」的形状钉住**（终审 I2）。
-    ///
-    /// <para>两个角色各自复刻一处**真实写点**：
-    /// **A = `session.setAxis`**（读 `State` → `with { Axes }` → 写回），
-    /// **B = `Stepper` 收尾**（读 `State` → `with { Status, Turn+1 }` → 写回）。
-    /// 两处**不共享别的锁**——`setAxis` 刻意不拿会话闸（`01` §3.5 要求即时生效），
-    /// 而 `Stepper` 拿的那把闸**挡不住 `setAxis`**。</para>
-    ///
-    /// <para>⚠️ **旧写法（`handle.State = handle.State with { … }`）下这条实测红**：
-    /// 200000 轮里 `Turn` 只剩约 **11.6 万**——**约四成更新被整份盖掉**
-    ///（每一次丢的是一次「后写的把先写的整份替换掉」）。
-    /// 现在两处都走 `UpdateState`（同一把锁）⇒ 两个字段都不丢。</para>
-    ///
-    /// <para>⚠️ **判据必须是「`Turn` 恰好等于轮数」**，不是区间：这两个角色**只**经 `UpdateState`
-    /// 写 `State`、没有别的写点，所以精确值可以要求；用区间会掩盖「丢一点也算过」。</para>
-    /// </summary>
+    // setAxis 不拿会话闸（要求即时生效），其读-改-写必须与 Stepper 的 Turn 自增共用一个 UpdateState 临界区。
     [Fact]
     public async Task UpdateState_TwoWriters_AxisAndTurn_BothSurvive()
     {
@@ -121,12 +104,7 @@ public class SessionHandleTests : IDisposable
             }
         });
 
-        // ⚠️ **`await Task.WhenAll`，不是 `Task.WaitAll`**——后者在本项目里是一条
-        // **编译错误**（xUnit1031：测试方法不得用阻塞式 task 操作，`-warnaserror` 下即 error）。
-        // ⚠️ 断言与轮数（200_000）**一字未动**：这条测试的意图是「两个写者交错 20 万轮、
-        // `Turn` 一次都不丢」，换掉等待方式不改变那个意图。
-        // ⚠️ **别改回 `Task.WaitAll`**：`dotnet build` 增量时分析器不重跑，
-        // 于是「0 警告」在改回去之后**照样打印得出来**——而全量构建是红的。
+        // 必须 await Task.WhenAll：Task.WaitAll 触发 xUnit1031（-warnaserror 下即 error）。
         await Task.WhenAll(setAxisRole, stepperRole);
 
         Assert.Equal(rounds, handle.State.Turn);                        // Turn 一次都没丢
@@ -147,12 +125,11 @@ public class SessionHandleTests : IDisposable
     [Fact]
     public void Create_LeavesNoListableButUnloadableSessionIfItDiesMidway()
     {
-        // ⚠️ 这条测试直接模拟「崩在两次写之间」，验证残留物是**隐形**的而不是致命的。
-        // 只调 Create() 测不出顺序——必须手工造出那个中间态。
+        // 模拟「崩在两次写之间」；只调 Create() 测不出顺序，必须手工造出中间态。
         var projectKey = Lilara.Core.Projects.ProjectKey.FromPath(@"C:\work");
         var mid = _store.SessionDirectory(projectKey, "999999999999");
 
-        // 只写 state，不写 spec —— 正是「先 state 后 spec」崩溃后的残骸
+        // 只写 state，不写 spec —— 正是「先 state 后 spec」崩溃后的残骸。
         Directory.CreateDirectory(mid);
         _store.WriteState(projectKey, new SessionState
         {
@@ -162,26 +139,13 @@ public class SessionHandleTests : IDisposable
             Pending = [],
         });
 
-        // 隐形：ListSessions 看不到它，于是没人会去 Load 它
+        // 隐形：ListSessions 看不到它，于是没人会去 Load 它。
         Assert.Empty(_store.ListSessions(projectKey));
         Assert.Null(_store.TryReadSpec(projectKey, "999999999999"));
     }
 
-    /// <summary>
-    /// ⚠️ **轴的 effort 必须与 spec 一致，否则 `Stepper` 从轴读会与建会话时的意图分叉。**
-    /// 不播种的话，一个 spec 说 `low` 的会话，轴会是表默认值 `high`——**出生即分叉**，
-    /// 而用户从没设过轴。
-    ///
-    /// <para>⚠️ **今天没有任何代码路径能产出 `effort != "high"` 的 spec**：`ProviderDefinition`
-    /// 没有 effort 字段，唯一的建会话调用点写死 `"high"`（`CommandDispatcher.cs:114`）。
-    /// 所以这条测试**用 `with { Effort = "low" }` 直接构造 spec** 来钉规则本身——
-    /// 它守的是「将来接上按提供商配 effort 时不会分叉」，而不是描述今天的行为。</para>
-    ///
-    /// <para>⚠️ 第二次 <see cref="SessionHandle.Load"/> 是**这条测试的另一半**：
-    /// 种子只有落盘才活得过重启（`Create` 里那一份 `state` 直接被 `WriteState`）；
-    /// 不落盘的话，重启后 `State.Axes` 是 null，`Load` 会补一份默认值把 `low`
-    /// **静默改回** `high`。</para>
-    /// </summary>
+    // 轴的 effort 必须与 spec 一致，否则 Stepper 从轴读会与建会话意图分叉（出生即分叉）。
+    // 种子只有落盘才活得过重启，否则 Load 会补默认值把 low 静默改回 high。
     [Fact]
     public void Create_SeedsTheEffortAxisFromTheSpec_AndItSurvivesAReload()
     {
@@ -193,11 +157,7 @@ public class SessionHandleTests : IDisposable
         Assert.Equal("low", reloaded.State.Axes![Axes.Effort]);
     }
 
-    /// <summary>
-    /// ⚠️ spec 里的 effort 可能是**表里没有的拼写错误**（`ClaudeRequestBuilder.ToEffort` 会为它抛异常）。
-    /// 那种值**不能**种进轴：头会渲染出一个「没有任何选项被选中」的下拉，
-    /// 比「悄悄用默认值」更坏——用户看到的是一个无法解释的空档。
-    /// </summary>
+    // spec 里表里没有的 effort 拼写错误不能种进轴：头会渲染出一个没有任何选项被选中的下拉。
     [Fact]
     public void Create_WithAnUnknownEffortInTheSpec_FallsBackToTheTableDefault()
     {
@@ -206,11 +166,7 @@ public class SessionHandleTests : IDisposable
         Assert.Equal(Axes.Defaults()[Axes.Effort], handle.State.Axes![Axes.Effort]);
     }
 
-    /// <summary>
-    /// ⚠️ spec 里的大小写变体要**规范化**再入轴（`CompleteAxes` 用 `Axes.TryParse`）。
-    /// 原样存 `"HIGH"` 会同时坏两件事：`ClaudeRequestBuilder.ToEffort` 的 switch
-    /// **区分大小写** ⇒ 请求时抛异常；头的下拉按表里的小写拼法匹配 ⇒ 一个选项都选不中。
-    /// </summary>
+    // spec 里的大小写变体要规范化再入轴：ToEffort 的 switch 区分大小写，头的下拉按小写匹配。
     [Fact]
     public void Create_NormalizesTheEffortCaseFromTheSpec()
     {
@@ -219,21 +175,8 @@ public class SessionHandleTests : IDisposable
         Assert.Equal("high", handle.State.Axes![Axes.Effort]);
     }
 
-    /// <summary>
-    /// ⚠️ **轴与 `Turn` 住同一份 `State`**（`SessionState.Axes`）。
-    /// 这条守的是「别把它们拆成两份」：一旦 `SaveAxes` 改成从轴另构造一个 `SessionState`，
-    /// `Turn` 会被抹成 0，而这一步**没有任何报错**——只是重启后会话「失忆」，
-    /// 且磁盘上看不出是哪次写坏的。
-    ///
-    /// <para>⚠️ **判据用 `Turn` 而不是 `Status`**：`"Running"` 只存在于内存
-    /// （`Stepper.cs:51` 那个 `with`），**磁盘上写过的状态只有 `"Idle"`**——
-    /// 写点共三处：`SessionHandle.Create` 的播种、`Stepper` 的收尾、
-    /// `SessionHandle.SaveAxes`（`session.setAxis` 的写回点；它写整份 `State`，
-    /// 所以**先把 `Status` 钉回 `Idle`**，见那里的注释）。构造一个
-    /// `Status = "Running"` 的 state 去落盘，等于在测一个真实数据里不存在的形状。
-    /// 而 `Status = "Idle"` 又恰好是 `SessionState` 的默认语义，**抹掉它这条测试也发现不了**
-    /// ⇒ 拿它当判据是假覆盖。`Turn` 的默认值是 0，抹掉会立刻显形。</para>
-    /// </summary>
+    // 轴与 Turn 住同一份 State，别拆成两份（拆了 Turn 会被抹成 0 且无报错）。
+    // 判据用 Turn 而不是 Status——磁盘上写过的状态只有 "Idle"，抹掉它这条测试也发现不了。
     [Fact]
     public void SaveAxes_WritesTheAxisWithoutDisturbingTurn()
     {

@@ -29,9 +29,7 @@ public class TimelineEventTests
     [Fact]
     public void RoundTrip_IsByteForByteStable()
     {
-        // ⚠️ 不能写 Assert.Equal(original, back)：Blocks 是集合，
-        // record 的自动相等对集合成员用引用相等，那条断言必挂。
-        // 往返字节相等覆盖面更强——它正是「序列化不丢判别式」想守的东西。
+        // record 自动相等对集合成员用引用相等，故断言走字节相等。
         TimelineEvent original = new TimelineEvent.MessageEvent
         {
             At = DateTimeOffset.UnixEpoch,
@@ -89,8 +87,7 @@ public class TimelineEventTests
 
         var json = JsonSerializer.Serialize(original, Json.Options);
 
-        // ⚠️ 落盘格式必须自解释：整数枚举既不可读，也会因重排静默重解释既有历史。
-        // 属性名与枚举值都是 camelCase（Json.Options），判别式 kind 由特性显式指定，不受影响。
+        // 落盘枚举必须是名字：整数既不可读，也会因重排静默重解释既有历史。
         Assert.Contains("\"from\":\"model\"", json);
         Assert.DoesNotContain("\"from\":1", json);
     }
@@ -107,7 +104,6 @@ public class TimelineEventTests
 
         var json = JsonSerializer.Serialize(original, Json.Options);
 
-        // ⚠️ 同一个对象里只能有一种约定：判别式值与枚举值都是小写。
         Assert.Contains("\"kind\":\"message\"", json);
         Assert.Contains("\"from\":\"user\"", json);
     }

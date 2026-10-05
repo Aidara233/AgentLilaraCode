@@ -69,9 +69,7 @@ public class SessionStoreTests : IDisposable
     [Fact]
     public void State_RoundTripsAPopulatedPendingQueue()
     {
-        // ⚠️ Pending 存在的全部理由就是「崩溃重启后待办不丢」——
-        // 只测空队列等于没测这个字段。它序列化成 IReadOnlyList<string>，
-        // 是有真实风险的接口类型，必须带值走一遍。
+        // Pending 的理由是「崩溃重启后待办不丢」；它序列化成 IReadOnlyList<string>，必须带值走一遍。
         var state = new SessionState
         {
             SessionId = "s1",
@@ -85,14 +83,14 @@ public class SessionStoreTests : IDisposable
 
         Assert.Equal("WaitingForInput", back.Status);
         Assert.Equal(7, back.Turn);
-        // 逐元素比较——Pending 是集合，整记录 Assert.Equal 会退化成引用相等
+        // Pending 是集合，整记录 Assert.Equal 会退化成引用相等，故逐元素比较。
         Assert.Equal(new[] { "m1", "m2" }, back.Pending);
     }
 
     [Fact]
     public void ListSessions_ReturnsMostRecentFirst()
     {
-        // ⚠️ 调用方取 [0] 当"当前会话"——顺序错了会随机续到别的会话上
+        // 调用方取 [0] 当「当前会话」，顺序错了会续到别的会话上。
         void Make(string id, DateTimeOffset createdAt) =>
             _store.WriteSpec("p1", Spec() with { SessionId = id, CreatedAt = createdAt });
 
@@ -106,8 +104,7 @@ public class SessionStoreTests : IDisposable
     [Fact]
     public void ListSessions_SkipsCorruptSpecRatherThanCrashingStartup()
     {
-        // ⚠️ 一个损坏的会话目录不该让整个核心起不来。
-        // 只判 File.Exists 挡不住这个——损坏的 JSON 会抛 JsonException 穿透出去。
+        // 一个损坏的会话目录不该让整个核心起不来；只判 File.Exists 挡不住，损坏的 JSON 会抛 JsonException。
         _store.WriteSpec("p1", Spec() with { SessionId = "good" });
 
         var badDir = _store.SessionDirectory("p1", "bad");
@@ -168,19 +165,14 @@ public class SessionStoreTests : IDisposable
         Assert.Empty(_store.ReadTimeline("p1", "s1"));
     }
 
-    /// <summary>
-    /// ⚠️ `Append` 用的是 <c>File.AppendAllText</c>，**不是原子**的：断电可能留下半行。
-    /// 而 history.jsonl 只追加、永不重写（01 §12.4），那半行会一直在。
-    /// 读的时候必须跳过它——完好前缀才是值钱的部分；
-    /// 让一条半行把整个会话炸掉（重启后第一条 `history` 就直接吐栈）是本末倒置。
-    /// </summary>
+    // Append 用的 File.AppendAllText 不是原子的，断电会留半行；history.jsonl 只追加不重写，读时须跳过半行。
     [Fact]
     public void Timeline_SkipsTornLastLineRatherThanCrashing()
     {
         _store.AppendEvent("p1", "s1", Msg("一"));
         _store.AppendEvent("p1", "s1", Msg("二"));
 
-        // 模拟断电截断：半个 JSON 对象，且**没有结尾换行**
+        // 模拟断电截断：半个 JSON 对象，没有结尾换行。
         File.AppendAllText(
             Path.Combine(_store.SessionDirectory("p1", "s1"), "history.jsonl"),
             "{\"kind\":\"message\",\"at\":\"2026-09-30T00:00:00+00:00\",\"from\":\"u");

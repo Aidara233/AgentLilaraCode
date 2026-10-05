@@ -1,10 +1,7 @@
 namespace Lilara.Core.Persistence;
 
-/// <summary>
-/// 全局数据根的解析（01 §8）。
-/// LILARA_HOME ?? ~/.lilara（Windows 下 ~ = %USERPROFILE%）。
-/// 多用户天然隔离：每个 OS 用户一份数据根，不需要额外的换用户机制。
-/// </summary>
+// 全局数据根：LILARA_HOME ?? ~/.lilara（Windows 下 ~ = %USERPROFILE%）。
+// 每个 OS 用户一份，天然隔离，不需要额外的换用户机制。
 public static class DataRoot
 {
     public const string EnvVar = "LILARA_HOME";

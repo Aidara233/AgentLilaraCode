@@ -17,7 +17,6 @@ public class ProjectKeyTests
     [Fact]
     public void FromPath_IsCaseInsensitive()
     {
-        // Windows 路径大小写不敏感（01 §12.1 要求规范化）
         Assert.Equal(ProjectKey.FromPath(@"C:\Work\Proj"),
                      ProjectKey.FromPath(@"c:\work\proj"));
     }

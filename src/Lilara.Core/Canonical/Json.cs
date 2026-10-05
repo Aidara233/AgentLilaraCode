@@ -4,32 +4,24 @@ using System.Text.Json.Serialization;
 
 namespace Lilara.Core.Canonical;
 
-/// <summary>落盘与回读共用的 JSON 设置。</summary>
+// 落盘与回读共用的 JSON 设置。
 public static class Json
 {
     public static readonly JsonSerializerOptions Options = new()
     {
         WriteIndented = false,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        // ⚠️ camelCase：判别式 kind 本来就是小写，属性却是大驼峰——同一对象两种约定。
-        // 控制面（03）要把这些同一批类型序列化给 Web 头，camelCase 正是那边要的形状。
+        // camelCase：判别式 kind 本就是小写，属性却大驼峰——同一对象只能有一种约定；
+        // 控制面把这批类型给 Web 头，camelCase 正是那边要的形状。
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        // ⚠️ 不转义非 ASCII。Unsafe 是相对「注入 HTML」说的；
-        // 本地文件存储正是它的正确用途，否则中文会被写成 \u4f60\u597d。
+        // 不转义非 ASCII：Unsafe 是相对「注入 HTML」说的，本地文件存储正是它的用途。
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-        // ⚠️ 枚举按名落盘，且值也是 camelCase——判别式的值本就是小写，
-        // 同一对象里只能有一种约定。整数枚举既不可读，也会因成员重排静默重解释既有历史；
-        // history.jsonl 是只追加、永不重写的，写错一次就是一次数据迁移。
+        // 枚举按名落盘、值也是 camelCase：整数枚举不可读，也会因成员重排静默重解释既有历史。
         Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
     };
 
-    /// <summary>
-    /// 稳定序列化入口。**参数类型必须是 `Block`（基类），不能写成泛型 `T`。**
-    /// ⚠️ 实测：`JsonSerializer.Serialize<Block>(b)` 会带上判别式 `"kind"`；
-    /// 而 `Serialize(b)` 泛型推断成具体子类 `TextBlock` 时，**判别式整个丢掉** ——
-    /// 出站 JSON 变成 `{"text":"hi"}`，反序列化时就认不出这是哪种块了。
-    /// 这正是「静态类型决定序列化形状」的陷阱，而它是静默的。
-    /// </summary>
+    // 稳定序列化入口。参数类型必须是 Block（基类），不能写成泛型 T——
+    // Serialize(b) 推断成具体子类时会丢掉判别式 "kind"，出站 JSON 变成 {"text":"hi"}。
     public static string StableSerialize(Block value) =>
         JsonSerializer.Serialize(value, Options);
 }

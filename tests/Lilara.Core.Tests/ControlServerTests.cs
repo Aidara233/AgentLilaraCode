@@ -12,19 +12,9 @@ using Lilara.Core.Session;
 
 namespace Lilara.Core.Tests;
 
-/// <summary>
-/// 控制面（`03`）——HTTP 快照 + WS。
-///
-/// <para>⚠️ 这些测试**真的起一个 Kestrel 并真的连**（短连接、端口由**系统分配**）。
-/// 理由：控制面的错法大多是「形状对但接不上」——CORS 头、WS 握手、
-/// 帧的序列化、并发写 socket 抛异常。**桩测不到那些**。</para>
-///
-/// <para>⚠️ 端口用 <b>0</b>（让 OS 分配）、**不是** `Random.Next(...)`：写死端口会让并行测试互撞
-/// （见 `ControlServer` 的注释：端口可注入是「集成测试写得出来」的前提），
-/// 而**随机**端口也靠不住——本机 Windows 的 TCP **排除段**（如 `50000-50059`，Hyper-V/WSL 保留）
-/// 落在随机区间里，绑到它会抛 `WSAEACCES`（复审实测：6 次全量跑里红 1 次）。
-/// ⇒ 绑 0、再从启动后的应用读回**系统实际分配的**端口。</para>
-/// </summary>
+// 控制面（HTTP 快照 + WS）：真的起 Kestrel 并真的连（短连接、端口由系统分配）——控制面的错法大多是
+// 「形状对但接不上」（CORS 头、WS 握手、帧序列化、并发写 socket），桩测不到。
+// 端口绑 0 让 OS 分配（不是 Random.Next）：随机段会撞上 Windows 的 TCP 排除段（Hyper-V/WSL 保留），绑到它会抛 WSAEACCES。
 public class ControlServerTests : IAsyncLifetime
 {
     private readonly string _root =
@@ -48,16 +38,12 @@ public class ControlServerTests : IAsyncLifetime
             DefaultModel = "m", Modality = "vision",
         });
         _bus = new EventBus();
-        // ⚠️ 预置回复：让步**真的走通**（而不是每次都撞「没有预置回复了」）。
-        // 这样事件里才有模型那条 `message.appended` 与 `step.end`，
-        // 否则测的只是「失败路径也发事件」。
+        // 预置回复：让步真的走通，事件里才有模型那条 message.appended 与 step.end，否则测的只是「失败路径也发事件」。
         _adapter = new Fakes.FakeAdapter();
         _adapter.Reply("好的").Reply("好的").Reply("好的");
         _dispatcher = new CommandDispatcher(_host, _bus, h => new Stepper(_host.Store, _adapter));
 
-        // ⚠️ 绑 **0**（让 OS 分配）而不是 `Random.Next(...)`：随机段会撞上 Windows 的 TCP 排除段
-        // （`WSAEACCES`），复审实测 6 次全量跑红 1 次。端口从启动后的应用读回来
-        //（`StartAsync` 返回 `WebApplication`，`Urls` 里是系统**实际**分配的地址）。
+        // 绑 0 让 OS 分配：随机段会撞上 Windows 的 TCP 排除段（WSAEACCES）；端口从启动后的应用读回来。
         _server = new ControlServer(_host, _dispatcher, _bus, 0);
         _app = await _server.StartAsync(CancellationToken.None);
         _port = new Uri(_app.Urls.First()).Port;
@@ -78,27 +64,20 @@ public class ControlServerTests : IAsyncLifetime
 
     private static readonly HttpClient Client = new() { Timeout = TimeSpan.FromSeconds(10) };
 
-    /// <summary>⚠️ 只监听本机（`03` §10「鉴权最小」）。</summary>
+    // 只监听本机（鉴权最小）。
     [Fact]
     public void BindAddress_IsLoopbackOnly() =>
         Assert.Equal("127.0.0.1", ControlServer.BindAddress);
 
-    /// <summary>
-    /// ⚠️ 快照必须带 **`seq` 高水位**（`03` §7 的原子性）：头拿它去 `subscribe(since:)`，
-    /// 「拉快照 → 订阅」之间落的事件才**不漏不重**。少了它头要么永远缺一条、要么重复渲染，
-    /// 而**头是无状态的**——每次刷新都重来。
-    /// </summary>
+    // 快照必须带 seq 高水位：头拿它去 subscribe(since:)，「拉快照 → 订阅」之间落的事件才不漏不重。
     [Fact]
     public async Task History_And_State_CarryTheSeqHighWaterMark()
     {
         var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
         var sid = ((Ack.Accepted)created.Ack).SessionId!;
 
-        // ⚠️ **建会话本身会发事件**（`session.created`，项目流 + 会话流各一条）——
-        // 所以高水位**不是从 0 起**。这条测试原本假设「建会话不产生事件」，
-        // 那个前提在复审补上 `session.created` 之后就不成立了。
-        // ⇒ 断言改成「与 `HighWaterMark` 读数一致」——**那才是真正的不变量**
-        //（快照带的高水位必须等于当时的流高水位），而不是写死一个数。
+        // 建会话本身会发事件（session.created，项目流 + 会话流各一条），故高水位不是从 0 起；
+        // 断言改成「与 HighWaterMark 读数一致」——那才是真正的不变量。
         var before = _bus.HighWaterMark(EventBus.SessionTopic(sid));
         _bus.Publish(EventBus.SessionTopic(sid), new WireEvent.Error(sid, "x"));
         var expected = _bus.HighWaterMark(EventBus.SessionTopic(sid));
@@ -110,12 +89,12 @@ public class ControlServerTests : IAsyncLifetime
         using var h = JsonDocument.Parse(history);
         using var s = JsonDocument.Parse(state);
 
-        // ⚠️ **不是写死 1**：是「快照带回来的**就是**流的高水位」。
+        // 不是写死 1：是「快照带回来的就是流的高水位」。
         Assert.Equal(expected, h.RootElement.GetProperty("highWater").GetInt64());
         Assert.Equal(expected, s.RootElement.GetProperty("highWater").GetInt64());
     }
 
-    /// <summary>⚠️ 未知会话 ⇒ **404**，不是 500、不是空对象。</summary>
+    // 未知会话 ⇒ 404，不是 500、不是空对象。
     [Fact]
     public async Task UnknownSession_Is404()
     {
@@ -124,10 +103,7 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Equal(System.Net.HttpStatusCode.NotFound, r.StatusCode);
     }
 
-    /// <summary>
-    /// ⚠️ 头是**独立 origin**，不放开 CORS 浏览器就连不上。
-    /// 预检（OPTIONS）必须回 204 且带允许头。
-    /// </summary>
+    // 头是独立 origin，不放开 CORS 浏览器就连不上；预检（OPTIONS）必须回 204 且带允许头。
     [Fact]
     public async Task Cors_AllowsTheHeadsOrigin()
     {
@@ -138,14 +114,8 @@ public class ControlServerTests : IAsyncLifetime
         Assert.True(r.Headers.Contains("Access-Control-Allow-Origin"));
     }
 
-    /// <summary>
-    /// ⚠️ **这条是控制面的核心验收**：连上 → 订阅 → 发命令 → 拿到 `ack` → 事件到达。
-    ///
-    /// <para>它一次验掉四件事，桩测都覆盖不到：
-    /// ① WS 握手通；② 帧的序列化形状对（头要按 `kind` 分派）；
-    /// ③ 命令**投递即返回**（`03` §1 判据 2）——`ack` 先到，事件随后来；
-    /// ④ 事件**带 `seq` 且单调**。</para>
-    /// </summary>
+    // 控制面的核心验收：连上 → 订阅 → 发命令 → 拿到 ack → 事件到达。
+    // 一次验掉 WS 握手、帧的序列化形状、命令投递即返回、事件带 seq 且单调。
     [Fact]
     public async Task WebSocket_AcksCommandsAndStreamsEvents()
     {
@@ -163,15 +133,12 @@ public class ControlServerTests : IAsyncLifetime
         // 订阅之后再发——订阅点之前的我们不关心
         await SendAsync(ws, "{\"kind\":\"subscribe\",\"topic\":\"session:" + sid + "\"}");
 
-        // ⚠️ **用拼接而不是 `$$"""`**：内插原始字符串里，载荷末尾的 `}}}` 会被当成内插洞的收尾
-        // （`CS9007`）——这个坑本项目已经踩过两次（T6/T8 的 brief）。拼接没有花括号歧义。
+        // 用拼接而不是 $$"""：内插原始字符串里，载荷末尾的 }}} 会被当成内插洞的收尾（CS9007）。
         await SendAsync(ws,
             "{\"kind\":\"command\",\"id\":\"c2\",\"payload\":{\"kind\":\"session.send\","
             + "\"sessionId\":\"" + sid + "\",\"blocks\":[{\"kind\":\"text\",\"text\":\"你好\"}]}}");
 
-        // ⚠️ **不能写死帧数**：ack 与 event 是两条独立的写路径，条数与时序都不定。
-        // 第一版写死「收 6 帧」，于是等第 6 帧等到超时——**那是测试的问题，不是实现的**。
-        // ⇒ 收到「我们真正在等的东西」就停。
+        // 不能写死帧数：ack 与 event 是两条独立的写路径，条数与时序都不定；收到真正在等的东西就停。
         var frames = new List<JsonElement>();
         for (var i = 0; i < 12; i++)
         {
@@ -190,20 +157,17 @@ public class ControlServerTests : IAsyncLifetime
         var events = frames.Where(f => f.GetProperty("kind").GetString() == "event").ToList();
         Assert.NotEmpty(events);
 
-        // ⚠️ 事件带 seq，且**单调增**
+        // 事件带 seq，且单调增
         var seqs = events.Select(e => e.GetProperty("seq").GetInt64()).ToList();
         for (var i = 1; i < seqs.Count; i++)
             Assert.True(seqs[i] > seqs[i - 1], "事件 seq 必须严格递增");
 
-        // ⚠️ 载荷自己的判别式也在（`WireEvent` 独立成根，不是继承 `TimelineEvent`）
+        // 载荷自己的判别式也在（WireEvent 独立成根，不是继承 TimelineEvent）
         Assert.Contains(events, e => e.GetProperty("payload").GetProperty("kind").GetString()
                                      == "message.appended");
     }
 
-    /// <summary>
-    /// ⚠️ 命令**不合法** ⇒ `accepted: false` + 理由（`rejected` 的正当用法）。
-    /// 而**业务失败**走 `error` 事件——两者混了，头会把网络抖动当成「你命令写错了」。
-    /// </summary>
+    // 命令不合法 ⇒ accepted: false + 理由；业务失败走 error 事件——两者混了头会把网络抖动当成「你命令写错了」。
     [Fact]
     public async Task WebSocket_RejectsAMalformedCommandWithoutClosingTheSocket()
     {
@@ -216,18 +180,14 @@ public class ControlServerTests : IAsyncLifetime
         Assert.False(ack.GetProperty("accepted").GetBoolean());
         Assert.Contains("nope", ack.GetProperty("reason").GetString());
 
-        // ⚠️ 而且 **socket 还活着**——一条坏命令不该踢掉头。
+        // 而且 socket 还活着——一条坏命令不该踢掉头。
         Assert.Equal(WebSocketState.Open, ws.State);
         await SendAsync(ws, """{"kind":"command","id":"c2","payload":{"kind":"provider.upsert","id":"p","apiKey":"k2"}}""");
         Assert.True((await ReceiveAsync(ws)).GetProperty("accepted").GetBoolean());
     }
 
-    /// <summary>
-    /// ⚠️ **线上的 `session.setAxis` 必须真的能到 dispatcher。**
-    /// T3 只在**类型**层加了命令，`ParseCommand` 的 switch 没跟上 ⇒ 帧落到 `_ => throw`
-    /// ⇒ 头（`05` §7.4 的轴下拉）发出来的东西全被回「命令形状不对」。
-    /// ⚠️ 这条测试走**真的 WS**，不是直接调 dispatcher——后者会在实现缺失时照样绿。
-    /// </summary>
+    // 线上的 session.setAxis 必须真的能到 dispatcher；走真的 WS，不是直接调 dispatcher——
+    // 后者会在实现缺失时照样绿。
     [Fact]
     public async Task WebSocket_SetAxis_ReachesTheDispatcher()
     {
@@ -236,80 +196,60 @@ public class ControlServerTests : IAsyncLifetime
 
         using var ws = new ClientWebSocket();
         await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
-        // ⚠️ **用拼接而不是 `$$"""`**：内插原始字符串里，载荷末尾的 `}}}` 会被当成内插洞的收尾
-        // （`CS9007`）——见 `WebSocket_AcksCommandsAndStreamsEvents` 的同款注释。
+        // 用拼接而不是 $$"""：载荷末尾的 }}} 会被当成内插洞的收尾（CS9007）。
         await SendAsync(ws, "{\"kind\":\"command\",\"id\":\"a1\",\"payload\":{\"kind\":\"session.setAxis\","
             + "\"sessionId\":\"" + sid + "\",\"axis\":\"safety\",\"value\":\"prod\"}}");
 
         var ack = await ReceiveAsync(ws);
         Assert.Equal("ack", ack.GetProperty("kind").GetString());
-        // ⚠️ **理由必须惰性取**：`WireJson.Options` 的 `WhenWritingNull` 把成功回执的 `reason`
-        // 整个省略（camelCase），`ack.GetProperty("reason")` 会**抛 KeyNotFoundException**。
-        // 而 `Assert.True` 的消息串是**无条件先求值**的——直接拼进去，成功那条路也照样炸
-        // （这是本测试第一版真踩到的：从「认不出命令」修好之后，失败点挪到了这行）。
-        // ⇒ 用 `TryGetProperty`，它在两种形态下都不抛。
+        // 理由必须惰性取：WhenWritingNull 把成功回执的 reason 整个省略，ack.GetProperty("reason") 会抛
+        // KeyNotFoundException，而 Assert.True 的消息串是无条件先求值的；用 TryGetProperty。
         Assert.True(ack.GetProperty("accepted").GetBoolean(),
             "认不出这条命令——`ParseCommand` 的 switch 漏了它："
             + (ack.TryGetProperty("reason", out var why) ? why.GetString() : "(无 reason 字段)"));
 
-        // ⚠️ 判据是「**命令真的生效了**」，不只是「回执说 accepted」——
-        // 回执可以说 accepted 而语义根本没跑（那正是「形状对但接不上」的形态）。
+        // 判据是「命令真的生效了」，不只是「回执说 accepted」——回执可以说 accepted 而语义根本没跑。
         var state = await Client.GetStringAsync(Http($"/sessions/{sid}/state"));
         using var doc = JsonDocument.Parse(state);
         Assert.Equal("prod", doc.RootElement.GetProperty("axes").GetProperty("safety").GetString());
     }
 
-    /// <summary>
-    /// ⚠️ **线上的 `provider.upsert`：省略 `apiKey` = 保留旧 key。**
-    ///
-    /// <para>⚠️ 判据是「帧里**根本没有** `apiKey` 键」——**不是** `"apiKey": null`。
-    /// 线上是 JSON，而 JSON 的「省略」就是这个形状；只有控制台走文本解析。
-    /// 只测控制台会漏掉线上这个臂，而这正是 G16 那条「两个前端」的形状。</para>
-    ///
-    /// <para>⚠️ 走**真的 WS**，不是直接调 dispatcher——后者在接线缺失时会照样绿。
-    /// 实现前这条必须红，且红的方式应当是「命令形状不对：The given key was not present…」
-    ///（`JsonElement.GetProperty` 对**缺失**的键**抛** `KeyNotFoundException`，实测行为）。</para>
-    /// </summary>
+    // 线上的 provider.upsert：省略 apiKey = 保留旧 key。
+    // 判据是「帧里根本没有 apiKey 键」，不是 "apiKey": null——线上是 JSON，省略就是这个形状；走真的 WS。
     [Fact]
     public async Task WebSocket_ProviderUpsert_WithoutTheApiKeyKey_KeepsTheStoredOne()
     {
-        // 前置：`InitializeAsync` 已存下 provider "p"（key="k"、协议 claude-messages）。
+        // 前置：InitializeAsync 已存下 provider "p"（key="k"、协议 claude-messages）。
         Assert.Equal("k", _host.Providers.Load("p")!.ApiKey);
 
         using var ws = new ClientWebSocket();
         await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
-        // ⚠️ 帧里**没有** `apiKey` 键——「省略」是键不存在，不是值为 null。
+        // 帧里没有 apiKey 键——「省略」是键不存在，不是值为 null。
         await SendAsync(ws, "{\"kind\":\"command\",\"id\":\"u1\",\"payload\":{\"kind\":\"provider.upsert\","
             + "\"id\":\"p\",\"protocol\":\"openai-chat\"}}");
 
         var ack = await ReceiveAsync(ws);
-        // ⚠️ **理由必须惰性取**：`WhenWritingNull` 把成功回执的 `reason` 整个省略（camelCase），
-        // 直接 `GetProperty("reason")` 会抛 `KeyNotFoundException`——见
-        // `WebSocket_SetAxis_ReachesTheDispatcher` 的同款注释。
+        // 理由必须惰性取：WhenWritingNull 把成功回执的 reason 省略，直接 GetProperty 会抛 KeyNotFoundException。
         Assert.True(ack.GetProperty("accepted").GetBoolean(),
             "省略 apiKey 的帧被回了「命令形状不对」——`ParseCommand` 那臂还在用 `GetProperty(\"apiKey\")`："
             + (ack.TryGetProperty("reason", out var why) ? why.GetString() : "(无 reason 字段)"));
 
-        // ⚠️ 判据是**盘上的后果**，不只是回执说 accepted：
-        //    协议真的改了，而 key 仍是旧的（不是被 null 抹成空）。
+        // 判据是盘上的后果，不只是回执说 accepted：协议真的改了，而 key 仍是旧的。
         var after = _host.Providers.Load("p")!;
         Assert.Equal(Protocols.OpenAiChat, after.Protocol);
         Assert.Equal("k", after.ApiKey);
     }
 
-    /// <summary>
-    /// ⚠️ **线上那条：帧里 `apiKey` 是【空串】**（「键完全缺失」那条是上面另一条测试）。
-    /// ⇒ 两个前端（G16）：只测 dispatcher 会漏掉「线上那条把 `""` 变成 null、或反过来」的情形。
-    /// </summary>
+    // 线上那条：帧里 apiKey 是空串（「键完全缺失」是上面另一条测试）——只测 dispatcher 会漏掉「线上那条把 "" 变成 null、或反过来」。
     [Fact]
     public async Task WebSocket_ProviderUpsert_WithAnEmptyApiKey_KeepsTheStoredOne()
     {
-        // 前置：`InitializeAsync` 已存下 provider "p"（key="k"、协议 claude-messages）。
+        // 前置：InitializeAsync 已存下 provider "p"（key="k"、协议 claude-messages）。
         Assert.Equal("k", _host.Providers.Load("p")!.ApiKey);
 
         using var ws = new ClientWebSocket();
         await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
-        // ⚠️ `"apiKey":""`——是**空串**，不是缺失。
+        // "apiKey":""——是空串，不是缺失。
         await SendAsync(ws, "{\"kind\":\"command\",\"id\":\"u2\",\"payload\":{\"kind\":\"provider.upsert\","
             + "\"id\":\"p\",\"protocol\":\"openai-chat\",\"apiKey\":\"\"}}");
 
@@ -319,25 +259,16 @@ public class ControlServerTests : IAsyncLifetime
             + (ack.TryGetProperty("reason", out var why) ? why.GetString() : "(无 reason 字段)"));
 
         var after = _host.Providers.Load("p")!;
-        Assert.Equal("k", after.ApiKey);                          // ⚠️ 空串不该抹掉旧 key
+        Assert.Equal("k", after.ApiKey);                          // 空串不该抹掉旧 key
         Assert.Equal(Protocols.OpenAiChat, after.Protocol);
     }
 
-    /// <summary>
-    /// ⚠️ **线上的 `provider.delete`：三条线里唯一能证明「头发的帧真的能删」的那条。**
-    ///
-    /// <para>⚠️ **判据是两端**：`ack.accepted` **与盘上的后果**。
-    /// 只断言 ack 是**半条判据**——ack 对了而文件还在的那种错，用户以为删了、
-    /// 下次发消息还在用那个凭据（而头也不会有任何提示）。</para>
-    ///
-    /// <para>⚠️ **必须走真的 WS**，不是直接调 dispatcher——`ParseCommand` 缺那一臂时，
-    /// 直接调 dispatcher 的测试**照样绿**（它绕过了解析），而头发的帧会静默落到
-    /// `_ => throw new ArgumentException` ⇒ 回一句「命令形状不对」，删不掉。</para>
-    /// </summary>
+    // 线上的 provider.delete：判据是两端（ack.accepted 与盘上的后果）；
+    // 必须走真的 WS，直接调 dispatcher 的测试会绕过解析照样绿。
     [Fact]
     public async Task WebSocket_ProviderDelete_RemovesTheStoredDefinition()
     {
-        // 前置：`InitializeAsync` 已存下 provider "p"。
+        // 前置：InitializeAsync 已存下 provider "p"。
         Assert.NotNull(_host.Providers.Load("p"));
 
         using var ws = new ClientWebSocket();
@@ -345,22 +276,17 @@ public class ControlServerTests : IAsyncLifetime
         await SendAsync(ws, """{"kind":"command","id":"d1","payload":{"kind":"provider.delete","id":"p"}}""");
 
         var ack = await ReceiveAsync(ws);
-        // ⚠️ **理由必须惰性取**：`WhenWritingNull` 把成功回执的 `reason` 整个省略（camelCase），
-        // 直接 `GetProperty("reason")` 会抛 `KeyNotFoundException`——见
-        // `WebSocket_SetAxis_ReachesTheDispatcher` 的同款注释。
+        // 理由必须惰性取：WhenWritingNull 把成功回执的 reason 省略，直接 GetProperty 会抛 KeyNotFoundException。
         Assert.True(ack.GetProperty("accepted").GetBoolean(),
             "provider.delete 的帧没被接受——`ParseCommand` 缺那一臂时它会落进 `_ => throw`："
             + (ack.TryGetProperty("reason", out var why) ? why.GetString() : "(无 reason 字段)"));
 
-        // ⚠️ **盘上真没了**——只断言 ack 是半条判据。
+        // 盘上真没了——只断言 ack 是半条判据。
         Assert.Null(_host.Providers.Load("p"));
     }
 
-    /// <summary>
-    /// ⚠️ **线上那条的「不存在 ⇒ 拒绝」**（不是幂等成功），且**理由要点名那个 id**。
-    /// 与 dispatcher 那条同源，但这条走**真 WS**——帧的字段名（`id`）接不上时，
-    /// 只有这条会红（会变成「命令形状不对」而不是「没有提供商 'nope'」）。
-    /// </summary>
+    // 线上那条的「不存在 ⇒ 拒绝」（不是幂等成功），且理由要点名那个 id；
+    // 与 dispatcher 那条同源，但这条走真 WS——帧的字段名接不上时只有这条会红。
     [Fact]
     public async Task WebSocket_ProviderDelete_OfAMissingProvider_IsRejectedNamingTheId()
     {
@@ -373,9 +299,7 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Contains("nope", ack.GetProperty("reason").GetString());
     }
 
-    /// <summary>
-    /// ⚠️ **头断连不影响任何东西**（`03` §1 判据 1）：断开之后核心照常收命令。
-    /// </summary>
+    // 头断连不影响任何东西：断开之后核心照常收命令。
     [Fact]
     public async Task HeadDisconnecting_DoesNotAffectTheCore()    {
         var ws = new ClientWebSocket();
@@ -383,20 +307,13 @@ public class ControlServerTests : IAsyncLifetime
         await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
         ws.Dispose();
 
-        // 核心照常работает
+        // 核心照常工作
         var r = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
         Assert.IsType<Ack.Accepted>(r.Ack);
     }
 
-    /// <summary>
-    /// ⚠️ **WS 的 Origin 白名单**——它是**`apiKey` 可选的硬前置**：网页能改 `endpoint`
-    /// 就能把流量（连同 key）转走，**且不需要知道 key**。
-    ///
-    /// <para>⚠️ **判据是「放行无 Origin，拒绝别的 origin」，不是「要求 Origin」**：
-    /// 浏览器发的握手**永远带 `Origin`**（挡住坏 origin 就达到了目的），
-    /// 而 curl / 测试驱动 / 未来的 CLI 头**不带**——要求它等于把它们**全部**误伤，
-    /// 而下面那批既有 WS 测试正是这条改动的**回归网**（误伤它们 = 自己拆掉安全网）。</para>
-    /// </summary>
+    // WS 的 Origin 白名单：放行无 Origin，拒绝别的 origin（不是「要求 Origin」）——
+    // 浏览器发的握手永远带 Origin，而 curl / 测试驱动 / 未来的 CLI 头不带，要求它等于把它们全部误伤。
     [Theory]
     [InlineData(null)]                     // 无 Origin（curl / 测试驱动）⇒ 放行
     [InlineData("http://127.0.0.1:7790")]  // 头自己的 origin ⇒ 放行
@@ -406,9 +323,7 @@ public class ControlServerTests : IAsyncLifetime
     public async Task WebSocket_OriginPolicy(string? origin)
     {
         using var socket = new ClientWebSocket();
-        // ⚠️ **设备端没有「带 Origin 的握手」这个 API，只能手设头**——
-        // `SetRequestHeader` 这条路**实测过**（.NET 10）：设了服务端 `ctx.Request.Headers["Origin"]`
-        // 收得到；**不设则该头根本不存在**（读出来是空串，不是 null）⇒ 判据里「放行无 Origin」就是这条。
+        // 只能手设头（设备端没有带 Origin 的握手 API）；不设则该头根本不存在（读出来是空串，不是 null）。
         if (origin is not null) socket.Options.SetRequestHeader("Origin", origin);
 
         var connect = socket.ConnectAsync(new Uri(Ws()), CancellationToken.None);
@@ -419,27 +334,19 @@ public class ControlServerTests : IAsyncLifetime
         }
         else
         {
-            // ⚠️ 握手被拒时 `ConnectAsync` 抛 `WebSocketException`（服务端回了 403）。
-            // ⚠️ **`localhost:7790` 在拒绝之列是刻意的**：它与 `127.0.0.1:7790` **不是同一个 origin**
-            // （浏览器就是这么判的），且放行 `localhost` 等于放行一个**任何本机程序都能抢占的名字**
-            // （hosts 文件 / DNS）。
+            // 握手被拒时 ConnectAsync 抛 WebSocketException（服务端回了 403）。
+            // localhost:7790 在拒绝之列是刻意的：它与 127.0.0.1:7790 不是同一个 origin，
+            // 且放行 localhost 等于放行一个任何本机程序都能抢占的名字（hosts 文件 / DNS）。
             await Assert.ThrowsAnyAsync<WebSocketException>(() => connect);
         }
     }
 
-    /// <summary>
-    /// ⚠️ **钉住「闸读的是参数，不是写死的字面量」**。
-    ///
-    /// <para>上面那条理论用的是**默认值** ⇒ 把参数忽略掉、写死 `http://127.0.0.1:7790`
-    /// 它**照样全绿**。本条的全部价值在**反向**那半：在一个显式传了**非默认**值的服务器上，
-    /// **默认值那个 origin 必须被拒**——只有这一条能杀死「参数被忽略」。</para>
-    /// </summary>
+    // 钉住「闸读的是参数，不是写死的字面量」：上面那条理论用的是默认值，把参数忽略掉也照样全绿；
+    // 本条在显式传非默认值的服务器上断言默认值那个 origin 必须被拒。
     [Fact]
     public async Task WebSocket_HonoursANonDefaultAllowedOrigin()
     {
-        // ⚠️ 显式传一个**非默认**的 allowedOrigin ⇒ 钉住「闸读的是参数，不是写死的字面量」。
-        // ⚠️ 建一个**第二个** ControlServer（另起一个系统分配的端口），别去动既有那个 `_server`。
-        // ⚠️ 同 `InitializeAsync`：绑 **0** 再读回**实际**端口，别用 `Random.Next`（会撞排除段）。
+        // 显式传一个非默认的 allowedOrigin；另起一个 ControlServer（绑 0 再读回实际端口）。
         const string mine = "http://127.0.0.1:19999";
         var server = new ControlServer(_host, _dispatcher, _bus, 0, allowedOrigin: mine);
         var app = await server.StartAsync(CancellationToken.None);
@@ -453,7 +360,7 @@ public class ControlServerTests : IAsyncLifetime
                 await ok.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws"), CancellationToken.None);
                 Assert.Equal(WebSocketState.Open, ok.State);
             }
-            // ⚠️ 反向：**默认值**那个 origin 在这里必须**被拒**——否则说明参数没被用上
+            // 反向：默认值那个 origin 在这里必须被拒——否则说明参数没被用上
             using var bad = new ClientWebSocket();
             bad.Options.SetRequestHeader("Origin", "http://127.0.0.1:7790");
             await Assert.ThrowsAnyAsync<WebSocketException>(
@@ -469,22 +376,9 @@ public class ControlServerTests : IAsyncLifetime
     private static async Task SendAsync(WebSocket ws, string json) =>
         await ws.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, true, CancellationToken.None);
 
-    /// <summary>
-    /// 收**一整帧**文本消息并解析。
-    ///
-    /// <para>⚠️ **不能只收一次就解析。** `ClientWebSocket.ReceiveAsync` 在
-    /// 「**有数据可用**」时就返回，**不保证**这一帧收完整了——语义如此，不是猜测。
-    /// 负载下 Kestrel 把一帧拆成两次 TCP 写出，`result.Count` 就是**半个帧**，
-    /// `JsonDocument.Parse` 会抛 `JsonException`。</para>
-    ///
-    /// <para>⚠️ **观测到的事实**（不是从语义推的）：`WebSocket_SetAxis_ReachesTheDispatcher`
-    /// 在全量跑时**偶发失败一次**，而**错开单跑 5/5 全绿** ⇒ 负载相关，与逻辑无关。
-    /// ⚠️ 分片本身**没有**被独立复现过——修的是**由 `ReceiveAsync` 语义推得**的隐患；
-    /// 若将来又见偶发，先怀疑别处。</para>
-    ///
-    /// <para>⚠️ **8 个调用点全都期望完整帧**（`grep -c EndOfMessage` = 0，无人依赖部分帧语义）
-    /// ⇒ 收满再接是**严格更正确**，不是行为变更。</para>
-    /// </summary>
+    // 收一整帧文本消息并解析：ReceiveAsync 在有数据可用时就返回，不保证收完整帧
+    // （负载下 Kestrel 会把一帧拆成两次 TCP 写出），JsonDocument.Parse 会抛 JsonException。
+    // 8 个调用点全都期望完整帧，收满再接是严格更正确。
     private static async Task<JsonElement> ReceiveAsync(WebSocket ws)
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -496,22 +390,14 @@ public class ControlServerTests : IAsyncLifetime
             var result = await ws.ReceiveAsync(buffer, cts.Token);
             Assert.Equal(WebSocketMessageType.Text, result.MessageType);
             ms.Write(buffer, 0, result.Count);
-            if (result.EndOfMessage) break;   // ⚠️ 这一句是修的全部要害
+            if (result.EndOfMessage) break;   // 这一句是修的全部要害
         }
 
         return JsonDocument.Parse(Encoding.UTF8.GetString(ms.ToArray())).RootElement.Clone();
     }
 
-    /// <summary>
-    /// ⚠️ **复审抓到的真缺陷（Critical）**：`resync_required` 之后该流的订阅**永久死亡**。
-    ///
-    /// <para>resync 时 `EventBus` 已经 `TryComplete()` 了那条 channel，泵随之结束；
-    /// 头按设计**重新订阅**（`03` §7 说这是**唯一**的降级路径），
-    /// 而第一版服务端 `if (subs.ContainsKey(topic)) return;` 把那条**死订阅**留在字典里
-    /// ⇒ 直接挡回去 ⇒ **该 topic 从此收不到任何事件**。</para>
-    ///
-    /// <para>⚠️ 更坏的地方：头**不会发现自己停了**（socket 是健康的，它只是安静）。</para>
-    /// </summary>
+    // resync_required 之后该流的订阅会永久死亡：EventBus 已 TryComplete 那条 channel，
+    // 而服务端把死订阅留在字典里 ⇒ 直接挡回去 ⇒ 该 topic 从此收不到任何事件，且头不会发现自己停了。
     [Fact]
     public async Task ResubscribingAfterResync_ActuallyRevivesTheStream()
     {
@@ -525,16 +411,16 @@ public class ControlServerTests : IAsyncLifetime
         // 灌爆缓冲，让「要补发的起点」够不着
         for (var i = 0; i < 1200; i++) _bus.Publish(topic, new WireEvent.Error(sid, $"{i}"));
 
-        // 用**太旧**的起点订阅 ⇒ 应当立刻 resync_required
+        // 用太旧的起点订阅 ⇒ 应当立刻 resync_required
         await SendAsync(ws, "{\"kind\":\"subscribe\",\"topic\":\"" + topic + "\",\"since\":1}");
         var first = await ReceiveAsync(ws);
         Assert.Equal("resync_required", first.GetProperty("kind").GetString());
 
-        // ⚠️ 头按设计重建：重新订阅（这次从那之后开始）
+        // 头按设计重建：重新订阅（这次从那之后开始）
         await SendAsync(ws, "{\"kind\":\"subscribe\",\"topic\":\"" + topic + "\",\"since\":"
             + _bus.HighWaterMark(topic) + "}");
 
-        // 再来一条**活的**事件——它必须到
+        // 再来一条活的事件——它必须到
         _bus.Publish(topic, new WireEvent.Error(sid, "LIVE"));
 
         var got = new List<string>();
@@ -548,11 +434,7 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Contains("LIVE", got);
     }
 
-    /// <summary>
-    /// ⚠️ **复审抓到的真缺陷**：`session.created` **声明并注册了却从没发布**。
-    /// `05` §6.1 要求头的「全局会话列表」随事件更新，而那份列表是**派生**的。
-    /// 少了它：在**控制台**敲 `session create`，已经打开的页面**看不见**这个新会话，且不会自愈。
-    /// </summary>
+    // session.created 声明并注册了却从没发布：在控制台敲 session create，已经打开的页面看不见这个新会话，且不会自愈。
     [Fact]
     public async Task SessionCreate_PublishesSessionCreatedOnTheProjectTopic()
     {
@@ -565,18 +447,8 @@ public class ControlServerTests : IAsyncLifetime
         Assert.IsType<WireEvent.SessionCreated>(p.Payload);
     }
 
-    /// <summary>
-    /// ⚠️ **复核抓到的漏网畸形帧**：`{"kind":"subscribe","topic":null}`。
-    ///
-    /// <para>它走的是另一条路：`GetString()` 对 JSON `null` **返回 null 而不抛** ⇒
-    /// `subscribe(null!)` ⇒ 字典查 null ⇒ **`ArgumentNullException`**，
-    /// 而不在原来那份异常类型白名单里 ⇒ 逃出接收循环 ⇒ **连接 Aborted**。
-    /// 复核者实测 9 帧矩阵：只有这一帧会踢掉连接，其余 8 种（`topic:123`、无 `topic`、
-    /// 无 `id`、`payload:null`、`id:null`、`kind:123`、非 JSON、未知 kind）都安然无恙。</para>
-    ///
-    /// <para>⇒ 修法不是往白名单里加一类，而是**不按类型赌**：既然「一个第三方头发错一帧
-    /// 不该让整条连接一起死掉」，那就该一律兜住。</para>
-    /// </summary>
+    // 畸形帧 {"kind":"subscribe","topic":null}：GetString() 对 JSON null 返回 null 而不抛 ⇒
+    // subscribe(null!) ⇒ ArgumentNullException 逃出接收循环 ⇒ 连接 Aborted。修法是不按类型赌，一律兜住。
     [Theory]
     [InlineData("{\"kind\":\"subscribe\",\"topic\":null}")]
     [InlineData("{\"kind\":\"subscribe\"}")]
@@ -590,7 +462,7 @@ public class ControlServerTests : IAsyncLifetime
 
         await SendAsync(ws, frame);
 
-        // ⚠️ 连接必须**还活着**：再发一条合法命令，它必须能回执。
+        // 连接必须还活着：再发一条合法命令，它必须能回执。
         await SendAsync(ws, """{"kind":"command","id":"ok","payload":{"kind":"provider.upsert","id":"p","apiKey":"k2"}}""");
 
         JsonElement ack = default;
@@ -607,11 +479,8 @@ public class ControlServerTests : IAsyncLifetime
         Assert.True(ack.GetProperty("accepted").GetBoolean());
     }
 
-    /// <summary>
-    /// ⚠️ **初始轴值必须来自快照**（`05` §11 #4）：`axis.changed` 只在订阅**之后**才有，
-    /// 头刚打开页面时没有任何事件可等。少了这一项，五个下拉全是空的，
-    /// 而用户看到的「空」与「默认值」在视觉上无法区分。
-    /// </summary>
+    // 初始轴值必须来自快照：axis.changed 只在订阅之后才有，头刚打开页面时没有事件可等；
+    // 少了它五个下拉全空，用户看到的「空」与「默认值」无法区分。
     [Fact]
     public async Task State_CarriesTheFiveAxes()
     {
@@ -627,11 +496,7 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Equal("dev", axes.GetProperty("safety").GetString());
     }
 
-    /// <summary>
-    /// ⚠️ **三个槽位**（`01` §3.1 头两个 + §3.2 尾槽位「浮动」）。
-    /// `05` §7.1 的「空的也要显示」要求它**恒在**且是**数组**——
-    /// 省略字段会让头分不清「空」与「没有这个概念」（既有注释已写明这条）。
-    /// </summary>
+    // 三个槽位（头两个 + 尾槽位「浮动」）：空的也要显示 ⇒ 恒在且是数组，省略字段会让头分不清「空」与「没有这个概念」。
     [Fact]
     public async Task State_CarriesThreeSlots_FloatingIncluded()
     {
@@ -651,56 +516,37 @@ public class ControlServerTests : IAsyncLifetime
     public async Task State_CarriesTheWholeSpec()
     {
         var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
-        var sid = ((Ack.Accepted)created.Ack).SessionId!;      // ⚠️ 分派型命令只在这个回执里给身份
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;      // 分派型命令只在这个回执里给身份
 
         using var s = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/state")));
         var spec = s.RootElement.GetProperty("spec");
 
-        // ⚠️ **整份 `SessionSpec` 交出去**（R-A：头要什么由头决定，核心不做子集裁剪）。
-        // ⚠️ 线上是 **camelCase**（`WireJson.Options`）——键名按它写，别按 C# 属性名。
+        // 整份 SessionSpec 交出去（核心不做子集裁剪）；线上是 camelCase，键名按它写。
         Assert.Equal(sid, spec.GetProperty("sessionId").GetString());
         Assert.False(string.IsNullOrEmpty(spec.GetProperty("projectKey").GetString()));
         Assert.False(string.IsNullOrEmpty(spec.GetProperty("workingDirectory").GetString()));
         Assert.NotEqual(default, spec.GetProperty("createdAt").GetDateTimeOffset());
 
         var model = spec.GetProperty("model");
-        // ⚠️ 值来自测试**预置的那个 provider**（`"p"` / `DefaultModel = "m"`）——
-        // 写死它们同时钉住了「spec 里的模型就是该会话实际绑的那份」。
+        // 值来自测试预置的那个 provider——写死它们同时钉住「spec 里的模型就是该会话实际绑的那份」。
         Assert.Equal("p", model.GetProperty("providerId").GetString());
         Assert.Equal("m", model.GetProperty("modelId").GetString());
         Assert.Equal(Protocols.ClaudeMessages, model.GetProperty("protocol").GetString());
         Assert.False(string.IsNullOrEmpty(model.GetProperty("effort").GetString()));
         Assert.True(model.GetProperty("maxTokens").GetInt32() > 0);
 
-        // ⚠️ **G12**：key 不在 `SessionSpec` 里（它住 `providers/*.json`）
-        // ⇒ 「整份交出去」这件事**天生不泄 key**——这条断言把那句话钉成可执行的。
+        // key 不在 SessionSpec 里（它住 providers/*.json）⇒「整份交出去」天生不泄 key。
         Assert.False(spec.TryGetProperty("apiKey", out _));
     }
 
-    /// <summary>
-    /// ⚠️ **`SessionSpec` 的属性集就是这几样——将来谁往里加一个凭据字段，这条会红。**
-    ///
-    /// <para>为什么不能只靠 `Assert.False(spec.TryGetProperty("apiKey"))`：那条是**缺字段型**断言，
-    /// 而 `WireJson.Options` 带 `WhenWritingNull` ⇒ 加一个**为 null** 的 `string? ApiKey`
-    /// 时键会被整个省掉、那条照样绿。（加了**非 null** 的值它才抓得住。）</para>
-    ///
-    /// <para>⚠️ **反射而不是枚举 JSON**：key 若加在**嵌套**类型上，会变成 `spec.model.apiKey`——
-    /// 顶层的 `TryGetProperty` 看不见它。属性集这条**两层一起钉**，
-    /// 且**与序列化选项无关**（改 `JsonSerializerOptions` 也动不了它）。</para>
-    ///
-    /// <para>⚠️ **这条是白名单**：加字段就得来改它。那正是要的——`SessionSpec` 是
-    /// **写进每个会话目录**的东西，加字段该是有意识的动作，不是顺手。</para>
-    ///
-    /// <para>⚠️ **钉的是「名字 + 类型」，不只是名字**（复审点出的残余缺口）：
-    /// 只比名字的话，有人把已有的 `ProviderId: string` 改成持有 `ApiKey` 的
-    /// `ProviderDefinition`——**名字集合一模一样、守卫照样绿**，而
-    /// `spec.model.providerId.apiKey` 就这么序列化出去了。
-    /// ⇒ `shape` 里带上 `PropertyType.Name`，那一次修改会**当场红**。</para>
-    /// </summary>
+    // SessionSpec 的属性集就是这几样——将来谁往里加一个凭据字段，这条会红。
+    // 只靠 Assert.False(spec.TryGetProperty("apiKey")) 不够：WhenWritingNull 会省掉值为 null 的键；
+    // 且反射而不是枚举 JSON，两层一起钉，与序列化选项无关。
+    // 钉的是「名字 + 类型」：只比名字的话，把 ProviderId: string 改成持有 ApiKey 的类型会名字集一模一样、守卫照样绿。
     [Fact]
     public void SessionSpec_HasExactlyTheseProperties_SoNoCredentialCanHide()
     {
-        // ⚠️ **名字 + 类型**，并按名字定序（反射的属性顺序不保证 ⇒ 不定序会偶发红）。
+        // 名字 + 类型，并按名字定序（反射的属性顺序不保证 ⇒ 不定序会偶发红）。
         static string[] Shape(Type t) =>
             t.GetProperties()
                 .Select(p => $"{p.Name}:{p.PropertyType.Name}")
@@ -712,20 +558,14 @@ public class ControlServerTests : IAsyncLifetime
              "SessionId:String", "WorkingDirectory:String"],
             Shape(typeof(SessionSpec)));
 
-        // ⚠️ **嵌套那层也要钉**——key 加在这里会序列化成 `spec.model.apiKey`，顶层看不见。
+        // 嵌套那层也要钉——key 加在这里会序列化成 spec.model.apiKey，顶层看不见。
         Assert.Equal(
             ["Effort:String", "MaxTokens:Int32", "ModelId:String",
              "Protocol:String", "ProviderId:String"],
             Shape(typeof(ModelSelection)));
     }
 
-    /// <summary>
-    /// ⚠️ **`GET /axes` 是头唯一的轴来源**（G8：头不许手抄）。
-    /// 少了它，头里那份手抄的 `AXES` 常量就是第二份契约——而 `Axes.cs:8` 明说「不许手抄」。
-    ///
-    /// <para>⚠️ 这条测试**同时钉住「中文标签归核心」**：`05` §3「渲染归核心，头只显示」——
-    /// 而下拉的 `主动性` / `安全` 就是渲染。头拿到英文档名自己是画不出中文的。</para>
-    /// </summary>
+    // GET /axes 是头唯一的轴来源（头不许手抄）；同时钉住「中文标签归核心」——下拉的中文名头自己画不出来。
     [Fact]
     public async Task Axes_Endpoint_HandsOutEverythingTheHeadNeeds()
     {
@@ -733,7 +573,7 @@ public class ControlServerTests : IAsyncLifetime
         var axes = doc.RootElement.GetProperty("axes").EnumerateArray().ToList();
 
         Assert.Equal(Axes.Names.Count, axes.Count);
-        // ⚠️ 顺序**就是** `Axes.Names` 的顺序——它决定头的渲染顺序（与 T1 那条同名约定一致）。
+        // 顺序就是 Axes.Names 的顺序——它决定头的渲染顺序。
         Assert.Equal(Axes.Names, axes.Select(a => a.GetProperty("name").GetString()!).ToList());
 
         foreach (var a in axes)
@@ -743,32 +583,22 @@ public class ControlServerTests : IAsyncLifetime
             Assert.NotEmpty(a.GetProperty("values").EnumerateArray());
         }
 
-        // ⚠️ **`inContext` 必须是真值而不是漏字段**：`effort` 是 false（`01` §3.5：不进上下文），
-        // 头据此把它画灰。少了这个字段，头分不清「不进上下文」与「核心没这个信息」。
+        // inContext 必须是真值而不是漏字段：effort 是 false，头据此把它画灰；少了这个字段头分不清「不进上下文」与「核心没这个信息」。
         var effort = axes.Single(a => a.GetProperty("name").GetString() == "effort");
         Assert.False(effort.GetProperty("inContext").GetBoolean());
 
-        // ⚠️ **告警的两端也归核心**：头里写字面量的话，轴里改一个档名就会让告警**静默失效**。
+        // 告警的两端也归核心：头里写字面量的话，轴里改一个档名就会让告警静默失效。
         Assert.Equal("prod", doc.RootElement.GetProperty("alertSafety").GetString());
         Assert.Equal("authorized", doc.RootElement.GetProperty("alertFrom").GetString());
     }
 
-    /// <summary>
-    /// ⚠️ **它不是「可选的美化」，是「不许手抄」的执行面**：头要渲染配置表单就必须知道
-    /// 「**合法协议** / **合法 auth**」——而这两样的真相来源在核心
-    ///（`Protocols.All` / `AuthSchemes`）。
-    /// ⚠️ 头已经抄错一次：`head/wwwroot/index.html` 的引导文案写死 `--protocol claude-messages`，
-    /// 而它只是**默认值**，不是「唯一能用的」——那正是用户第一次配置时踩的坑。
-    /// </summary>
+    // 它不是「可选的美化」，是「不许手抄」的执行面：头要渲染配置表单就必须知道合法协议 / 合法 auth，真相来源在核心。
     [Fact]
     public async Task ProviderSchema_CarriesTheTruthItOwns()
     {
         using var s = JsonDocument.Parse(await Client.GetStringAsync(Http("/provider-schema")));
 
-        // ⚠️ **与真相来源对拍，不写死字面量**——写死的话，这个端点与 `Protocols.All`
-        //    分叉了测试也不会红，而「不许手抄」正是这个端点存在的理由。
-        // ⚠️ `!` 是必须的：`GetString()` 返回 `string?`，而 `Protocols.All` 是
-        //    `IReadOnlyList<string>`（非空）⇒ 不加会报 CS8620，本项目 `-warnaserror` 下即错误。
+        // 与真相来源对拍，不写死字面量；! 是必须的（GetString() 返回 string?，不加会报 CS8620，-warnaserror 下即错误）。
         var protocols = s.RootElement.GetProperty("protocols").EnumerateArray()
             .Select(e => e.GetString()!).ToList();
         Assert.Equal(Protocols.All, protocols);
@@ -777,18 +607,12 @@ public class ControlServerTests : IAsyncLifetime
             .Select(e => e.GetString()).ToList();
         Assert.Equal([AuthSchemes.ApiKey, AuthSchemes.Bearer], auth);
 
-        // ⚠️ **人话规则要含设备名那一档**——它是 T1c 补上的、最容易被漏掉的一类，
-        //    而头要靠这句话**预先**挡掉用户手打的 `NUL`（不然用户撞的是「核心崩了」）。
+        // 人话规则要含设备名那一档，头要靠它预先挡掉用户手打的 NUL（不然用户撞的是「核心崩了」）。
         Assert.Contains("设备名", s.RootElement.GetProperty("providerIdRule").GetString());
     }
 
-    /// <summary>
-    /// ⚠️ **`defaultModel` 有意**不交——它今天**没有可信来源**（核过：`claude-opus-5` 只出现在
-    /// `CommandDispatcher` 的兜底那一处，而 `IModelAdapter` 不交默认模型）。
-    /// ⇒ 交它 = 要么复制一份（G10），要么**发明**一个来源。
-    /// ⚠️ 这条断言是**反向的**，因为「下一个人顺手补上它」是最可能发生的事：
-    /// 他觉得 schema 里少个默认模型是缺陷，而**它是有意缺席的**。
-    /// </summary>
+    // defaultModel 有意不交——它今天没有可信来源（claude-opus-5 只出现在 CommandDispatcher 的兜底那一处）；
+    // 交它 = 要么复制一份，要么发明一个来源。这条断言是反向的，因为「下一个人顺手补上它」是最可能发生的事。
     [Fact]
     public async Task ProviderSchema_DeliberatelyOmitsTheDefaultModel()
     {
@@ -798,27 +622,9 @@ public class ControlServerTests : IAsyncLifetime
         Assert.False(s.RootElement.TryGetProperty("model", out _));
     }
 
-    /// <summary>
-    /// ⚠️ **端点交的键就这三个，一个不多**——**任何会被序列化出来的**新增键都会让这条红。
-    /// ⚠️ 注意这个限定词**不是修辞**：**值为 null 的**新增字段**不会被序列化出来**，
-    /// 因此这条**看不见**它（见下面第二条实测）——别把「任何新增键」读成全称。
-    ///
-    /// <para>⚠️ **它多守住的是什么**：原来的 `Assert.False(TryGetProperty("defaultModel"))` 只看**两个写死的名字**
-    /// ⇒ 「新增一个**名字不叫** `defaultModel` / `model` 的**非空**键」它看不见。
-    /// 实测：给端点加 `DefaultModelHint = "claude-opus-5"` ⇒ **只有这条红**（键集合变 4 个），另外两条绿。</para>
-    ///
-    /// <para>⚠️⚠️ **但它看不见「值为 null 的字段」那一格——别把这条当成已经守住了。**
-    /// 实测：给端点加 `DefaultModel = (string?)null` ⇒ **三条全绿**；
-    /// 真二进制 + curl 观测到的线上 JSON **仍然只有这三个键**
-    ///（`WhenWritingNull` 把 null 键整个省掉，线上契约根本没变）。</para>
-    ///
-    /// <para>⚠️ ⇒ 它与 T3 的 `SessionSpec_HasExactlyTheseProperties_…` **不是同一套理**，
-    /// 别把两者写成「都绕开了 `WhenWritingNull`」：
-    /// 那里**反射 CLR 属性集**（与序列化选项无关，**null 也看得见**），
-    /// 这里**数的是序列化出来的键**（`WhenWritingNull` 一省，**键就数不出来**）。
-    /// ⇒ 要连「值为 null 的字段」一起守，只有一条路：把它变成**有 CLR 形状可反射的命名类型**
-    ///（匿名对象今天做不到）——那是另一件事，超出本 Minor 的范围。</para>
-    /// </summary>
+    // 端点交的键就这三个，一个不多——任何会被序列化出来的新增键都会让这条红。
+    // 限定词「会被序列化出来的」不是修辞：值为 null 的新增字段不会被序列化，这条看不见它。
+    // 它与 SessionSpec_HasExactlyTheseProperties 不是同一套理：那里反射 CLR 属性集（null 也看得见），这里数的是序列化出来的键。
     [Fact]
     public async Task ProviderSchema_CarriesExactlyTheseKeys()
     {
@@ -829,18 +635,12 @@ public class ControlServerTests : IAsyncLifetime
             s.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal));
     }
 
-    /// <summary>
-    /// ⚠️ **`/providers` 要把「端点决定数据发去哪」这件事交出来**（核心自己每次 `provider set`
-    /// 都印一行端点），头看不到就无从核对；`hasApiKey` 让表单显示「已配置」而不是一个
-    /// 会让人重填一遍的空框。
-    ///
-    /// <para>⚠️ **端点与认证方式显式设上**——它们是可空的，而 `WhenWritingNull`
-    ///（`WireJson.Options`）会把 null 的键整个省掉 ⇒ 不设的话，红的是**测法**、不是端点。</para>
-    /// </summary>
+    // /providers 要把「端点决定数据发去哪」交出来，hasApiKey 让表单显示「已配置」而不是一个空框。
+    // 端点与认证方式显式设上——它们是可空的，WhenWritingNull 会把 null 的键整个省掉。
     [Fact]
     public async Task Providers_CarriesEverythingButTheKey()
     {
-        // ⚠️ 端点与认证方式**显式设上**——它们是可空的，而 `WhenWritingNull` 会把 null 的键整个省掉。
+        // 端点与认证方式显式设上——它们是可空的，而 WhenWritingNull 会把 null 的键整个省掉。
         _host.Providers.Save(new ProviderDefinition
         {
             Id = "full", Protocol = Protocols.ClaudeMessages, ApiKey = "k",
@@ -859,14 +659,11 @@ public class ControlServerTests : IAsyncLifetime
         Assert.True(p.GetProperty("hasApiKey").GetBoolean());
     }
 
-    /// <summary>
-    /// ⚠️ **G12 的可执行判据：key 能改不能看**（用户裁定 R-B）。
-    /// </summary>
+    // key 能改不能看。
     [Fact]
     public async Task Providers_NeverLeaksTheKey()
     {
-        // ⚠️ **哨兵串**：一个不可能偶然出现的值。**别用「不含 apiKey 字样」那种弱判据**——
-        //    字段一改名它就失效了。
+        // 哨兵串：一个不可能偶然出现的值；别用「不含 apiKey 字样」那种弱判据（字段一改名就失效）。
         const string sentinel = "SENTINEL-8f3a2b1c-DO-NOT-LEAK";
         _host.Providers.Save(new ProviderDefinition
         {
@@ -876,21 +673,18 @@ public class ControlServerTests : IAsyncLifetime
 
         var body = await Client.GetStringAsync(Http("/providers"));
 
-        // ⚠️ 断言**字节里**不含它——这是 G12「可写不可读」唯一可执行的判据。
+        // 断言字节里不含它——这是「可写不可读」唯一可执行的判据。
         Assert.DoesNotContain(sentinel, body);
         Assert.DoesNotContain(sentinel[..16], body);
 
-        // ⚠️ **反向那半不能省**：只断言「不含哨兵」的话，「这个端点什么都没交」也能过。
+        // 反向那半不能省：只断言「不含哨兵」的话，「这个端点什么都没交」也能过。
         using var a = JsonDocument.Parse(body);
         var p = a.RootElement.EnumerateArray().Single(e => e.GetProperty("id").GetString() == "leaky");
         Assert.True(p.GetProperty("hasApiKey").GetBoolean());   // 「有 key」这件事要看得见
         Assert.False(p.TryGetProperty("apiKey", out _));        // 而「是什么」不行
     }
 
-    /// <summary>
-    /// ⚠️ **没有 `claims.json` 时返回 `[]`，不是 404 也不是 500**——
-    /// 「这个项目没人声明任何东西」是合法且**最常见**的形态。
-    /// </summary>
+    // 没有 claims.json 时返回 []，不是 404 也不是 500——「这个项目没人声明任何东西」是合法且最常见的形态。
     [Fact]
     public async Task Claims_WithNoClaimsFile_IsAnEmptyArray()
     {
@@ -900,41 +694,31 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Equal("[]", (await r.Content.ReadAsStringAsync()).Trim());
     }
 
-    /// <summary>
-    /// ⚠️ **走真 WS，不是直接调 dispatcher。** 后者在接线缺失时会**照样绿**——
-    /// 它绕过的正是本条要钉的那一层。实现前这条必须红，且红的方式应当是
-    /// 「认不出的命令 'claim.release'」。
-    /// </summary>
+    // 走真 WS，不是直接调 dispatcher——后者在接线缺失时会照样绿，它绕过的正是本条要钉的那一层。
     [Fact]
     public async Task WebSocket_ClaimRelease_ReachesTheDispatcher()
     {
         var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
         var sid = ((Ack.Accepted)created.Ack).SessionId!;
 
-        // ⚠️ 先占上。`claim.acquire` **不在**线上命令表里（`03` §3 资源那节只有 release），
-        // 所以这里直接走 dispatcher——认领是控制台/模型的动作，头**从不发**它。
+        // 先占上。claim.acquire 不在线上命令表里，故直接走 dispatcher——认领是控制台/模型的动作，头从不发它。
         await _dispatcher.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src"]), "c2", false, CancellationToken.None);
         Assert.NotEmpty(new ClaimStore(_work).All());
 
         using var ws = new ClientWebSocket();
         await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
-        // ⚠️ **用拼接而不是 `$$"""`**：内插原始字符串里，载荷末尾的 `}}}` 会被当成内插洞的收尾
-        // （`CS9007`）——见 `WebSocket_AcksCommandsAndStreamsEvents` 的同款注释。
+        // 用拼接而不是 $$"""：载荷末尾的 }}} 会被当成内插洞的收尾（CS9007）。
         await SendAsync(ws, "{\"kind\":\"command\",\"id\":\"a1\",\"payload\":{\"kind\":\"claim.release\","
             + "\"sessionId\":\"" + sid + "\",\"scope\":[\"src\"]}}");
 
         var ack = await ReceiveAsync(ws);
         Assert.Equal("ack", ack.GetProperty("kind").GetString());
-        // ⚠️ **理由必须惰性取**：`WireJson.Options` 的 `WhenWritingNull` 把成功回执的 `reason`
-        // 整个省略（camelCase），`ack.GetProperty("reason")` 会**抛 KeyNotFoundException**。
-        // 而 `Assert.True` 的消息串是**无条件先求值**的——直接拼进去，成功那条路也照样炸。
-        // ⇒ 用 `TryGetProperty`，它在两种形态下都不抛。
+        // 理由必须惰性取：WhenWritingNull 把成功回执的 reason 省略，直接 GetProperty("reason") 会抛 KeyNotFoundException；用 TryGetProperty。
         Assert.True(ack.GetProperty("accepted").GetBoolean(),
             "认不出这条命令——`ParseCommand` 的 switch 漏了它："
             + (ack.TryGetProperty("reason", out var why) ? why.GetString() : "(无 reason 字段)"));
 
-        // ⚠️ 判据是「**命令真的生效了**」，不只是「回执说 accepted」——
-        // 回执可以说 accepted 而语义根本没跑（那正是「形状对但接不上」的形态）。
+        // 判据是「命令真的生效了」，不只是「回执说 accepted」。
         Assert.Empty(new ClaimStore(_work).All());
     }
 }

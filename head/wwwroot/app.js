@@ -1,44 +1,23 @@
-// ⚠️ **零构建**（用户裁定）：原生 JS，没有打包、没有依赖、没有类型。
-// 页面**直连核心**（`03` §1 的 WS + HTTP）——头进程不代理。
-//
-// ⚠️ **头的第一原则是反话**（`05` §1）：「核心越克制，头越要喧哗。」
-// 核心为缓存优化，头为**人的注意力**优化。所以这里默认「多显示」而不是「省着显示」。
-//
-// ⚠️ 按 `05` §4 的四条义务逐条对：
-//   ① 两个槽位原样显示 —— **做了**（并排，且空的也显示）
-//   ② 声明可见       —— **做了**（保守：只做「声明主动」那一格，不做写入时自动检查）
-//   ③ 审批走独立流   —— **阻塞**：核心侧闸门不存在，页面**明说**而不是显示空壳
-//   ④ 安全轴显眼     —— **做了**（右栏最上 + 跨轴告警）
-// ⚠️ 头仍是 `05` §1.1 的**可替换件**——义务必须履行，其余全是实现自由。
+// 零构建：原生 JS，无打包、无依赖、无类型。页面直连核心（WS + HTTP），头不代理。
+// 头是可替换件——履行义务即可，其余是实现自由。
 
 const $ = (id) => document.getElementById(id);
 
 let core = "http://127.0.0.1:7788";
 let ws = null;
-let wsReady = false;                // ⚠️ 见 connect()：**只有它才是「可以发帧了吗」的判据**
-let current = null;                 // 当前会话 id（**视图**，不是真相）
-let epoch = 0;                      // ⚠️ 每次 openSession 自增——**同 id 的并发重入靠它区分**
-let creating = null;                // ⚠️ 刚发出的 session.create 的命令 id（只有它是「分配型回执」）
+let wsReady = false;                // 唯一的「可以发帧了吗」判据（见 connect()）
+let current = null;                 // 当前会话 id（视图，非真相）
+let epoch = 0;                      // 每次 openSession 自增，用来区分同 id 的并发重入
+let creating = null;                // 刚发出的 session.create 的命令 id
 let currentProject = null;
-const sessions = new Map();         // sessionId -> { projectKey }  ← §6.1：派生索引
-const cursors = new Map();          // topic -> lastSeq           ← §7：每流一个游标
-const claims = new Map();           // sessionId -> Set<path>     ← 声明（义务 2）
+const sessions = new Map();         // sessionId -> { projectKey }（派生索引）
+const cursors = new Map();          // topic -> lastSeq，每流一个游标
+const claims = new Map();           // sessionId -> Set<path>（声明）
 let axes = {};                      // 当前会话的轴值
 
-// ---- 引导（`05` §2.2：**这是头的行为**，核心不做策略） ----
-//
-// ⚠️ 核心启动后**没有任何会话**（`01` §8.1），也没有任何提供商。
-// 「配置提供商 → 建初始会话」是**头的策略**——它正是头比控制台强的地方
-// （控制台没有视图，做不了这个判断）。
-//
-// ⚠️ **幂等是硬要求**：这段每次开页面都跑，所以「项目下有会话就打开它」——
-// 少了它，每开一次浏览器就多一个会话（`01` §8.1）。
-//
-// ⚠️ **去重：`bootstrap()` 有两个入口**（首屏的 IIFE 与 `onopen` 的自恢复）。
-// 它**不是**可重入的（会重复 `session.create`），而首屏那两条路可能**几乎同时**触发：
-// `connect()` 在 `CONNECTING(0)` 时就返回了，`onopen` 可能在 IIFE 的 `await bootstrap()` **之前**跑。
-// ⇒ 用**一次性承诺**去重：并发调用拿到**同一个**承诺；**成功**后留着（后续调用是 no-op）；
-// **失败**则清空，让核心起来后的 `onopen` 能**重试**——那正是终审 I4 要的自恢复。
+// ---- 引导：核心启动后没有会话与提供商，「配置提供商 → 建初始会话」是头的策略 ----
+// bootstrap() 有两个入口（首屏 IIFE 与 onopen 自恢复）且不可重入 ⇒ 用一次性承诺去重；
+// 失败时清空，让核心起来后的 onopen 能重试。
 let bootPromise = null;
 function bootstrap() {
   if (bootPromise) return bootPromise;
@@ -47,33 +26,27 @@ function bootstrap() {
 }
 
 async function runBootstrap() {
-  // ⚠️ **轴表先拉**（G8：头不自带副本）。少了这一步，`AXES` 是空数组
-  // ⇒ 右栏一个控件都画不出来，而用户看到的「没有轴」与「头坏了」分不清。
+  // 轴表先拉：AXES 为空则右栏画不出任何控件。
   await loadAxes();
   await loadSessions();
 
-  // ① 有没有提供商？——没有就不能做别的（§2.2：引导页此时**挡住**其余操作）
+  // ① 没有提供商就不能做别的（引导页挡住其余操作）
   const providers = await (await fetch(core + "/providers")).json();
   if (!providers || providers.length === 0) { showOnboarding(); return; }
   hideOnboarding();
 
   // ② 当前项目下有会话？
   if (sessions.size === 0) {
-    // ⇒ **由头调** session.create（核心只认命令，谁来调是头的事）
-    // ⚠️ **先等连接就绪**：`command()` 在 `!wsReady` 时按设计**拒绝发送**，而 `connect()`
-    // 返回时握手还没完成 ⇒ 不等的话这条首屏创建是**掷硬币**（见 `connected()`）。
+    // session.create 由头调（核心只认命令）。connect() 返回时握手还没完成，
+    // 而 command() 在 !wsReady 时拒绝发送 ⇒ 必须先 await connected()。
     await connected();
     creating = "boot-create";
     command("boot-create", { kind: "session.create" });
     return;
   }
 
-  // ③ 有 ⇒ 打开**最近的**（**不新建**——见上面的幂等）
-  // ⚠️ **取 `[0]`，不是 `[size - 1]`**：`SessionStore.ListSessions` 是
-  // `OrderByDescending(x => x.Spec.CreatedAt)` ⇒ **最新在前**，所以最近的会话是**第一个**。
-  // ⚠️ 原来写的是 `[sessions.size - 1]`——那取到的是**最旧**的，与注释和意图都相反，
-  // 而且与核心自己不一致：`Program.cs` 启动时 `resume = existing[0]`（**最新**）
-  // ⇒ 头打开最旧的、核心 resume 最新的，**同一次启动里两个前端指着不同的会话**。
+  // ③ 有 ⇒ 打开最近的（不新建）。ListSessions 按 CreatedAt 降序 ⇒ [0] 才是最新，
+  // 核心启动时 resume 的也是 [0]。
   openSession([...sessions.keys()][0]);
 }
 
@@ -90,7 +63,7 @@ function hideOnboarding() {
 }
 
 async function loadSessions() {
-  // ⚠️ §6.1：**全局会话列表是派生的**——对每个 pk 取 sessions 的并集。头自己拼。
+  // 全局会话列表是派生的：对每个项目取 sessions 的并集。
   const projects = await (await fetch(core + "/projects")).json();
   sessions.clear();
   for (const pk of projects) {
@@ -100,13 +73,8 @@ async function loadSessions() {
   }
   renderSessions();
 
-  // ⚠️ **项目流订阅在这里补一次**（第二个入口，见 `connect()` 的时序分析）。
-  // 首屏那条路上 `connect()` 的 `onopen` 会因 `currentProject === null` **提前返回**
-  //（它转去补跑 `bootstrap()`，见那里的 I4 注释）⇒ **根本没走到**它那句 `subscribe`；
-  // 而重连那条路上 `onopen` 先显式订一次、本函数末尾再订一次。
-  // ⚠️ **重复订阅是安全的**：核心侧 `ControlServer.PumpAsync` 的 `Subscribe` 对同 topic
-  // **换掉旧的**（它要的正是这个语义，见那里「重复订阅必须换掉那条旧的」的注释）；
-  // 而 `since: null` = 「只要从现在开始的」⇒ 在任一顺序下都恰好剩下**一条**有效订阅。
+  // 在这里补订项目流。重复订阅是安全的：核心对同 topic 换掉旧的，
+  // 且 since: null 只要从现在起的事件 ⇒ 任一顺序下恰剩一条有效订阅。
   if (currentProject) subscribe(`project:${currentProject}`, null);
 }
 
@@ -123,19 +91,14 @@ function renderSessions() {
   }
 }
 
-// ---- 打开会话：先快照、再带高水位订阅（`03` §7 的原子性） ----
+// ---- 打开会话：先快照，再带高水位订阅 ----
 
 async function openSession(id) {
-  // ⚠️ **先领世代号**：`current !== id` **判不出「同 id 的两次并发调用谁更新」**——
-  // 双击同一个会话时两个守卫会**双双通过**，同一份 turns 被 `appendChild` **两遍**
-  //（`#timeline` 的清空在函数开头，而 `renderTurn` 是 `appendChild`，中间隔着 `await`）。
-  // 世代号让**后一次调用作废前一次**，与 id 是什么无关（`A→B→A`、`onopen`/resync 的
-  // `openSession(current)` 撞上用户对同一会话的点击，也都是同一类）。
+  // 世代号让后一次调用作废前一次（同 id 双击时 current !== id 判不出来）。
   const gen = ++epoch;
 
-  // ⚠️ **先等连接就绪**：本函数末尾的 `subscribe()` 在 `!wsReady` 时会**静默返回**，
-  // 而它可能是首屏/重连的第一条发送（`bootstrap`→`openSession`、`onopen`→`openSession`）
-  // ⇒ 不等的话，会话流可能根本没订上，而页面以为订过了（见 `connected()`）。
+  // subscribe() 在 !wsReady 时会静默返回 ⇒ 先等连接就绪，
+  // 否则会话流可能根本没订上，而页面以为订过了。
   await connected();
   if (gen !== epoch) return;
   current = id;
@@ -146,8 +109,8 @@ async function openSession(id) {
   const state = await (await fetch(`${core}/sessions/${id}/state`)).json();
   const history = await (await fetch(`${core}/sessions/${id}/history`)).json();
 
-  // ⚠️ **快照回来时，用户可能已经又开了别的会话**（或同一个）——`#timeline` / `#slots` / 右栏
-  // 都是**全局节点**，继续渲染就会把上一次的 turn 追加进已经清空的那条时间线里。
+  // 快照回来时用户可能已开了别的会话——这些是全局节点，继续渲染会把上一次的
+  // turn 追加进已经清空的那条时间线里。
   if (gen !== epoch) return;
 
   renderSlots(state.slots);
@@ -157,20 +120,20 @@ async function openSession(id) {
 
   await loadClaims();
 
-  // ⚠️ **又一个 await，再守一次**。少了它，就会拿**捕获的 `id`**去订会话流。
+  // 又一个 await，再守一次：否则会拿捕获的 id 去订会话流。
   if (gen !== epoch) return;
 
-  // ⚠️ **用快照带回来的高水位当起点**——「拉快照 → 订阅」之间那段窗口不漏不重的唯一办法。
+  // 用快照带回来的高水位当起点：这是「拉快照 → 订阅」窗口不漏不重的唯一办法。
   subscribe(`session:${id}`, history.highWater);
 }
 
 function subscribe(topic, since) {
-  // ⚠️ 判据是 `wsReady`，**不是 `ws.readyState`**——见 `connect()` 那段。
+  // 判据是 wsReady，不是 ws.readyState。
   if (!wsReady) return;
   ws.send(JSON.stringify({ kind: "subscribe", topic, since }));
 }
 
-// ---- 渲染：**核心渲染，头只显示**（`05` §3） ----
+// ---- 渲染：核心渲染，头只显示 ----
 
 function textOf(blocks) {
   return (blocks || []).filter((b) => b.kind === "text").map((b) => b.text).join("");
@@ -193,13 +156,11 @@ function renderMeta(text, cls) {
 }
 
 function renderSlots(slots) {
-  // ⚠️ **空的也要显示**（§7.1）：`（空）` 与「有这个槽位但没内容」是两回事，
-  // 而用户要能分清「核心没配提示词」与「头坏了」。
+  // 空的也要显示：区分「核心没配提示词」与「头坏了」。
   const fmt = (b) => (b && b.length ? b.map(textOf).join("") : "（空）");
   $("slot-system").textContent = slots ? fmt(slots.system) : "（空）";
   $("slot-premier").textContent = slots ? fmt(slots.premier) : "（空）";
-  // ⚠️ 浮动槽的正文由**核心**给（`05` §3：核心渲染）。核心还没有装配器 ⇒ 它恒空，
-  // 而页面**如实显示「尚未实现」**——不假装它是空的提示词。
+  // 浮动槽正文由核心给；核心尚无装配器 ⇒ 恒空，如实显示「尚未实现」。
   $("floating-body").textContent = slots && slots.floating && slots.floating.length
     ? slots.floating.map(textOf).join("")
     : "（核心侧装配器尚未实现）";
@@ -210,33 +171,19 @@ function setStatus(status, turn) {
 }
 
 // ---- 五轴（义务 4 的落点） ----
-//
-// ⚠️ **轴表从核心拉，头不自带副本**（G8 / `Axes.cs:8`：「任何别处（头的下拉…）
-// 都从这张表读，**不许手抄**」）。加一条轴、改一个档，只改核心 `Axes.Table` 一处。
-//
-// ⚠️ 标签（`主动性` / `安全` …）与 `inContext` 也**归核心**——`05` §3「渲染归核心，头只显示」，
-// 而下拉的标签就是渲染。核心交 `{ name, label, values, inContext }`，头只画控件。
-// ⚠️ 由此 `GET /axes` 端点在 **T4**，而 `Axes` 要补上 `01` §3.5 的中文名（那是唯一真相来源，不是头）。
+// 轴表、标签、inContext 都从核心拉（单一真相来源是核心的 Axes.Table，头不许手抄）：
+// 核心交 { name, label, values, inContext }，头只画控件。
 let AXES = [];
 async function loadAxes() {
-  // ⚠️ **一次拉取拿到三样**：轴表本身 + 告警线的两端。
-  // ⚠️ **告警两端必须被真的覆盖**——只声明 `let ALERT_SAFETY = "prod"` 而不赋值，
-  // 那两个字面量就还是硬编码的副本（「静默失效」的入口），白写了 `GET /axes` 的那两个字段。
+  // 一次拉取拿到三样：轴表 + 告警线的两端（必须真的赋值，否则又成硬编码副本）。
   const cfg = await (await fetch(core + "/axes")).json();
   AXES = cfg.axes;
   ALERT_SAFETY = cfg.alertSafety;
   ALERT_FROM = cfg.alertFrom;
 }
 
-// ⚠️ **告警线的两端也归核心**：`安全=生产` 的档名与「权限≥授权」的起始档，
-// 头里各写一个字面量就是**两份副本**——改一个档名就静默失效（告警不再响，而用户以为它在守）。
-//
-// ⚠️ 下面的初始值是**占位**，`loadAxes()` 会用核心交的值覆盖它。
-// ⚠️ 但「有初始值」这件事本身有代价：**如果 `loadAxes()` 失败或没跑**，
-// 这两个占位值就成了真的在用——那时告警按一份**没人维护的副本**判断。
-// ⇒ 占位值取**永不触发告警**的那个（空串），宁可漏报也不误报：
-// 漏报的表现是「该响没响」，而误报会让用户学会无视这个告警。
-// ⚠️ 这也解释了为什么 `bootstrap()` 的第一句必须是 `await loadAxes()`。
+// 告警线的两端归核心。下面的初始值是占位，loadAxes() 会覆盖；
+// 但若 loadAxes() 失败或没跑，占位值就真的在用 ⇒ 取空串（永不触发）：宁可漏报。
 let ALERT_SAFETY = "";
 let ALERT_FROM   = "";
 
@@ -247,8 +194,7 @@ function renderAxes(values) {
 
   for (const a of AXES) {
     const row = document.createElement("div");
-    // ⚠️ `inContext` 由**核心**给（`01` §3.5：`effort` 不进上下文）——
-    // 头不再靠手抄的 `effort: true` 标记，那又是一份副本。
+    // inContext 由核心给（effort 不进上下文），头不手抄。
     row.className = "axis" + (a.inContext ? "" : " effort");
 
     const sel = document.createElement("select");
@@ -268,12 +214,9 @@ function renderAxes(values) {
     const lab = document.createElement("label");
     lab.textContent = a.label;
 
-    // ⚠️ **安全轴放在右栏最上面单独一份**（义务 4），这里跳过它免得出现两个控件。
-    // ⚠️ 但**标签也要填**——它是从核心来的（`05` §3：渲染归核心），不能因为换了位置就丢掉。
-    // ⚠️ **是 `replaceWith`，不是 `appendChild`**：`#ax-safety` 在 HTML 里**就是那个 `<select>`
-    // 本身**（不是容器）⇒ append 会得到 `<select id="ax-safety"><select id="ax-safety">…`：
-    // 重复 id，且外层那个空下拉才是用户看见的（本任务 Step 3 实测：`#ax-safety.options` 长度为 0）。
-    // ⇒ 用刚建好的 `sel` **顶替**那个占位 select（同一个 id，选项与 onchange 都是新的）。
+    // 安全轴在右栏最上面单独一份，这里跳过它免得出现两个控件；标签也要填（从核心来）。
+    // #ax-safety 在 HTML 里就是那个 <select> 本身（不是容器）⇒ 必须 replaceWith，
+    // 不能 appendChild（否则得到重复 id，且用户看见的是外层那个空下拉）。
     if (a.name === "safety") {
       $("ax-safety-label").textContent = a.label;
       $("ax-safety").replaceWith(sel);
@@ -287,21 +230,8 @@ function renderAxes(values) {
   renderAlert();
 }
 
-/// ⚠️ **跨轴告警**（`01` §3.5 定的那条）：`安全=生产` + `权限≥授权` → 告警。
-/// ⚠️ 它是**纯提示、不联动**——不设「生产 ⇒ 权限封顶」，那是家长式干预且会掩盖
-/// 「安全是建议」这个诚实的定位。
-/// ⚠️ **跨轴告警**（`01` §3.5 定的那条）：`安全=生产` + `权限≥授权` → 告警。
-/// ⚠️ 它是**纯提示、不联动**——不设「生产 ⇒ 权限封顶」，那是家长式干预且会掩盖
-/// 「安全是建议」这个诚实的定位。
-///
-/// ⚠️ **两头都读核心交的值，不写字面量**：`ALERT_SAFETY` 是安全轴里代表生产的**档名**，
-/// `ALERT_FROM` 是权限轴里「授权及以上」的**起始档**。写字面量的话，
-/// 轴里改一个档名就会让告警**静默失效**——用户以为它在守，而它再也不响。
-///
-/// ⚠️ **判据是「档位序」而不是「是不是这两个值之一」**：权限是**单调阶梯**（`01` §3.5，
-/// 0 禁用 … 5 信任），所以 `≥授权` 的正确写法是「在表里的下标 ≥ `ALERT_FROM` 的下标」。
-/// 今天 `AT_OR_ABOVE` 恰好等于 {authorized, trusted} 两个，但那是**巧合**——
-/// 权限轴加第 6 档时，枚举写法会漏掉它，而序数写法自动覆盖。
+// 跨轴告警：安全=生产 + 权限≥授权 → 告警（纯提示、不联动）。
+// 判据用档位序（下标 ≥ ALERT_FROM 的下标）而不是枚举值——权限轴加档时枚举写法会漏。
 function alertFromIndex() {
   const perm = AXES.find((a) => a.name === "permission");
   return perm ? perm.values.indexOf(ALERT_FROM) : -1;
@@ -311,11 +241,8 @@ function renderAlert() {
   const perm = AXES.find((a) => a.name === "permission");
   const at = perm ? perm.values.indexOf(axes.permission) : -1;
 
-  // ⚠️ **每一端都必须先「解析出来」才算数。**
-  // `indexOf` 找不到时返回 `-1`，而 `at >= -1` **恒真** ⇒ 少了 `from >= 0` 这道守卫，
-  // 只要安全档恰好相符就会**误报**（而误报会让用户学会无视这个告警）。
-  // 同理 `ALERT_SAFETY === ""` 表示「核心还没把告警线交过来」（见 `loadAxes` 的注释），
-  // 那时**不该**按一个占位值判断。
+  // indexOf 找不到返回 -1，而 at >= -1 恒真 ⇒ 必须守 from >= 0；
+  // ALERT_SAFETY === "" 表示核心还没把告警线交过来，那时不该按占位值判断。
   const from = alertFromIndex();
   const ready = ALERT_SAFETY !== "" && from >= 0;
   const risky = ready && axes.safety === ALERT_SAFETY && at >= from;
@@ -326,7 +253,7 @@ function renderAlert() {
     : "";
 }
 
-// ---- 声明（义务 2） ----
+// ---- 声明 ----
 
 async function loadClaims() {
   const all = await (await fetch(core + "/claims")).json();
@@ -339,8 +266,7 @@ async function loadClaims() {
 }
 
 function renderClaims() {
-  // ⚠️ §7.2：**呈现的关键不是列表，是「冲突」**。
-  // 列表画在下面，冲突**顶到最上面**——因为树里（或者列表里）的 ⚠ 会被忽略。
+  // 呈现的关键是「冲突」，所以把冲突顶到最上面。
   const paths = [...claims.entries()].flatMap(([sid, set]) => [...set].map((p) => ({ sid, p })));
   const conflicts = [];
   for (let i = 0; i < paths.length; i++) {
@@ -366,9 +292,7 @@ function renderClaims() {
     for (const p of set) {
       const el = document.createElement("div");
       el.className = "claim";
-      // ⚠️ **不用 `innerHTML`**：`p` 是磁盘上 `claims.json` 里的路径，**不是**标记，
-      // 不该被当 HTML 解析（本文件别处——冲突条那行——用的就是 `textContent`，
-      // 只有这里漏了）。结构照旧：`<span class="who">sid</span> 空格 路径`。
+      // p 来自磁盘上的 claims.json 路径，不是标记 ⇒ 用 textContent，不用 innerHTML。
       const who = document.createElement("span");
       who.className = "who";
       who.textContent = sid;
@@ -381,19 +305,9 @@ function renderClaims() {
 
 // ---- WS ----
 
-// ⚠️ **握手就绪闸**：`connect()` 只是**发起**握手，它返回时 socket 还在 `CONNECTING`，
-// 而 `wsReady` 仍是 false。
-// ⚠️ 于是「连上之前就发」和「没连上硬发」成了两回事：`subscribe()` / `command()` 的
-// `if (!wsReady)` 挡住了后者（对——那是为了不静默丢帧），却**挡不住前者**：
-// `bootstrap()` / `openSession()` 的 `fetch` 完全可能在握手完成**之前**跑完 ⇒ 那两处首屏发送
-// （② 建会话的命令、`openSession` 末尾的会话流订阅）撞上 `!wsReady` 被**静默丢掉**，
-// 而页面**不会自愈**（`openSession` 以为订过了，`bootstrap` 以为建过了）。
-// ⚠️ 这与 `connect()` 注释里追求的「**任一顺序都订上**」是同一件事：光有 `wsReady` 只把
-// 判据从「读 socket 瞬时状态」收敛到「显式开关」，还要**等它翻转**才算完。
-// ⚠️ 本任务 Step 3 实测到过这一条：首次开页面时 `bootstrap` 的 `session.create` 落在
-// `!wsReady` 上，时间线只剩「✗ 没连上核心」，左边一个会话都没有。
-// ⚠️ **有界**（2 秒）：核心根本不在时照样放行，让调用点走各自的失败路径（报错/空态），
-// 不把页面吊死在这个 await 上。
+// 握手就绪闸：connect() 返回时 socket 还在 CONNECTING，wsReady 仍为 false，
+// 而「连上之前就发」的调用点（bootstrap / openSession 的首屏发送）会在握手完成前跑完。
+// 有界 2 秒：核心根本不在时照样放行，让调用点走各自的失败路径。
 function connected() {
   if (wsReady) return Promise.resolve();
   return new Promise((resolve) => {
@@ -406,50 +320,28 @@ function connected() {
 function connect() {
   ws = new WebSocket(core.replace("http", "ws") + "/ws");
 
-  // ⚠️ **`new WebSocket` 是异步的**：这一行返回时 `readyState` 还是 `CONNECTING(0)`。
-  // ⇒ 拿 `readyState === OPEN` 当「能发帧了吗」的判据**是错的**——
-  //   它在建连**之前**判 false（错得明显、反而看得见），但在建连**途中**也判 false，
-  //   于是「按顺序写在 `onopen` 之后」的那行其实**根本没发出去**，而且**静默失败**。
-  // ⚠️ 本文件有三处发送点都在 `onopen` 之后：项目流订阅、`openSession`（内含 `subscribe`）、
-  //   `bootstrap`→`openSession`。**首屏那一处必然静默**（见下面 `onopen` 的时序分析）。
-  // ⇒ **发送凭据交给显式开关**：`connect()` 置 false，`onopen` 第一句置 true，`onclose` 置 false。
-  //   它有唯一的所有者与唯一的判据，不需要读 socket 的瞬时状态。
+  // new WebSocket 是异步的：这行返回时 readyState 还是 CONNECTING，
+  // 不能拿 readyState === OPEN 当「能发帧了吗」的判据 ⇒ 发送凭据交给显式开关 wsReady
+  //（connect() 置 false，onopen 第一句置 true，onclose 置 false）。
   wsReady = false;
 
   ws.onopen = () => {
-    // ⚠️ **第一句就置位**——下面的 `subscribe()` 与 `openSession()` 都同步读它。
+    // 第一句就置位：下面的 subscribe() 与 openSession() 都同步读它。
     wsReady = true;
     $("status").textContent = "已连接";
 
-    // ⚠️ **`currentProject === null` 就是「核心当时没起来」的信号**（终审 I4）。
-    // 首屏那条路上 `bootstrap()` 的第一句 `loadAxes()` 会 fetch `/axes`；核心不在时它 reject
-    // ⇒ `loadSessions()` 没跑 ⇒ `currentProject` / `current` 都是 null ⇒ 下面两行都跳过、
-    // 页面空白**直到手工刷新**（`05` §2.1：头是独立进程，先开头的场景完全合理）。
-    // ⇒ 在这里补跑一次 `bootstrap()`（它自己去重，见那里的 `bootPromise`）：
-    //   · 首屏「`onopen` 赶在 IIFE 的 `await bootstrap()` 之前」时，两者拿到**同一个**承诺，
-    //     不会各跑一遍（各跑一遍 = 建两个会话）；
-    //   · 核心后起来时，这正是**自恢复**那一步。
+    // currentProject === null 是「核心当时没起来」的信号：在这里补跑 bootstrap()
+    //（去重靠 bootPromise）——既处理首屏两条路的并发，也做核心后起时的自恢复。
     if (currentProject === null) {
       bootstrap().catch((e) => renderMeta("✗ 核心没连上：" + (e && e.message ? e.message : e), "error"));
       return;   // 还没有当前项目/会话，下面两行无从谈起（`current` 也必为 null）
     }
 
-    // ⚠️ **重连必须重拉会话列表**（终审 I3）：断线窗口里由**控制台**建的会话，靠
-    // `subscribe(project:…, null)` 是**补不回来**的——`since: null` = 「只要从现在起的」，
-    // 新订阅**不补发旧事件**，也不会 resync ⇒ 那个会话在本页**永远不出现**，且不自愈。
-    //
-    // ⚠️ 账本曾把「`subscribe()` 重订丢 `since`」判为**良性**，理由是「重订后紧跟一次快照重读」——
-    // 那句只对 `loadSessions()` 末尾那次重订成立；**`onopen` 这次前面没有任何快照拉取**。
-    // ⇒ 那条「良性」的依据是错的（终审翻案），下面这次 `loadSessions()` 就是它真后果的修法。
-    //
-    // ⚠️ 会不会「订两次 / 留旧订阅」？——不会：
-    //   · `loadSessions()` 末尾自己会再 `subscribe` 一次同 topic；服务端
-    //     `ControlServer.PumpAsync` 的 `Subscribe` 对**同 topic 换掉旧的** ⇒ 净剩**一条**。
-    //   · 不会留下旧 pk 的订阅：`currentProject` 只从 `null` 变成**某一个** pk，从不改指。
-    //   · 那次 `loadSessions()` 是**必须**的——它是本页唯一会重拉 `/projects` 的地方。
+    // 重连必须重拉会话列表：since: null 只要从现在起的事件，断线窗口里（控制台）
+    // 建的会话补不回来，也不会自愈。重复订阅安全（同 topic 换掉旧的）。
     loadSessions();
     subscribe(`project:${currentProject}`, null);
-    if (current) openSession(current);   // 重连一律拉快照重建（§6.2 唯一的降级路径）
+    if (current) openSession(current);   // 重连一律拉快照重建（唯一的降级路径）
   };
 
   ws.onclose = () => {
@@ -462,19 +354,14 @@ function connect() {
     const frame = JSON.parse(e.data);
 
     if (frame.kind === "ack") {
-      // ⚠️ **判据是「我们刚发的那条 create 的回执」，不是「这个 sessionId 我不认识」。**
-      // 后者错两次：① `send` / `interrupt` / `start` 的回执**也带 `sessionId`**，而
-      // `loadSessions()` 的 `sessions.clear()` 到重填之间有个窗口——落在窗口里的 send 回执
-      // 会**误触一次全量重开**；② 服务端建会话是**先发 `session.created` 再回 ack**，
-      // 两条帧先后不定 ⇒ 靠 `sessions.has` 判断，结果本身就是**不确定的**。
+      // 判据是「我们刚发的那条 create 的回执」（frame.id === creating），
+      // 不是「这个 sessionId 我不认识」：send / interrupt 的回执也带 sessionId，
+      // 且服务端是先发 session.created 再回 ack，两条帧先后不定。
       if (frame.accepted && frame.id === creating) {
         creating = null;
-        // ⚠️ **建完要打开它**：首屏那条 `boot-create` 原来是建完就 `return`，**没人 `openSession`**
-        // ⇒ 中栏空、**右栏五个轴全空**（`renderAxes` 只在 `openSession` 里跑）、`send()` 静默不发，
-        // 非刷新一次不可。先 `loadSessions()`（把新会话收进 `sessions`，并订上刚出现的项目流）
-        // 再打开它。
-        // ⚠️ **必须带 `catch`**：reject 时 `openSession` 根本不跑（建的会话停在「建了没打开」，
-        // 正是上面要治的症状换个触发条件），且留下未观测 rejection。
+        // 建完要打开它：先 loadSessions()（把新会话收进 sessions 并订上项目流）
+        // 再 openSession()。必须带 catch——reject 时会话停在「建了没打开」，
+        // 且留下未观测 rejection。
         loadSessions().then(() => openSession(frame.sessionId))
                       .catch((e) => renderMeta("✗ " + e.message, "error"));
       }
@@ -483,22 +370,19 @@ function connect() {
     }
 
     if (frame.kind === "resync_required") {
-      // ⚠️ §6.2：降级路径**只有一条**——拉快照重建。
-      // **不发明「部分合并」**：那是另一套状态机，且必然与快照对不齐。
+      // 降级路径只有一条：拉快照重建（不做「部分合并」——那是另一套状态机）。
       renderMeta("（事件跟不上，已重新拉取快照）");
       cursors.delete(frame.topic);
       if (current && frame.topic === `session:${current}`) openSession(current);
-      // ⚠️ **两条都要**：`loadClaims()` **不发 subscribe**——重订项目流的只有 `loadSessions()`
-      // 末尾那一句。服务端发 resync 时那条订阅的 channel 已被 `TryComplete()`，此后 `Publish`
-      // **一律跳过它** ⇒ 只刷声明的话项目流**永久静默**（`session.created` / `claim.*` 再也收不到），
-      // 而且**不会自愈**——义务 2 的实时性就这么死掉。
+      // 两条都要：loadClaims() 不发 subscribe，重订项目流只靠 loadSessions() 末尾那句；
+      // resync 后旧订阅的 channel 已被 TryComplete() ⇒ 少调则项目流永久静默、不自愈。
       if (frame.topic.startsWith("project:")) { loadSessions(); loadClaims(); }
       return;
     }
 
     if (frame.kind !== "event") return;
 
-    // ⚠️ **每流独立的游标**（§7）。只丢弃重复，**不排序**——排序是核心的保证。
+    // 每流独立游标：只丢弃重复，不排序——排序是核心的保证。
     if (frame.seq <= (cursors.get(frame.topic) ?? 0)) return;
     cursors.set(frame.topic, frame.seq);
 
@@ -510,8 +394,7 @@ function connect() {
 function handleProjectEvent(p) {
   switch (p.kind) {
     case "session.created": loadSessions(); break;
-    // ⚠️ 义务 2 的实时性靠这两条——声明变化**必须**刷新右栏，
-    // 否则「谁在动哪些文件」只在开页面那一刻是对的。
+    // 声明变化必须刷新右栏，否则「谁在动哪些文件」只在开页面那一刻是对的。
     case "claim.acquired":
     case "claim.released": loadClaims(); break;
   }
@@ -524,7 +407,7 @@ function handleEvent(p) {
       break;
 
     case "session.step.begin":
-      // ⚠️ 「在跑」的信号源是它，不是 `session.state`——后者是磁盘的镜像，而磁盘**从不存 Running**。
+      // 「在跑」的信号源是它：session.state 是磁盘的镜像，而磁盘从不存 Running。
       if (p.sessionId === current) setStatus("Running", p.turn - 1);
       break;
 
@@ -542,21 +425,21 @@ function handleEvent(p) {
       break;
 
     case "axis.changed":
-      // ⚠️ 只在**真的迁移**时来（核心侧已保证），所以这里直接重渲染即可。
+      // 只在真的迁移时才来（核心侧保证），这里直接重渲染即可。
       if (p.sessionId === current) { axes[p.axis] = p.value; renderAxes(axes); }
       break;
 
     case "error":
-      // ⚠️ **业务失败走这里**（`03` §3 的分界线）——它不是 `rejected`（命令没写错）。
+      // 业务失败走这里（不是 rejected：命令本身没写错）。
       if (p.sessionId === current) renderMeta("✗ " + p.message, "error");
       break;
   }
 }
 
-// ---- 命令（`03` §3） ----
+// ---- 命令 ----
 
 function command(id, payload) {
-  // ⚠️ 同 `subscribe`：判据是 `wsReady`。
+  // 同 subscribe：判据是 wsReady。
   if (!wsReady) { renderMeta("✗ 没连上核心", "error"); return; }
   ws.send(JSON.stringify({ kind: "command", id, payload }));
 }
@@ -582,17 +465,14 @@ $("interrupt").onclick = () => {
   if (current) command(crypto.randomUUID().slice(0, 8), { kind: "session.interrupt", sessionId: current });
 };
 
-// ⚠️ **`GET /providers` 是头的引导要用的**（`05` §2.2）：没有提供商时**不能做别的**。
-// 端点不存在的话 `bootstrap()` 会在 `fetch(...).json()` 上抛，
-// 而那是**第一条**要跑的异步动作 ⇒ 整个页面停在空白，控制台里一条错。
-// ⇒ 它在 `ControlServer.MapSnapshots` 里加。
+// GET /providers 是引导要用的：端点不存在时 bootstrap() 会在 fetch().json() 上抛，
+// 而那是最先跑的异步动作 ⇒ 整个页面停在空白。
 
 (async () => {
-  try { core = (await (await fetch("/config.json")).json()).core; } catch { /* 用默认值 */ }
+  try { core = (await (await fetch("/config.json")).json()).core; } catch { }   // 取不到就用默认值
   connect();
-  // ⚠️ **失败必须可见**（终审 I4）：核心没起来时 `bootstrap()` 的第一句 `loadAxes()` 就 reject。
-  // 不接的话那是一次**未观测拒绝**——页面停在空白、只在控制台留一条错，用户无从判断。
-  // 接住并打一行到时间线；核心起来后由 `onopen` 的 `currentProject === null` 分支**自动重试**。
+  // 失败必须可见：不接的话是一次未观测拒绝（页面停在空白）；接住并打一行到时间线，
+  // 核心起来后由 onopen 的 currentProject === null 分支自动重试。
   try {
     await bootstrap();
   } catch (e) {

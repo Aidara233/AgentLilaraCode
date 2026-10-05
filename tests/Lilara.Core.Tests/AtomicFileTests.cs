@@ -68,12 +68,7 @@ public class AtomicFileConcurrencyTests : IDisposable
         if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true);
     }
 
-    /// <summary>
-    /// ⚠️ **实测过的真缺陷**：旧实现的 tmp 名是**固定的** `path + ".tmp"`，
-    /// 两个并发写会写同一个 tmp 再各自 <c>Move</c>，第二个 <c>Move</c> 抛
-    /// （文件已被搬走 → <c>FileNotFoundException</c>）。
-    /// 真实时延：`SaveState` 与 HTTP 快照端点同时碰同一个 `state.json`。
-    /// </summary>
+    // 并发写同一路径是真实场景（SaveState 与 HTTP 快照端点同时碰 state.json）。
     [Fact]
     public async Task Write_ToleratesConcurrentWritersToTheSamePath()
     {
@@ -93,7 +88,7 @@ public class AtomicFileConcurrencyTests : IDisposable
 
         Assert.Empty(errors);
         Assert.True(File.Exists(target));
-        // ⚠️ 不留残渣：唯一名 tmp 若失败未清，会在磁盘上越积越多。
+        // 不留残渣：失败未清的 tmp 会在磁盘上越积越多。
         Assert.Empty(Directory.GetFiles(_dir, "*.tmp"));
     }
 }

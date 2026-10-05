@@ -3,10 +3,7 @@ using Lilara.Core.Canonical;
 
 namespace Lilara.Core.Adapters.OpenAi;
 
-/// <summary>
-/// OpenAI Responses 响应 → canonical。⚠️ 纯函数。
-/// ⚠️ `output` 是异构数组——只取 `type == "message"` 的项；其余（reasoning 等）跳过。
-/// </summary>
+// OpenAI Responses 响应 → canonical。纯函数：output 是异构数组，只取 type == "message" 的项，其余（reasoning 等）跳过。
 public static class OpenAiResponsesResponse
 {
     public static ModelReply Map(string json)
@@ -14,8 +11,7 @@ public static class OpenAiResponsesResponse
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
 
-        // ⚠️ 根守卫**必须最先**：TryGetProperty 在非对象根上直接抛（实测，
-        // 与 OpenAiChatResponse 同一条事实）。少了它，`[]` / `null` / `5` / `"hi"` 全是崩溃。
+        // 根守卫必须最先：TryGetProperty 在非对象根上直接抛，少了它 [] / null / 5 / "hi" 全是崩溃。
         if (root.ValueKind != JsonValueKind.Object)
             return new ModelReply { Blocks = [], StopReason = "unknown", Refused = false };
 
@@ -45,16 +41,9 @@ public static class OpenAiResponsesResponse
             }
         }
 
-        // ⚠️ Responses 的拒答信号不在 status 里（`incomplete` 是「没生成完」不是拒答）。
-        // 目前没有可靠的拒答指示，故恒 false——有的话如实透传即可。
-        //
-        // ⚠️ 原版 Responses API 另有 `incomplete_details.reason`（`max_output_tokens` 等），
-        // **本实现不读它**——控制器派发时的 Ruling：当时 `POST /v1/responses` 对五个模型
-        // （deepseek-flash / gpt-5.6-luna / gpt-5.6-sol / gpt-5.6-terra / gpt-6-astra）
-        // 全都回 `upstream_error`，该字段无从实测；
-        // ⚠️ 网关恢复后补测过：正常与截断两种响应**都不含** `incomplete_details`，截断仍是 `"completed"`。
-        // 没有可观测信号就不发明规则（沿用 Task 6 的纪律）。
-        // `status` 原样透传，诊断能力不受损。将来实测到再补。
+        // 拒答信号不在 status 里（incomplete 是「没生成完」不是拒答）：没有可观测信号，故恒 false。
+        // 原版另有 incomplete_details.reason，实测正常与截断两种响应都不含它，截断仍是 "completed"。
+        // status 原样透传。
         var blocks = texts.Count > 0
             ? texts.Select(t => (Block)new Block.TextBlock(t)).ToList()
             : [];

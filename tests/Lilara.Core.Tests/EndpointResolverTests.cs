@@ -2,14 +2,10 @@ using Lilara.Core.Adapters;
 
 namespace Lilara.Core.Tests;
 
-/// <summary>
-/// 端点解析（01 §7：全局层持有「端点、key、协议类型」）。
-/// ⚠️ 判据不是「别让环境变量赢」，而是「赢了必须说得清」。
-/// 全程离线：环境变量是**注入**的，不读真实进程环境，更不联网。
-/// </summary>
+// 判据是「环境变量赢了必须说得清」，不是「别让它赢」；全程离线（环境是注入的）。
 public class EndpointResolverTests
 {
-    /// <summary>假的环境读取器：只认那一个变量名。</summary>
+    // 假的环境读取器：只认那一个变量名。
     private static Func<string, string?> Env(string? value) =>
         name => name == EndpointResolver.EnvVar ? value : null;
 
@@ -48,10 +44,7 @@ public class EndpointResolverTests
         Assert.Equal(EndpointSource.Default, resolved.Source);
     }
 
-    /// <summary>
-    /// 这条才是「可见性」的判据：**同一个 URL、两种来源，调用方必须能把它们分开**。
-    /// 分不开的话，环境变量接管就又变回静默的了。
-    /// </summary>
+    // 同一个 URL、两种来源，调用方必须能把它们分开。
     [Fact]
     public void Resolve_SameUrlFromDifferentSourcesIsDistinguishable()
     {
@@ -62,19 +55,15 @@ public class EndpointResolverTests
         Assert.NotEqual(fromEnv.Source, configured.Source);
     }
 
-    /// <summary>
-    /// ⚠️ 名字写错的话，解析器会以为「没人设过」，而 SDK 那边照样会去读——
-    /// 于是又变回静默接管。这个名字是整条可见性链的第一个环节。
-    /// </summary>
+    // 名字写错的话解析器以为「没人设过」，而 SDK 照样会读——又变回静默接管。
     [Fact]
     public void EnvVar_MatchesTheNameTheSdkReads()
     {
         Assert.Equal("ANTHROPIC_BASE_URL", EndpointResolver.EnvVar);
     }
 
-    // ---- 每个协议族给自己的官方兜底 + 是否读环境（T9 修复轮 1 的 Ruling ①） ----
-    // ⚠️ 这三条都用**按名传参**：新增的 `officialUrl` / `envVar` 排在 `getEnv` 之后，
-    //    按位置传会把 Func 送进 string 形参（既有调用点就踩过这个 `CS1503`）。
+    // ---- 每个协议族给自己的官方兜底 + 是否读环境 ----
+    // 这三条都按名传参：officialUrl / envVar 排在 getEnv 之后，按位置传会把 Func 送进 string 形参（CS1503）。
 
     [Fact]
     public void Resolve_UsesTheCallersOfficialUrlAsFallback()
@@ -88,7 +77,7 @@ public class EndpointResolverTests
     [Fact]
     public void Resolve_WithNullEnvVarReadsNoEnvironment()
     {
-        // ⚠️ 这是「不让环境接管」的判据：即便环境里那变量有值，也不许它赢。
+        // 即便环境里那变量有值，也不许它赢。
         var resolved = EndpointResolver.Resolve(
             null, officialUrl: "https://api.openai.com", envVar: null,
             getEnv: Env("http://127.0.0.1:15721"));

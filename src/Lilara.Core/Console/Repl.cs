@@ -7,18 +7,8 @@ using Lilara.Core.Session;
 
 namespace Lilara.Core.Console;
 
-/// <summary>
-/// 命令面（04 §1.1）。⚠️ **它不是头**：同步收发、没有视图、不订阅、不流式渲染。
-///
-/// <para>⚠️ **它的新形状**：它现在是控制面的一个**客户端适配器**——
-/// 把一行文本解析成 <see cref="CoreCommand"/>，交给 <see cref="CommandDispatcher"/>，
-/// 再把回执**格式化**成人看的字。命令的语义**一条都不在这里**（那些在 dispatcher 里，
-/// 头走同一套）。这里只剩两样控制台专有的东西：
-/// ① **文本解析**（`--flag value` 那种人写风格，含它那几道守卫）；
-/// ② **显示**（回执与结果怎么印）。</para>
-///
-/// <para>⚠️ 它因此**减掉的只有视图**：命令是全部，事件不订阅，快照按需拉。</para>
-/// </summary>
+// 命令面：同步收发、没有视图、不订阅。把一行文本解析成 CoreCommand 交给 dispatcher，
+// 再把回执格式化成人看的字；命令的语义一条都不在这里。
 public sealed class Repl(
     CoreHost host,
     CommandDispatcher dispatcher,
@@ -30,17 +20,8 @@ public sealed class Repl(
     private readonly Func<SessionHandle, Stepper> _resolveStepper = resolveStepper;
     private readonly TextWriter _out = output;
 
-    /// <summary>
-    /// ⚠️ **这是控制台自己的概念**，不是核心的状态。核心只知道「激活表」。
-    /// `session.activate` **不许**写它——否则头点一下 B，用户在控制台敲的下一句就跑 B 去了。
-    ///
-    /// <para>⚠️ setter 会**顺带登记进宿主激活表**。这不是顺手做好事，是**正确性**：
-    /// 不登记的话，dispatcher 找不到它就会从磁盘**另载入一个实例**，
-    /// 于是同一个会话有两个 `SessionHandle`（`State` 是可变属性）⇒ 状态分叉。
-    /// 宿主的 `TryGetActivated` 本来就承诺「同一会话同一个实例」，
-    /// 而控制台是唯一能绕过 `Activate()` 直接塞 handle 的地方。
-    /// </para>
-    /// </summary>
+    // 控制台自己的「当前会话」概念，不是核心状态（只有控制台动作能设它）；
+    // setter 会把 handle 登记进宿主激活表——不登记会让同一会话出现两个实例、状态分叉。
     public SessionHandle? Current
     {
         get => _current;
@@ -53,21 +34,8 @@ public sealed class Repl(
 
     private SessionHandle? _current;
 
-    /// <summary>
-    /// 「这条命令可能改变提供商集合吗」——**纯控制台**的显示刷新判据
-    /// （`provider set` 之后要重印端点那一行）。
-    ///
-    /// ⚠️ **它不再是核心的缓存失效判据**。失效点是 `CommandDispatcher` 的 `provider.upsert`
-    /// ——挂在字符串判据上会让线上的 `provider.upsert` 走不到它，缓存就**静默失效**。
-    /// 换句话说：这个谓词现在只影响**一行字印不印**，不影响正确性。
-    ///
-    /// <para>⚠️ **`provider delete` 有意**不**扩进这个谓词**（T7 评审核过）：谓词只服务
-    /// `provider set` 之后的重印。删掉当前 provider 之后重印端点是**没有意义的**——
-    /// 调用点 `PrintEndpoint` 经 `StepperResolver` 现解析、`Endpoint is null` 时**提前返回**
-    /// ⇒ 删完再印**什么都不会印**，而屏幕上**过时的那一行照样留着**。
-    /// ⇒ 扩谓词**不改变任何可观测行为**。真修法是另一条「当前会话的 provider 没了」的提示，
-    /// 超出本批次——**不是**往这里加一个字符串。</para>
-    /// </summary>
+    // 纯控制台的显示刷新判据（provider set 之后要重印端点那一行）；
+    // 只影响一行字印不印，不影响正确性。provider delete 有意不扩进来。
     public static bool IsProviderSetCommand(string line) =>
         line.Trim().StartsWith("provider set ", StringComparison.Ordinal);
 
@@ -76,35 +44,26 @@ public sealed class Repl(
         var trimmed = line.Trim();
         if (trimmed.Length == 0) return true;
 
-        // ⚠️ 只有 `quit` / `exit` 是控制台**本地**的命令——退出这个循环是进程的事，
-        // 不是核心命令集的一部分（头没有「退出」这条）。
+        // quit / exit 是控制台本地命令，不是核心命令集的一部分（头没有「退出」这条）。
         if (trimmed is "quit" or "exit") return false;
 
-        // 查询走快照那一层（03 §8.1：控制台只用「命令 + 快照」两层）。
+        // 查询走快照那一层（控制台只用「命令 + 快照」两层）。
         if (trimmed == "history") { PrintHistory(); return true; }
         if (trimmed == "status") { PrintStatus(); return true; }
-        // ⚠️ **判据与解析器共用**（`IsClaimList`）——两边各写一份时它们漂过：
-        // 解析器切词（大小写不敏感、多空格都算），而这里曾用精确的 `== "claim list"`
-        // ⇒ `claim LIST` / `claim\tlist` 被解析器认作查询、却被这里放行
-        // ⇒ 落进 `AsMessage` ⇒ **当成消息发给了模型**。
+        // 判据与解析器共用（IsClaimList）：各写一份会漂 ⇒ claim LIST 被当成消息发给模型。
         if (CoreCommandParser.IsClaimList(trimmed)) { PrintClaims(); return true; }
 
         var (parsed, parseError) = CoreCommandParser.Parse(trimmed, Current?.SessionId);
         if (parseError is not null) { _out.WriteLine(parseError); return true; }
 
-        // ⚠️ 不是命令形态 ⇒ 它是**一条消息**，发给当前会话。这是控制台的主用法。
+        // 不是命令形态 ⇒ 当作一条消息发给当前会话。
         var command = parsed ?? AsMessage(trimmed);
         if (command is null) return true;   // AsMessage 已经印过引导语
 
         return await DispatchAsync(command, ct);
     }
 
-    /// <summary>
-    /// 把一行普通文本变成「发给当前会话的消息」。
-    /// ⚠️ 引导语要**一次把两步都讲完**：只提「没配提供商」的话，
-    /// 配了提供商但没建会话的人看不到下一步；只提「没会话」则反之。
-    /// 用户会卡在回环里（01 §8.1：核心不替你建会话）。
-    /// </summary>
+    // 把一行普通文本变成「发给当前会话的消息」。没会话时印的引导语要一次把两步都讲完。
     private CoreCommand? AsMessage(string text)
     {
         if (Current is not null)
@@ -116,10 +75,7 @@ public sealed class Repl(
         return null;
     }
 
-    /// <summary>
-    /// 按命令的种类决定「谁做那个动作」与「怎么印」。
-    /// ⚠️ 这段 switch **只负责控制台的形态**——命令的语义全在 dispatcher 里。
-    /// </summary>
+    // 按命令种类决定「谁做动作」与「怎么印」；这段 switch 只管控制台形态，语义全在 dispatcher。
     private async Task<bool> DispatchAsync(CoreCommand command, CancellationToken ct)
     {
         var id = Guid.NewGuid().ToString("N")[..8];
@@ -143,36 +99,25 @@ public sealed class Repl(
                         + $"（{accepted.Note}）。");
                     break;
 
-                // ⚠️ **删成功了要吭一声**：`Ack.Accepted.Reply` 是 null ⇒ 不加这条 case 就落进
-                // `default: PrintReply(null)` ⇒ **一声不吭**。用户分不清「删了」与「没反应」——
-                // 而删是**不可逆**的，「以为删了」的下一步往往是去重配一个已经不在的 id。
+                // 删成功要吭一声：Accepted.Reply 是 null，不加这条 case 会落进 default 一声不吭。
                 case CoreCommand.ProviderDelete del:
                     _out.WriteLine($"✓ 提供商 '{del.Id}' 已删除。");
                     break;
 
                 case CoreCommand.SessionCreate:
-                    // ⚠️ 控制台的「当前会话」在这里被设——**只有控制台自己的动作**能设它。
+                    // 控制台的「当前会话」只在这里（控制台自己的动作）被设。
                     Current = _host.Activated.First(h => h.SessionId == accepted.SessionId);
                     _out.WriteLine($"✓ 会话 {accepted.SessionId} 已创建。");
                     break;
 
-                // ⚠️ 轴改了要**立刻重印状态**——策略那一行就在 `PrintStatus` 里，
-                // 而用户在控制台改完轴最想知道的就是「现在是什么」。
-                //
-                // ⚠️ 印的是**命令带的那个会话 id**，不是 `Current`：`axis set` 可以指向
-                // 任意一个已存在的会话。用 `Current!.SessionId` 有两个真缺陷——
-                // ① 改的是别的会话时印错人；② `Current` 为 null（核心起来时没选中会话，
-                // 但盘上有会话可达）时**直接 NRE**，而它不在下面那两个 catch 里，会掀翻 REPL。
+                // 轴改了立刻重印状态（策略那一行在 PrintStatus 里）。
+                // 印的是命令带的会话 id，不是 Current：axis set 可指向别的会话，且 Current 可能为 null。
                 case CoreCommand.SessionSetAxis set:
                     _out.WriteLine($"✓ {set.SessionId} 的轴已更新");
-                    // 只有改的**就是**当前会话时重印状态；否则印的是另一个会话的数字，张冠李戴。
                     if (Current is not null && Current.SessionId == set.SessionId) PrintStatus();
                     break;
 
-                // ⚠️ 声明**成功了要吭一声**：`claim` 的 `Ack.Accepted.Reply` 是 **null**，
-                // 于是落进 `default: PrintReply(null)` ⇒ **一声不吭**。
-                // 用户分不清「占了」与「没反应」——而这正是「静默成功」最坏的地方：
-                // 他下一步会在一个自以为占上的地方工作。
+                // 声明成功要吭一声：Accepted.Reply 是 null，否则用户分不清「占了」与「没反应」。
                 case CoreCommand.ClaimAcquire acquire:
                     _out.WriteLine($"✓ 已占 {string.Join("、", acquire.Scope)}");
                     break;
@@ -190,14 +135,13 @@ public sealed class Repl(
         }
         catch (DispatchException ex)
         {
-            // ⚠️ 业务失败（模型 400 / 上游 503）——一行人话，REPL 继续活着。
-            // 它**不是** rejected：命令没写错，是这次没成。
+            // 业务失败（模型 400 / 上游 503）：一行人话，REPL 继续活着。这不是 rejected。
             _out.WriteLine($"✗ {ex.Message}");
             return true;
         }
         catch (ModelCallFailedException ex)
         {
-            // 建会话 / 解析适配器阶段的失败仍然是「这一步没成」，同样一行人话。
+            // 建会话 / 解析适配器阶段的失败同样一行人话。
             _out.WriteLine($"✗ {ex.Message}");
             return true;
         }
@@ -215,10 +159,7 @@ public sealed class Repl(
 
         _out.WriteLine($"⏺  {SessionQueries.ModelBody(reply.Blocks)}");
 
-        // ⚠️ 三条链路**各有各的截断用词**：Claude 说 max_tokens、Chat 说 length、
-        // Responses 说 incomplete。只认第一个的话，另外两条的截断会**完全不提示**——
-        // 用户看着「（这一步没有正文输出）」以为是模型没话说，其实是 token 烧完了。
-        // ⚠️ 原样比对，不在上游就叫别的词时臆造（未知词一律不提示）。
+        // 三条链路各有截断用词：max_tokens / length / incomplete；未知词一律不提示。
         if (reply.StopReason is "max_tokens" or "length" or "incomplete")
             _out.WriteLine($"（输出被截断了：{reply.StopReason}）");
     }
@@ -243,15 +184,12 @@ public sealed class Repl(
     {
         if (Current is null) { _out.WriteLine("还没有会话。用 `session create` 建一个。"); return; }
 
-        // ⚠️ 走 SessionQueries（先查内存激活表）——直接读磁盘会在步进行中报 Idle。
+        // 走 SessionQueries：直接读磁盘会在步进行中报 Idle。
         var state = SessionQueries.StateOf(_host, Current);
         _out.WriteLine($"会话 {Current.SessionId} · {state.Status} · 第 {state.Turn} 步");
 
-        // ⚠️ **模型来自 spec（建会话时冻结，不会变），effort 来自轴（会变）——两个来源，别混。**
-        // 旧代码这里印的是 `Spec.Model.Effort`，那是**冻结的快照**：`axis set effort` 一改，
-        // 它就和请求里实际发的 effort 分叉——控制台说还是旧值。同一个「设了没用」换到**显示层**。
-        // ⚠️ `!` 与索引器是 `Load` / `Create` 的契约（`CompleteAxes` 保证 `Axes` 非空且五键齐全），
-        // `Stepper` 读 effort 用的是同一套写法。
+        // 模型来自 spec（建会话时冻结），effort 来自轴（会变）——两个来源，别混。
+        // `!` 与索引器是 Load / Create 的契约（CompleteAxes 保证 Axes 非空且五键齐全）。
         _out.WriteLine($"模型 {Current.Spec.Model.ModelId} · effort {state.Axes![Axes.Effort]}");
         _out.WriteLine("策略 " + string.Join(" · ",
             Axes.Names.Select(n => $"{n}={state.Axes!.GetValueOrDefault(n, "?")}")));
@@ -260,7 +198,7 @@ public sealed class Repl(
 
     private void PrintClaims()
     {
-        // ⚠️ 声明落在**工作目录**（`01` §8），所以要有一个会话来问它的工作目录。
+        // 声明落在工作目录，所以要有一个会话来问它的工作目录。
         if (Current is null) { _out.WriteLine("还没有选中会话。"); return; }
 
         var claims = new ClaimStore(Current.Spec.WorkingDirectory).All();

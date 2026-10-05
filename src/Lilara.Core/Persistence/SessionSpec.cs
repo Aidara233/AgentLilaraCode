@@ -1,27 +1,23 @@
 namespace Lilara.Core.Persistence;
 
-/// <summary>
-/// 会话持有的模型选择：解析结果的快照 + 指向定义的引用（01 §7.2）。
-/// 会话必须能回答「这一步是哪个模型跑的」，否则重启后历史来路不明。
-/// </summary>
+// 会话持有的模型选择：解析结果的快照 + 指向定义的引用。
 public sealed record ModelSelection
 {
-    /// <summary>指向 <c>providers/</c> 里的定义。</summary>
+    // 指向 providers/ 里的定义。
     public required string ProviderId { get; init; }
 
-    /// <summary>「换模型 = 改会话配置」改的是这个。</summary>
     public required string ModelId { get; init; }
 
-    /// <summary>快照：建会话时协议是什么。老会话遇到新适配器也不慌。</summary>
+    // 快照：建会话时协议是什么。
     public required string Protocol { get; init; }
 
-    /// <summary>思考强度轴（01 §3.5）。纯请求参数，绝不进上下文。</summary>
+    // 思考强度轴。纯请求参数，绝不进上下文。
     public required string Effort { get; init; }
 
     public required int MaxTokens { get; init; }
 }
 
-/// <summary>创建时写一次，此后不可变（01 §8）。</summary>
+// 创建时写一次，此后不可变。
 public sealed record SessionSpec
 {
     public required string SessionId { get; init; }

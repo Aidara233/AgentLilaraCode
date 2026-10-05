@@ -9,19 +9,10 @@ using Lilara.Core.Session;
 namespace Lilara.Core.Hosting;
 
 /// <summary>
-/// 命令的**唯一执行点**（04 §1.1）。
-///
-/// ⚠️ 它存在的理由是**结构性**的：控制台不只是「另一个前端」，它与头
-/// **走同一条命令通道、同一个命令集、同一个回执**（04 §1.1）。
-/// 今天 Repl 直连 handler，头要接进来就得复制一份语义——而**复制语义正是
-/// 本项目付过代价的那类缺陷**（多处副本只改一处）。
-///
-/// <para>⚠️ **它不打印任何东西。** 回执与结果都**返回**给调用方，由前端决定怎么显示。
-/// 这正是头能复用它的前提——同样的回执，控制台印一行字，头渲染成一块 UI。</para>
-///
-/// <para>⚠️ **分工**：文本形态的守卫（-- 开头 / 末尾缺值 / 未知标志）住在**控制台的解析器**里——
-/// 那是控制台专属语法，搬进来会把它泄漏到线上协议。而**语义**校验（未知协议 / 未知 auth）
-/// 在这里，否则线上 provider.upsert 能写进一个控制台写不进的坏值。</para>
+/// 命令的唯一执行点。控制台与头走同一条命令通道、同一个命令集、同一个回执。
+/// 它不打印任何东西——回执与结果都返回给调用方，由前端决定怎么显示。
+/// 文本形态的守卫（`--` 开头 / 末尾缺值 / 未知标志）住在控制台的解析器里；
+/// 语义校验（未知协议 / 未知 auth）在这里，否则线上 `provider.upsert` 能写进坏值。
 /// </summary>
 public sealed class CommandDispatcher(
     CoreHost host, EventBus bus, Func<SessionHandle, Stepper> resolveStepper)
@@ -32,34 +23,17 @@ public sealed class CommandDispatcher(
 
     /// <summary>
     /// 分派一条命令。
-    /// <para><paramref name="awaitCompletion"/>：
-    /// **控制台传 true**——它没有视图（03 §8.1），唯一的输出就是这次的返回值，
-    /// 所以「命令投递即返回」在本地**退化成同步拿回执**（04 §1.1 明确允许）。
-    /// **控制面传 false**——立刻回 ack，模型回话经**事件**流出。</para>
+    /// <paramref name="awaitCompletion"/>：控制台传 true——它没有视图，唯一的输出就是这次的返回值，
+    /// 「命令投递即返回」于是在本地退化成同步拿回执；控制面传 false——立刻回 ack，模型回话经事件流出。
     /// </summary>
     public async Task<DispatchResult> DispatchAsync(
         CoreCommand command, string commandId, bool awaitCompletion, CancellationToken ct)
     {
-        // ⚠️ **兜底（backstop）：这里是常驻进程唯一的最后一道闸。**
-        // 上面每一个 handler 都在 `Program.cs` 的 `while (true) { await repl.ExecuteAsync(...) }`
-        // 里被调用，而**那一层没有任何 catch**——handler 里逃出来的任何异常都会掀翻
-        // **同时托管控制台与控制面的那个进程**。
-        //
-        // ⚠️⚠️ **这个失败类已经打死进程两次**（都是实测）：
-        //   ① Windows 设备名（`provider set NUL --key k` ⇒ 未捕获 `UnauthorizedAccessException`）；
-        //   ② 删一个正被并发读按住的文件（`File.Delete` ⇒ `IOException`，2000 次里 1623 次）。
-        // ⇒ 计划里**早就点名**这是缺的那一块（`Repl.ExecuteAsync` 只接 `DispatchException` /
-        //   `ModelCallFailedException`，`Program.cs` 没有 catch）——这里把它补上。
-        //
-        // ⚠️ 两个 `when` 都不是可选的：
-        //   · **取消要原样冒出去**：`Stepper` 的中断路依赖它传导
-        //     （见 `HandleSessionSendAsync` 自己那句 `catch (OperationCanceledException) when (stepCts.IsCancellationRequested)`）。
-        //   · **`DispatchException` 是既有的「业务失败」出口，也必须原样冒出去**——
-        //     `04` §1.1 / `03` §3 把它与 `rejected` 分得很清（rejected = 命令不合法；
-        //     DispatchException = 命令没错、这次没成，控制台印一行人话）。把它折成 `rejected`
-        //     会让「上游 503」变成「你的命令写错了」——**四条既有测试钉着这条必须抛出**
-        //     （`ModelFailure_ThrowsDispatchExceptionNotRejected` 等）。
-        // ⇒ 兜底只接**意外**异常，不接那两条**已定义**的路。
+        // 兜底：这里是常驻进程唯一的最后一道闸——handler 逃出的任何异常都会掀翻
+        // 同时托管控制台与控制面的那个进程（调用它的 `Program.cs` 那一层没有任何 catch）。
+        // 两个 `when` 都不是可选的：取消要原样冒出去（`Stepper` 的中断路依赖它传导）、
+        // `DispatchException` 是既有的「业务失败」出口也必须原样冒出去（把它折成 `rejected`
+        // 会让「上游 503」变成「你的命令写错了」）⇒ 兜底只接意外异常，不接那两条已定义的路。
         try
         {
             switch (command)
@@ -97,87 +71,48 @@ public sealed class CommandDispatcher(
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            throw;   // ⚠️ 取消不是错误——原样冒出去（见上）
+            throw;
         }
         catch (DispatchException)
         {
-            throw;   // ⚠️ 业务失败的既有出口——原样冒出去（见上）
+            throw;
         }
         catch (Exception ex)
         {
-            // 意外异常：**变成人话回执，进程活着**。⚠️ 只接这一格，别把上面两条也吞进来。
             return Reject(commandId, $"命令执行时出错：{ex.Message}");
         }
     }
 
     /// <summary>
-    /// ⚠️ **id 会变成文件名**（`ProviderStore.PathFor(id) => Path.Combine(_root, $"{id}.json")`）
-    /// ⇒ 它必须**不含路径语法**。判据是「**它是不是一个单纯的文件名**」，
-    /// 不是「它像不像 ASCII 标识符」——后者会把 `本地` 这类合法 id 一起挡掉
-    /// （实测的教训方向：白名单型判据总会漏掉用户正当的输入）。
-    /// ⚠️ 实测坑：`../escaped` 让文件落在**数据根**（`providers/` 之外）——
-    /// 控制台曾回「已保存」，而文件根本没进 `providers/`。
-    ///
-    /// <para>⚠️ **`Path.GetFileName` 是平台相关的**（.NET 的既有性质，不是本项目的选择）：
-    /// Windows 上它把 `a/b` 也当分隔符 ⇒ 拒绝；这正是**要的**（数据根可能被同步到别的平台）。
-    /// ⇒ 因此补了一条针对 `/` 的用例，且**用 `Path` 自己的词法**、不自己拼字符类——
-    /// 同一个仓库里 `Claims.Normalize` 已经吃过「自己拼分隔符」的亏。</para>
-    ///
-    /// <para>⚠️ **`internal static` 是刻意的**：T4 的 provider-schema 要把它**交出去**
-    /// 作为 id 的规则，所以它必须能被单独引用；本项目的测试也直接钉它的真值表。</para>
+    /// `id` 会变成文件名（`ProviderStore.PathFor(id) => Path.Combine(_root, $"{id}.json")`）
+    /// ⇒ 判据是「它是不是一个单纯的文件名」，不是「它像不像 ASCII 标识符」。
+    /// `Path.GetFileName` 是平台相关的：Windows 上它把 `a/b` 也当分隔符 ⇒ 拒绝——
+    /// 数据根可能被同步到别的平台，这正是要的。
+    /// `internal static` 是刻意的：测试与 provider-schema 直接钉它的真值表。
     /// </summary>
     internal static bool IsSafeProviderId(string id) =>
         !string.IsNullOrWhiteSpace(id)
-        // ⚠️ 这一句挡的是**路径语法**：`a/b` / `a\b` / `/abs` / `C:\abs` / `../escaped`
-        //    （`Path.GetFileName("../escaped")` = `escaped` ≠ `../escaped` ⇒ 拒绝）。
+        // 挡路径语法：`Path.GetFileName("../escaped")` = `escaped` ≠ `../escaped` ⇒ 拒绝。
         && id == Path.GetFileName(id)
         && id.IndexOfAny(Path.GetInvalidFileNameChars()) < 0
-        // ⚠️ **`.` 与 `..` 由这一句挡，不是上一句**——实测 `Path.GetFileName("..")` 就是 `..`、
-        //    `Path.GetFileName(".")` 就是 `.` ⇒ 上一句对它们是**放行**。
-        //    ⚠️ **它不冗余，别删**：删掉就把 `.` / `..` 放回来了（注释把守卫从代码里删掉的那种缺陷）。
-        //    ⚠️ 代价实测：`PathFor("..")` 得到 `...json`（段里没有分隔符）⇒ 今天仍落在 `providers/` 内，
-        //    不构成穿越——它是**纵深防御**；但 `PathFor` 一旦不拼 `.json`，它立刻变成穿越。
+        // `.` / `..` 由这一句挡（`Path.GetFileName("..")` 就是 `..`）——不冗余，删了会把它们放回来。
         && id is not "." and not ".."
-        // ⚠️ 设备名另算：`NUL` 词法上是个完全合法的文件名，上面几条一条都抓不到它——见其注释。
+        // 设备名另算：`NUL` 词法上是合法文件名，上面几条都抓不到它——见其注释。
         && !IsWindowsDeviceName(id);
 
     /// <summary>
-    /// ⚠️ **Windows 设备名：真二进制里是「未捕获异常掀翻常驻进程」**——实测（真二进制 + 临时数据根）：
-    /// <list type="bullet">
-    /// <item>`provider set COM1 --key k` ⇒ 未捕获 `FileNotFoundException`（`\\.\COM1`）⇒ **REPL 直接死**，
-    ///   后续命令不再执行；盘上无文件。</item>
-    /// <item>`provider set NUL --key k` ⇒ 未捕获 `UnauthorizedAccessException`（`\\.\NUL`）⇒ **同样掀翻进程**。</item>
-    /// </list>
-    /// ⚠️ 别把这条记成「回 ✓ 而盘上无文件」——那是**裸** `File.WriteAllText(<dir>/"NUL.json", …)` 的行为
-    /// （实测确实不抛、`GetFiles` 看不见、`File.Exists` 为 false）。`ProviderStore.Save` 走的是
-    /// `AtomicFile`（先写 `.tmp` 再 `Move`），**路径不同、结局不同**：`Move` 找不到那个 `.tmp` ⇒ 抛。
-    /// **探针 ≠ 被测物，要验证就调那个函数。**
-    ///
-    /// <para>⚠️ **取「第一个点之前」那一段，不是 `Path.GetFileNameWithoutExtension`。**
-    /// 实测 `NUL.txt.txt.json` **同样是设备名**（一样抛、一样掀翻进程），而 `GetFileNameWithoutExtension`
-    /// 给出 `NUL.txt.txt` ⇒ 会**放行**它。判据要盖过系统的怪癖，不是刚好合上它。</para>
-    ///
-    /// <para>⚠️ 判定 = **大小写不敏感**（实测 `nul.json` 一样是设备名）+ `TrimEnd()`（`NUL  .json` 同样是）
-    /// + **相等、不是前缀**——实测 `NULx` / `COM1x` / `COM10` / `LPT10` / `console` / `connect`
-    /// 都是**正常文件**，前缀型会把这一大片正当 id 一起误杀；保留表只有 **1–9 与 `¹²³`**
-    /// （`COM0` / `LPT0` / `COM10` / `LPT10` 实测都能正常写入）。</para>
-    ///
-    /// <para>⚠️ **`CONIN$` / `CONOUT$` 是伪设备；裸 `CONIN` / `CONOUT` 是正常文件**——
-    /// 实测（`ProviderStore.Save`）：前者抛 `IOException` / `UnauthorizedAccessException`，
-    /// 后者正常写入。⇒ 只挡带 `$` 的那两个，**别顺手把裸名字也挡了**（那是误杀）。</para>
-    ///
-    /// <para>⚠️ **`¹` `²` `³`（U+00B9 / B2 / B3）也算数字，但别的「数字」写法不算**——
-    /// 实测 `COM¹` 抛异常，而 `COM⁴` `COM⁵` `COM⁹`（U+2074…）、全角 `COM１`（U+FF11）、
-    /// 阿拉伯-印度 `COM١`（U+0661）**都是正常文件**。
-    /// ⇒ **只加这三个，别扩**。按「数字」的直觉去扩，会把判据开得比系统**宽**——
-    /// 而那是另一个方向的错（与「前缀型」同一族：误杀）。</para>
-    ///
-    /// <para>⚠️ **Linux 上 `NUL` 是正常文件名，这里照样拒绝**——与 `/` 那条同一套理
-    /// （数据根可能被同步到别的平台），**这是刻意的**。</para>
+    /// Windows 设备名：真二进制里是「未捕获异常掀翻常驻进程」（`COM1` ⇒ `\\.\COM1` 抛
+    /// `FileNotFoundException`；`NUL` ⇒ `\\.\NUL` 抛 `UnauthorizedAccessException`）。
+    /// 取「第一个点之前」那一段，不是 `Path.GetFileNameWithoutExtension`——`NUL.txt.txt.json`
+    /// 同样是设备名。判据大小写不敏感 + `TrimEnd()`，且是**相等不是前缀**（`NULx` / `COM10` /
+    /// `console` / `connect` 都是正常文件）；数字只有 **1–9 与 `¹²³`**（`COM⁴`、全角 `COM１`、
+    /// 阿拉伯-印度 `COM١` 都是正常文件——别按「数字」直觉扩，会把判据开得比系统宽）。
+    /// `CONIN$` / `CONOUT$` 是伪设备，裸 `CONIN` / `CONOUT` 是正常文件。
+    /// Linux 上 `NUL` 是正常文件名，这里照样拒绝（数据根可能被同步到别的平台）。
     /// </summary>
     private static bool IsWindowsDeviceName(string id)
     {
-        // 「第一个点之前」+ 去尾随空白：`NUL.` / `NUL  .json` / `NUL.txt.txt.json` 都归到 `NUL`。
+        // 「第一个点之前」+ 去尾随空白：`NUL.` / `NUL.txt.txt.json` 都归到 `NUL`。
         var dot = id.IndexOf('.');
         var stem = (dot < 0 ? id : id[..dot]).TrimEnd();
 
@@ -185,13 +120,12 @@ public sealed class CommandDispatcher(
             || stem.Equals("PRN", StringComparison.OrdinalIgnoreCase)
             || stem.Equals("AUX", StringComparison.OrdinalIgnoreCase)
             || stem.Equals("NUL", StringComparison.OrdinalIgnoreCase)
-            // ⚠️ 带 `$` 的伪设备：**裸 `CONIN` / `CONOUT` 是正常文件**，别顺手加。
+            // 带 `$` 的伪设备——裸 `CONIN` / `CONOUT` 是正常文件。
             || stem.Equals("CONIN$", StringComparison.OrdinalIgnoreCase)
             || stem.Equals("CONOUT$", StringComparison.OrdinalIgnoreCase))
             return true;
 
-        // ⚠️ **相等**，不是前缀（实测 `COM1x` 正常写入）；数字只有 **1–9 与 `¹²³`**
-        //    （`COM0` / `LPT0` / `COM10` / `LPT10` / `COM⁴` 实测都能正常写入）。
+        // 相等，不是前缀（`COM1x` / `COM10` / `LPT10` 正常写入）；数字只有 1–9 与 `¹²³`。
         if (stem.Length != 4) return false;
         var head = stem[..3];
         if (!head.Equals("COM", StringComparison.OrdinalIgnoreCase)
@@ -202,72 +136,42 @@ public sealed class CommandDispatcher(
 
     private DispatchResult HandleProviderUpsert(CoreCommand.ProviderUpsert p, string id)
     {
-        // ⚠️ **id 先过闸，且必须在 Protocol / Auth 之前**：它是最底层的那一条——
-        // 一个坏 id 会让**后面所有**校验都变得没有意义（文件压根落错地方）。
-        // ⚠️ 判据住在 dispatcher，不在控制台——控制台与头是两个前端，
-        // 放前端会被另一个绕过（本项目的规范，G16）。
+        // id 先过闸，且在 Protocol / Auth 之前；判据住在 dispatcher
+        // （控制台与头是两个前端，放前端会被另一个绕过）。
         if (!IsSafeProviderId(p.Id))
             return Reject(id, UnsafeProviderIdReason(p.Id));
 
-        // ⚠️ 语义校验在这里，不在控制台——否则线上能写进坏值。
+        // 语义校验在这里，不在控制台——否则线上能写进坏值。
         if (p.Protocol is not null && !Protocols.All.Contains(p.Protocol))
             return Reject(id, $"未知协议 '{p.Protocol}'。支持：{string.Join(" / ", Protocols.All)}");
 
-        // ⚠️ 大小写是**静默改行为**：AuthSchemes.Bearer 的字面量是小写 "bearer"，
-        // 而适配器判的是序号相等。手写 Bearer（大写）会被悄悄当成 x-api-key 发出去。
+        // 大小写静默改行为：`AuthSchemes.Bearer` 的字面量是小写 "bearer"，适配器判序号相等——
+        // 手写大写 `Bearer` 会被悄悄当成 x-api-key 发出去。
         if (!string.IsNullOrEmpty(p.Auth)
             && p.Auth != AuthSchemes.ApiKey && p.Auth != AuthSchemes.Bearer)
             return Reject(id, $"未知认证方式 '{p.Auth}'。支持：{AuthSchemes.ApiKey} / {AuthSchemes.Bearer}");
 
-        // ⚠️ 先读旧定义，**保留本次没提到的字段**。整文件覆盖会抹掉手写配置
-        // （Endpoint / Modality / DefaultModel / Protocol 都是操作者配置）。
+        // 先读旧定义，保留本次没提到的字段（Endpoint / Modality / DefaultModel / Protocol 都是操作者配置）。
         var existing = _host.Providers.Load(p.Id);
 
-        // ⚠️ **新 provider 必须给 key，已有 provider 省略即保留**（用户裁定 R-B：头读不到 key，
-        // 不该逼它重发）。两条方向不对称，所以判据要**一起**看 `p.ApiKey` 与 `existing`：
-        //   · 新 provider 省 key ⇒ 存下一个**发不出去的配置**（用户以为配好了，第一次发消息才炸）
-        //     ⇒ 比拒绝更糟，**必须拒**。⚠️ 理由要**点名那个 id**——用户手打了三个 provider 时，
-        //     光说「必须给 key」他不知道自己错在哪一个。
-        //   · 已有 provider 省 key ⇒ 保留旧 key（这正是 R-B 要的那条路）。
-        // ⚠️ **这条要在 `Save` 之前**：拒绝时盘上不许留下半成品。
-        //
-        // ⚠️⚠️ **判据走 `ProviderDefinition.HasKey`——一处定义、三处调用**（守卫 / 落盘 /
-        // `/providers` 的 `hasApiKey`）。**别在这里再拼一遍 `IsNullOrEmpty` / `is null`。**
-        //
-        // 这条纪律是**付过代价**的：判据曾**拼成两份、而且漂了**——守卫用 `is null`、
-        // `/providers` 用 `!IsNullOrEmpty`。而 `""` **不是 null** ⇒ 它
-        //   · 新 id 带 `""` ⇒ **绕过守卫**、被 Accepted、存下一个**空 key**（正是上面那句
-        //     「存一个发不出去的配置」）。⚠️ 线上 `Opt(...)` 对 `{"apiKey": ""}` 返回 `""`
-        //     （`JsonValueKind.String` 对空串也为真）⇒ **两个前端都会走到这里**；
-        //   · 已有 provider 带 `""` ⇒ 旧写法 `p.ApiKey ?? existing!.ApiKey` 判它「非 null」
-        //     ⇒ **把存着的 key 覆盖成空**——R-B 那条失败路径（头读不到 key ⇒ 一个天真的表单
-        //     提交空输入框就把 key 抹了）从另一扇门进来。
-        // ⇒ 空串与缺失**等价**（都是「没给」），而这条等价**只写在 `HasKey` 那一处**。
-        // ⚠️ **别改成 `IsNullOrWhiteSpace`**：那是**第三个**判据，一改就又变成两份拼写
-        //（空白串是另一个问题，不在本处顺手改）。
+        // 新 provider 必须给 key，已有 provider 省略即保留——两条方向不对称。
+        // 空串与缺失等价（都是「没给」），这条等价只写在 `ProviderDefinition.HasKey` 一处，
+        // 别在这里再拼一遍 `IsNullOrEmpty` / `is null`。
+        // 这条要在 `Save` 之前：拒绝时盘上不许留下半成品。
         if (!ProviderDefinition.HasKey(p.ApiKey) && existing is null)
             return Reject(id, $"新提供商 '{p.Id}' 必须给 --key。");
 
-        // ⚠️「存得下、发不出」那个旧顾虑，对**从命令进来的值**已由上面两道闸解决。
-        // 但**手写进 providers/<id>.json 的未知协议绕过了闸**，而下面的 existing?.Protocol
-        // 会让它**原样保留**——那一半由 AdapterFactory 在**发消息时**给人话兜底。
+        // 手写进 providers/<id>.json 的未知协议绕过上面的闸，existing?.Protocol 会原样保留——
+        // 那一半由 AdapterFactory 在发消息时给人话兜底。
         var effectiveProtocol = p.Protocol ?? existing?.Protocol ?? Protocols.ClaudeMessages;
 
         _host.Providers.Save(new ProviderDefinition
         {
             Id = p.Id,
             Protocol = effectiveProtocol,
-            // ⚠️ `ProviderDefinition.ApiKey` 是 **`required`——保留它，别去掉**：
-            // 去掉会让别的构造点**静默漏填**（那正是 `required` 存在的理由）。
-            // 这里**构造时必给值**：**空串与缺失等价**（都是「没给」）⇒ 用上面已载入的旧 key。
-            // 判据走 `ProviderDefinition.HasKey`（同上：一处定义、别在这里再拼一遍）。
-            //
-            // ⚠️⚠️ **下面这个 `!` 与上面的守卫是「耦合」的——动守卫会殃及这一行。**
-            // 实测（R1）：**只**把守卫还原成 `is null` 时，这一行会在 `existing == null` 上抛
-            // `NullReferenceException`（红在这一行，而不是在守卫那条断言上）——守卫放行了
-            // `""`、落盘却去取 `existing!.ApiKey`，而 `existing` 正是 null。
-            // ⇒ 守卫必须继续保证「`!HasKey(p.ApiKey)` 且 `existing is null` 的组合已被拒」；
-            // 改守卫条件时**连带复核这一行**（这就是本项目「两份判据漂了」的同一族形状）。
+            // `ProviderDefinition.ApiKey` 是 `required`——保留它，别去掉（去掉会让别的构造点静默漏填）。
+            // 空串与缺失等价 ⇒ 用上面已载入的旧 key；判据走 `ProviderDefinition.HasKey`。
+            // 下面这个 `!` 与上面的守卫耦合：改守卫条件时连带复核这一行。
             ApiKey = ProviderDefinition.HasKey(p.ApiKey) ? p.ApiKey! : existing!.ApiKey,
             DefaultModel = p.Model ?? existing?.DefaultModel ?? "claude-opus-5",
             Modality = existing?.Modality ?? "vision",
@@ -275,75 +179,43 @@ public sealed class CommandDispatcher(
             AuthScheme = string.IsNullOrEmpty(p.Auth) ? existing?.AuthScheme : p.Auth,
         });
 
-        // ⚠️ **失效点必须在这里**，不能挂在控制台的 IsProviderSetCommand 上——
-        // 那是个**字符串**判据，线上的 provider.upsert 走不到它 ⇒ 缓存**静默失效**，
-        // 用户改了 provider 却还在用旧的（Repl 那段注释警告的同一个 bug，换了个入口）。
+        // 失效点必须在这里，不能挂在控制台的字符串判据 `IsProviderSetCommand` 上——
+        // 线上 `provider.upsert` 走不到它 ⇒ 缓存静默失效。
         _host.InvalidateSteppers();
 
         return new DispatchResult(new Ack.Accepted { CommandId = id, Note = effectiveProtocol });
     }
 
-    /// <summary>
-    /// ⚠️ **坏 id 的拒绝理由只此一份**：`provider.upsert` 与 `provider.delete` 共用同一个闸
-    /// （<see cref="IsSafeProviderId"/>）⇒ 理由也该是同一句。两处各写一句会漂，
-    /// 而漂的表现是「**同一个坏 id，两条命令给出不同的解释**」——用户不知道该信哪句。
-    /// </summary>
+    /// <summary>坏 id 的拒绝理由只此一份——`upsert` 与 `delete` 共用同一个闸，两处各写一句会漂。</summary>
     private static string UnsafeProviderIdReason(string id) =>
         $"提供商 id '{id}' 不合法：它会变成 providers/ 下的文件名，"
         + "必须是**非空**、**不含路径语法**（分隔符 / `..` / 非法字符）、"
         + "且**不是 Windows 设备名**（`NUL` / `CON` / `COM1` …）的单纯文件名。";
 
     /// <summary>
-    /// 删掉一个提供商（`04` §1.1 的 `provider.delete`）。
+    /// 删掉一个提供商（`provider.delete`）。
     ///
-    /// <para>⚠️ **同一个闸，且必须在「任何文件系统调用之前」。** `ProviderStore.Delete` 走
-    /// 同一个 `PathFor(id)` ⇒ `delete ../escaped` 会删掉 `<数据根>/escaped.json`——
-    /// **`providers/` 之外**的东西。而**删是不可逆的**：闸若漏了或挪到删除之后，
-    /// ack 仍会是 `rejected`，而那个文件**已经没了**。⇒ 闸放在最前面。</para>
+    /// 同一个闸，且必须在任何文件系统调用之前：`ProviderStore.Delete` 走同一个 `PathFor(id)`
+    /// ⇒ 坏 id 会让它在 `providers/` 之外动手，而删除不可逆。不存在 ⇒ 拒绝，不是幂等成功。
+    /// 删一个正被会话引用的 provider **不阻止**——用户可能就是要删掉坏配置；
+    /// 删完 `InvalidateSteppers()` 让后果可见（那个会话下次发消息会走「绑定的提供商已不存在」那条路）。
     ///
-    /// <para>⚠️ **设备名那一臂在删除路径上是「纵深防御」，不是当前生效的那道防线**——
-    /// 别把这条读成「文件系统在这里不安全」。实测（`net10.0`）：`File.Exists("…/providers/NUL.json")`
-    /// 返回 **false 且不抛** ⇒ `ProviderStore.Delete` 里那个 `File.Exists` 先短路，
-    /// **`File.Delete` 根本走不到**（与 `.`/`..` 那条同级：留着是因为**万一那道预检被去掉**，
-    /// 实测 `File.Delete` 对 `NUL`/`CON` 抛 `UnauthorizedAccessException`，而 `COM1.json` **不抛**——
-    /// 所以它今天挡的是「将来预检被撤掉」那一格，不是当前这一格）。</para>
-    ///
-    /// <para>⚠️ **别把两道防线说成一个 `预检`**：挡住 `NUL` 这类的是
-    /// **`ProviderStore.Delete` 里的 `File.Exists`**；而挡住 `/abs` 那种**绝对路径**的是
-    /// **本方法上面那道闸**——`PathFor("/abs")` 解析成 `/abs.json`（`Path.Combine` 的第二段带根
-    /// 会把第一段整个丢掉）⇒ **`providers/` 之外**，若那里真有个文件，`File.Exists` 就是 true、
-    /// **那道预检拦不住它**。（两条都实测过。）</para>
-    ///
-    /// <para>⚠️ 那设备名这一臂为什么还留着？因为**没有它会回一句假话**：`delete NUL` 会答
-    /// 「没有提供商 'NUL'，无从删除。」——把一个**被拒绝的非法 id** 说成**不存在**，
-    /// 而用户会去翻 `providers/` 找一个本该被拒的输入。</para>
-    ///
-    /// <para>⚠️ **不存在 ⇒ 拒绝，不是幂等成功。** 本项目一路在收「静默的成功」：
-    /// `provider delet local`（拼错）若回 ✓，用户以为删掉了、其实没删，
-    /// 而下一次发消息用的还是那个凭据。理由里**点名那个 id**——手打了三个 provider 时，
-    /// 光说「没有这个提供商」他不知道是哪一个。</para>
-    ///
-    /// <para>⚠️ **删一个正被会话引用的 provider **不阻止**（R-A：想改啥都行）**——
-    /// 用户可能就是要把一个坏配置删掉，`SessionSpec` 的存在**不构成**「不能删」的理由。
-    /// 但**后果要可见**：删完 `InvalidateSteppers()`，那个会话下次发消息会走
-    /// `StepperResolver` 的「绑定的提供商已不存在」那条路（已实现；`Program.cs` 启动时也报）。</para>
+    /// 两道防线别混为一谈：挡住 `NUL` 这类的是 `ProviderStore.Delete` 里的 `File.Exists`
+    /// （实测它对 `NUL.json` 返回 false 且不抛 ⇒ `File.Delete` 走不到；`File.Delete` 对 `NUL`/`CON`
+    /// 抛 `UnauthorizedAccessException`，对 `COM1.json` 不抛）；挡住 `/abs` 绝对路径的是本方法上面那道闸
+    /// （`PathFor("/abs")` 解析成 `/abs.json`，`Path.Combine` 的第二段带根会丢掉第一段）。设备名那一臂
+    /// 是纵深防御，留着是因为没有它会回一句假话——把被拒的非法 id 说成「不存在」。
     /// </summary>
     private DispatchResult HandleProviderDelete(CoreCommand.ProviderDelete d, string id)
     {
         if (!IsSafeProviderId(d.Id))
             return Reject(id, UnsafeProviderIdReason(d.Id));
 
-        // ⚠️ 判据走 `ProviderStore.Delete` 的返回值（**文件层**：那个文件在不在）——
-        // **别在这里改成 `Load(d.Id) is null`**：`Load` 把损坏的文件也算「不存在」，
-        // 于是坏配置会永远删不掉（见 `ProviderStore.Delete` 的注释）。
-        //
-        // ⚠️ **并发读撞上时给一句定制的话，而不是让异常冒出去。**
-        // `Delete` 已经重试过（与 `AtomicFile.Write` 同款），仍失败说明那个文件**真的被别的句柄按住**
-        // （`FileShare.Read` 不含 `FILE_SHARE_DELETE`）——而这是本项目的**常态**：
-        // 头的轮询 / 任何网页的 `fetch(GET /providers)` 都能按住它。
-        // ⚠️ **别把这条失败退回成 `false`**：那是「没有提供商 'x'，无从删除。」——对一次**暂时占用**是**假话**。
-        // 这里把**真正的原因**（忙）讲出来。⚠️ 之所以接两种异常：sharing violation 抛 `IOException`，
-        // 没带 `FILE_SHARE_DELETE` 的句柄抛 `UnauthorizedAccessException`。
+        // 判据走 `ProviderStore.Delete` 的返回值（文件层），别改成 `Load(d.Id) is null`——
+        // `Load` 把损坏的文件也算「不存在」，坏配置会永远删不掉。
+        // 接两种异常：`FileShare.Read` 不含 `FILE_SHARE_DELETE`，被并发读按住时 sharing violation
+        // 抛 `IOException`、没带 DELETE 的句柄抛 `UnauthorizedAccessException`——
+        // 把「暂时占用」说成「不存在」是假话，所以这里讲出真正的原因（忙）。
         bool deleted;
         try
         {
@@ -357,9 +229,7 @@ public sealed class CommandDispatcher(
         if (!deleted)
             return Reject(id, $"没有提供商 '{d.Id}'，无从删除。");
 
-        // ⚠️ **失效点必须在这里**，不能挂在控制台的字符串判据上——那是个**字符串**判据，
-        // 线上的 `provider.delete` 走不到它 ⇒ 缓存**静默失效**，
-        // 用户删了 provider 而会话还在用那份已经删掉的配置跑（与 upsert 同源的理由）。
+        // 失效点必须在这里，不能挂在控制台的字符串判据上——线上 `provider.delete` 走不到它 ⇒ 缓存静默失效。
         _host.InvalidateSteppers();
 
         return new DispatchResult(new Ack.Accepted { CommandId = id });
@@ -374,21 +244,17 @@ public sealed class CommandDispatcher(
         var model = _host.Providers.ToSelection(provider, null, "high", 16000);
         var handle = SessionHandle.Create(_host.Store, _host.WorkingDirectory, model);
 
-        // 登记进激活表——快照端点据此避免读到盘上过期的 Idle（见 CoreHost.TryGetActivated）。
+        // 登记进激活表——快照端点据此避免读到盘上过期的 Idle。
         _host.Register(handle);
 
-        // ⚠️ **`session.created` 必须发**——`05` §6.1 要求头的「全局会话列表」随事件更新，
-        // 而那份列表是**派生**的（对每个 pk 取 sessions 的并集，核心不存它）。
-        // 第一版**声明并注册了这个事件类型却从没发布**，于是：在控制台敲 `session create`，
-        // 已经打开的页面**看不见**这个新会话，而且不会自愈。
-        // ⚠️ 它同时发到**项目 topic**（跨会话那一层）与**会话 topic**——
-        // 头订的是前者（它还不可能知道这个新会话的 id），而后者让「刚订阅上就活起来」成立。
+        // `session.created` 必须发：头的「全局会话列表」是派生的（对每个 pk 取 sessions 并集，
+        // 核心不存它）。同时发到项目 topic（头订的是它，它还不可能知道新会话的 id）与会话 topic。
         _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
             new WireEvent.SessionCreated(handle.SessionId, handle.ProjectKey));
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
             new WireEvent.SessionCreated(handle.SessionId, handle.ProjectKey));
 
-        // ⚠️ 分配型命令**必须**回传新身份，否则后续命令无从指涉（03 §2 的唯一例外）。
+        // 分配型命令必须回传新身份，否则后续命令无从指涉。
         return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = handle.SessionId });
     }
 
@@ -396,9 +262,8 @@ public sealed class CommandDispatcher(
     {
         if (!TryFind(a.SessionId, out _, out var notFound)) return Reject(id, notFound!);
 
-        // ⚠️ 激活**只是载入内存**。它**不许**去写「控制台的当前会话」——
-        // 那是控制台自己的概念（Repl.Current）。头点一下 B 就改掉控制台的当前会话，
-        // 用户在控制台敲的下一句就会跑到 B 去。两者必须分开。
+        // 激活只是载入内存，不许写「控制台的当前会话」（那是 `Repl.Current` 自己的概念）——
+        // 否则头点一下 B 就改掉控制台的当前会话，用户在控制台敲的下一句会跑到 B 去。
         return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = a.SessionId });
     }
 
@@ -407,21 +272,9 @@ public sealed class CommandDispatcher(
     {
         if (!TryFind(s.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
-        // ⚠️ **次序照 `01` §6.1 原文**：
-        //   入队(x) → 若 x 是事件，**立即追加进记录** → 安排一次「启动」（去重）
-        // 追加与入队必须**紧挨着**：一旦分开，「已落盘未入队」或「已入队未落盘」
-        // 这两种中间态就会各自丢消息。
-        //
-        // ⚠️ **这两步刻意不拿闸**（放在闸外）——这是「合并是队列的副产品」能成立的**前提**。
-        // 第一次实测就抓到了：把入队放进闸里，第二条 send 会**卡在闸上**、
-        // 根本没机会入队，于是「3 次入队 → 第一次取空队列」永远不成立，
-        // 连发 3 条真的调了 **3 次模型**（`call=3`）。
-        // 文档要的是「后两次是 no-op」，而 no-op 的前提是**它们先进得来**。
-        //
-        // ⚠️ 那并发安全吗？——**安全**，靠的是各自那一层的锁：
-        //   · 追加：`HistoryLog.Append` 自带**按路径**的锁（防字节交错）
-        //   · 入队：`SessionHandle.Enqueue` 自带队列锁
-        // ⇒ 短临界区各自负责，不必被「整步」那把大闸罩着。
+        // 追加与入队必须紧挨着——分开会产生「已落盘未入队」/「已入队未落盘」两种中间态，各自丢消息。
+        // 这两步刻意不拿闸：合并是队列的副产品，而 no-op 的前提是后来的 send 先进得来。
+        // 并发安全靠各自那层的锁：`HistoryLog.Append` 自带按路径的锁，`SessionHandle.Enqueue` 自带队列锁。
         var at = DateTimeOffset.UtcNow;
 
         _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
@@ -432,15 +285,12 @@ public sealed class CommandDispatcher(
         });
         handle.Enqueue(s.Blocks);
 
-        // ⚠️ **事件从 dispatcher 发，不从 `Stepper` 发**——这是「控制台的命令也产生事件」的实现。
-        // `03` §8.1 只说控制台**不订阅**，没说它的命令不产生事件。
-        // 若事件在 `Stepper` 里发、或者干脆由控制面自己发，那么**控制台敲的那句话
-        // 在头上是看不见的**——头的视图会**静默**少一步，而且它没办法发现。
+        // 事件从 dispatcher 发，不从 `Stepper` 发——否则控制台敲的那句话在头上看不见
+        // （控制台不订阅，但它的命令照样产生事件；缺了它头的视图会静默少一步）。
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
             new WireEvent.MessageAppended(handle.SessionId, "user", s.Blocks, at));
 
-        // ⚠️ **启动去重**（`01` §6.1「会话 Running？→ no-op」）。
-        // 已经有一个推进在飞时，本次只入队、**不再安排一次推进**。
+        // 启动去重：已有推进在飞时，本次只入队、不再安排一次推进。
         if (!handle.TryEnterStep())
             return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = s.SessionId });
 
@@ -448,16 +298,13 @@ public sealed class CommandDispatcher(
 
         if (awaitCompletion)
         {
-            // 控制台：**同步拿结果**（`04` §1.1 明确允许「本地退化成同步拿回执」）。
-            // 它的失败要**抛给调用方**——控制台打印一行人话、REPL 继续活着。
+            // 控制台：同步拿结果，失败抛给调用方（打印一行人话、REPL 继续活着）。
             var reply = await RunStepAsync(handle, ct, throwOnFailure: true);
             return accepted with { Reply = reply };
         }
 
-        // ⚠️ 控制面：**立刻回执，步在后台跑**（`03` §1 判据 2：命令投递即返回、结果走事件）。
-        // 这不只是「协议好看」——**没有它，`session.interrupt` 无事可做**：
-        // 步要是在命令里同步跑完，那条 interrupt 命令根本轮不到执行
-        // （它的"当前步"在它到达之前就已经结束了）。
+        // 控制面：立刻回执、步在后台跑——否则 `session.interrupt` 无事可做
+        // （步若在命令里同步跑完，那条 interrupt 在它的「当前步」结束前根本轮不到执行）。
         _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
             CancellationToken.None);
 
@@ -465,51 +312,36 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
-    /// 跑一步：闸 → 事件 → 推进。**调用方必须先 `TryEnterStep` 拿到那把标志。**
-    ///
-    /// <para>⚠️ **取消与失败必须分开**（这是本方法的要害）：
-    /// 用户按了中断不是失败，**不能报 `error`**——否则每次正常中断都变成一条红色告警，
-    /// 头会开始忽略 `error`，而那正是它最该看的东西。
-    /// 判据是 <see cref="Cancellation.ShouldWrap"/> 的镜像：看**是不是调用方取消的**。</para>
+    /// 跑一步：闸 → 事件 → 推进。调用方必须先 `TryEnterStep` 拿到那把标志。
+    /// 取消与失败必须分开——用户按了中断不是失败，不能报 `error`
+    /// （否则每次正常中断都变成红色告警，头会开始忽略 `error`，而那正是它最该看的东西）。
     /// </summary>
     private async Task<ModelReply?> RunStepAsync(SessionHandle handle, CancellationToken ct, bool throwOnFailure)
     {
-        // ⚠️ **CTS 每步一个**，且**登记进宿主**（`interrupt` 靠它找到"当前那个步"）。
-        // 一个长命的 CTS 会让 `interrupt` 落在空闲期时把**下一次**的 token 变成已取消 ⇒
-        // 适配器判「调用方取消」⇒ 不包装 ⇒ 裸 `OperationCanceledException` 冒到前端。
+        // CTS 每步一个，且登记进宿主（`interrupt` 靠它找到「当前那个步」）——
+        // 长命的 CTS 会让空闲期的 interrupt 把下一次的 token 变成已取消。
         using var stepCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _host.SetCts(handle.SessionId, stepCts);
 
         var gate = _host.GateFor(handle.SessionId);
 
-        // ⚠️ **「我拿到了闸」必须是显式记录的，不能靠 `gate.CurrentCount == 0` 去猜。**
-        // 第一版在 finally 里写 `if (gate.CurrentCount == 0) gate.Release();`——
-        // 那判的是**闸的当前状态**，不是**本方法的持有记录**。窄路径：
-        //   `WaitAsync` 在**没拿到**闸时抛 OCE（已取消的 token）⇒ 走到 finally
-        //   ⇒ `ExitStep()` **先**放行了下一次推进，新步拿到闸（count→0）
-        //   ⇒ 本步读到 0（那是**别人的**）⇒ 多还一次 ⇒ 第三个步也能进来。
-        // 一次虚假 `Release` 就打破 `02` §3.2「会话内严格串行」这条正确性条款，
-        // 后果是两步并发写 `handle.State`（`Turn` 丢更新）与并发 `DrainQueue`。
-        // ⚠️ 纪律：**没实际跑出过复现**（窗口只有几条指令宽），这是靠**代码审查**定的——
-        // 用状态代理所有权本来就是错的，不需要复现才修。
+        // 「我拿到了闸」必须是显式记录的，不能靠 `gate.CurrentCount == 0` 去猜——
+        // 那判的是闸的当前状态，不是本方法的持有记录；用状态代理所有权本来就是错的。
         var acquired = false;
         try
         {
             await gate.WaitAsync(stepCts.Token);
             acquired = true;
 
-            // ⚠️ **`step.begin` 是「在跑」的唯一信号源**，不是 `session.state`——
-            // 后者是磁盘的镜像，而**磁盘从不存 Running**（`Stepper` 只把它写进内存）。
-            // 缺了它，头**连轮询都看不出在跑**。
+            // `step.begin` 是「在跑」的唯一信号源，不是 `session.state`——磁盘从不存 Running。
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                 new WireEvent.StepBegin(handle.SessionId, handle.State.Turn + 1, DateTimeOffset.UtcNow));
 
-            // 取空队列——**合并是队列的副产品**：第一次推进就把后来那几条一起拿去渲染。
+            // 取空队列——合并是队列的副产品。
             var blocks = handle.DrainQueue();
             var reply = await _resolveStepper(handle).StepAsync(handle, blocks, stepCts.Token);
 
-            // ⚠️ 模型消息**由这里发**（`Stepper` 不碰事件总线——它是纯推进器）。
-            // 判据跟 `Stepper` 落盘时一致：拒答 / 空块不产生模型消息。
+            // 模型消息由这里发（`Stepper` 不碰事件总线）；判据与它落盘时一致：拒答 / 空块不产生模型消息。
             if (!reply.Refused && reply.Blocks.Count > 0)
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                     new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, DateTimeOffset.UtcNow));
@@ -519,9 +351,7 @@ public sealed class CommandDispatcher(
         }
         catch (OperationCanceledException) when (stepCts.IsCancellationRequested)
         {
-            // ⚠️ **中断不是失败。** 用户消息已经落盘了（那是事实），模型那半没写成，
-            // `Turn` 不递增——这是一次**没完成的步**，不是一个错。
-            // ⇒ 发 `state` 回到 Idle，**不发 `error`**。
+            // 中断不是失败：用户消息已落盘、Turn 不递增 ⇒ 发 `state` 回到 Idle，不发 `error`。
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                 new WireEvent.StateChanged(handle.SessionId, "Idle", handle.State.Turn));
 
@@ -530,16 +360,13 @@ public sealed class CommandDispatcher(
         }
         catch (Exception ex)
         {
-            // 真失败：**走事件，不走回执**（`03` §3 的分界线）。
+            // 真失败走事件，不走回执。
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                 new WireEvent.Error(handle.SessionId, ex.Message));
 
-            // ⚠️ 后台路**必须吞掉异常**：`Task.Run` 里逃出去的是**未观测异常**。
-            // ⚠️ 理由要写准：自 .NET 4.5 起未观测的任务异常**默认被吞**、**不终结进程**
-            //   （`TaskScheduler.UnobservedTaskException` 只记日志）。所以**不是**「会打死进程」。
-            // 真正的理由是：那条异常**到一个没人看的地方去了**——头只会看到
-            //   「步开始了但永远等不到 `step.end`」，而用户拿到的是次静默失败。
-            // ⇒ 必须**显式**捕获并**发成 `error` 事件**，让失败**可见**。
+            // 后台路必须吞掉异常：自 .NET 4.5 起未观测的任务异常默认被吞、不终结进程
+            // （`TaskScheduler.UnobservedTaskException` 只记日志）——它只是到一个没人看的地方去了。
+            // 必须显式捕获并发成 `error` 事件，否则头只会看到「步开始了却永远等不到 `step.end`」。
             if (throwOnFailure) throw new DispatchException(ex.Message, ex);
             return null;
         }
@@ -547,16 +374,14 @@ public sealed class CommandDispatcher(
         {
             _host.SetCts(handle.SessionId, null);   // 先摘掉，再让 using 释放
             handle.ExitStep();
-            // ⚠️ 按**记录**释放，不按状态猜——见上面 `acquired` 的注释。
             if (acquired) gate.Release();
         }
     }
 
     /// <summary>
-    /// ⚠️ **`step.end` 必须在 `Turn` 自增之后**（`Stepper` 已经加过了），
-    /// 且**在拒答分支之外**——拒答也走这一步（`Turn` 照样加一）。
-    /// 挂在「模型消息之后」会**漏掉拒答**，于是头看着一次拒答像「什么都没发生」，
-    /// 而且它**永远等不到 `step.end`**，会以为那一步卡住了。
+    /// `step.end` 必须在 `Turn` 自增之后（`Stepper` 已经加过了），且在拒答分支之外——
+    /// 拒答也走这一步（`Turn` 照样加一）；挂在「模型消息之后」会漏掉拒答，
+    /// 头看着一次拒答像「什么都没发生」，而且永远等不到 `step.end`。
     /// </summary>
     private void PublishStepEnd(SessionHandle handle, ModelReply reply)
     {
@@ -571,7 +396,7 @@ public sealed class CommandDispatcher(
     {
         if (!TryFind(s.SessionId, out _, out var notFound)) return Reject(id, notFound!);
 
-        // Task 4 接上队列语义（01 §6.1「启动」）。当前 send 已直接完成一步，故此处是 no-op。
+        // 当前 send 已直接完成一步，故此处是 no-op。
         return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = s.SessionId });
     }
 
@@ -579,15 +404,10 @@ public sealed class CommandDispatcher(
     {
         if (!TryFind(i.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
-        // ⚠️ **两个条件都必需**，缺一不可：
-        //   ① **该会话确实在跑**（`IsRunning`）——否则这次 interrupt 是在打断一个
-        //      **还没开始的**步。那正是「长命 CTS」会造成的灾难：一个常驻的 CTS
-        //      被 Cancel 之后，**下一次**步的 token 出生即已取消 ⇒
-        //      适配器判「调用方取消」⇒ 不包装 ⇒ 裸 `OperationCanceledException`
-        //      冒到前端（REPL 只接 `ModelCallFailedException`）⇒ **打死常驻进程**。
-        //   ② **CTS 非空**——它是「当前那个步」的句柄，空说明步刚结束、还没来得及摘。
-        // ⇒ 只有「在跑 **且** 有句柄」时才 Cancel。空闲时的 interrupt 是 **no-op**，
-        //   但**仍然回 ack**（命令本身合法——它在语义上等于「停下」，而没在跑就是已经停下了）。
+        // 两个条件都必需：该会话确实在跑（否则是在打断还没开始的步）、且 CTS 非空
+        // （它是「当前那个步」的句柄，空说明步刚结束、还没来得及摘）。
+        // 只有「在跑 且 有句柄」时才 Cancel；空闲时的 interrupt 是 no-op，但**仍然回 ack**
+        // （命令本身合法，语义上等于「停下」，而没在跑就是已经停下了）。
         if (handle.IsRunning && _host.CtsFor(i.SessionId) is { } cts)
         {
             try
@@ -596,8 +416,7 @@ public sealed class CommandDispatcher(
             }
             catch (ObjectDisposedException)
             {
-                // 竞态：步刚好在这一瞬间结束并释放了它。**不是错误**——
-                // 我们本来要做的就是「让它停」，它已经停了。吞掉，回 ack。
+                // 竞态：步刚好在这一瞬间结束并释放了它。不是错误——我们要的就是「让它停」，它已经停了。
             }
         }
 
@@ -605,12 +424,10 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
-    /// 设置一条轴。⚠️ 三个拒绝理由的**顺序**是刻意的：会话 → 轴 → 值。
-    /// 反过来的话，「会话不存在 + 轴名也写错」会报「轴不认识」，把用户引向错的方向。
-    ///
-    /// <para>⚠️ 找会话走 <see cref="TryFind"/>，**不是**只看激活表：核心重启之后会话
-    /// **在盘上、不在内存里**，只看激活表会回一句**假话**——「不存在」，
-    /// 而它存在，只是没被激活。`TryFind` 的回落分支会 `Activate` 把它载进来。</para>
+    /// 设置一条轴。拒绝理由的顺序是刻意的：会话 → 轴 → 值
+    /// （反过来，「会话不存在 + 轴名也写错」会报「轴不认识」，把用户引向错的方向）。
+    /// 找会话走 <see cref="TryFind"/>，不是只看激活表——核心重启之后会话在盘上、不在内存里，
+    /// 只看激活表会回一句假话「不存在」，而它存在、只是没被激活。
     /// </summary>
     private DispatchResult HandleSessionSetAxis(CoreCommand.SessionSetAxis x, string id)
     {
@@ -619,35 +436,23 @@ public sealed class CommandDispatcher(
         if (!Axes.IsKnown(x.Axis))
             return Reject(id, $"没有 '{x.Axis}' 这条轴。可用的：{string.Join("|", Axes.Names)}");
 
-        // ⚠️ 合法值清单**从表里拼**（G8）——手抄一份会在加档时静默过期，
-        // 而这条错误信息是用户唯一的线索。
+        // 合法值清单从表里拼——手抄一份会在加档时静默过期，而这条错误信息是用户唯一的线索。
         if (!Axes.TryParse(x.Axis, x.Value, out var canonical))
             return Reject(id, $"'{x.Axis}' 不取 '{x.Value}'。可用的：{Axes.LegalValuesText(x.Axis)}");
 
-        // ⚠️ `!` 是 **`Load` / `Create` 的契约**（与 `Stepper` 读 effort 那句同源）：
-        // 它们保证 `State.Axes` 非空（见 `SessionState.Axes` 的注释）。`TryFind` 给的
-        // handle 只可能来自这两条来路——激活表里那份本来就是 `Create` / `Load` 的产物，
-        // 回落分支走的是 `CoreHost.Activate` ⇒ `Load`；能拿到 null 的只有手工
-        // `new SessionHandle`，那不是运行时路径。
+        // `!` 是 `Load` / `Create` 的契约：它们保证 `State.Axes` 非空，
+        // `TryFind` 给的 handle 只可能来自这两条来路（含回落分支的 `CoreHost.Activate` ⇒ `Load`）。
 
-        // ⚠️ 相同值不是迁移 ⇒ 不发事件（`01` §5）。见测试里的理由。
+        // 相同值不是迁移 ⇒ 不发事件。
         if (handle.State.Axes!.TryGetValue(x.Axis, out var current) && current == canonical)
             return new DispatchResult(new Ack.Accepted { CommandId = id });
 
-        // ⚠️ **改内存 + 落盘必须走 `UpdateStateAndPersist`（同一个临界区）**，不能写成
-        // `handle.State = handle.State with { Axes = next }; handle.SaveAxes(store);`——
-        // 那两句之间没有锁，而 `Stepper` 的收尾也做一次「读 `State` → `with` → 写回」
-        // （它拿的会话闸**挡不住 `setAxis`**，因为 `setAxis` 刻意不拿闸）。两条交错时，
-        // 后写的会把先写的**整份**盖掉：丢 `Turn`，或把状态永久卡在 `Running`（终审 I2）。
-        //
-        // ⚠️ **换的是 `handle.State` 这个字段，不是 `handle` 本身。** `SessionState` 是 record，
-        // `with` 换出一份带新轴的副本；而 `SessionHandle` 是**可变的活对象**，
-        // 宿主的激活表里存的是**它**的引用（`CoreHost._activated`）——
-        // 写 `handle = handle with { … }` 或 `new SessionHandle` 会让表里那份指向**旧实例**，
-        // 于是 dispatcher 与快照端点各读各的，**状态分叉**（`Repl.Current` 的 setter 同源）。
-        //
-        // ⚠️ `persistedStatus: "Idle"` ＝「钉回磁盘语义」（见 `SessionHandle.SaveAxes` 的注释）：
-        // 本命令不拿会话闸，能在**整个模型调用**里发生，那时内存是 `Running`，而磁盘从不存它。
+        // 改内存 + 落盘必须走 `UpdateStateAndPersist`（同一个临界区）：`setAxis` 刻意不拿会话闸，
+        // 而 `Stepper` 的收尾也做一次「读 State → with → 写回」——两条交错会整份盖掉，
+        // 丢 `Turn`，或把状态永久卡在 `Running`。
+        // 换的是 `handle.State` 这个字段，不是 `handle` 本身——激活表存的是引用，
+        // 换实例会让 dispatcher 与快照端点状态分叉。
+        // `persistedStatus: "Idle"`：本命令不拿会话闸，能在整个模型调用里发生，那时内存是 `Running`、磁盘从不存它。
         handle.UpdateStateAndPersist(_host.Store, s =>
         {
             var next = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal) { [x.Axis] = canonical };
@@ -661,12 +466,8 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
-    /// ⚠️ **找会话走 `TryFind`，不是只看激活表。** 核心重启之后会话**在盘上、不在内存里**，
-    /// 只看激活表会回一句**假话**——「没有会话 '…'」，而它存在，只是没被激活。
-    ///
-    /// <para>⚠️ **这条纪律的来路**：`HandleSessionSetAxis` 踩过同一个坑，在 `9c3bd0d` 修过
-    /// （`TryGetActivated` → `TryFind`）。⇒ **本文件的任何「按 id 取会话」都必须走
-    /// <see cref="TryFind"/>**——写新处理器时照抄这一行，别自己拼。</para>
+    /// 找会话走 <see cref="TryFind"/>，不是只看激活表——核心重启之后会话在盘上、不在内存里，
+    /// 只看激活表会回一句假话「没有会话」。本文件任何「按 id 取会话」都必须走 `TryFind`。
     /// </summary>
     private DispatchResult HandleClaimAcquire(CoreCommand.ClaimAcquire c, string id)
     {
@@ -675,34 +476,27 @@ public sealed class CommandDispatcher(
 
         var store = new ClaimStore(handle.Spec.WorkingDirectory);
 
-        // ⚠️ **`scope` 是列表（`01` §12.4）⇒ 先整体校验，再整体写入**：
-        // 任一条与他人冲突就**整条命令回 rejected**，**一个都不写**——
-        // 部分写入会让用户看到"占了一半"，而命令语义是"占这片区域"。
+        // `scope` 是列表 ⇒ 先整体校验、再整体写入：任一条与他人冲突就整条命令 rejected、
+        // 一个都不写——部分写入会让用户看到「占了一半」，而命令语义是「占这片区域」。
         var paths = c.Scope.Select(p => Claims.Normalize(p, handle.Spec.WorkingDirectory)).ToList();
 
-        // ⚠️ **读-改-写必须在 `store.Update` 的**同一把锁**里**（见它的注释）：
-        // 两个会话同时 acquire 时，分开的 `All()`/`Save()` 会**丢更新**（静默）。
+        // 读-改-写必须在 `store.Update` 的同一把锁里——分开的 `All()`/`Save()` 会静默丢更新。
         Claim? clash = null;
         var updated = store.Update(current =>
         {
             var list = current.ToList();
 
-            // ⚠️ **本次新增先攒在 `additions` 里，最后才合并进 `list`。**
-            // 初版是「边判边 `list.Add`」，于是多元素 scope 时：
-            // 第 1 条 `Add` 进去、第 2 条冲突 ⇒ `return list` 返回的是**已含第 1 条的**列表
-            // ⇒ `Update` 判「变了」⇒ **把第 1 条写了进去**。
-            // 那时「一个都不写」只对**单元素** scope 成立——而注释当时声称的是无条件成立。
+            // 本次新增先攒在 `additions` 里，最后才合并进 `list`——边判边 `Add` 时，
+            // 第 2 条冲突会连第 1 条一起被写进去（「一个都不写」只对单元素 scope 成立）。
             var additions = new List<Claim>();
             foreach (var path in paths)
             {
-                // ⚠️ 判据要看「已有 **+ 本次已接受的**」：同一 scope 里写两条相互重叠的路径
-                //（如 `["src", "src/a.cs"]`）也必须在**命令内部**自洽，否则会自己和自己冲突。
+                // 判据看「已有 + 本次已接受的」——同一 scope 里两条重叠路径也要命令内部自洽，否则会自己和自己冲突。
                 var against = list.Concat(additions);
 
-                // ⚠️ **冲突 ⇒ rejected 且点名持有者**（`01` §12.2）。这句话是「你的工作集会被作废」
-                // 在界面上唯一能被看见的地方——只回一句「已被占用」，用户不知道去找谁。
+                // 冲突 ⇒ rejected 且点名持有者——只回一句「已被占用」，用户不知道去找谁。
                 clash = Claims.FindConflict(against, c.SessionId, path);
-                if (clash is not null) return list;      // ⚠️ 返回**原始** `list`（不含任何 additions）
+                if (clash is not null) return list;
 
                 // 幂等：自己已经占着这条（含同一 scope 里重复写两次）就跳过
                 if (against.Any(x => x.SessionId == c.SessionId && x.Path == path)) continue;
@@ -716,9 +510,8 @@ public sealed class CommandDispatcher(
         if (clash is not null)
             return Reject(id, $"'{clash.Path}' 已被会话 {clash.SessionId} 占用。");
 
-        // ⚠️ **只为**真的新增的**发事件**（`01` §5：无迁移则无事件）。
-        // 初版是「为 `paths` 里每条都发」——于是**幂等重占也发事件**（复审实测：第二次相同
-        // acquire 多出一条事件），头据此把没有的变化渲染成有。
+        // 只为真的新增的（`updated.Added`）发事件——无迁移则无事件；
+        // 为 `paths` 里每条都发会让幂等重占也发事件，头据此把没有的变化渲染成有。
         foreach (var claim in updated.Added)
             _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
                 new WireEvent.ClaimAcquired(c.SessionId, claim.Path));
@@ -728,15 +521,13 @@ public sealed class CommandDispatcher(
 
     private DispatchResult HandleClaimRelease(CoreCommand.ClaimRelease c, string id)
     {
-        // ⚠️ 同上：`TryFind`，不是 `TryGetActivated`。
         if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
         var store = new ClaimStore(handle.Spec.WorkingDirectory);
         var paths = c.Scope.Select(p => Claims.Normalize(p, handle.Spec.WorkingDirectory)).ToList();
 
-        // ⚠️ **逃生口**（`03` §3）：不检查占用者是不是自己——模型失控时，
-        // 用户要能从一个**别的**会话里把锁摘掉。
-        // ⚠️ 同样在 `Update` 的锁里（读-改-写不可分）。
+        // 逃生口：不检查占用者是不是自己——模型失控时，用户要能从**别的**会话里把锁摘掉。
+        // 同样在 `Update` 的锁里（读-改-写不可分）。
         var updated = store.Update(current =>
         {
             var list = current.ToList();
@@ -744,9 +535,8 @@ public sealed class CommandDispatcher(
             return list;
         });
 
-        // ⚠️ **只为真正被删掉的发事件**（`01` §5）。
-        // 初版是「为 scope 里每条都发」——复审实测 `["q1","never-held"]` 发了**2 条**事件，
-        // 其中一条路径**根本没被删**（它本来就不在）。那与这段自己引的「无迁移则无事件」矛盾。
+        // 只为真正被删掉的（`updated.Removed`）发事件——为 scope 里每条都发，
+        // 会给根本没被删的路径也发（它本来就不在）。
         foreach (var claim in updated.Removed)
             _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
                 new WireEvent.ClaimReleased(c.SessionId, claim.Path));
@@ -756,12 +546,9 @@ public sealed class CommandDispatcher(
 
     /// <summary>
     /// 找会话：先看激活表，miss 才扫项目目录回落到磁盘载入。
-    ///
-    /// <para>⚠️ **miss 时 out 的是「理由字符串」，不是拼好的回执**：回执的
-    /// <see cref="Ack.CommandId"/> 是**发起这条命令的那一方**给的 id（`Ack.CommandId` 的契约是
-    /// 「命令 id 由头生成，核心原样带回——头靠它把『我发过的那条』对上」），而 `sessionId`
-    /// 是**另一个**东西。在这里拼 `Reject` 只能用会话 id 当 `CommandId`（错误），
-    /// 所以把理由交回调用方，由它用自己的命令 id 去 `Reject`。</para>
+    /// miss 时 out 的是理由字符串而非拼好的回执——<see cref="Ack.CommandId"/> 是发起方的 id，
+    /// 与会话 id 是两个东西，在这里拼 `Reject` 只能用会话 id 当 `CommandId`（错），
+    /// 所以把理由交回调用方，由它用自己的命令 id 去 `Reject`。
     /// </summary>
     private bool TryFind(string sessionId, out SessionHandle handle, out string? notFoundReason)
     {
@@ -774,7 +561,7 @@ public sealed class CommandDispatcher(
             return true;
         }
 
-        // 扫项目目录：找不到就是**命令不合法**（会话 id 写错了）——rejected 的正当用法。
+        // 扫项目目录：找不到就是命令不合法（会话 id 写错了）——rejected 的正当用法。
         foreach (var dir in ProjectDirs())
         {
             var projectKey = Path.GetFileName(dir);
@@ -800,8 +587,8 @@ public sealed class CommandDispatcher(
 
 /// <summary>
 /// 命令执行中的**业务**失败（模型 400、上游 503、提供商失联）。
-/// ⚠️ 它与 <see cref="Ack.Rejected"/> 是**两回事**：rejected 是「你的命令写错了」，
-/// 这个是「命令没错，但这次没成」。走 error 事件，不走回执（03 §3）。
+/// 与 <see cref="Ack.Rejected"/> 是两回事：rejected 是「你的命令写错了」，
+/// 这个是「命令没错，但这次没成」。走 error 事件，不走回执。
 /// </summary>
 public sealed class DispatchException(string message, Exception? inner = null)
     : Exception(message, inner);

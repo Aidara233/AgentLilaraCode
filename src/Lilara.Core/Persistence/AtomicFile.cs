@@ -2,10 +2,7 @@ using System.Text;
 
 namespace Lilara.Core.Persistence;
 
-/// <summary>
-/// 原子重写：先写 .tmp，再替换。
-/// 崩溃在两步之间只会留下一个孤儿 .tmp，目标文件永远不是半截的。
-/// </summary>
+// 原子重写：先写 .tmp，再替换——崩溃在两步之间只留一个孤儿 .tmp，目标文件永不半截。
 public static class AtomicFile
 {
     private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
@@ -16,17 +13,12 @@ public static class AtomicFile
                   ?? throw new ArgumentException($"路径没有目录部分: {path}", nameof(path));
         Directory.CreateDirectory(dir);
 
-        // ⚠️ tmp 名**必须唯一**：旧实现用固定的 `path + ".tmp"`，两个并发写会写同一个 tmp
-        // 再各自 Move，第二个 Move 抛（实测过）。真实时延：`SaveState` 与 HTTP 快照端点
-        // 同时碰同一个 state.json。
+        // tmp 名必须唯一：两个并发写共用同一个 tmp 时，第二个 Move 会抛。
         var tmp = $"{path}.{Guid.NewGuid():N}.tmp";
         File.WriteAllText(tmp, content, Utf8NoBom);
 
-        // ⚠️ Windows 上目标被别的句柄占着时，`File.Move` 抛的**可能是两种异常**：
-        //   · `IOException`（sharing violation：对方开了句柄但带了共享）
-        //   · `UnauthorizedAccessException`（access denied：对方没带 FILE_SHARE_DELETE）
-        // **只接 `IOException` 是不够的**——这条由并发测试实测抓出来（我第一版只接了它）。
-        // 两者在这个场景下都是**暂时**的，短重试即可；仍失败就清 tmp 再抛。
+        // Windows 上目标被别的句柄占着时，File.Move 可能抛 IOException 或
+        // UnauthorizedAccessException（取决于对方有没有带 FILE_SHARE_DELETE）——都是暂时的。
         for (var attempt = 0; ; attempt++)
         {
             try

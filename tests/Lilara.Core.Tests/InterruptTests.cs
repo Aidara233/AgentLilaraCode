@@ -8,15 +8,8 @@ using Lilara.Core.Session;
 
 namespace Lilara.Core.Tests;
 
-/// <summary>
-/// 中断（`03` §3 `session.interrupt`）。
-///
-/// <para>⚠️ 这些测试之所以存在，是因为**中断在核心侧曾经完全没实现**——
-/// `CancellationToken` 管道通到底，但调用方**永远传 `None`**。
-/// 而「实现错了」的代价特别大：一个长命的 CTS 会把**下一次**的步也变成已取消，
-/// 于是裸的 `OperationCanceledException` 冒到前端（REPL 只接 `ModelCallFailedException`）
-/// **打死常驻进程**。</para>
-/// </summary>
+// 长命 CTS 会把下一次步也变成已取消 ⇒ 裸 OperationCanceledException 冒到 REPL
+// （只接 ModelCallFailedException）⇒ 打死常驻进程。
 public class InterruptTests : IDisposable
 {
     private readonly string _root =
@@ -53,11 +46,7 @@ public class InterruptTests : IDisposable
         d.DispatchAsync(new CoreCommand.SessionSend(sessionId, [new Block.TextBlock(text)]),
             Guid.NewGuid().ToString("N")[..8], awaitCompletion, CancellationToken.None);
 
-    /// <summary>
-    /// ⚠️ **控制面那条路的要害**：`awaitCompletion: false` 时步**在后台跑**，
-    /// 命令**立刻**回来。没有它，`session.interrupt` 无事可做——
-    /// 步要是在命令里同步跑完，interrupt 根本轮不到执行。
-    /// </summary>
+    // awaitCompletion:false 时步在后台跑、命令立刻回来——没有它 interrupt 无事可做。
     [Fact]
     public async Task AsyncMode_ReturnsImmediatelyWhileTheStepRunsInTheBackground()
     {
@@ -70,7 +59,7 @@ public class InterruptTests : IDisposable
         await SendAsync(dispatcher, sessionId, "一", awaitCompletion: false);
         sw.Stop();
 
-        // ⚠️ 断言的是「**远早于**模型返回就回来了」，不是精确毫秒。
+        // 断言的是「远早于模型返回就回来了」，不是精确毫秒。
         Assert.True(sw.ElapsedMilliseconds < 1000, "awaitCompletion:false 必须立刻回执");
         await entered.Task;   // 但步确实开始了
 
@@ -78,10 +67,7 @@ public class InterruptTests : IDisposable
         await Task.Delay(200);   // 让它收尾
     }
 
-    /// <summary>
-    /// ⚠️ 中断**不是失败**：不许报 `error`，且**不许把异常漏出去**。
-    /// 漏出去的那个异常在后台路上是**未观测异常**——.NET 上会**直接终结进程**。
-    /// </summary>
+    // 中断不是失败：不许报 error，也不许把异常漏出去（后台路上的未观测异常会直接终结进程）。
     [Fact]
     public async Task Interrupt_DoesNotEmitAnErrorEvent()
     {
@@ -105,8 +91,7 @@ public class InterruptTests : IDisposable
         var payloads = new List<WireEvent>();
         while (sub.Reader.TryRead(out var p)) payloads.Add(p.Payload);
 
-        // ⚠️ **一次正常中断不该产生 `error`**——否则头会开始忽略 error，
-        // 而那正是它最该看的东西。
+        // 一次正常中断不该产生 error——否则头会开始忽略 error，而那正是它最该看的东西。
         Assert.Empty(payloads.OfType<WireEvent.Error>());
 
         // 而是回到 Idle
@@ -117,27 +102,20 @@ public class InterruptTests : IDisposable
         Assert.Equal(0, host.Activated.First().State.Turn);
     }
 
-    /// <summary>
-    /// ⚠️ **空闲时 interrupt 必须是 no-op、且不许污染下一次**。
-    ///
-    /// <para>这是「长命 CTS」那个灾难的回归测试：若 CTS 是每会话一个长命的，
-    /// 空闲期的 interrupt 会把它 Cancel，而**下一次**步的 token 出生即已取消 ⇒
-    /// 适配器判「调用方取消」⇒ 裸异常冒到前端 ⇒ 打死进程。
-    /// ⇒ 断言「先 interrupt、再正常发一条，那条**必须成功**」。</para>
-    /// </summary>
+    // 空闲时 interrupt 必须是 no-op，且不许污染下一次步（长命 CTS 会让下一次出生即已取消）。
     [Fact]
     public async Task InterruptWhileIdle_DoesNotPoisonTheNextStep()
     {
         var (host, bus, sessionId) = NewHarness(async () => "ok", out var dispatcher);
 
-        // 空闲时中断（此刻没有步在跑）
+        // 空闲时中断（此刻没有步在跑）。
         var r = await dispatcher.DispatchAsync(
             new CoreCommand.SessionInterrupt(sessionId), "i1", true, CancellationToken.None);
         Assert.IsType<Ack.Accepted>(r.Ack);
 
         using var sub = bus.Subscribe(EventBus.SessionTopic(sessionId));
 
-        // ⚠️ 紧接着正常发一条——它必须**完整跑完**
+        // 紧接着正常发一条——它必须完整跑完。
         var result = await SendAsync(dispatcher, sessionId, "二", awaitCompletion: true);
 
         Assert.NotNull(result.Reply);
@@ -149,7 +127,7 @@ public class InterruptTests : IDisposable
         Assert.Equal(1, host.Activated.First().State.Turn);   // 这一步真的完成了
     }
 
-    /// <summary>中断一个不存在的会话 ⇒ `rejected`（命令本身不合法）。</summary>
+    // 中断一个不存在的会话 ⇒ rejected（命令本身不合法）。
     [Fact]
     public async Task InterruptAnUnknownSession_IsRejected()
     {
@@ -161,17 +139,7 @@ public class InterruptTests : IDisposable
         Assert.IsType<Ack.Rejected>(r.Ack);
     }
 
-    /// <summary>
-    /// ⚠️ **「长命 CTS」那个灾难的**真正**回归测试**（上一条只覆盖了空闲中断那条路，
-    /// 而那条路上 CTS 根本没被创建过——所以它区分不出 CTS 的生命周期）。
-    ///
-    /// <para>灾难场景要**先真的取消过一次**：步在跑 → 中断 → 那个 CTS **已是已取消状态**
-    /// → 若它被**复用**（长命），下一次步的 token **出生即已取消** ⇒
-    /// 适配器判「调用方取消」⇒ 不包装 ⇒ 裸 `OperationCanceledException`
-    /// 冒到前端（REPL 只接 `ModelCallFailedException`）⇒ **打死常驻进程**。</para>
-    ///
-    /// <para>⇒ 断言「中断过一轮之后，**再发的那条必须完整跑完**」。</para>
-    /// </summary>
+    // 中断过一轮之后（CTS 已处于已取消状态），再发的那条必须完整跑完。
     [Fact]
     public async Task AfterAnInterruptedStep_TheNextStepStillCompletes()
     {
@@ -189,18 +157,14 @@ public class InterruptTests : IDisposable
         await dispatcher.DispatchAsync(new CoreCommand.SessionInterrupt(sessionId), "i", true, CancellationToken.None);
         await Task.Delay(300);   // 让取消传导完、步收尾
 
-        // ⚠️ **关键**：这一条必须完整跑完。若 CTS 被复用，它的 token 出生即已取消。
+        // 这条必须完整跑完；若 CTS 被复用，它的 token 出生即已取消。
         var result = await SendAsync(dispatcher, sessionId, "二", awaitCompletion: true);
 
         Assert.NotNull(result.Reply);
         Assert.Equal("第二次", ((Block.TextBlock)result.Reply!.Blocks[0]).Text);
     }
 
-    /// <summary>
-    /// ⚠️ **同步路（控制台）的失败要抛给调用方**——控制台印一行人话、REPL 继续活着。
-    /// 后台路则**必须吞掉**（未观测异常会终结进程）。两条路的差别就在这里，
-    /// 而它由 `throwOnFailure` 一个开关控制——**别把两条路合并成一条**。
-    /// </summary>
+    // 同步路（控制台）的失败要抛给调用方；后台路必须吞掉（未观测异常会终结进程）——由 throwOnFailure 分开。
     [Fact]
     public async Task SyncMode_PropagatesFailureForTheConsoleToPrint()
     {

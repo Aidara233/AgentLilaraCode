@@ -4,10 +4,8 @@ using Lilara.Core.Records;
 
 namespace Lilara.Core.Persistence;
 
-/// <summary>
-/// 会话在磁盘上的落点（01 §8）：
-///   &lt;数据根&gt;/projects/&lt;projectKey&gt;/sessions/&lt;sessionId&gt;/{spec.json, state.json, history.jsonl}
-/// </summary>
+// 会话在磁盘上的落点：
+//   <数据根>/projects/<projectKey>/sessions/<sessionId>/{spec.json, state.json, history.jsonl}
 public sealed class SessionStore(string dataRoot)
 {
     private readonly string _dataRoot = dataRoot;
@@ -41,14 +39,9 @@ public sealed class SessionStore(string dataRoot)
     public IReadOnlyList<TimelineEvent> ReadTimeline(string projectKey, string sessionId) =>
         HistoryLog.ReadAll(Path.Combine(SessionDirectory(projectKey, sessionId), "history.jsonl"));
 
-    /// <summary>
-    /// 该项目下的全部会话 id，**按创建时间降序**（最近的在最前）。
-    /// 启动时「选最近的会话」用它（01 §8.1）。
-    /// ⚠️ 顺序必须确定：调用方（Program.cs）取 [0] 当"当前会话"，
-    /// 而 Directory.GetDirectories 的顺序是未定义的。
-    /// 不按目录 mtime（脆弱），不按 id 降序（id 是随机的 Guid，做不了时间代理）——
-    /// 按 spec.json 里的 CreatedAt，那是唯一权威的时间来源。
-    /// </summary>
+    // 该项目下的全部会话 id，按 spec.json 里的 CreatedAt 降序。
+    // 顺序必须确定（调用方取 [0] 当当前会话），而 Directory.GetDirectories 顺序未定义；
+    // 不按目录 mtime（脆弱），也不按 id（Guid 是随机的，做不了时间代理）。
     public IReadOnlyList<string> ListSessions(string projectKey)
     {
         var dir = Path.Combine(ProjectsRoot, projectKey, "sessions");
@@ -62,12 +55,8 @@ public sealed class SessionStore(string dataRoot)
             .ToList();
     }
 
-    /// <summary>
-    /// 读不到就返回 null，不抛——调用方要的是「有没有」，不是异常。
-    /// ⚠️ 两种「读不到」都要吞：**文件不存在**，和**文件损坏**。
-    /// 只判 File.Exists 是不够的——一个损坏的 spec.json 会抛 JsonException，
-    /// 穿透 ListSessions 炸掉整个启动，而这正是调用方那个 null 判断想防的事。
-    /// </summary>
+    // 读不到返回 null，不抛。两种「读不到」都吞：文件不存在，和文件损坏——
+    // 只判 File.Exists 不够，损坏的 spec.json 会抛 JsonException 炸掉整个启动。
     public SessionSpec? TryReadSpec(string projectKey, string sessionId)
     {
         var path = Path.Combine(SessionDirectory(projectKey, sessionId), "spec.json");
@@ -79,7 +68,6 @@ public sealed class SessionStore(string dataRoot)
         }
         catch (JsonException)
         {
-            // 损坏的会话目录应被跳过，而不是让整个核心起不来
             return null;
         }
     }

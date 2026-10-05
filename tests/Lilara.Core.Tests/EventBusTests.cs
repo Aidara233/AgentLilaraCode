@@ -7,7 +7,7 @@ public class EventBusTests
 {
     private static WireEvent Evt(string s = "x") => new WireEvent.Error(s, "m");
 
-    /// <summary>基本投递：订阅者按序拿到，seq 从 1 起单调增。</summary>
+    // 订阅者按序拿到，seq 从 1 起单调增。
     [Fact]
     public async Task Subscribe_ReceivesEventsInOrderWithMonotonicSeq()
     {
@@ -24,32 +24,16 @@ public class EventBusTests
         Assert.Equal([1L, 2L, 3L], got.Select(p => p.Seq));
     }
 
-    /// <summary>
-    /// ⚠️ **这条是整个事件层存在的理由**（`03` §4 的硬约束）。
-    ///
-    /// <para>要防的那个错写法：各生产者先 `Interlocked.Increment` 拿序号，再各自写 socket。
-    /// 那样**编号唯一但不保证有序**——甲拿 5、乙拿 6，乙先写出去 ⇒ 头收 6 再收 5 ⇒
-    /// `lastSeq` 前进到 6，**5 被永久跳过且无从发现**。</para>
-    ///
-    /// <para>⇒ 判据是「订阅者收到的 seq **严格递增**」（而不只是「不重复」：
-    /// 不重复却乱序，同样是那个洞）。多生产者并发压，才试得出来。</para>
-    ///
-    /// <para>⚠️ **区分力实测过（两次都跑了）**：把 seq 分配挪到 `lock` **之前** ⇒ **红**；
-    /// 把 fan-out 挪出锁 ⇒ **红**。</para>
-    /// <para>⚠️ 作者曾在这里写下「抓不住 seq 分配挪出锁」，**那是错的**——
-    /// 他的两次「变异存活」都是量错了对象：一次把 `Interlocked` 写在**锁内**（语义空操作），
-    /// 一次探针在**还原之后**才跑。**⇒ 报「存活」之前先确认变异真的落上、且跑的是变异版。**</para>
-    /// </summary>
+    // 判据是订阅者收到的 seq 严格递增（不只是不重复）；seq 分配与 fan-out 必须在同一临界区。
     [Fact]
     public async Task ConcurrentPublishers_DeliverStrictlyIncreasingSeq()
     {
-        // ⚠️ 订阅容量要够大，否则压测期间就溢出了——那测的是溢出行为，不是投递有序。
+        // 订阅容量要够大，否则测的是溢出行为，不是投递有序。
         var bus = new EventBus(subscriptionCapacity: 4096);
         const int perProducer = 400;
         const int producers = 4;
         using var sub = bus.Subscribe(EventBus.SessionTopic("s1"), since: null);
 
-        // 先把订阅挂上，再开并发发布
         var publish = Task.Run(() =>
         {
             Parallel.For(0, producers, i =>
@@ -70,19 +54,15 @@ public class EventBusTests
 
         Assert.Equal(expected, got.Count);
 
-        // ⚠️ **严格递增**（不是「不重复」）——乱序正是要防的洞。
+        // 严格递增，不是「不重复」——乱序正是要防的洞。
         for (var i = 1; i < got.Count; i++)
             Assert.True(got[i] > got[i - 1], $"第 {i} 条 seq={got[i]} 不大于前一条 {got[i - 1]}：投递乱序了");
 
-        // 且编号无洞（1..N 恰好一次）
+        // 且编号无洞（1..N 恰好一次）。
         Assert.Equal(Enumerable.Range(1, expected).Select(i => (long)i), got);
     }
 
-    /// <summary>
-    /// ⚠️ **per-topic 缓冲，不是全局一个环**：一个话痨 topic 不许挤掉另一个的补发能力。
-    /// 全局环的后果是**循环抖动**——A 流式把环填满 ⇒ B 的游标判「太旧」⇒ 拉全量 ⇒
-    /// 又被挤掉 ⇒ 再拉，每次都付一次全量快照。
-    /// </summary>
+    // 缓冲是 per-topic 的：一个话痨 topic 不许挤掉另一个的补发能力。
     [Fact]
     public async Task ANoisyTopicDoesNotEvictAnotherTopicsBuffer()
     {
@@ -90,10 +70,9 @@ public class EventBusTests
 
         bus.Publish(EventBus.SessionTopic("quiet"), Evt("重要"));
 
-        // 话痨 topic 灌爆它自己的缓冲
         for (var i = 0; i < 50; i++) bus.Publish(EventBus.SessionTopic("noisy"), Evt($"{i}"));
 
-        // ⚠️ quiet 的补发仍然够得着（since=0 → 要补 seq 1）
+        // quiet 的补发仍够得着（since=0 要补 seq 1）。
         using var sub = bus.Subscribe(EventBus.SessionTopic("quiet"), since: 0);
 
         Assert.False(sub.NeedsResync);
@@ -101,10 +80,7 @@ public class EventBusTests
         Assert.Equal(1, p.Seq);
     }
 
-    /// <summary>
-    /// ⚠️ 补发起点太旧 ⇒ **立刻** `NeedsResync`（`03` §7 唯一的降级路径）。
-    /// 判据一句话：**「要补发的起点已不在该 topic 的缓冲里」**。
-    /// </summary>
+    // 要补发的起点已不在该 topic 的缓冲里 ⇒ 立刻 NeedsResync。
     [Fact]
     public async Task Subscribe_SinceTooOld_RequiresResync()
     {
@@ -117,7 +93,7 @@ public class EventBusTests
         await Task.CompletedTask;
     }
 
-    /// <summary>补发够得着时**正常补**，不该误报 resync。</summary>
+    // 补发够得着时正常补，不误报 resync。
     [Fact]
     public async Task Subscribe_SinceWithinBuffer_ReplaysWithoutResync()
     {
@@ -132,17 +108,14 @@ public class EventBusTests
         Assert.Equal([4L, 5L], got);
     }
 
-    /// <summary>
-    /// ⚠️ 慢订阅者**不许**拖住发布方：队列满就丢、标记待重建。
-    /// 若改成阻塞，一个卡住的头会把整把锁（以及所有发布方）拖死。
-    /// </summary>
+    // 慢订阅者不许拖住发布方：队列满就丢并标记待重建，否则一个卡住的头会拖死所有发布方。
     [Fact]
     public void SlowSubscriber_IsDroppedNotBlockingThePublisher()
     {
         var bus = new EventBus();
         using var sub = bus.Subscribe(EventBus.SessionTopic("s1"));
 
-        // 发布远超订阅队列上界，且**从不去读**
+        // 发布远超订阅队列上界，且从不去读。
         var sw = System.Diagnostics.Stopwatch.StartNew();
         for (var i = 0; i < EventBus.DefaultSubscriptionCapacity * 3; i++)
             bus.Publish(EventBus.SessionTopic("s1"), Evt($"{i}"));
@@ -152,7 +125,7 @@ public class EventBusTests
         Assert.True(sub.NeedsResync, "队列溢出后必须标记待重建，否则头会静默缺事件");
     }
 
-    /// <summary>退订之后不再收到——否则断开的头会永远占着内存。</summary>
+    // 退订之后不再收到。
     [Fact]
     public void Dispose_StopsDelivery()
     {
@@ -165,13 +138,10 @@ public class EventBusTests
 
         Assert.True(sub.Reader.TryRead(out var first));
         Assert.Equal(1, first.Seq);
-        Assert.False(sub.Reader.TryRead(out _));   // 退订后的那条没进来
+        Assert.False(sub.Reader.TryRead(out _));
     }
 
-    /// <summary>
-    /// ⚠️ 快照端点要用的**高水位**：头拉完快照再 `subscribe(since: 高水位)`，
-    /// 「拉快照 → 订阅」之间落的事件才不漏不重。它必须与 seq 分配在同一临界区里读。
-    /// </summary>
+    // 高水位必须与 seq 分配在同一临界区里读，否则「拉快照 → 订阅」之间的事件会漏或重。
     [Fact]
     public void HighWaterMark_MatchesTheLastPublishedSeq()
     {
@@ -182,10 +152,10 @@ public class EventBusTests
         bus.Publish(EventBus.SessionTopic("s1"), Evt("b"));
 
         Assert.Equal(2, bus.HighWaterMark(EventBus.SessionTopic("s1")));
-        Assert.Equal(0, bus.HighWaterMark(EventBus.SessionTopic("other")));   // 互不影响
+        Assert.Equal(0, bus.HighWaterMark(EventBus.SessionTopic("other")));
     }
 
-    /// <summary>seq 是**每 topic** 的，不是全局的（`03` §4「流内单调增」）。</summary>
+    // seq 是每 topic 的，不是全局的。
     [Fact]
     public void Seq_IsPerTopic()
     {
@@ -197,13 +167,7 @@ public class EventBusTests
         Assert.Equal(1, bus.HighWaterMark(EventBus.SessionTopic("b")));
     }
 
-    /// <summary>
-    /// ⚠️ **复审抓到的真缺陷**：补发时 `TryWrite` 的返回值被丢掉了。
-    /// 要补的条数落在 <c>(subscriptionCapacity, topicCapacity]</c> 之间时，resync 判据
-    /// **不触发**（缓冲里够得着），前 N 条进队列、**其余的写失败且被无视**，
-    /// `NeedsResync` 还是 false ⇒ 头**静默少一段**——正是本类开头警告的那个洞。
-    /// <para>⚠️ 判据是「缺口要么被补上、要么**明说**跟不上」，不能两者都没有。</para>
-    /// </summary>
+    // 补发写失败被无视会静默少一段：缺口要么补上、要么明说（NeedsResync）。
     [Fact]
     public void Subscribe_ReplayBiggerThanTheQueue_ReportsResyncInsteadOfTruncatingSilently()
     {
@@ -216,7 +180,7 @@ public class EventBusTests
         var got = 0;
         while (sub.Reader.TryRead(out _)) got++;
 
-        // ⚠️ 要么补齐，要么标 resync。**只有「256 且 NeedsResync=false」才是缺陷。**
+        // 要么补齐，要么标 resync；只拿到 256 且 NeedsResync=false 才是缺陷。
         Assert.True(got == 300 || sub.NeedsResync,
             $"补发被静默截断：拿到 {got} 条、NeedsResync={sub.NeedsResync}（两者必居其一）");
     }

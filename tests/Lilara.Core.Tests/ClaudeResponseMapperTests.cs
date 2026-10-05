@@ -6,8 +6,7 @@ namespace Lilara.Core.Tests;
 
 public class ClaudeResponseMapperTests
 {
-    // ⚠️ SDK 12.51.0 的 Usage 把 9 个成员全标了 required（含可空的缓存/服务层字段）。
-    // 测试只关心 token 计数，其余按「没有」显式置空，别让对象初始化器漏项。
+    // SDK 把 Usage 的 9 个成员全标了 required（含可空的缓存/服务层字段），其余须显式置空。
     private static Usage UsageOf(long outputTokens) => new()
     {
         InputTokens = 1,
@@ -55,7 +54,7 @@ public class ClaudeResponseMapperTests
     [Fact]
     public void Map_FlagsRefusalAndToleratesEmptyContent()
     {
-        // Review Focus #2：拒答时 content 可能为空，绝不能在这里炸
+        // 拒答时 content 可能为空，绝不能在这里炸。
         var refusal = new Message
         {
             ID = "msg_test",
@@ -75,10 +74,7 @@ public class ClaudeResponseMapperTests
         Assert.Empty(reply.Blocks);
     }
 
-    /// <summary>
-    /// ⚠️ 这条测试原先断言的是**错的行为**（推理块被忽略）——它把 00 §5 铁律的违反钉住了。
-    /// 现在断言相反的事实：推理块逐字保留，签名原样。
-    /// </summary>
+    // 推理块逐字保留，签名原样。
     [Fact]
     public void Map_KeepsReasoningBlocksWithTheirSignature()
     {
@@ -101,7 +97,7 @@ public class ClaudeResponseMapperTests
 
         var reply = ClaudeResponseMapper.Map(withThinking);
 
-        // ⚠️ 顺序是 [reasoning, text]，且必须原样保住——上游会校验签名与顺序
+        // 顺序是 [reasoning, text]，必须原样保住——上游会校验签名与顺序。
         Assert.Equal(2, reply.Blocks.Count);
         var reasoning = Assert.IsType<CanonicalBlock.ReasoningBlock>(reply.Blocks[0]);
         Assert.Equal("想想", reasoning.Text);

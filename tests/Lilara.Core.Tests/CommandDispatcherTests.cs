@@ -9,11 +9,7 @@ using Lilara.Core.Tests.Fakes;
 
 namespace Lilara.Core.Tests;
 
-/// <summary>
-/// ⚠️ 这些测试存在的原因是**结构性的**：`CommandDispatcher` 是**头**将来直接依赖的表面。
-/// 既有 `ReplTests` 走的是「文本 → Repl → dispatcher」整条链，它们能证明没改坏，
-/// 但**证明不了 dispatcher 自己是对的**（比如头不带 `--flag` 语法，直接用类型化命令）。
-/// </summary>
+// CommandDispatcher 是将来头直接依赖的表面；ReplTests 走整条链证明没改坏，但证明不了 dispatcher 自己是对的。
 public class CommandDispatcherTests : IDisposable
 {
     private readonly string _root =
@@ -47,11 +43,7 @@ public class CommandDispatcherTests : IDisposable
         return ((Ack.Accepted)r.Ack).SessionId!;
     }
 
-    /// <summary>
-    /// ⚠️ **数据外泄那条的运行时证明**：dispatcher 必须按**该会话自己的** provider 解析 stepper。
-    /// 共用一把的话，给 B 发消息会把 B 的全量历史发到 A 的端点上。
-    /// （`CoreHostTests` 在宿主层钉过一次；这里钉的是 **dispatcher 真的用了它**。）
-    /// </summary>
+    // dispatcher 必须按该会话自己的 provider 解析 stepper；共用一把会把 B 的全量历史发到 A 的端点上。
     [Fact]
     public async Task Send_UsesTheSessionsOwnStepper()
     {
@@ -73,17 +65,7 @@ public class CommandDispatcherTests : IDisposable
         Assert.Equal([sessionId], seen);
     }
 
-    /// <summary>
-    /// ⚠️ **同一会话的两步不许重叠**——但**入队不许被挡住**。
-    ///
-    /// <para>⚠️ 这条测试在 Task 4 被**改过断言**，理由正当，记在此处：
-    /// Task 3 时 `send` = 直接跑一步，所以「第二个 send 必须**阻塞**到第一个放行」是对的。
-    /// Task 4 按 `01` §6.1 改成「send = 入队 + 安排启动」后，第二个 send **必须立刻返回**
-    /// （它只入队，不推进）——**否则「合并是队列的副产品」永远不成立**：
-    /// 卡在闸上的第二条根本没机会入队，连发 3 条就真的调 3 次模型（第一次实测就是 `call=3`）。
-    /// ⇒ 不变量从「第二个阻塞」变成「**两步不重叠** + 第二个立即返回」。
-    /// 防重叠的职责也从闸（覆盖全部）收窄成 `TryEnterStep` 那把标志（只管推进）。</para>
-    /// </summary>
+    // 同一会话的两步不许重叠，但入队不许被挡住——第二条卡在闸上就没机会入队，「合并是队列的副产品」不成立。
     [Fact]
     public async Task Send_DoesNotOverlapTwoStepsButDoesNotBlockEnqueueing()
     {
@@ -113,7 +95,7 @@ public class CommandDispatcherTests : IDisposable
             new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("一")]), "a", true, CancellationToken.None);
         await firstEntered.Task;   // 第一个已经在模型里了
 
-        // ⚠️ 第二个必须**立刻**回来（只入队，不推进）
+        // 第二个必须立刻回来（只入队，不推进）
         var second = await dispatcher.DispatchAsync(
             new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("二")]), "b", true, CancellationToken.None);
         Assert.IsType<Ack.Accepted>(second.Ack);
@@ -128,10 +110,7 @@ public class CommandDispatcherTests : IDisposable
         Assert.Equal(1, maxConcurrent);   // 全程没有两个步同时在飞
     }
 
-    /// <summary>
-    /// ⚠️ `rejected` **只用于「命令本身不合法」**（`03` §3）。
-    /// 会话不存在 ⇒ rejected（用户把 id 写错了）。
-    /// </summary>
+    // rejected 只用于「命令本身不合法」；会话不存在 ⇒ rejected（用户把 id 写错了）。
     [Fact]
     public async Task UnknownSession_IsRejected()
     {
@@ -144,11 +123,8 @@ public class CommandDispatcherTests : IDisposable
         Assert.Contains("nope", ((Ack.Rejected)r.Ack).Reason);
     }
 
-    /// <summary>
-    /// ⚠️ 而**模型失败不是 rejected**——它是 `DispatchException`（→ 将来走 `error` 事件）。
-    /// 混了的话，头会把一次网络抖动当成「你的命令写错了」，
-    /// 然后让用户去改一个没写错的命令。
-    /// </summary>
+    // 模型失败不是 rejected——它是 DispatchException（→ 走 error 事件）；
+    // 混了头会把网络抖动当成「命令写错了」，让用户去改一个没写错的命令。
     [Fact]
     public async Task ModelFailure_ThrowsDispatchExceptionNotRejected()
     {
@@ -165,7 +141,7 @@ public class CommandDispatcherTests : IDisposable
         Assert.Contains("上游 503", ex.Message);
     }
 
-    /// <summary>⚠️ `session.create` 是**分配型命令**——必须回传新身份，否则后续命令无从指涉。</summary>
+    // session.create 是分配型命令——必须回传新身份，否则后续命令无从指涉。
     [Fact]
     public async Task SessionCreate_ReturnsTheNewSessionId()
     {
@@ -179,11 +155,7 @@ public class CommandDispatcherTests : IDisposable
         Assert.True(host.TryGetActivated(id, out _));
     }
 
-    /// <summary>
-    /// ⚠️ **未知协议必须在 dispatcher 里被拒**（不是只在控制台）。
-    /// 否则线上的 `provider.upsert` 能写进一个控制台写不进的坏值——
-    /// 而「两个前端行为不一致」正是 `04` §1.1 要消灭的东西。
-    /// </summary>
+    // 未知协议必须在 dispatcher 里被拒（不是只在控制台），否则线上 provider.upsert 能写进控制台写不进的坏值。
     [Theory]
     [InlineData("gemini")]
     [InlineData("Claude-Messages")]   // 大小写：看着像，但不是
@@ -196,13 +168,11 @@ public class CommandDispatcherTests : IDisposable
             "c", true, CancellationToken.None);
 
         Assert.IsType<Ack.Rejected>(r.Ack);
-        Assert.Null(host.Providers.Load("bad"));   // 且**不落盘**
+        Assert.Null(host.Providers.Load("bad"));   // 且不落盘
     }
 
-    /// <summary>
-    /// ⚠️ 未知 auth 同理，而且它是**静默改行为**：`AuthSchemes.Bearer` 的字面量是小写 `bearer`，
-    /// 手写 `Bearer`（大写）序号不等，会被悄悄当成 x-api-key 发出去。
-    /// </summary>
+    // 未知 auth 同理，而且它是静默改行为：AuthSchemes.Bearer 的字面量是小写 bearer，
+    // 手写 Bearer（大写）序号不等，会被悄悄当成 x-api-key 发出去。
     [Fact]
     public async Task ProviderUpsert_RejectsAnUnknownAuth()
     {
@@ -216,11 +186,8 @@ public class CommandDispatcherTests : IDisposable
         Assert.Null(host.Providers.Load("bad"));
     }
 
-    /// <summary>
-    /// ⚠️ **stepper 缓存的失效点必须在 dispatcher 里**（不能挂在控制台的字符串判据上——
-    /// 线上 `provider.upsert` 走不到它 ⇒ 缓存**静默失效**，用户改了 provider 却还在用旧的）。
-    /// 这条直接钉住「upsert 之后缓存确实空了」。
-    /// </summary>
+    // stepper 缓存的失效点必须在 dispatcher 里——挂在控制台的字符串判据上，
+    // 线上 provider.upsert 走不到它，缓存静默失效，用户改了 provider 却还在用旧的。
     [Fact]
     public async Task ProviderUpsert_InvalidatesTheStepperCache()
     {
@@ -239,10 +206,7 @@ public class CommandDispatcherTests : IDisposable
         Assert.NotSame(before, host.StepperFor(handle));
     }
 
-    /// <summary>
-    /// ⚠️ **省略 key = 保留旧 key**（R-B：头读不到 key，不该逼它重发）。
-    /// 头改协议时**必须**能不带 key 走通——不然它永远改不了已有 provider。
-    /// </summary>
+    // 省略 key = 保留旧 key；头改协议时必须能不带 key 走通，不然永远改不了已有 provider。
     [Fact]
     public async Task ProviderUpsert_WithoutApiKey_KeepsTheStoredOne()
     {
@@ -255,14 +219,11 @@ public class CommandDispatcherTests : IDisposable
             "c", true, CancellationToken.None);
 
         var after = host.Providers.Load("p")!;
-        Assert.Equal("k", after.ApiKey);                          // ⚠️ 盘上**仍是旧 key**
-        Assert.Equal(Protocols.OpenAiChat, after.Protocol);       // 而这一项**真的改了**
+        Assert.Equal("k", after.ApiKey);                          // 盘上仍是旧 key
+        Assert.Equal(Protocols.OpenAiChat, after.Protocol);       // 而这一项真的改了
     }
 
-    /// <summary>
-    /// ⚠️ 新 provider **必须**给 key：否则会存下一个**发不出去的配置**，比拒绝更糟
-    /// （用户以为配好了，第一次发消息才炸）。
-    /// </summary>
+    // 新 provider 必须给 key：否则会存下一个发不出去的配置，比拒绝更糟（用户以为配好了，第一次发消息才炸）。
     [Fact]
     public async Task ProviderUpsert_WithoutApiKey_ForANewProvider_IsRejected()
     {
@@ -275,18 +236,13 @@ public class CommandDispatcherTests : IDisposable
             "c", true, CancellationToken.None);
 
         var rejected = Assert.IsType<Ack.Rejected>(r.Ack);
-        Assert.Contains("brand-new", rejected.Reason);            // ⚠️ 理由要**点名那个 id**——
+        Assert.Contains("brand-new", rejected.Reason);            // 理由要点名那个 id——
                                                                   // 用户手打了三个 provider 时，光说「必须给 key」不够
-        Assert.Null(host.Providers.Load("brand-new"));            // ⚠️ 且**没有半成品落盘**
+        Assert.Null(host.Providers.Load("brand-new"));            // 且没有半成品落盘
     }
 
-    /// <summary>
-    /// ⚠️ **第三条不是凑数**：`InvalidateSteppers()` 挂在 `HandleProviderUpsert` 的**末尾**，
-    /// 而「省略 key」这条路径最自然的写法就是**提前 return** ⇒ **改了协议但缓存没失效**
-    /// = 用旧适配器发新协议（正是本文件里 `ProviderUpsert_InvalidatesTheStepperCache` 防的那件事，
-    /// 换了个入口回来）。
-    /// ⇒ 范本就在上面那条，**唯一的区别是这次不带 key**。
-    /// </summary>
+    // InvalidateSteppers() 挂在 HandleProviderUpsert 的末尾，「省略 key」这条路径最自然的写法是提前 return
+    // ⇒ 改了协议但缓存没失效 = 用旧适配器发新协议。
     [Fact]
     public async Task ProviderUpsert_WithoutApiKey_StillInvalidatesSteppers()
     {
@@ -301,15 +257,11 @@ public class CommandDispatcherTests : IDisposable
             new CoreCommand.ProviderUpsert("p", null, null, Protocols.OpenAiChat, null, null),
             "c", true, CancellationToken.None);
 
-        Assert.NotSame(before, host.StepperFor(handle));          // ⚠️ 缓存必须换掉
+        Assert.NotSame(before, host.StepperFor(handle));          // 缓存必须换掉
     }
 
-    /// <summary>
-    /// ⚠️ **空串与「缺失」等价**（都是「没给」）——判据必须与 `/providers` 的 `hasApiKey`
-    /// **共用同一个词**（`IsNullOrEmpty`）。两处漂过一次：守卫用 `is null`，于是
-    /// **新** provider 带一个空串就**绕过守卫**、被 Accepted、存下一个**空 key**——
-    /// 正是上面那条注释要防的「存一个发不出去的配置，比拒绝更糟」。
-    /// </summary>
+    // 空串与「缺失」等价（都是「没给」）；判据必须与 /providers 的 hasApiKey 共用同一个词（IsNullOrEmpty）——
+    // 否则新 provider 带一个空串就绕过守卫、被 Accepted、存下一个空 key。
     [Fact]
     public async Task ProviderUpsert_WithAnEmptyApiKey_ForANewProvider_IsRejected()
     {
@@ -321,15 +273,12 @@ public class CommandDispatcherTests : IDisposable
             new CoreCommand.ProviderUpsert("brand-new", "", null, null, null, null),
             "c", true, CancellationToken.None);
 
-        Assert.IsType<Ack.Rejected>(r.Ack);                       // ⚠️ 不是 Accepted（空 key 发不出去）
-        Assert.Null(host.Providers.Load("brand-new"));            // ⚠️ 不留半成品
+        Assert.IsType<Ack.Rejected>(r.Ack);                       // 不是 Accepted（空 key 发不出去）
+        Assert.Null(host.Providers.Load("brand-new"));            // 不留半成品
     }
 
-    /// <summary>
-    /// ⚠️ **已有 provider 带空串 ⇒ 保留旧 key，不是抹掉**。
-    /// 这正是 R-B 那条失败路径的**另一扇门**：头读不到 key ⇒ 一个天真的表单把空输入框原样提交
-    /// ⇒ 旧判据（`p.ApiKey ?? existing!.ApiKey`）判 `""` 非 null ⇒ **把存着的 key 覆盖成空**。
-    /// </summary>
+    // 已有 provider 带空串 ⇒ 保留旧 key，不是抹掉：旧判据 p.ApiKey ?? existing!.ApiKey 判 "" 非 null
+    // ⇒ 把存着的 key 覆盖成空。
     [Fact]
     public async Task ProviderUpsert_WithAnEmptyApiKey_KeepsTheStoredOne()
     {
@@ -342,17 +291,11 @@ public class CommandDispatcherTests : IDisposable
             "c", true, CancellationToken.None);
 
         var after = host.Providers.Load("p")!;
-        Assert.Equal("k", after.ApiKey);                          // ⚠️ 空输入框不该抹掉 key
-        Assert.Equal(Protocols.OpenAiChat, after.Protocol);       // 而这一项**真的改了**
+        Assert.Equal("k", after.ApiKey);                          // 空输入框不该抹掉 key
+        Assert.Equal(Protocols.OpenAiChat, after.Protocol);       // 而这一项真的改了
     }
 
-    /// <summary>
-    /// ⚠️ **删掉之后盘上真的没有了**——这一条钉的是「四条线」里 dispatcher 那条的**盘上后果**。
-    ///
-    /// <para>⚠️ **只断言 ack 是半条判据**：ack 说 accepted 而文件还在的那种错，
-    /// 用户以为删了、下次发消息还在用那个凭据（`StepperResolver` 会照旧载入它）。
-    /// ⇒ 判据必须落在盘上（`Load` 为 null / 文件不存在）。</para>
-    /// </summary>
+    // 删掉之后盘上真的没有了；只断言 ack 是半条判据——用户以为删了、下次发消息还在用那个凭据。
     [Fact]
     public async Task ProviderDelete_RemovesTheStoredDefinition()
     {
@@ -364,52 +307,36 @@ public class CommandDispatcherTests : IDisposable
             new CoreCommand.ProviderDelete("p"), "c", true, CancellationToken.None);
 
         Assert.IsType<Ack.Accepted>(r.Ack);
-        Assert.Null(host.Providers.Load("p"));                       // ⚠️ 读不到了
+        Assert.Null(host.Providers.Load("p"));                       // 读不到了
         Assert.Empty(host.Providers.List());                        // 且列表里也没了
     }
 
-    /// <summary>
-    /// ⚠️ **损坏的 provider 文件必须删得掉**——这一条钉的是「判据是**文件层**，不是 `Load is null`」。
-    ///
-    /// <para>`Load` 把**损坏**的文件也当作「不存在」⇒ 若有人把 dispatcher 的判据改成
-    /// `Load(d.Id) is null`，一个坏配置会**永远删不掉**，而**「把一个坏配置删掉」正是用户最想做的事**。
-    /// ⚠️ **其余三条删除测试全都抓不到**这个改动（`RemovesTheStoredDefinition` / `BoundBySession`
-    /// / `InvalidatesTheCache`——**不都是在本条之上**）：它们用的是**能正常解析**的文件
-    /// ⇒ `Load` 非 null、判据照样通过。⇒ 这一条是那块缺口唯一的钉子。</para>
-    ///
-    /// <para>⚠️ 断言要**落在盘上**（文件真的没了）——只断言 ack 是半条判据。</para>
-    /// </summary>
+    // 损坏的 provider 文件必须删得掉（判据是文件层，不是 Load is null）；
+    // 其余三条删除测试用的是能正常解析的文件，抓不到这个改动。
     [Fact]
     public async Task ProviderDelete_OfACorruptProviderFile_IsAccepted_NotRejected()
     {
         var (host, _) = NewHarness();
-        // ⚠️ **不能走 `Providers.Save`**（那写的必定是合法 JSON）——直接往盘上写一个坏文件。
+        // 不能走 Providers.Save（那写的必定是合法 JSON）——直接往盘上写一个坏文件。
         var dir = Path.Combine(_root, "providers");
         Directory.CreateDirectory(dir);
         var file = Path.Combine(dir, "broken.json");
         File.WriteAllText(file, "{ 这不是合法 JSON");
 
-        // ⚠️ 先确认前提成立：`Load` 对它是 null（所以「改成 Load」会把它当不存在）。
+        // 先确认前提成立：Load 对它是 null（所以「改成 Load」会把它当不存在）。
         Assert.Null(host.Providers.Load("broken"));
 
         var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
         var r = await dispatcher.DispatchAsync(
             new CoreCommand.ProviderDelete("broken"), "c", true, CancellationToken.None);
 
-        Assert.IsType<Ack.Accepted>(r.Ack);        // ⚠️ 改了判据这里会变 Rejected
-        Assert.False(File.Exists(file));           // ⚠️ 且盘上真的没了
+        Assert.IsType<Ack.Accepted>(r.Ack);        // 改了判据这里会变 Rejected
+        Assert.False(File.Exists(file));           // 且盘上真的没了
     }
 
-    /// <summary>
-    /// ⚠️ **删一个不存在的 id ⇒ `Rejected`，且理由点名那个 id——不是幂等成功。**
-    ///
-    /// <para>理由：本项目一路在收「静默的成功」。`provider delet local`（拼错）若回 ✓，
-    /// 用户以为删掉了、其实没删，而下一次发消息用的还是那个凭据。
-    /// 「点名 id」是必需的：用户手打了三个 provider 时，只说「没有这个提供商」他不知道是哪一个。</para>
-    ///
-    /// <para>⚠️ **不变的那半也要断言**：拒绝时**不许**顺手清缓存、也不许动别的文件——
-    /// 一次没做成的命令不该有任何副作用。</para>
-    /// </summary>
+    // 删一个不存在的 id ⇒ Rejected 且理由点名那个 id，不是幂等成功；
+    // provider delet local（拼错）若回 ✓，用户以为删掉了、其实没删，下次发消息用的还是那个凭据。
+    // 拒绝时不许顺手清缓存、也不许动别的文件——一次没做成的命令不该有任何副作用。
     [Fact]
     public async Task ProviderDelete_OfAProviderThatDoesNotExist_IsRejected_NamingTheId()
     {
@@ -421,24 +348,14 @@ public class CommandDispatcherTests : IDisposable
             new CoreCommand.ProviderDelete("local"), "c", true, CancellationToken.None);
 
         var rejected = Assert.IsType<Ack.Rejected>(r.Ack);
-        Assert.Contains("local", rejected.Reason);                   // ⚠️ 理由点名那个 id
-        Assert.NotNull(host.Providers.Load("p"));                    // ⚠️ 别的 provider 一根汗毛没动
+        Assert.Contains("local", rejected.Reason);                   // 理由点名那个 id
+        Assert.NotNull(host.Providers.Load("p"));                    // 别的 provider 一根汗毛没动
     }
 
-    /// <summary>
-    /// ⚠️ **删一个正被会话引用的 provider 不阻止**（R-A：想改啥都行；用户可能就是要把一个坏配置删掉）
-    /// ——`SessionSpec` 的存在**不构成**「不能删」的理由。
-    ///
-    /// <para>⚠️ 但**后果必须可见**：删完 `InvalidateSteppers()`，被引用的会话下次发消息
-    /// 会走 `StepperResolver` 的「绑定的提供商已不存在」那条路（已实现）。
-    /// 断言那条路真的被走到（`UnconfiguredAdapter`），而不只是「缓存对象换了」——
-    /// 后者在「删了但换了个同样坏的」时也会成立。</para>
-    ///
-    /// <para>⚠️ **必须先 `StepperFor` 一次把缓存捂热**（`before`）：不预热的话缓存里本来就
-    /// 没有该会话那一条 ⇒ 删完再解析**必然**是新对象 ⇒ 这条测试在「`InvalidateSteppers()`
-    /// 被删掉」时**照样绿**（实测：变异 3 下只有隔壁那条红）。预热之后，
-    /// 少了失效的那一句就会把**旧的那个**还回来 ⇒ 这条也红。</para>
-    /// </summary>
+    // 删一个正被会话引用的 provider 不阻止（想改啥都行；用户可能就是要把一个坏配置删掉），
+    // 但后果必须可见：删完 InvalidateSteppers()，被引用的会话下次发消息走 StepperResolver 的
+    // 「绑定的提供商已不存在」那条路。必须先 StepperFor 一次把缓存捂热，
+    // 否则对「InvalidateSteppers 被删掉」没有区分力。
     [Fact]
     public async Task ProviderDelete_OfAProviderBoundByASession_IsAccepted_NotBlocked()
     {
@@ -448,25 +365,21 @@ public class CommandDispatcherTests : IDisposable
         var sessionId = await CreateSessionAsync(dispatcher);        // 会话绑到 "p"
         host.TryGetActivated(sessionId, out var handle);
 
-        var before = host.StepperFor(handle);                        // ⚠️ 把缓存捂热（见上）
+        var before = host.StepperFor(handle);                        // 把缓存捂热（见上）
 
         var r = await dispatcher.DispatchAsync(
             new CoreCommand.ProviderDelete("p"), "c", true, CancellationToken.None);
 
-        Assert.IsType<Ack.Accepted>(r.Ack);                          // ⚠️ 不阻止（没有「谁在用」的闸）
+        Assert.IsType<Ack.Accepted>(r.Ack);                          // 不阻止（没有「谁在用」的闸）
         Assert.Null(host.Providers.Load("p"));                       // 而且真删了
 
         var after = host.StepperFor(handle);                         // 下一次解析走的是……
-        Assert.NotSame(before, after);                               // ⚠️ 缓存真的失效了
-        Assert.IsType<UnconfiguredAdapter>(after.Adapter);           // ⚠️ 「绑定的提供商已不存在」那条路
+        Assert.NotSame(before, after);                               // 缓存真的失效了
+        Assert.IsType<UnconfiguredAdapter>(after.Adapter);           // 「绑定的提供商已不存在」那条路
     }
 
-    /// <summary>
-    /// ⚠️ **失效点必须在 dispatcher 里**（与 upsert 同源）：挂在控制台的字符串判据上，
-    /// 线上的 `provider.delete` 走不到它 ⇒ 缓存**静默失效**，
-    /// 用户删了 provider 而会话还在用**那个已经被删掉的**配置跑。
-    /// ⚠️ 这条**不建会话**、直接看缓存对象换没换——与上面那条「被引用的会话」分工不同。
-    /// </summary>
+    // 失效点必须在 dispatcher 里（与 upsert 同源）：挂在控制台的字符串判据上，
+    // 线上的 provider.delete 走不到它 ⇒ 缓存静默失效，用户删了 provider 而会话还在用那个配置跑。
     [Fact]
     public async Task ProviderDelete_InvalidatesTheStepperCache()
     {
@@ -483,18 +396,9 @@ public class CommandDispatcherTests : IDisposable
         Assert.NotSame(before, host.StepperFor(handle));
     }
 
-    /// <summary>
-    /// ⚠️ **C1 回归：删一个正被【别的句柄读着】的 provider，必须回 `Rejected`（带理由），
-    /// 不是把异常抛出 `DispatchAsync`。**
-    ///
-    /// <para>抛出去会一路冒到 `Program.cs` 的主循环（那里**没有** catch）⇒
-    /// 把**常驻进程**（控制台 + 控制面一起）打死。触发面**不需要奇异 id、也不经过 Origin 闸**：
-    /// 本文件那个读写竞态，任何一个网页 `fetch("http://127.0.0.1:7788/providers")` 循环
-    /// 就能按住（HTTP 不做 Origin 校验，CORS 还是 `*`），头自己的轮询同样会按住它。</para>
-    ///
-    /// <para>⚠️ 句柄带 `FileShare.Read`（**不含** `FILE_SHARE_DELETE`）⇒ Windows 上
-    /// `File.Delete` 抛 `IOException`（实测）。句柄持到测试结束 ⇒ 重试仍失败 ⇒ 落到层 2 的定制消息。</para>
-    /// </summary>
+    // 删一个正被别的句柄读着的 provider 必须回 Rejected（带理由），不是把异常抛出 DispatchAsync——
+    // 抛出去会冒到 Program.cs 的主循环（那里没有 catch）把常驻进程打死。
+    // 句柄带 FileShare.Read（不含 FILE_SHARE_DELETE）⇒ Windows 上 File.Delete 抛 IOException。
     [Fact]
     public async Task ProviderDelete_WhileAReadHandleIsOpen_IsRejectedWithAReason_NotAnException()
     {
@@ -510,19 +414,12 @@ public class CommandDispatcherTests : IDisposable
 
         var rejected = Assert.IsType<Ack.Rejected>(r.Ack);
         Assert.Contains("p", rejected.Reason);
-        // ⚠️ 层 2 的**定制**消息——既不是原始异常文本，更不是那句**假话**「没有提供商 'p'」（它在，只是忙）。
+        // 层 2 的定制消息——既不是原始异常文本，更不是那句假话「没有提供商 'p'」（它在，只是忙）。
         Assert.Contains("正被占用", rejected.Reason);
     }
 
-    /// <summary>
-    /// ⚠️ **C1 的第三层（dispatcher 兜底）**：任何 handler 抛出的**意外**异常都必须变成
-    /// `rejected`，不许冒出去打死常驻进程。
-    ///
-    /// <para>这条用「落盘必然失败」逼出它——把 `providers/` 从一个目录换成**同名文件**，
-    /// `AtomicFile.Write` 的 `Directory.CreateDirectory` 必抛 `IOException`。
-    /// ⚠️ 它**必须是意外异常**，而不是某个被接住的业务失败（`DispatchException` 另走一路，
-    /// 那 4 条既有测试钉着它必须**原样抛出**）。⇒ 删掉 catch-all 时**只有这条**红。</para>
-    /// </summary>
+    // 任何 handler 抛出的意外异常都必须变成 rejected，不许冒出去打死常驻进程；
+    // DispatchException 另走一路，既有测试钉着它必须原样抛出。
     [Fact]
     public async Task UnexpectedExceptionFromAHandler_BecomesARejection_NotAnEscapingException()
     {
@@ -542,7 +439,7 @@ public class CommandDispatcherTests : IDisposable
         Assert.Contains("命令执行时出错", rejected.Reason);
     }
 
-    /// <summary>挂起的适配器：让测试能精确控制「模型什么时候返回」。</summary>
+    // 挂起的适配器：让测试能精确控制「模型什么时候返回」。
     private sealed class GatedAdapter(Func<Task<string>> gate) : Lilara.Core.Adapters.IModelAdapter    {
         public Lilara.Core.Adapters.ResolvedEndpoint? Endpoint => null;
         public string Protocol => Protocols.ClaudeMessages;
@@ -560,14 +457,8 @@ public class CommandDispatcherTests : IDisposable
         }
     }
 
-    /// <summary>
-    /// ⚠️ **事件必须从 dispatcher 发，而且控制台那条路也要发**。
-    ///
-    /// <para>`03` §8.1 只说控制台**不订阅**任何流，**没说它的命令不产生事件**。
-    /// 若事件由控制面自己发（或发在 `Stepper` 里），那么**用户在控制台敲的那句话
-    /// 在头上是看不见的**——头的视图会**静默**少一步，且它没办法发现自己少了。
-    /// 这条测试直接走 dispatcher（控制台走的就是它），断言事件确实出来了。</para>
-    /// </summary>
+    // 事件必须从 dispatcher 发，控制台那条路也要发；否则用户在控制台敲的那句话在头上是看不见的，
+    // 头的视图会静默少一步，且它没办法发现自己少了。
     [Fact]
     public async Task Send_PublishesTheStepLifecycleEvents()
     {
@@ -587,8 +478,7 @@ public class CommandDispatcherTests : IDisposable
         var kinds = new List<string>();
         while (sub.Reader.TryRead(out var p)) kinds.Add(p.Payload.GetType().Name);
 
-        // ⚠️ 四条都要在，且顺序固定：
-        //   用户消息（send 时就发）→ 步开始 → 模型消息 → 步结束 → 状态
+        // 顺序固定：用户消息（send 时就发）→ 步开始 → 模型消息 → 步结束 → 状态。
         Assert.Equal(
             ["MessageAppended", "StepBegin", "MessageAppended", "StepEnd", "StateChanged"],
             kinds);
@@ -597,11 +487,8 @@ public class CommandDispatcherTests : IDisposable
         Assert.False(sub.NeedsResync);
     }
 
-    /// <summary>
-    /// ⚠️ **拒答也必须走到 `step.end`**。`Stepper` 的拒答分支**不写模型消息**，
-    /// 但 `Turn` 照样递增。把 `step.end` 挂在「模型消息之后」会**漏掉拒答**——
-    /// 于是头看着一次拒答像「什么都没发生」，并且**永远等不到 step.end**，会以为那一步卡住了。
-    /// </summary>
+    // 拒答也必须走到 step.end（Stepper 的拒答分支不写模型消息，但 Turn 照样递增）；
+    // 挂在「模型消息之后」会漏掉拒答，头永远等不到 step.end。
     [Fact]
     public async Task Refusal_StillPublishesStepEnd()
     {
@@ -623,7 +510,7 @@ public class CommandDispatcherTests : IDisposable
         var end = Assert.IsType<WireEvent.StepEnd>(payloads.Last(e => e is WireEvent.StepEnd));
         Assert.True(end.Refused);
         Assert.Equal(1, end.Turn);
-        // ⚠️ 拒答**不产生**模型消息——只有那条用户消息
+        // 拒答不产生模型消息——只有那条用户消息
         Assert.Single(payloads.OfType<WireEvent.MessageAppended>());
     }
 }

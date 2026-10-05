@@ -6,10 +6,7 @@ using Lilara.Core.Session;
 
 namespace Lilara.Core.Tests;
 
-/// <summary>
-/// 「全新跑 → provider set → 发消息」那条首次使用路径的关键逻辑。
-/// ⚠️ 这些测试只**构造**适配器、从不 CallAsync——不联网。
-/// </summary>
+// 「全新跑 → provider set → 发消息」那条首次使用路径；只构造适配器，不联网。
 public class StepperResolverTests : IDisposable
 {
     private readonly string _root =
@@ -56,11 +53,7 @@ public class StepperResolverTests : IDisposable
         Assert.IsType<ClaudeAdapter>(stepper.Adapter);
     }
 
-    /// <summary>
-    /// ⚠️ 这条原先断言「退回任意一个提供商」——那是**错的**行为，已被反转。
-    /// 会话 spec 里的 ProviderId 正是为了钉住「这一步是哪个提供商跑的」（01 §7.2）；
-    /// 随手换一个可能是**另一个 key + 另一个端点**，等于把数据发给了别人。
-    /// </summary>
+    // 不许退回任意一个提供商——可能是另一个 key + 另一个端点，等于把数据发给了别人。
     [Fact]
     public void Resolve_WithUnknownPreferredId_DoesNotSubstituteAnotherProvider()
     {
@@ -71,7 +64,7 @@ public class StepperResolverTests : IDisposable
         Assert.IsType<UnconfiguredAdapter>(stepper.Adapter);
     }
 
-    /// <summary>占位适配器必须**点名**缺的是哪个提供商——「还没有配置提供商」是句误导的话。</summary>
+    // 占位适配器必须点名缺的是哪个提供商。
     [Fact]
     public async Task Resolve_WithUnknownPreferredId_PlaceholderNamesTheMissingProvider()
     {
@@ -97,9 +90,8 @@ public class StepperResolverTests : IDisposable
     [Fact]
     public void Resolve_WithKnownPreferredId_UsesIt()
     {
-        // ⚠️ 顺序是刻意的：`List()` 按 Id 升序，所以「退回任意一个」会先拿到 `aaa`，
-        // 而 `aaa` 的协议是未知的——`AdapterFactory.Create` 会抛。
-        // 于是「断言拿到 ClaudeAdapter」能区分「用了 preferred」与「用了任意一个」。
+        // 顺序刻意：List() 按 Id 升序，aaa 的协议未知会让 AdapterFactory.Create 抛，
+        // 故断言拿到 ClaudeAdapter 能区分「用了 preferred」与「用了任意一个」。
         Save("aaa", protocol: "bogus-proto");
         Save("zzz");
 
