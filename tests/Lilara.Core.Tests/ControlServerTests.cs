@@ -309,6 +309,44 @@ public class ControlServerTests : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// ⚠️ **钉住「闸读的是参数，不是写死的字面量」**。
+    ///
+    /// <para>上面那条理论用的是**默认值** ⇒ 把参数忽略掉、写死 `http://127.0.0.1:7790`
+    /// 它**照样全绿**。本条的全部价值在**反向**那半：在一个显式传了**非默认**值的服务器上，
+    /// **默认值那个 origin 必须被拒**——只有这一条能杀死「参数被忽略」。</para>
+    /// </summary>
+    [Fact]
+    public async Task WebSocket_HonoursANonDefaultAllowedOrigin()
+    {
+        // ⚠️ 显式传一个**非默认**的 allowedOrigin ⇒ 钉住「闸读的是参数，不是写死的字面量」。
+        // ⚠️ 建一个**第二个** ControlServer（另起随机端口），别去动既有那个 `_server`。
+        const string mine = "http://127.0.0.1:19999";
+        var port = Random.Shared.Next(20_000, 60_000);
+        var server = new ControlServer(_host, _dispatcher, _bus, port, allowedOrigin: mine);
+        var app = await server.StartAsync(CancellationToken.None);
+        try
+        {
+            // 放行：非默认那个 origin 自己
+            using (var ok = new ClientWebSocket())
+            {
+                ok.Options.SetRequestHeader("Origin", mine);
+                await ok.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws"), CancellationToken.None);
+                Assert.Equal(WebSocketState.Open, ok.State);
+            }
+            // ⚠️ 反向：**默认值**那个 origin 在这里必须**被拒**——否则说明参数没被用上
+            using var bad = new ClientWebSocket();
+            bad.Options.SetRequestHeader("Origin", "http://127.0.0.1:7790");
+            await Assert.ThrowsAnyAsync<WebSocketException>(
+                () => bad.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws"), CancellationToken.None));
+        }
+        finally
+        {
+            await app.StopAsync(CancellationToken.None);
+            await app.DisposeAsync();
+        }
+    }
+
     private static async Task SendAsync(WebSocket ws, string json) =>
         await ws.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, true, CancellationToken.None);
 

@@ -80,8 +80,9 @@ try
     // ⚠️ **WS 只接受这个 origin 的页面**（见 `ControlServer.MapWebSocket` 的注释）。
     // 印出来是为了**失败能自解释**：页面从别的 origin（例如 `localhost:7790`）打开时会被拒，
     // 用户得能看见被接受的到底是哪一个——否则只能瞎猜。
-    // ⚠️ 这里读的是**同一个常量**（`DefaultAllowedOrigin`），不是抄一份字面量。
-    Console.WriteLine($"  WS 只接受来自 {ControlServer.DefaultAllowedOrigin} 的页面；其它 origin 的网页会被拒。");
+    // ⚠️ 这里读的是**实例值**（`AllowedOrigin`），不是默认常量——否则将来 origin 可配时，
+    // 横幅会印一个闸其实**拒绝**的 origin，而用户恰好靠横幅自解释失败原因。
+    Console.WriteLine($"  WS 只接受来自 {controlServer.AllowedOrigin} 的页面；其它 origin 的网页会被拒。");
 }
 catch (Exception ex)
 {

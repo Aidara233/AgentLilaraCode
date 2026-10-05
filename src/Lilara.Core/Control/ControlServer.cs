@@ -35,7 +35,8 @@ public sealed class ControlServer(
     /// **任何本机程序都能抢占的名字**（hosts 文件 / DNS）——端口也一样，所以
     /// 这里**不做** `127.0.0.1:*` 那种通配。</para>
     ///
-    /// <para>⚠️ 参数默认值与启动横幅**共用这一个常量**（否则两处副本会分叉）。</para>
+    /// <para>⚠️ **只有参数默认值读它**。启动横幅读的是**实例值** <see cref="AllowedOrigin"/>——
+    /// 否则将来有人传非默认值时，横幅会印一个闸其实**拒绝**的 origin，而用户恰好靠横幅自解释失败原因。</para>
     /// </summary>
     internal const string DefaultAllowedOrigin = "http://127.0.0.1:7790";
 
@@ -43,6 +44,14 @@ public sealed class ControlServer(
     public const string BindAddress = "127.0.0.1";
 
     public string Url => $"http://{BindAddress}:{port}";
+
+    /// <summary>
+    /// ⚠️ 给**启动横幅**读：横幅必须印**闸真正在接受的那个值**（实例值），不是默认常量——
+    /// 否则将来有人传非默认值时，横幅会印一个闸其实**拒绝**的 origin，而用户恰好靠横幅自解释失败原因。
+    ///
+    /// <para>⚠️ `internal`（不是 `public`）：公开面里没有它，`Program.cs` 同程序集读得到。</para>
+    /// </summary>
+    internal string AllowedOrigin => allowedOrigin;
 
     /// <summary>
     /// 启动。
@@ -282,6 +291,11 @@ public sealed class ControlServer(
         // 浏览器发的握手**永远带 `Origin`**（挡住坏 origin 就达到了目的），
         // 而 curl / 测试驱动 / 未来的 CLI 头**不带**——要求它会把它们**全部**误伤，
         // 而那批既有 WS 测试正是这条改动的**回归网**。
+        //
+        // ⚠️ **这是防网页，不是鉴权**：非浏览器客户端可以随意伪造 `Origin`
+        // （本文件对应的测试就是靠 `SetRequestHeader` 伪造的）。
+        // 它挡住的是「用户在浏览器里开着某个页面」这一条路，不是「有人想连就能连」。
+        // ⇒ 别把这道闸当成鉴权边界（`apiKey` 可选之后尤其别）。
         //
         // ⚠️ 用**索引器**取头（`ctx.Request.Headers["Origin"]`，大小写不敏感），
         // 不用 .NET 10 的强类型属性——索引器两种写法都吃，且**能被 grep 到**。
