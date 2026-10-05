@@ -47,8 +47,13 @@ public sealed record ProviderDefinition
     /// ⇒ `"apiKey": ""` 既**绕过守卫**（存下空 key），又**抹掉已有 provider 的 key**。
     /// ⇒ 空串与缺失**等价**（都是「没给」）。</para>
     ///
-    /// <para>⚠️ **别改成 `IsNullOrWhiteSpace`**：那是**第三个**判据（本判据故意不管空白串），
-    /// 一改就又变成两份拼写。空白串是另一个问题。</para>
+    /// <para>⚠️ **`空串 ≠ 给过 key`；但「全空白」算不算，是一个**未裁决的契约问题**（不在本轮范围）。**
+    /// 今天 `HasKey("   ")` 为 true ⇒ 拿全空白当 key 的新 provider 会被**接受并落盘**，
+    /// 而每一次请求都会鉴权失败——正是本判据要防的「配好了却发不出去」。
+    /// ⚠️ 这条**不是本轮引入的**（旧判据 `is null` 也放行 `"   "`），且今天**没有任何测试钉住这个选择**。</para>
+    ///
+    /// <para>⚠️ **改它本身是一处的事**（三处调用都走这个函数）——但那是**改契约**，不是改拼写。
+    /// 别把它与「两份拼写」混为一谈：拼写问题已经由本函数收掉了。</para>
     /// </summary>
     public static bool HasKey(string? apiKey) => !string.IsNullOrEmpty(apiKey);
 
