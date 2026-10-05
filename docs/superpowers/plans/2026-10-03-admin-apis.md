@@ -531,18 +531,59 @@ if (p.ApiKey is null && existing is null)
 
 - [ ] **Step 1: 测试**（⚠️ 两条都是 G12 的可执行判据）
 
+⚠️ **先说一个会让测试「假红」的坑**：`WireJson.Options` 带
+`DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull`（`WireJson.cs:28`），
+而 `Endpoint` / `AuthScheme` 是 `string?`、默认 **null** ⇒ **键根本不会出现**。
+⇒ 断言「这些字段都在」时，**必须先把它们设上**，否则红的是测法、不是端点。
+
 ```csharp
-[Fact] public void Providers_CarriesEverythingButTheKey()
-{ /* 断言 id/protocol/defaultModel/endpoint/authScheme/modality/hasApiKey 都在 */ }
+[Fact]
+public async Task Providers_CarriesEverythingButTheKey()
+{
+    // ⚠️ 端点与认证方式**显式设上**——它们是可空的，而 `WhenWritingNull` 会把 null 的键整个省掉。
+    _host.Providers.Save(new ProviderDefinition
+    {
+        Id = "full", Protocol = Protocols.ClaudeMessages, ApiKey = "k",
+        DefaultModel = "m", Modality = "vision",
+        Endpoint = "http://127.0.0.1:1/v1", AuthScheme = AuthSchemes.Bearer,
+    });
 
-[Fact] public void Providers_NeverLeaksTheKey()
-{ /* ⚠️ 用**真实数据根**（或写入一个含哨兵串的 key）打一遍，
-     断言响应字节里不含那个哨兵的前 16 个字符 */ }
+    using var a = JsonDocument.Parse(await Client.GetStringAsync(Http("/providers")));
+    var p = a.RootElement.EnumerateArray().Single(e => e.GetProperty("id").GetString() == "full");
+
+    Assert.Equal(Protocols.ClaudeMessages, p.GetProperty("protocol").GetString());
+    Assert.Equal("m", p.GetProperty("defaultModel").GetString());
+    Assert.Equal("http://127.0.0.1:1/v1", p.GetProperty("endpoint").GetString());
+    Assert.Equal(AuthSchemes.Bearer, p.GetProperty("authScheme").GetString());
+    Assert.Equal("vision", p.GetProperty("modality").GetString());
+    Assert.True(p.GetProperty("hasApiKey").GetBoolean());
+}
+
+[Fact]
+public async Task Providers_NeverLeaksTheKey()
+{
+    // ⚠️ **哨兵串**：一个不可能偶然出现的值。**别用「不含 apiKey 字样」那种弱判据**——
+    //    字段一改名它就失效了。
+    const string sentinel = "SENTINEL-8f3a2b1c-DO-NOT-LEAK";
+    _host.Providers.Save(new ProviderDefinition
+    {
+        Id = "leaky", Protocol = Protocols.ClaudeMessages, ApiKey = sentinel,
+        DefaultModel = "m", Modality = "vision",
+    });
+
+    var body = await Client.GetStringAsync(Http("/providers"));
+
+    // ⚠️ 断言**字节里**不含它——这是 G12「可写不可读」唯一可执行的判据。
+    Assert.DoesNotContain(sentinel, body);
+    Assert.DoesNotContain(sentinel[..16], body);
+
+    // ⚠️ **反向那半不能省**：只断言「不含哨兵」的话，「这个端点什么都没交」也能过。
+    using var a = JsonDocument.Parse(body);
+    var p = a.RootElement.EnumerateArray().Single(e => e.GetProperty("id").GetString() == "leaky");
+    Assert.True(p.GetProperty("hasApiKey").GetBoolean());   // 「有 key」这件事要看得见
+    Assert.False(p.TryGetProperty("apiKey", out _));        // 而「是什么」不行
+}
 ```
-
-⚠️ **第二条的哨兵写法**：用一个**不可能偶然出现**的串（如 `SENTINEL-8f3a2b1c-DO-NOT-LEAK`）写进 provider，
-跑完断言响应里 `IndexOf(sentinel[..16]) < 0`。**别用「不含 apiKey 字样」这种弱判据**
-（字段改名就失效了）。
 
 - [ ] **Step 2–4: 红 → 实现 → 绿**
 
