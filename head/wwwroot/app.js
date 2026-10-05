@@ -35,6 +35,10 @@ const info = new Map();             // sid -> { spec?, turn, status }
 let providers = [];
 const provNotes = new Map();        // providerId -> { text, ok }（最近一次自检的结果）
 const testCmd = new Map();          // 命令 id -> providerId（回执认得回来）
+let editingProvider = null;         // 供应商视图里正在编辑的那个 id；null = 没有
+let showNewCard = false;            // 「新建」那张卡要不要展开（默认收起——它不是数据，是入口）
+let SCHEMA = { protocols: [], authSchemes: [] };   // GET /provider-schema（头的合法值来源，**不许手抄**）
+const pendingAcks = new Map();      // 命令 id -> (frame) => void（`commandNow` 的回执关联）
 
 // ---- 引导：核心启动后没有会话与提供商，「配置提供商 → 建初始会话」是头的策略 ----
 // bootstrap() 有两个入口（首屏 IIFE 与 onopen 自恢复）且不可重入 ⇒ 用一次性承诺去重；
@@ -49,6 +53,7 @@ function bootstrap() {
 async function runBootstrap() {
   // 轴表先拉：AXES 为空则右栏画不出任何控件。
   await loadAxes();
+  await loadSchema();
   await loadSessions();
   await loadProviders();
   loadCoreFacts();                  // 底栏是自述，不阻塞引导 —— 失败了也只是底栏空着
@@ -328,7 +333,282 @@ function setStatus(status, turn) {
   el.className = "chip " + (status === "Running" ? "running" : "live");
 }
 
-// ---- 右栏三块：提供商 / 会话 / 项目 ----
+// ---- 视图切换：会话 / 供应商 ----
+// ⚠️ 只在**页面内**切：共享同一个 WS、同一份 providers 缓存、同一套样式。
+// 另开一个 HTML 文件就得把 WS 那套管线抽成共用 js 或重写一遍，而这两个视图用的
+// 就是同一份数据（会话视图的供应商下拉 = 供应商视图维护的那份清单）。
+
+function showView(which) {
+  document.body.classList.toggle("providers", which === "providers");
+  $("nav-sessions").classList.toggle("on", which !== "providers");
+  $("nav-providers").classList.toggle("on", which === "providers");
+  // 视图进 URL 片段：可收藏、可前进后退、刷新后停在原地。
+  // ⚠️ 用 `history.replaceState` 而不是改 `location.hash`——后者会**再触发**一次 hashchange，
+  // 与我们这里读 hash 的地方来回打架（无限循环）。
+  try { history.replaceState(null, "", which === "providers" ? "#providers" : "#sessions"); } catch { }
+  if (which === "providers") {
+    loadProviders().then(renderProvidersView).catch((e) => renderMeta("✗ " + e.message, "error"));
+  } else {
+    // 切回来时把会话视图的缓存刷一遍——供应商可能在那边被改过。
+    renderSessions();
+    if (current) openSession(current);
+  }
+}
+
+function renderProvidersView() {
+  const grid = $("prov-grid");
+  grid.innerHTML = "";
+  $("prov-count").textContent = providers.length ? `共 ${providers.length}` : "";
+
+  for (const p of providers) grid.appendChild(providerCard(p));
+
+  // 「新建」永远在最后。⚠️ 默认**收起**：它是个入口不是数据，一进页面就摊开一张
+  // 空表单会把「我有哪些供应商」这件事淹没掉。
+  grid.appendChild(showNewCard ? providerCard(null) : newProviderStub());
+}
+
+function newProviderStub() {
+  const card = document.createElement("div");
+  card.className = "pcard";
+  card.style.cssText = "border-style:dashed;text-align:center";
+  const b = btn("+ 新建供应商", () => { showNewCard = true; renderProvidersView(); }, "btn-primary");
+  card.appendChild(b);
+  return card;
+}
+
+// `p === null` ⇒ 新建卡。
+function providerCard(p) {
+  const isNew = p === null;
+  const editing = isNew || editingProvider === p.id;
+
+  const card = document.createElement("div");
+  card.className = "pcard" + (editing ? " editing" : "");
+
+  // ---- 只读态：一行摘要 + 三个动作 ----
+  if (!editing) {
+    const top = document.createElement("div");
+    top.className = "top";
+    const id = document.createElement("span");
+    id.className = "pid";
+    id.textContent = p.id;
+    top.appendChild(id);
+    card.appendChild(top);
+
+    const dl = document.createElement("dl");
+    dl.className = "kv";
+    kv(dl, [
+      ["协议", p.protocol],
+      ["默认模型", p.defaultModel],
+      ["模型清单", p.models && p.models.length ? p.models.join("、") : "(未声明)", !p.models || !p.models.length],
+      ["端点", p.endpoint],
+      ["认证", p.authScheme],
+      ["密钥", p.hasApiKey ? "已配置" : "未配置", !p.hasApiKey],
+    ]);
+    card.appendChild(dl);
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    actions.append(
+      btn("编辑", () => { editingProvider = p.id; renderProvidersView(); }),
+      btn("自检", () => testProvider(p.id)),
+      btn("删除", () => deleteProvider(p.id), "btn-ghost"),
+    );
+    card.appendChild(actions);
+
+    const note = provNotes.get(p.id);
+    if (note) {
+      const n = document.createElement("div");
+      n.className = note.ok === false ? "note-bad" : "note-ok";
+      n.textContent = note.text;
+      card.appendChild(n);
+    }
+    return card;
+  }
+
+  // ---- 编辑态（新建走同一张表单，只是 id 可填、没有删除） ----
+  const form = document.createElement("div");
+  form.className = "form";
+
+  const fId = field("id", "id", isNew ? "" : p.id, "mono");
+  if (!isNew) { fId.input.disabled = true; fId.input.title = "id 是文件名，改它等于改名——先删了重建"; }
+  fId.input.placeholder = "单个文件名，如 local";
+
+  const fProtocol = selectField("protocol", "协议", SCHEMA.protocols, isNew ? SCHEMA.protocols[0] : p.protocol);
+  const fModel = field("defaultModel", "默认模型", isNew ? "" : p.defaultModel);
+  const fModels = field("models", "模型清单（逗号分隔）",
+    isNew ? "" : (p.models || []).join(","), "mono");
+  fModels.input.placeholder = "deepseek-flash,gpt-4o（留空 = 不声明，头退回文本框）";
+  const fEndpoint = field("endpoint", "端点", isNew ? "" : (p.endpoint || ""), "mono");
+  fEndpoint.input.placeholder = "留空 = 官方地址";
+  const fAuth = selectField("auth", "认证方式", SCHEMA.authSchemes,
+    isNew ? "" : (p.authScheme || ""), /* allowEmpty */ true);
+  const fKey = field("apiKey", "密钥", "", "mono");
+  fKey.input.type = "password";
+  // ⚠️ 绝不回填密钥（key 能改不能看）。留空 = 保留旧的。
+  fKey.input.placeholder = p && p.hasApiKey ? "（已配置，留空就不改）" : "新建必须填";
+
+  // 顺序：id / 协议 / 默认模型 / 认证 / 端点 / 清单。id 与协议并排，其余各占一行。
+  form.append(fId.wrap, fProtocol.wrap);
+  form.append(fModel.wrap, fAuth.wrap);
+  form.append(fEndpoint.wrap);
+  form.append(fModels.wrap);
+  form.append(fKey.wrap);
+  card.appendChild(form);
+
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  actions.append(
+    btn("保存", async () => {
+      const payload = {
+        kind: "provider.upsert",
+        id: fId.input.value.trim(),
+        protocol: fProtocol.select.value || null,
+        model: fModel.input.value.trim() || null,
+        endpoint: fEndpoint.input.value.trim() || null,
+        auth: fAuth.select.value || null,
+        // ⚠️ 清单用**数组**发（核心那条 `OptStringList` 只认数组）。
+        // 空串 ⇒ 空数组 = 明确清空；这不是「没给」（没给是**不发这个键**）。
+        models: fModels.input.value.trim() === ""
+          ? []
+          : fModels.input.value.split(",").map((s) => s.trim()).filter(Boolean),
+      };
+      // ⚠️ 密钥留空 ⇒ **整个键都不发**（= 保留旧 key），不是发一个空串。
+      const key = fKey.input.value;
+      if (key !== "") payload.apiKey = key;
+
+      const r = await commandNow(crypto.randomUUID().slice(0, 8), payload);
+      if (!r.accepted) { showCardError(card, r.reason); return; }
+      editingProvider = null;
+      showNewCard = false;
+      await loadProviders();
+      renderProvidersView();
+      refreshProviderChoices();
+    }),
+    btn("取消", () => { editingProvider = null; showNewCard = false; renderProvidersView(); }),
+  );
+  if (!isNew) actions.appendChild(btn("删除", () => deleteProvider(p.id), "btn-ghost"));
+  card.appendChild(actions);
+
+  form.querySelectorAll("input,select")[0]?.focus();
+  return card;
+}
+
+function field(name, label, value, cls) {
+  const wrap = document.createElement("div");
+  wrap.className = "field";
+  const lab = document.createElement("label");
+  lab.textContent = label;
+  const input = document.createElement("input");
+  input.className = cls || "";
+  input.value = value || "";
+  lab.htmlFor = input.id = "pf-" + name;
+  wrap.append(lab, input);
+  return { wrap, input };
+}
+
+function selectField(name, label, options, value, allowEmpty) {
+  const wrap = document.createElement("div");
+  wrap.className = "field";
+  const lab = document.createElement("label");
+  lab.textContent = label;
+  const sel = document.createElement("select");
+  sel.id = "pf-" + name;
+  if (allowEmpty) {
+    const o = document.createElement("option");
+    o.value = ""; o.textContent = "（默认）";
+    sel.appendChild(o);
+  }
+  for (const v of options || []) {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = v;
+    if (value === v) o.selected = true;
+    sel.appendChild(o);
+  }
+  wrap.append(lab, sel);
+  return { wrap, select: sel };
+}
+
+function btn(label, onclick, cls) {
+  const b = document.createElement("button");
+  b.textContent = label;
+  if (cls) b.className = cls;
+  b.onclick = onclick;
+  return b;
+}
+
+function showCardError(card, reason) {
+  const n = document.createElement("div");
+  n.className = "note-bad";
+  n.textContent = "✗ " + reason;
+  card.appendChild(n);
+}
+
+async function deleteProvider(id) {
+  if (!confirm(`删除供应商 '${id}'？\n\n引用它的会话不会因此改绑——它们会立刻连不上，\n而会话视图里可以把它们改到别的供应商。`)) return;
+  const r = await commandNow(crypto.randomUUID().slice(0, 8), { kind: "provider.delete", id });
+  if (!r.accepted) { alert(r.reason); return; }
+  await loadProviders();
+  renderProvidersView();
+  refreshProviderChoices();
+}
+
+function testProvider(id) {
+  const cid = crypto.randomUUID().slice(0, 8);
+  testCmd.set(cid, id);
+  provNotes.set(id, { text: "正在测…", ok: null });
+  renderProvidersView();
+  command(cid, { kind: "provider.test", id });
+}
+
+// ---- 会话视图里的「可改」下拉 ----
+// 改 provider / model 都发 `session.configure`（一条命令，两个可空字段）。
+// 改完**不**本地改显示：等核心的 `spec.changed` 回来再渲染——那是真相。
+// （否则核心若拒绝（比如供应商不存在），页面会先显示成功再被打脸。）
+
+function providerSelect(currentId, onPick) {
+  const sel = document.createElement("select");
+  for (const p of providers) {
+    const o = document.createElement("option");
+    o.value = p.id; o.textContent = p.id;
+    if (p.id === currentId) o.selected = true;
+    sel.appendChild(o);
+  }
+  // 当前绑的那个可能已经不存在（被删了）——补一个选项，否则下拉会显示成第一个，
+  // 而**那是个谎**：会话实际绑的还是那个不存在的 id。
+  if (currentId && !providers.some((p) => p.id === currentId)) {
+    const o = document.createElement("option");
+    o.value = currentId;
+    o.textContent = currentId + "（已不存在）";
+    o.selected = true;
+    sel.appendChild(o);
+  }
+  sel.onchange = () => onPick(sel.value);
+  return sel;
+}
+
+function modelSelect(providerId, currentModel, onPick) {
+  const p = providers.find((x) => x.id === providerId);
+  // 清单没声明 ⇒ 退回文本框（「没声明清单」不等于「没有模型」）。
+  if (!p || !p.models || p.models.length === 0) {
+    const input = document.createElement("input");
+    input.value = currentModel || "";
+    input.onchange = () => onPick(input.value.trim());
+    return input;
+  }
+  const sel = document.createElement("select");
+  const opts = [...p.models];
+  // 当前模型不在清单里也要能选中——否则显示成第一个，而那是谎。
+  if (currentModel && !opts.includes(currentModel)) opts.unshift(currentModel);
+  for (const m of opts) {
+    const o = document.createElement("option");
+    o.value = m; o.textContent = m;
+    if (m === currentModel) o.selected = true;
+    sel.appendChild(o);
+  }
+  sel.onchange = () => onPick(sel.value);
+  return sel;
+}
+
 
 function kv(dl, pairs) {
   dl.innerHTML = "";
@@ -344,90 +624,90 @@ function kv(dl, pairs) {
 
 async function loadProviders() {
   providers = await (await fetch(core + "/providers")).json();
-  renderProviders();
 }
 
-function renderProviders() {
-  const box = $("prov-list");
+// 合法协议 / 认证方式 / id 规则的**唯一**来源（核心）。⚠️ 头不许手抄——曾抄错一次协议默认值。
+async function loadSchema() {
+  try { SCHEMA = await (await fetch(core + "/provider-schema")).json(); } catch { /* 拿不到就用空表 */ }
+}
+
+// 发一条命令并**等它的回执**（`command` 是发了不管；表单要能根据成败决定下一步）。
+// ⚠️ 超时兜底：核心不回的话不能永远挂着（有界 10 秒，与 provider 自检同一个量级）。
+function commandNow(id, payload) {
+  return new Promise((resolve) => {
+    if (!wsReady) { resolve({ accepted: false, reason: "没连上核心" }); return; }
+    const to = setTimeout(() => {
+      if (pendingAcks.delete(id)) resolve({ accepted: false, reason: "核心没有回执（10 秒）" });
+    }, 10000);
+    pendingAcks.set(id, (frame) => { clearTimeout(to); resolve(frame); });
+    ws.send(JSON.stringify({ kind: "command", id, payload }));
+  });
+}
+
+// 供应商那份清单变了 ⇒ 会话视图的下拉要跟着变（否则用户在下拉里看不到刚建的那个）。
+function refreshProviderChoices() {
+  if (current) openSession(current);
+}
+
+// 会话视图右栏的「模型」块：两个可改的下拉（提供商 / 模型）+ 改绑的即时反馈。
+// ⚠️ 提供商那块**不在这里编辑**——编辑在供应商视图（`05 §2.2`：「配置提供商 → 建初始会话」
+// 是头的策略）。这里只回答问题「现在用的是哪个」并允许**改绑**。
+function renderModelPicker(spec) {
+  const box = $("model-picker");
   box.innerHTML = "";
-  if (providers.length === 0) {
-    const n = document.createElement("div");
-    n.className = "note";
-    n.textContent = "还没有提供商。在核心终端里执行 `provider set <id> --key <key>`。";
-    box.appendChild(n);
-    return;
-  }
-  for (const p of providers) {
-    const wrap = document.createElement("div");
-    wrap.style.marginBottom = "9px";
+  const note = $("model-note");
+  note.textContent = "";
 
-    const head = document.createElement("div");
-    head.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:2px";
-    const name = document.createElement("span");
-    name.className = "sid";
-    name.style.cssText = "font-size:12px;color:var(--ink);flex:1";
-    name.textContent = p.id;
+  const pid = spec.model?.providerId;
+  const mid = spec.model?.modelId;
+  const dl = document.createElement("dl");
+  dl.className = "kv";
 
-    // 「它通不通」是这一块最要紧的问题——核心上一批刚加的 `provider.test` 正是为它。
-    // 不填任何参数：用的是 provider 自己配置里的 key 与端点（key 能改不能看，浏览器自然也不持有）。
-    const test = document.createElement("button");
-    test.textContent = "自检";
-    test.style.cssText = "padding:3px 8px;font-size:11px";
-    test.onclick = () => {
-      const cid = crypto.randomUUID().slice(0, 8);
-      testCmd.set(cid, p.id);
-      provNotes.set(p.id, { text: "正在测…", ok: null });
-      renderProviders();
-      command(cid, { kind: "provider.test", id: p.id });
-    };
-    head.append(name, test);
+  const bind = (providerId, modelId) => {
+    commandNow(crypto.randomUUID().slice(0, 8),
+      { kind: "session.configure", sessionId: current, providerId, model: modelId })
+      .then((r) => { if (!r.accepted) { note.textContent = "✗ " + r.reason; note.className = "note-bad"; } });
+    // ⚠️ 改完**不**本地改显示：等核心的 `spec.changed`（那是真相）。
+    // 本地先改的话，核心若拒绝，页面会先显示成功再被打脸。
+  };
 
-    const dl = document.createElement("dl");
-    dl.className = "kv";
-    // ⚠️ apiKey 永远不显示 —— GET /providers 只给 hasApiKey（key 能改不能看）。
-    //    端点 / 认证方式是配置的一部分，要看得见才能核对（端点是「为什么连不上」的头号嫌疑）。
-    kv(dl, [
-      ["协议", p.protocol],
-      ["模型", p.defaultModel],
-      ["端点", p.endpoint],
-      ["认证", p.authScheme],
-      ["密钥", p.hasApiKey ? "已配置" : "未配置", !p.hasApiKey],
-    ]);
+  // 提供商下拉
+  const dtP = document.createElement("dt"); dtP.textContent = "提供商";
+  const ddP = document.createElement("dd");
+  ddP.appendChild(providerSelect(pid, (v) => bind(v, null)));
 
-    wrap.append(head, dl);
+  // 模型下拉（清单来自该提供商的 `models`；没声明就退回文本框）
+  const dtM = document.createElement("dt"); dtM.textContent = "模型";
+  const ddM = document.createElement("dd");
+  ddM.appendChild(modelSelect(pid, mid, (v) => bind(null, v)));
 
-    // 自检结果**就地**落在该 provider 下面：核心回的是这句就够回答「通不通 + 为什么」。
-    const note = provNotes.get(p.id);
-    if (note) {
-      const n = document.createElement("div");
-      n.className = "note";
-      n.style.cssText = "margin-top:4px;line-height:1.6";
-      if (note.ok === true) n.style.color = "var(--accent-ink)";
-      if (note.ok === false) n.style.color = "var(--danger)";
-      n.textContent = note.text;   // 自带 ✓/✗ 前缀，别再补一个
-      wrap.appendChild(n);
-    }
+  dl.append(dtP, ddP, dtM, ddM);
+  box.appendChild(dl);
 
-    box.appendChild(wrap);
+  if (!providers.length) {
+    note.textContent = "还没有提供商。切到「供应商」建一个。";
+    note.className = "note-bad";
+  } else if (pid && !providers.some((p) => p.id === pid)) {
+    // 会话绑的那个被删了 —— 这正是 `session.configure` 存在的理由，把话说清楚。
+    note.textContent = `会话绑的供应商 '${pid}' 已不存在。在「供应商」里重建它，或从上面挑一个换过去。`;
+    note.className = "note-bad";
   }
 }
 
 function renderSessionPanel(state) {
   const spec = state.spec || {};
-  const st = state.state || {};
-  const p = providers.find((x) => x.id === spec.model?.providerId);
   const dl = document.createElement("dl");
   dl.className = "kv";
+  // ⚠️ 提供商 / 模型 / 协议 / 思考强度**不在这里**——它们住在上面那块「模型」里
+  // （可改的下拉），在这里再列一遍就是同一事实的两个显示点，改了一个忘一个。
   kv(dl, [
     ["会话", spec.sessionId],
-    ["提供商", spec.model?.providerId],
-    ["模型", spec.model?.modelId],
-    ["协议", spec.model?.protocol ?? p?.protocol],
-    ["思考强度", spec.model?.effort],
     ["创建", shortTime(spec.createdAt)],
   ]);
   $("sess-detail").innerHTML = "";
   $("sess-detail").appendChild(dl);
+
+  renderModelPicker(spec);
 }
 
 function renderProjectPanel(state) {
@@ -495,45 +775,77 @@ let ALERT_FROM   = "";
 // ⚠️ 轴名**不写字面量**，一律回去查核心给的表。
 const axisNamed = (n) => AXES.find((a) => a.name === n);
 
+// 渲染时会被**换掉**的控件要留住引用：安全轴那一格在 HTML 里是个 `<select>`，
+// 每渲染一次就 `replaceWith` 一个新控件 ⇒ 第二次必须用上一次换进去的那个，
+// 否则会往一个已脱离文档的节点上画（页面上什么都看不到，且不报错）。
+const caret = { axSecurity: null };
+
 function renderAxes(values) {
   axes = values || {};
   $("ax-safety").innerHTML = "";
   $("axes").innerHTML = "";
 
+  // ⚠️ 安全轴那一格在 HTML 里是个 `<select>`，被 `replaceWith` 换掉之后**需要重新拿**。
+  // 第一次渲染时它是原始的；之后每次渲染它都是上一次换进去的那个控件。
+  // 不修回来的话，第二次 renderAxes 会往一个**已经脱离文档**的节点上画（页面上什么都没有）。
+  if (!caret.axSecurity) caret.axSecurity = $("ax-safety");
+  const secSel = caret.axSecurity;
+
   for (const a of AXES) {
     const row = document.createElement("div");
-    // inContext 由核心给（effort 不进上下文），头不手抄。
-    row.className = "axis" + (a.inContext ? "" : " effort");
+    // inContext 由核心给（effort / 温度不进上下文），头不手抄。
+    row.className = "axis" + (a.inContext ? "" : " no-context");
 
-    const sel = document.createElement("select");
-    sel.id = "ax-" + a.name;
-    for (const v of a.values) {
-      const o = document.createElement("option");
-      o.value = v; o.textContent = v;
-      if (axes[a.name] === v) o.selected = true;
-      sel.appendChild(o);
+    // ⚠️ 数值范围轴（核心交 `range`）画**数字输入**，不画下拉——21 个选项的下拉没人用。
+    // 判据是 `a.range` 的有无，不是我这边认轴名。
+    // ⚠️ 旧核心不交 range ⇒ 这条路走 select 分支，照样画得出来（核心先上线、头后跟）。
+    let ctl;
+    if (a.range) {
+      ctl = document.createElement("input");
+      ctl.type = "number";
+      ctl.min = a.range.min; ctl.max = a.range.max; ctl.step = a.range.step;
+      // 值可能规范化过（`1.0`）而 `type=number` 只认 `1`——交给浏览器不必较真，它认得出。
+      ctl.value = axes[a.name] ?? "";
+    } else {
+      ctl = document.createElement("select");
+      for (const v of a.values) {
+        const o = document.createElement("option");
+        o.value = v; o.textContent = v;
+        if (axes[a.name] === v) o.selected = true;
+        ctl.appendChild(o);
+      }
     }
-    sel.onchange = () => {
+
+    const axisName = a.name;   // 闭包捕获，别用循环变量
+    const send = () => {
       if (!current) return;
-      command(crypto.randomUUID().slice(0, 8),
-        { kind: "session.setAxis", sessionId: current, axis: a.name, value: sel.value });
+      const value = ctl.value;
+      // 空值不发（用户把数字框清空的那一刻不该发一条空轴值）。
+      if (value === "") return;
+      commandNow(crypto.randomUUID().slice(0, 8),
+        { kind: "session.setAxis", sessionId: current, axis: axisName, value })
+        .then((r) => {
+          // ⚠️ 被拒时**必须把控件退回真相**：数字框还留着用户敲的 0.75，而核心没接受它。
+          // 不退的话页面上那个值看起来是设上了的——那是谎。
+          if (!r.accepted) { ctl.value = axes[axisName] ?? ""; renderMeta("✗ " + r.reason, "error"); }
+        });
     };
+    ctl.onchange = send;
 
     const lab = document.createElement("label");
     lab.textContent = a.label;
 
     // 安全轴在右栏最上面单独一份，这里跳过它免得出现两个控件；标签也要填（从核心来）。
-    // #ax-safety 在 HTML 里就是那个 <select> 本身（不是容器）⇒ 必须 replaceWith，
-    // 不能 appendChild（否则得到重复 id，且用户看见的是外层那个空下拉）。
     // ⚠️ 判据是「这条轴的取值里含着告警线那一端」——**不是**比 "safety" 字面量：
     //    轴名归核心，头这里只能按核心给的数据认。
-    if (a.values.includes(ALERT_SAFETY)) {
+    if (a.values && a.values.includes(ALERT_SAFETY)) {
       $("ax-safety-label").textContent = a.label;
-      $("ax-safety").replaceWith(sel);
+      secSel.replaceWith(ctl);
+      caret.axSecurity = ctl;      // 换过了，下次要用新的那个
       continue;
     }
 
-    row.appendChild(lab); row.appendChild(sel);
+    row.appendChild(lab); row.appendChild(ctl);
     $("axes").appendChild(row);
   }
 
@@ -671,6 +983,16 @@ function connect() {
     const frame = JSON.parse(e.data);
 
     if (frame.kind === "ack") {
+      // ⚠️ **等回执的那条路最先判、且判完就 return**：表单发的命令（provider.upsert /
+      // session.configure）由 `commandNow` 的 promise 消费它的成败。不 return 的话，
+      // 同一条回执还会往时间线上再打一行——用户看到两次「✗」，一次在表单里、一次在会话里。
+      if (frame.id && pendingAcks.has(frame.id)) {
+        const resolve = pendingAcks.get(frame.id);
+        pendingAcks.delete(frame.id);
+        resolve(frame);
+        return;
+      }
+
       // 判据是「我们刚发的那条 create 的回执」（frame.id === creating），
       // 不是「这个 sessionId 我不认识」：send / interrupt 的回执也带 sessionId，
       // 且服务端是先发 session.created 再回 ack，两条帧先后不定。
@@ -694,7 +1016,8 @@ function connect() {
         //    「同一事实别在两处各推一遍」那条（核心已经在 note 里说清楚了）。
         const ok = note.startsWith("✓") ? true : note.startsWith("✗") ? false : null;
         provNotes.set(pid, { text: note, ok });
-        renderProviders();
+        // 只在看着供应商视图时重画（在会话视图里刷那边没意义；切过去时自然会画上）。
+        if (document.body.classList.contains("providers")) renderProvidersView();
       } else if (frame.accepted && frame.note) {
         renderMeta("ℹ " + frame.note);
       }
@@ -767,6 +1090,13 @@ function handleEvent(p) {
       if (p.sessionId === current) { axes[p.axis] = p.value; renderAxes(axes); }
       break;
 
+    case "spec.changed":
+      // 改绑（换供应商 / 换模型）的回声。⚠️ **不在这里改本地缓存再重画**——
+      // 直接拉一次快照（`openSession`），因为模型清单、provider 是否存在这些
+      // 都要跟着重取。一条命令一次快照，量很小。
+      if (p.sessionId === current) openSession(current);
+      break;
+
     case "error":
       // 业务失败走这里（不是 rejected：命令本身没写错）。
       if (p.sessionId === current) renderMeta("✗ " + p.message, "error");
@@ -794,6 +1124,8 @@ function send() {
 
 $("send").onclick = send;
 $("text").onkeydown = (e) => { if (e.key === "Enter") send(); };
+$("nav-sessions").onclick = () => showView("sessions");
+$("nav-providers").onclick = () => showView("providers");
 $("new").onclick = () => {
   const cmdId = crypto.randomUUID().slice(0, 8);
   creating = cmdId;
@@ -808,6 +1140,8 @@ $("interrupt").onclick = () => {
 
 (async () => {
   try { core = (await (await fetch("/config.json")).json()).core; } catch { }   // 取不到就用默认值
+  // 视图先定（片段里写着就直接进那一页，省得闪一下会话视图再跳）。
+  if (location.hash === "#providers") showView("providers");
   connect();
   // 失败必须可见：不接的话是一次未观测拒绝（页面停在空白）；接住并打一行到时间线，
   // 核心起来后由 onopen 的 currentProject === null 分支自动重试。

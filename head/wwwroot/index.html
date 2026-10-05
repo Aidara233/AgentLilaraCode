@@ -46,7 +46,11 @@ html, body { height: 100%; }
 body {
   margin: 0;
   display: grid;
-  grid-template-rows: 1fr auto;       /* 工作区 / 底部状态栏 */
+  /* ⚠️ 三行，与下面的 `grid-template-areas` **逐行对齐**：
+     导航 / 工作区 / 底部状态栏。行数写少（比如只写 `1fr auto`）时，
+     多出来的那条 areas 行会去分 `1fr` ⇒ **导航被撑满整屏**、下面的内容全挤到底部
+     （截图才发现）。行数与区域行数必须一样多。 */
+  grid-template-rows: auto minmax(0, 1fr) auto;
   background: var(--bg);
   color: var(--ink);
   font: 14px/1.65 var(--f-read);
@@ -56,13 +60,116 @@ body {
 body {
   grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--insp-w);
   grid-template-areas:
+    "nav  nav    nav"
     "rail center insp"
     "bar  bar    bar";
 }
+#nav  { grid-area: nav; }
 #left  { grid-area: rail; }
 #center{ grid-area: center; }
 #right { grid-area: insp; }
 #bar   { grid-area: bar; }
+
+/* ---------- 顶部导航 ---------- */
+
+#nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 var(--pad);
+  border-bottom: 1px solid var(--rule);
+  background: var(--panel);
+}
+#nav .brand {
+  font-family: var(--f-mono);
+  font-size: 11px;
+  letter-spacing: .16em;
+  color: var(--ink-3);
+  margin-right: 12px;
+}
+.navbtn {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.navbtn:hover { color: var(--ink); background: var(--rule-soft); }
+.navbtn.on { color: var(--accent-ink); border-bottom-color: var(--accent); font-weight: 600; }
+
+/* ---------- 供应商视图：占满工作区 ---------- */
+
+#providers-view {
+  display: none;
+  grid-column: 1 / -1;
+  grid-row: 2;
+  overflow: auto;
+  padding: 18px 20px 24px;
+  background: var(--bg);
+}
+body.providers #left,
+body.providers #center,
+body.providers #right { display: none; }
+body.providers #providers-view { display: block; }
+
+#providers-view .head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+#providers-view .head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+#providers-view .grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+/* 卡片。正在编辑的那张加一圈强调色——「哪张在编辑」必须一眼看得出来。 */
+.pcard {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 12px;
+}
+.pcard.editing { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.pcard .top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.pcard .top .pid { font-family: var(--f-mono); font-size: 12.5px; color: var(--ink); flex: 1; }
+.pcard .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.pcard .actions button { padding: 4px 9px; font-size: 11.5px; }
+
+/* 表单：标签在上、控件在下，一行两个。 */
+.form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
+.form .full { grid-column: 1 / -1; }
+.field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.field label { font-size: 11px; color: var(--ink-3); }
+.field input, .field select {
+  font: 12px var(--f-read);
+  padding: 5px 7px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--ink);
+  min-width: 0;
+}
+.field input.mono { font-family: var(--f-mono); font-size: 11.5px; }
+.field input:focus, .field select:focus { outline: none; border-color: var(--accent); background: #fff; }
+.field .hint { font-size: 10.5px; color: var(--ink-3); }
+
+.note-ok { color: var(--accent-ink); font-size: 11.5px; margin-top: 6px; line-height: 1.6; }
+.note-bad { color: var(--danger); font-size: 11.5px; margin-top: 6px; line-height: 1.6; }
+
+/* 会话视图右栏里的「可改」控件：跟轴的控件同形，但它是可操作的，不是只读的。
+   ⚠️ 选 `.kv select` 而不是 `.kv dd select`——制作它的代码把控件塞进 dd 里靠的是实现细节，
+   将来换个包装就静默失效。`.kv select` 覆盖 dd 里、以及任何更深一层的那一个。 */
+.kv input, .kv select {
+  width: 100%;
+  font: 11.5px var(--f-mono);
+  padding: 3px 5px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+}
+.kv input:focus, .kv select:focus { outline: none; border-color: var(--accent); }
 
 /* ---------- 通用零件 ---------- */
 
@@ -227,7 +334,6 @@ button:disabled:hover { border-color: var(--rule); }
   white-space: nowrap;
 }
 #title.muted { color: var(--ink-3); font-family: var(--f-read); font-size: 13px; }
-#title-meta { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); }
 
 .chip {
   display: inline-flex;
@@ -431,8 +537,10 @@ button:disabled:hover { border-color: var(--rule); }
   min-width: 0;
 }
 .axis select:focus { outline: none; border-color: var(--accent); }
-/* effort 不进上下文（纯请求参数）—— 视觉上标出来，别让它混在别的轴里。 */
-.axis.effort { opacity: .55; }
+/* 不进上下文的轴画灰 —— ⚠️ 类名叫 `no-context`，**不是** `effort`：
+   曾经只有 effort 是这样的，所以那句 CSS 叫 `.axis.effort`。温度加进来之后
+   它成了**两条**轴共有的一件事，沿用 effort 这个名字会让下一个人以为它只关 effort。 */
+.axis.no-context { opacity: .55; }
 
 .claim { display: flex; gap: 8px; font-size: 11.5px; padding: 3px 0; border-bottom: 1px dotted var(--rule-soft); }
 .claim .who { font-family: var(--f-mono); font-size: 10.5px; color: var(--ink-3); flex: none; }
@@ -493,18 +601,39 @@ button:disabled:hover { border-color: var(--rule); }
   :root { --rail-w: 208px; --insp-w: 288px; }
 }
 @media (max-width: 820px) {
-  /* 单栏堆叠：中栏在最上，边栏依次落到下面。 */
+  /* 单栏堆叠：中栏在最上，边栏依次落到下面。
+     ⚠️ `nav` 也必须列出——`grid-template-areas` 是**整套**声明的，漏掉具名区域
+     会让那条规则整块判无效（同族事故见前面那条注释）。 */
   body {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(0, 1fr) auto auto auto;
-    grid-template-areas: "center" "rail" "insp" "bar";
+    grid-template-rows: auto minmax(0, 1fr) auto auto auto;
+    grid-template-areas: "nav" "center" "rail" "insp" "bar";
   }
   #left { max-height: 200px; border-right: 0; border-bottom: 1px solid var(--rule); }
   #right { border-left: 0; border-top: 1px solid var(--rule); }
+  /* 供应商视图在这条断点下也是整行。 */
+  #providers-view { grid-row: auto; }
 }
 </style>
 </head>
 <body>
+
+<!-- ========== 顶部导航：会话 / 供应商 ========== -->
+<nav id="nav">
+  <span class="brand">LILARA</span>
+  <button id="nav-sessions" class="navbtn on">会话</button>
+  <button id="nav-providers" class="navbtn">供应商</button>
+</nav>
+
+<!-- ========== 供应商视图（切到它时，三栏整体让位） ========== -->
+<section id="providers-view">
+  <div class="head">
+    <h2>供应商</h2>
+    <span class="muted mono" id="prov-count"></span>
+  </div>
+  <!-- 卡片由 renderProvidersView() 画。 -->
+  <div class="grid" id="prov-grid"></div>
+</section>
 
 <!-- ========== 左栏：项目 / 会话尺 ========== -->
 <aside id="left">
@@ -525,11 +654,14 @@ button:disabled:hover { border-color: var(--rule); }
     <button id="interrupt" class="btn-ghost" disabled>中断</button>
   </div>
 
-  <!-- 核心启动后「没有提供商」时显示它，并挡住输入框。 -->
+  <!-- 核心启动后「没有提供商」时显示它，并挡住输入框。
+       ⚠️ 这里**曾经**写着「头的引导只到『提示你在哪配』为止（计划 D5：不做配置表单）」——
+       那句话是**假的**，而且是双向的假：① 「计划 D5」讲的是**前缀指纹**，与 provider 配置无关；
+       ② 头现在**做**配置表单（顶部导航 → 供应商）。两处一起更正，不是删掉了事。 -->
   <div id="onboarding" class="onboard" hidden>
     <b>先配置一个提供商。</b>核心启动后是空的——没有提供商不能推进任何会话。
     <code>provider set &lt;id&gt; --key &lt;key&gt; --protocol claude-messages</code>
-    <span class="hint muted">头的「引导」目前只到「提示你在哪配」为止（计划 D5：不做配置表单）。</span>
+    <span class="hint muted">也可以点上面的「供应商」在这里建（核心终端那条命令仍然管用）。</span>
   </div>
 
   <div id="timeline"></div>
@@ -577,10 +709,13 @@ button:disabled:hover { border-color: var(--rule); }
     </div>
   </section>
 
-  <!-- 提供商 / 会话 / 项目：本版着重的三块。 -->
+  <!-- 提供商 / 会话 / 项目：本版着重的三块。
+       ⚠️ 提供商那块**不再在这里编辑**——它搬去了独立的供应商视图（顶部导航切过去）。
+       这里只回答「现在用的是哪个」，并提供**改绑**。 -->
   <section class="panel">
-    <h4>提供商</h4>
-    <div id="prov-list"><div class="note">读取中…</div></div>
+    <h4>模型</h4>
+    <div id="model-picker"></div>
+    <div class="note" id="model-note"></div>
   </section>
 
   <section class="panel">
