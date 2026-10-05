@@ -370,6 +370,157 @@ public class ParserTests
         Assert.Null(err);   // ⇒ 当成普通消息
     }
 
+    // ---- session create：选目录 + 起名 ----
+
+    // ⚠️ 光杆的 `session create` 必须继续成立——今天控制台的默认手感，
+    // 而且它走的是**另一条分支**（词数 2），不是「标志循环什么都没解析到」。
+    [Fact]
+    public void SessionCreate_Bare_ProducesACommandWithNoOptions()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session create");
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.SessionCreate>(cmd);
+        Assert.Null(c.Cwd);
+        Assert.Null(c.Title);
+    }
+
+    [Fact]
+    public void SessionCreate_ParsesBothFlags()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session create --cwd D:\\work\\proj --title 重构");
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.SessionCreate>(cmd);
+        Assert.Equal("D:\\work\\proj", c.Cwd);
+        Assert.Equal("重构", c.Title);
+    }
+
+    [Fact]
+    public void SessionCreate_WithOnlyOneFlag_LeavesTheOtherNull()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session create --title 只有名字");
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.SessionCreate>(cmd);
+        Assert.Null(c.Cwd);
+        Assert.Equal("只有名字", c.Title);
+    }
+
+    // ⚠️ 未知标志必须拒绝：拼错的 `--cwd` 被静默吞掉的话，会话会照常建出来——
+    // 而它落在**核心的工作目录**，不是用户想要的地方。用户不会发现。
+    [Fact]
+    public void SessionCreate_WithAnUnknownFlag_IsAnError()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session create --cdw D:\\work");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    // 末尾标志缺值不能静默通过（与 provider set 同一份守卫）。
+    [Fact]
+    public void SessionCreate_WithATrailingFlag_IsAnError()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session create --cwd");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    // 反向对照：词边界。session creates … 必须落回 (null, null)（⇒ 当消息）。
+    [Fact]
+    public void SessionCreate_NeedsAWordBoundary()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session creates foo");
+
+        Assert.Null(cmd);
+        Assert.Null(err);
+    }
+
+    // ---- 销毁面：deactivate / archive / delete ----
+
+    [Fact]
+    public void SessionDeactivate_ParsesTheId()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session deactivate abc123");
+
+        Assert.Null(err);
+        Assert.Equal("abc123", Assert.IsType<CoreCommand.SessionDeactivate>(cmd).SessionId);
+    }
+
+    [Fact]
+    public void SessionDelete_ParsesTheId()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session delete abc123");
+
+        Assert.Null(err);
+        Assert.Equal("abc123", Assert.IsType<CoreCommand.SessionDelete>(cmd).SessionId);
+    }
+
+    // ⚠️ 不给 `--unarchive` ⇒ `Archived` 是 **null**（三态的中性档）——
+    // 写成 `default(bool?)` 之外的任何东西（比如 false）都会把「归档」变成「取消归档」。
+    [Fact]
+    public void SessionArchive_WithNoFlag_MeansArchive()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session archive abc123");
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.SessionArchive>(cmd);
+        Assert.Equal("abc123", c.SessionId);
+        Assert.Null(c.Archived);
+    }
+
+    [Fact]
+    public void SessionArchive_WithUnarchiveFlag_MeansUnarchive()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session archive abc123 --unarchive");
+
+        Assert.Null(err);
+        Assert.False(Assert.IsType<CoreCommand.SessionArchive>(cmd).Archived);
+    }
+
+    // ⚠️ 这三条**光杆也必须报错**，不能落回「当成消息」——`session delete` 被当消息发出去，
+    // 用户以为删了，而会话还在、还白烧一次模型调用。这就是 `session.start` 那个既有缺陷的形状。
+    [Theory]
+    [InlineData("session deactivate")]
+    [InlineData("session archive")]
+    [InlineData("session delete")]
+    public void DestructiveVerbs_WithoutAnId_AreErrors_NotMessages(string line)
+    {
+        var (cmd, err) = CoreCommandParser.Parse(line);
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    // 多余的词不猜（猜错的方向是动错会话，其中一条不可逆）。
+    [Theory]
+    [InlineData("session delete a b")]
+    [InlineData("session deactivate a b")]
+    [InlineData("session archive a b c")]
+    public void DestructiveVerbs_WithExtraWords_AreErrors(string line)
+    {
+        var (cmd, err) = CoreCommandParser.Parse(line);
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    // 反向对照：词边界。`session deletes x` / `session archivex` 必须落回 (null, null)（⇒ 当消息）。
+    [Theory]
+    [InlineData("session deletes abc")]
+    [InlineData("session archives abc")]
+    [InlineData("session archivex abc")]
+    [InlineData("session deletex abc")]
+    public void DestructiveVerbs_NeedAWordBoundary(string line)
+    {
+        var (cmd, err) = CoreCommandParser.Parse(line);
+
+        Assert.Null(cmd);
+        Assert.Null(err);
+    }
+
     // ---- session configure：改绑供应商 / 换模型 ----
 
     [Fact]

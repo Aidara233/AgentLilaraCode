@@ -121,4 +121,81 @@ public class CoreHostTests : IDisposable
         host.SetCts("s1", null);
         Assert.Null(host.CtsFor("s1"));
     }
+
+    // ---- 销毁面要用的三个 ----
+
+    // ⚠️ **不能拿激活表当「删得掉吗」的判据**：`session.create` 走 `Register()` 登记，
+    // 新会话**一定**在激活表里 ⇒ 那样写会让「刚建的会话删不掉」。
+    // `StatusOf` 的读盘那半就是为了盖住这一条。
+    [Fact]
+    public void StatusOf_ReadsTheDisk_WhenTheSessionIsNotActivated()
+    {
+        var host = new CoreHost(_root, Work);
+        var h = NewSession();
+
+        // 落盘一份 `Running`（磁盘上正常不会存它，但作为「读盘那半真的读了盘」的判据最好用：
+        // 内存里没有这一项，返回值只可能来自磁盘）。
+        host.Store.WriteState(h.ProjectKey, h.State with { Status = "Running" });
+
+        Assert.False(host.TryGetActivated(h.SessionId, out _));
+        Assert.Equal("Running", host.StatusOf(h.SessionId));
+    }
+
+    // 内存优先：`Running` 只写内存、从不落盘，所以**只有**走内存那一臂才看得到它。
+    [Fact]
+    public void StatusOf_PrefersTheInMemoryCopy()
+    {
+        var host = new CoreHost(_root, Work);
+        var h = NewSession();
+        host.Register(h);
+
+        h.UpdateState(s => s with { Status = "Running" });
+
+        Assert.Equal("Running", host.StatusOf(h.SessionId));
+        Assert.Equal("Idle", host.Store.ReadState(h.ProjectKey, h.SessionId).Status);   // 磁盘上仍是 Idle
+    }
+
+    [Fact]
+    public void StatusOf_OnAnUnknownSession_IsIdle()
+    {
+        var host = new CoreHost(_root, Work);
+
+        Assert.Equal("Idle", host.StatusOf("nope"));
+    }
+
+    [Fact]
+    public void Deactivate_DropsTheActivatedCopy_ButLeavesTheDiskAlone()
+    {
+        var host = new CoreHost(_root, Work);
+        var h = NewSession();
+        host.Register(h);
+
+        Assert.True(host.Deactivate(h.SessionId));
+        Assert.False(host.TryGetActivated(h.SessionId, out _));
+
+        // 第二次就是「它本来就没激活」——调用方要能分辨这两个。
+        Assert.False(host.Deactivate(h.SessionId));
+
+        // 存储侧零改动：磁盘从不存「激活」。
+        Assert.NotNull(host.Store.TryReadSpec(h.ProjectKey, h.SessionId));
+    }
+
+    // 只丢**这一个**会话的缓存——用全量 `InvalidateSteppers` 去顶替会让别的会话白掉一次缓存。
+    [Fact]
+    public void ForgetStepper_DropsOnlyThatSession()
+    {
+        var host = new CoreHost(_root, Work);
+        var a = NewSession();
+        var b = NewSession();
+        host.Register(a);
+        host.Register(b);
+
+        var firstA = host.StepperFor(a);
+        var firstB = host.StepperFor(b);
+
+        host.ForgetStepper(a.SessionId);
+
+        Assert.NotSame(firstA, host.StepperFor(a));
+        Assert.Same(firstB, host.StepperFor(b));
+    }
 }

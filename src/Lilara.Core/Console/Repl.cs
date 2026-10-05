@@ -108,6 +108,10 @@ public sealed class Repl(
 
                 case CoreCommand.SessionCreate:
                     // 控制台的「当前会话」只在这里（控制台自己的动作）被设。
+                    // ⚠️ `Activated` 是 `ConcurrentDictionary`，`First` 无顺序保证——
+                    // 但这里按 **id** 筛，只可能有一个匹配，所以顺序无关。
+                    // ⚠️ 不拿 `Ack.Accepted.SessionId` 去 `First` 一个**别的东西**：
+                    // 那会把「刚建的那个」与「激活表里任意一个」混起来。
                     Current = _host.Activated.First(h => h.SessionId == accepted.SessionId);
                     _out.WriteLine($"✓ 会话 {accepted.SessionId} 已创建。");
                     break;

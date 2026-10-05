@@ -55,8 +55,8 @@ public sealed class CommandDispatcher(
                 case CoreCommand.ProviderTest t:
                     return await HandleProviderTestAsync(t, commandId, ct);
 
-                case CoreCommand.SessionCreate:
-                    return HandleSessionCreate(commandId);
+                case CoreCommand.SessionCreate c:
+                    return HandleSessionCreate(c, commandId);
 
                 case CoreCommand.SessionActivate a:
                     return HandleSessionActivate(a, commandId);
@@ -75,6 +75,16 @@ public sealed class CommandDispatcher(
 
                 case CoreCommand.SessionConfigure c:
                     return HandleSessionConfigure(c, commandId);
+
+                // ---- 销毁面 ----
+                case CoreCommand.SessionDeactivate d:
+                    return HandleSessionDeactivate(d, commandId);
+
+                case CoreCommand.SessionArchive a:
+                    return HandleSessionArchive(a, commandId);
+
+                case CoreCommand.SessionDelete del:
+                    return HandleSessionDelete(del, commandId);
 
                 case CoreCommand.ClaimAcquire a: return HandleClaimAcquire(a, commandId);
                 case CoreCommand.ClaimRelease r: return HandleClaimRelease(r, commandId);
@@ -336,27 +346,65 @@ public sealed class CommandDispatcher(
         }
     }
 
-    private DispatchResult HandleSessionCreate(string id)
+    /// <summary>
+    /// 建会话。落在哪个项目由 <see cref="CoreCommand.SessionCreate.Cwd"/> 决定
+    /// （不给就回落核心的工作目录）。
+    ///
+    /// <para>⚠️ **没有「按项目键建」那一半**，理由见 `SessionCreate` 的注释：
+    /// 键推不回目录，那个形状会在半路失败。</para>
+    /// </summary>
+    private DispatchResult HandleSessionCreate(CoreCommand.SessionCreate c, string id)
     {
         var provider = _host.Providers.List().FirstOrDefault();
         if (provider is null)
             return Reject(id, "先配提供商：provider set <id> --key <key>");
 
+        var workingDirectory = _host.WorkingDirectory;
+
+        if (!string.IsNullOrWhiteSpace(c.Cwd))
+        {
+            // ⚠️ **不存在 ⇒ 拒绝，不建目录**：建目录是策略，核心不做策略（`00` §1.3）。
+            // 但**全新目录天然可用**——`ProjectKey.FromPath` 是纯函数，不要求它先存在过。
+            try
+            {
+                workingDirectory = Path.GetFullPath(c.Cwd);
+            }
+            catch (Exception ex)
+            {
+                return Reject(id, $"cwd '{c.Cwd}' 不是合法路径：{ex.Message}");
+            }
+
+            if (!Directory.Exists(workingDirectory))
+                return Reject(id, $"目录不存在：{workingDirectory}。核心不替你建目录。");
+        }
+
         var model = _host.Providers.ToSelection(provider, null, "high", 16000);
-        var handle = SessionHandle.Create(_host.Store, _host.WorkingDirectory, model);
+        var handle = SessionHandle.Create(_host.Store, workingDirectory, model, Trimmed(c.Title));
 
         // 登记进激活表——快照端点据此避免读到盘上过期的 Idle。
         _host.Register(handle);
 
         // `session.created` 必须发：头的「全局会话列表」是派生的（对每个 pk 取 sessions 并集，
         // 核心不存它）。同时发到项目 topic（头订的是它，它还不可能知道新会话的 id）与会话 topic。
+        // ⚠️ 项目 topic 用的是 **handle 的** pk，不是核心工作目录的—— `--project` 建到别处时
+        // 两者不同，而头订的正是新会话那个项目的流。
         _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
             new WireEvent.SessionCreated(handle.SessionId, handle.ProjectKey));
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
             new WireEvent.SessionCreated(handle.SessionId, handle.ProjectKey));
 
         // 分配型命令必须回传新身份，否则后续命令无从指涉。
-        return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = handle.SessionId });
+        // Note 是给**人**看的一句补充（`Ack.Accepted.Note` 的契约：头不该依赖它）——
+        // 这里交项目键，因为「建到哪个项目去了」正是本命令新增的那个自由度。
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            SessionId = handle.SessionId,
+            Note = handle.ProjectKey,
+        });
+
+        // 空白 → null（`Title` 可空是磁盘格式不破的前提，别把 "" 存进去）。
+        static string? Trimmed(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
     }
 
     private DispatchResult HandleSessionActivate(CoreCommand.SessionActivate a, string id)
@@ -602,37 +650,238 @@ public sealed class CommandDispatcher(
         var before = handle.Spec.Model;
 
         // 两个字段都是「null = 保留旧值」——照 `provider.upsert` 的语义。
-        // ⚠️ 同一个表达式**算一次、用两次**（比较 + 落盘）：写成两遍会在只改一处时静默分叉。
-        var providerChanged = !string.IsNullOrWhiteSpace(c.ProviderId) && c.ProviderId != before.ProviderId;
-        var nextProviderId = string.IsNullOrWhiteSpace(c.ProviderId) ? before.ProviderId : c.ProviderId!;
-        var nextModelId = string.IsNullOrWhiteSpace(c.ModelId) ? before.ModelId : c.ModelId!;
-
-        // Protocol 是**供应商定义的快照**，换供应商时必须跟着重取，否则它和 ProviderId 不同代。
-        // ⚠️ 它**不是**「现在真的走哪条协议」——`Stepper` 取适配器的 Protocol（provider 定义
-        // 可以被 `provider set --protocol` 改掉）。这里只是让快照跟上此刻的定义。
-        var nextProtocol = target?.Protocol ?? before.Protocol;
-
-        var next = before with
+        // ⚠️ **判断与落盘一起放进 `UpdateSpecAndPersist` 的锁内**（值级 `Func`）。
+        // 原来这三行在锁外、拿的是 `handle.Spec.Model` 那一份 —— 两次并发 configure
+        // 会各自读到**同一代**旧值、各自算、各自写回，后写的把前写的整份盖掉（丢更新）。
+        // 值级形态下第二条从第一条的结果接着算，那个丢更新在结构上不存在了。
+        var changed = false;
+        var next = handle.UpdateSpecAndPersist(_host.Store, s =>
         {
-            ProviderId = nextProviderId,
-            ModelId = nextModelId,
-            Protocol = nextProtocol,
-        };
+            var b = s.Model;
+            var m = b with
+            {
+                ProviderId = string.IsNullOrWhiteSpace(c.ProviderId) ? b.ProviderId : c.ProviderId!,
+                ModelId = string.IsNullOrWhiteSpace(c.ModelId) ? b.ModelId : c.ModelId!,
+                // Protocol 是**供应商定义的快照**，换供应商时必须跟着重取，否则它与 ProviderId 不同代。
+                // ⚠️ 它**不是**「现在真的走哪条协议」——`Stepper` 取适配器的 Protocol（provider 定义
+                // 可以被 `provider set --protocol` 改掉）。这里只是让快照跟上此刻的定义。
+                Protocol = target?.Protocol ?? b.Protocol,
+            };
+            changed = m != b;
+            return s with { Model = m };
+            // ⚠️ 没变时**也写了盘**（`UpdateSpecAndPersist` 是无条件的）。这是代价，不是疏漏：
+            // 想省掉这次写就得把「比不比得出差别」挪到锁外判，而那正是上面刚关掉的那个丢更新窗口。
+            // 内容逐字节相同的 `spec.json` 重写一次没有可观测后果（`AtomicFile` 是整份原子替换）。
+        }).Model;
 
         // 同值不是迁移 ⇒ 不发事件（与 `session.setAxis` 同一条约定）。
-        if (next == before)
+        if (!changed)
             return new DispatchResult(new Ack.Accepted { CommandId = id });
 
-        // 改内存 + 落盘在**同一个临界区**里（`UpdateSpecAndPersist`），与 `State` 共用一把锁。
-        handle.UpdateSpecAndPersist(_host.Store, s => s with { Model = next });
-
         // ⚠️ 失效点在这里，不能挂在控制台的字符串判据上——线上 `session.configure` 走不到它 ⇒ 缓存静默失效。
-        if (providerChanged) _host.InvalidateSteppers();
+        // `providerChanged` 与 `changed` 都在锁内定，两个都是「这一代里真的变了没有」。
+        if (next.ProviderId != before.ProviderId) _host.InvalidateSteppers();
 
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
             new WireEvent.SpecChanged(handle.SessionId, next));
 
         return new DispatchResult(new Ack.Accepted { CommandId = id, Note = $"{next.ProviderId} / {next.ModelId}" });
+    }
+
+    /// <summary>
+    /// 把会话摘出内存。**磁盘零改动**（激活是内存账，`state.json` 从不存它）。
+    ///
+    /// <para>⚠️ 这条命令**只在会话确实激活着**的时候有意义，所以它的拒绝理由分两种：
+    /// 「不存在」与「本来就没激活」——**别把它们并成一句**，用户要能分辨自己敲错了 id
+    /// 还是那一刀砍在空气上。</para>
+    /// </summary>
+    private DispatchResult HandleSessionDeactivate(CoreCommand.SessionDeactivate c, string id)
+    {
+        if (!_host.TryGetActivated(c.SessionId, out var handle))
+            return Reject(id, _host.Store.FindSession(c.SessionId) is null
+                ? $"会话 '{c.SessionId}' 不存在。"
+                : $"会话 '{c.SessionId}' 本来就没激活。");
+
+        if (IsRunning(handle))
+            return Reject(id, RunningRefusal(c.SessionId));
+
+        _host.Deactivate(c.SessionId);
+        // ⚠️ 只丢**这一个**会话的 stepper——它下次被激活时 `StepperFor` 会重新解析。
+        // 不丢的话缓存里那把还握着旧 provider 的 key/端点（同 `session.configure` 的理由）。
+        _host.ForgetStepper(c.SessionId);
+
+        // 会话还在（磁盘上完好、还能再激活）⇒ 两条流都发，与控制台/头各自的订阅面无关。
+        PublishDestruction(handle.ProjectKey, handle.SessionId,
+            new WireEvent.SessionDeactivated(handle.SessionId, handle.ProjectKey), toSessionTopic: true);
+
+        return new DispatchResult(new Ack.Accepted { CommandId = id });
+    }
+
+    /// <summary>
+    /// 归档 / 取消归档。**原地标记**——目录不动、记录一条不少、`ListSessions` **照列**它。
+    ///
+    /// <para>⚠️ **幂等不许当成功**：「想归档时已经归档」与「想取消时本来就没归档」
+    /// 都 <c>Rejected</c>。写成 no-op 的话用户永远分不清「存进去了」和「什么都没发生」——
+    /// 而这条命令的全部意义就是「它到底存没存」。</para>
+    /// </summary>
+    private DispatchResult HandleSessionArchive(CoreCommand.SessionArchive c, string id)
+    {
+        var found = _host.Store.FindSession(c.SessionId);
+        if (found is null) return Reject(id, $"会话 '{c.SessionId}' 不存在。");
+
+        var (projectKey, spec) = found.Value;
+
+        // ⚠️ handle 只拿来判「在没在跑」与「要不要走同一把锁」——
+        // 没激活时**不**为了改一个字段去 `Activate`（那会产生一份用户没要求的内存副本）。
+        var live = _host.TryGetActivated(c.SessionId, out var h) ? h : null;
+
+        if (IsRunning(live)) return Reject(id, RunningRefusal(c.SessionId));
+
+        // `Archived` 三态：null=归档、false=取消。**不要**写成 `c.Archived == true`——
+        // 那会把「没给」与「给定 false」混成同一个分支（本记录的注释里有完整理由）。
+        var archive = c.Archived != false;
+        var wanted = archive ? DateTimeOffset.UtcNow : (DateTimeOffset?)null;
+
+        if (archive && spec.ArchivedAt is not null)
+            return Reject(id, $"会话 '{c.SessionId}' 已经归档了。要取消：session archive {c.SessionId} --unarchive");
+
+        if (!archive && spec.ArchivedAt is null)
+            return Reject(id, $"会话 '{c.SessionId}' 本来就没归档。");
+
+        // ⚠️ 两条路，取决于它**当下激活着没有**：
+        //  · 激活着 ⇒ 走 handle 的 `UpdateSpecAndPersist`（同一把 `_gate`，与 `configure` 互斥）
+        //  · 没激活 ⇒ 直接写盘。**这是安全的**：没有 handle 就没有别的东西在改它
+        //    （激活表存的就是那个 handle），而 `_host.Store` 的进程内写者只有这两条路。
+        var patched = live is not null
+            ? live.UpdateSpecAndPersist(_host.Store, s => s with { ArchivedAt = wanted })
+            : Direct(spec with { ArchivedAt = wanted });
+        var next = patched.ArchivedAt;
+
+        PublishDestruction(projectKey, c.SessionId,
+            new WireEvent.SessionArchived(c.SessionId, projectKey, next), toSessionTopic: true);
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Note = next is null ? "已取消归档" : "已归档",
+        });
+
+        // 不激活、只落盘的那条路。返回**落盘的那份**（与 `UpdateSpecAndPersist` 的约定一致：
+        // 别在调用点再读一遍，那可能已经是下一次改动后的值）。
+        SessionSpec Direct(SessionSpec patched)
+        {
+            _host.Store.WriteSpec(projectKey, patched);
+            return patched;
+        }
+    }
+
+    /// <summary>
+    /// **删掉会话**：目录、记录、状态一起。本仓唯一不可逆的动作。
+    ///
+    /// <para>⚠️ 顺序是**先摘声明、后删目录**，不能反：声明住在会话的**工作目录**里，
+    /// 而那个路径只有 `spec.json` 里才有——目录删了就要不回地址了。</para>
+    /// </summary>
+    private DispatchResult HandleSessionDelete(CoreCommand.SessionDelete c, string id)
+    {
+        // ⚠️ 「存在」走 `SessionExists`（看目录）而不是 `FindSession`（要读得出 spec）：
+        // 损坏的 `spec.json` 会让后者说「不存在」，而那恰恰是最该删得掉的一类
+        // （同 `provider.delete` 用文件层返回值而不是 `Load` 的那条教训）。
+        var located = _host.Store.FindSession(c.SessionId);
+        if (located is null)
+        {
+            // 目录在、但 spec 读不出来（损坏）⇒ 只删目录，没有工作目录可拿来摘声明。
+            foreach (var pk in _host.Store.ListProjects())
+            {
+                if (!_host.Store.SessionExists(pk, c.SessionId)) continue;
+
+                if (!TryDelete(pk, c.SessionId, out var why)) return Reject(id, why!);
+                PublishDestruction(pk, c.SessionId,
+                    new WireEvent.SessionDeleted(c.SessionId, pk), toSessionTopic: false);
+                return new DispatchResult(new Ack.Accepted
+                {
+                    CommandId = id,
+                    Note = "spec.json 读不出来（已损坏），只删了目录——它占的声明无从查找，可能残留。",
+                });
+            }
+
+            return Reject(id, $"会话 '{c.SessionId}' 不存在。");
+        }
+
+        var (projectKey, spec) = located.Value;
+
+        var live = _host.TryGetActivated(c.SessionId, out var h) ? h : null;
+        if (IsRunning(live)) return Reject(id, RunningRefusal(c.SessionId));
+
+        // 声明全在**它自己的工作目录**里（`ClaimStore` 按工作目录分区、`claim.acquire`
+        // 用的就是 `handle.Spec.WorkingDirectory`）⇒ 只需要建**一个** store。
+        // ⚠️ 别为了「保险」去扫所有项目：那会在别人的目录上做读-改-写。
+        var released = new ClaimStore(spec.WorkingDirectory)
+            .Update(current => current.Where(x => x.SessionId != c.SessionId))
+            .Removed;
+
+        if (!TryDelete(projectKey, c.SessionId, out var reason)) return Reject(id, reason!);
+
+        // 释放了哪几条要**点名**：用户可能正靠那几条锁挡着另一个会话。
+        foreach (var claim in released)
+            _bus.Publish(EventBus.ProjectTopic(projectKey),
+                new WireEvent.ClaimReleased(c.SessionId, claim.Path));
+
+        PublishDestruction(projectKey, c.SessionId,
+            new WireEvent.SessionDeleted(c.SessionId, projectKey), toSessionTopic: false);
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Note = released.Count == 0
+                ? "无声明需要释放"
+                : $"已释放声明：{string.Join("、", released.Select(x => x.Path))}",
+        });
+
+        bool TryDelete(string pk, string sid, out string? why)
+        {
+            try
+            {
+                if (_host.Store.DeleteSession(pk, sid)) { why = null; return true; }
+                why = $"会话 '{sid}' 不存在。";
+                return false;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // 「暂时占用」与「删掉了」是两回事，说清楚是前者（同 `provider.delete` 的取舍）。
+                why = $"无法删除会话 '{sid}'：目录正被占用（可能有并发读）。稍后再试。";
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 三条销毁命令共用的「在跑就不许动」。**判据是 `Running` 而不是「在不在激活表」**——
+    /// `session.create` 走 `Register()` 登记，用激活表判会让**刚建的会话删不掉**。
+    ///
+    /// <para>为什么不是「原地掐断」：`Stepper` 的收尾会 `SaveState` 把 `state.json` 写回去，
+    /// 目录就在那一刻被重新造出来——留下一个**有 state、没 spec** 的目录，
+    /// 而 `ListSessions` **静默跳过**它（下次同 id 建会话时 `WriteSpec` 会翻出这个孤儿 state）。
+    /// **半删状态比一句拒绝坏得多。**</para>
+    ///
+    /// <para>`handle is null` ⇒ **没在跑**：推进必须持有 handle
+    /// （`RunStepAsync` 的第一个参数就是它，而它只可能来自 `TryFind` / `Activate`）。
+    /// 所以这里不需要再去读盘。</para>
+    /// </summary>
+    private static bool IsRunning(SessionHandle? handle) =>
+        handle is not null && (handle.IsRunning || handle.State.Status == "Running");
+
+    private static string RunningRefusal(string sessionId) =>
+        $"会话 '{sessionId}' 正在跑，不能归档 / 去激活 / 删除。先 `session interrupt {sessionId}`。";
+
+    /// <summary>
+    /// 发一条销毁面的事件。<paramref name="toSessionTopic"/> 只有
+    /// <see cref="WireEvent.SessionDeleted"/> 走 <c>false</c>——会话没了，
+    /// 会话流上的订阅者**已经无处可投**（详见那条事件的注释）。
+    /// </summary>
+    private void PublishDestruction(string projectKey, string sessionId, WireEvent evt, bool toSessionTopic)
+    {
+        if (toSessionTopic) _bus.Publish(EventBus.SessionTopic(sessionId), evt);
+        _bus.Publish(EventBus.ProjectTopic(projectKey), evt);
     }
 
     /// <summary>
@@ -732,23 +981,16 @@ public sealed class CommandDispatcher(
         }
 
         // 扫项目目录：找不到就是命令不合法（会话 id 写错了）——rejected 的正当用法。
-        foreach (var dir in ProjectDirs())
+        // ⚠️ 扫的这一步住在 `SessionStore.FindSession`（`ControlServer.TryFind` 走同一处）——
+        // 两处各写一份会漂，而「按 id 找会话」正是最不该漂的那件事。
+        if (_host.Store.FindSession(sessionId) is not { } found)
         {
-            var projectKey = Path.GetFileName(dir);
-            if (_host.Store.TryReadSpec(projectKey, sessionId) is null) continue;
-
-            handle = _host.Activate(projectKey, sessionId);
-            return true;
+            notFoundReason = $"会话 '{sessionId}' 不存在。";
+            return false;
         }
 
-        notFoundReason = $"会话 '{sessionId}' 不存在。";
-        return false;
-    }
-
-    private IEnumerable<string> ProjectDirs()
-    {
-        var root = _host.Store.ProjectsRoot;
-        return Directory.Exists(root) ? Directory.GetDirectories(root) : [];
+        handle = _host.Activate(found.ProjectKey, sessionId);
+        return true;
     }
 
     private static DispatchResult Reject(string id, string reason) =>

@@ -27,12 +27,20 @@ let currentProject = null;
 const sessions = new Map();         // sessionId -> { projectKey }（派生索引，次序 = 显示次序）
 const cursors = new Map();          // topic -> lastSeq，每流一个游标
 const claims = new Map();           // sessionId -> Set<path>（声明）
+// path -> true，那些**主人已经不在了**的声明（核心 `/claims` 的 `stale` 字段）。
+// 单独一张表而不是塞进 `claims`：冲突判据只关心「谁占了什么」，而 stale 是**另一件事**
+// （「这条还有没有人认」）——混进同一张表会让冲突逻辑被迫理解它不关心的维度。
+const staleClaims = new Set();
 let axes = {};                      // 当前会话的轴值
 
 // 派生视图缓存：不发事件的东西靠它渲染（项目名 / 步数 / 状态）。
 const projects = new Map();         // pk -> { dir?, count }
 const info = new Map();             // sid -> { spec?, turn, status }
 let providers = [];
+// 归档的会话默认**折叠**在左栏里（⚠️ 过滤只发生在这里——核心的 `ListSessions`
+// **照列**归档会话，理由见 `SessionSpec.ArchivedAt` 的注释：那是「一个项目下有哪些会话」
+// 的唯一定义，而 `/claims` 也走它）。
+let showArchived = false;
 const provNotes = new Map();        // providerId -> { text, ok }（最近一次自检的结果）
 const testCmd = new Map();          // 命令 id -> providerId（回执认得回来）
 let editingProvider = null;         // 供应商视图里正在编辑的那个 id；null = 没有
@@ -112,8 +120,7 @@ async function loadSessions() {
         spec: st.spec,
         turn: st.state.turn,
         status: st.state.status,
-      });
-      const p = projects.get(st.spec.projectKey);
+      });      const p = projects.get(st.spec.projectKey);
       if (p && !p.dir) p.dir = st.spec.workingDirectory;
     } catch { /* 单个会话读不出来不该拖垮整张列表 */ }
   }
@@ -176,16 +183,31 @@ function renderSessions() {
     key.textContent = pk.slice(0, 8);
     const cnt = document.createElement("span");
     cnt.className = "pcount";
-    cnt.textContent = ids.length;
+
+    // 归档的**默认折叠**（见 `showArchived` 的注释：过滤只发生在这个显示层）。
+    const archived = ids.filter((id) => (info.get(id)?.spec || {}).archivedAt);
+    const visible = showArchived ? ids : ids.filter((id) => !archived.includes(id));
+
+    // 计数只说**看得见的那部分**，否则「折叠着却显示 5」是个谎。
+    cnt.textContent = visible.length;
     head.append(nm, key, cnt);
+
+    if (archived.length) {
+      const toggle = document.createElement("button");
+      toggle.className = "archtoggle";
+      toggle.textContent = showArchived ? `隐藏归档 (${archived.length})` : `显示归档 (${archived.length})`;
+      toggle.onclick = (e) => { e.stopPropagation(); showArchived = !showArchived; renderSessions(); };
+      head.appendChild(toggle);
+    }
     g.appendChild(head);
 
-    for (const id of ids) {
+    for (const id of visible) {
       const v = info.get(id) || {};
 
       const row = document.createElement("div");
-      row.className = "srow" + (id === current ? " active" : "");
+      row.className = "srow" + (id === current ? " active" : "") + (v.spec?.archivedAt ? " archived" : "");
       row.title = id + (v.status ? ` · ${v.status}` : "");
+      if (v.spec?.archivedAt) row.title += ` · 已归档 ${shortTime(v.spec.archivedAt)}`;
 
       // 刻度：横杠的高度 = 这一步数 / 本栏最大步数。
       const gauge = document.createElement("span");
@@ -195,7 +217,15 @@ function renderSessions() {
 
       const sid = document.createElement("span");
       sid.className = "sid";
-      sid.textContent = id.slice(0, 8);
+      // 有名字就显示名字（id 在 hover 的 title 里）；没名字还是显示 id。
+      // ⚠️ 名字只在 `session.create` 那一次定，**没有任何命令能改它**。
+      const spec = v.spec || {};
+      if (spec.title) {
+        sid.textContent = spec.title;
+        sid.classList.add("named");
+      } else {
+        sid.textContent = id.slice(0, 8);
+      }
 
       const turn = document.createElement("span");
       turn.className = "sturn";
@@ -222,12 +252,24 @@ async function openSession(id) {
   current = id;
   $("interrupt").disabled = false;   // 没选中会话时它是死的 —— 别让它看起来可点（点了也没事，只是会骗人）
   renderSessions();
-  $("title").textContent = id;
-  $("title").classList.remove("muted");
+  // ⚠️ 这里**不设 `#title`**——名字/ id 要等快照回来（`renderTitle`）。先设一个 id
+  // 再被名字盖掉会闪一下，而且那是同一事实的两个显示点。
   $("timeline").innerHTML = "";
 
-  const state = await (await fetch(`${core}/sessions/${id}/state`)).json();
-  const history = await (await fetch(`${core}/sessions/${id}/history`)).json();
+  // ⚠️ 两条 fetch 必须**各自**带 catch：`session.delete` 会让它们 404，
+  // 而 404 的 `.json()` 会**抛**。不接的话这个 async 函数变成一次未观测拒绝 ⇒
+  // 页面停在「current 已经指向一个不存在的会话、时间线却被清空了」那个半截状态。
+  let state, history;
+  try {
+    state = await (await fetch(`${core}/sessions/${id}/state`)).json();
+    history = await (await fetch(`${core}/sessions/${id}/history`)).json();
+  } catch (e) {
+    if (gen !== epoch) return;
+    // 没东西可画 ⇒ 退回「没选会话」，别留一个空壳。
+    clearCenter();
+    renderMeta("✗ 会话读不出来（可能刚被删掉）：" + (e && e.message ? e.message : e), "error");
+    return;
+  }
 
   // 快照回来时用户可能已开了别的会话——这些是全局节点，继续渲染会把上一次的
   // turn 追加进已经清空的那条时间线里。
@@ -240,6 +282,7 @@ async function openSession(id) {
 
   renderSlots(state.slots);
   renderAxes(state.axes);
+  renderTitle(state.spec);
   renderSessionPanel(state);
   renderProjectPanel(state);
   setStatus(state.state.status, state.state.turn);
@@ -700,14 +743,107 @@ function renderSessionPanel(state) {
   dl.className = "kv";
   // ⚠️ 提供商 / 模型 / 协议 / 思考强度**不在这里**——它们住在上面那块「模型」里
   // （可改的下拉），在这里再列一遍就是同一事实的两个显示点，改了一个忘一个。
+  // ⚠️ 名字**也不在这里**：它住 #title（中栏顶上）。同一个事实只该有一个显示点。
   kv(dl, [
     ["会话", spec.sessionId],
     ["创建", shortTime(spec.createdAt)],
+    ["归档", spec.archivedAt ? shortTime(spec.archivedAt) : null],
   ]);
   $("sess-detail").innerHTML = "";
   $("sess-detail").appendChild(dl);
 
+  renderSessionActions(spec);
   renderModelPicker(spec);
+}
+
+// 会话级的两个动作：归档 / 取消归档、删除。
+// ⚠️ 它们与「改绑供应商」不是一类：改绑可逆，**删除不可逆**——
+// 而删除抹掉的是 `history.jsonl`，全仓唯一一份不可从代码重现的东西。
+function renderSessionActions(spec) {
+  const box = $("sess-actions");
+  box.innerHTML = "";
+  const id = spec.sessionId;
+  if (!id) return;
+
+  const archived = !!spec.archivedAt;
+
+  box.append(
+    btn(archived ? "取消归档" : "归档", () => archiveSession(id, !archived)),
+    btn("删除", () => deleteSession(id, spec), "btn-ghost"),
+  );
+}
+
+async function archiveSession(id, archive) {
+  // `archived` 为 null ⇒ 归档；false ⇒ 取消归档（核心侧那份三态）。
+  const payload = { kind: "session.archive", sessionId: id };
+  if (!archive) payload.archived = false;
+
+  const r = await commandNow(crypto.randomUUID().slice(0, 8), payload);
+  if (!r.accepted) { renderMeta("✗ " + r.reason, "error"); return; }
+  // 事件也会来（`session.archived`），但那条只让左栏重画；右栏这几个字段要重拉快照。
+  if (current === id) openSession(id);
+}
+
+// ⚠️ **`confirm()` 不是屏障**，别拿它当安全机制：核心那边靠自己「检查 + 删」一气呵成
+// （两个核心共享数据根时，前端在离得远的地方做的检查挡不住互删）。
+// 这里的「键入 id 才放行」是**防误点**——用户手上那个值必须是**真的 id**，
+// 而不是一条随手回车就能过的确认。删掉的东西**回不来**。
+async function deleteSession(id, spec) {
+  const label = spec.title ? `${spec.title}（${id}）` : id;
+  if (!confirm(`删除会话 ${label}？\n\n`
+    + `这会删掉整个会话目录：对话记录、状态、配置。\n`
+    + `⚠️ 记录只追加、从不另存，删了**回不来**。\n\n`
+    + `它占的声明会一并释放（回执里会点名）。`)) return;
+
+  const typed = prompt(`确认删除：请键入会话 id\n\n${id}`);
+  if (typed === null) return;
+  if (typed.trim() !== id) { renderMeta("✗ id 不匹配，没有删除。", "error"); return; }
+
+  const r = await commandNow(crypto.randomUUID().slice(0, 8), { kind: "session.delete", sessionId: id });
+  if (!r.accepted) { renderMeta("✗ " + r.reason, "error"); return; }
+  if (r.note) renderMeta("ℹ " + r.note);
+  // 会话已不在 ⇒ 事件会让左栏重画（`session.deleted`）；万一它正开着，也要清中栏。
+  if (current === id) clearCenter();
+}
+
+// 中栏回到「没选会话」。⚠️ **必须真的清空**：停在一条已经被删掉的时间线上是最糟的谎言
+// （用户会以为自己看的是现存的东西）。
+function clearCenter() {
+  current = null;
+  $("timeline").innerHTML = "";
+  $("title").innerHTML = "";
+  $("title").className = "muted";
+  $("title").textContent = "未选会话";
+  $("status").textContent = "未连接";
+  $("status").className = "chip";
+  $("interrupt").disabled = true;
+  $("sess-detail").innerHTML = '<div class="note">未选会话。</div>';
+  $("proj-detail").innerHTML = '<div class="note">未选会话。</div>';
+  $("model-picker").innerHTML = "";
+  $("model-note").textContent = "";
+  $("sess-actions").innerHTML = "";
+  renderSessions();
+}
+
+// 中栏顶上那一行：**有名字就显示名字**（id 退到后面当等宽副标题），没有就还是 id。
+// ⚠️ 名字不在这里改——今天**没有任何命令能改它**（所以也没有 `session.renamed` 事件），
+// 只有 `session.create --title` 那一次。别做成可点的输入框，那会指向一个不存在的命令。
+function renderTitle(spec) {
+  const el = $("title");
+  el.innerHTML = "";
+  el.classList.remove("muted");
+
+  if (spec && spec.title) {
+    const name = document.createElement("span");
+    name.className = "tname";
+    name.textContent = spec.title;
+    const id = document.createElement("span");
+    id.className = "tid";
+    id.textContent = spec.sessionId;
+    el.append(name, id);
+  } else {
+    el.textContent = spec ? spec.sessionId : "";
+  }
 }
 
 function renderProjectPanel(state) {
@@ -881,9 +1017,11 @@ function renderAlert() {
 async function loadClaims() {
   const all = await (await fetch(core + "/claims")).json();
   claims.clear();
+  staleClaims.clear();
   for (const c of all) {
     if (!claims.has(c.sessionId)) claims.set(c.sessionId, new Set());
     claims.get(c.sessionId).add(c.path);
+    if (c.stale) staleClaims.add(c.path);
   }
   renderClaims();
 }
@@ -923,6 +1061,18 @@ function renderClaims() {
       path.className = "p";
       path.textContent = p;
       el.append(who, path);
+
+      // ⚠️ **残声明**：它指向一个已经不存在的会话（`session.delete` 是两步——先摘声明、
+      // 再删目录，崩在中间就会留下这种；手删目录也会）。核心**不自动清理**它
+      // （在别人正活跃地写 claims.json 时从别处删条目会打架），但必须**看得见**——
+      // 否则它会静静地骗人：「这个文件有人占着」，而那个「人」早就没了。
+      if (staleClaims.has(p)) {
+        const tag = document.createElement("span");
+        tag.className = "stale";
+        tag.textContent = "会话已不存在";
+        tag.title = "这条声明的主人已经不在盘上了。核心不会自动清理它（见 /claims 的 stale 字段）。";
+        el.appendChild(tag);
+      }
       box.appendChild(el);
     }
   }
@@ -1054,7 +1204,44 @@ function handleProjectEvent(p) {
     // 声明变化必须刷新右栏，否则「谁在动哪些文件」只在开页面那一刻是对的。
     case "claim.acquired":
     case "claim.released": loadClaims(); break;
+
+    // ⚠️ 这三条**不能只靠 `session.created` 那种「重拉列表」**：
+    // 归档态住在每个会话的 `spec` 里，而 `loadSessions` 的循环会**跳过已知会话**
+    // （`if (info.has(id) && ...spec) continue`），所以重拉列表**读不出归档态的变化**。
+    // ⇒ 必须逐条把那个会话的 `/state` 重拉一遍。
+    case "session.archived":
+      refreshSessionInfo(p.sessionId); break;
+
+    case "session.deleted":
+      // 会话没了：把它从所有本地缓存里摘掉，再重拉列表。
+      info.delete(p.sessionId);
+      sessions.delete(p.sessionId);
+      claims.delete(p.sessionId);
+      // ⚠️ 删掉的**正是当前打开的那个** ⇒ 中栏必须清空。停在一条已经被删掉的时间线上
+      // 会让用户以为看的是现存的东西——那是本页能犯的最大的谎。
+      if (current === p.sessionId) clearCenter();
+      loadSessions();
+      renderClaims();
+      break;
+
+    // ⚠️ `session.deactivated` **刻意什么都不做**：头的界面完全不显示「激活」这件事
+    //（快照端点会自己回落磁盘）。这条事件是给**别的客户端**（控制台）看的——
+    // 别因为这里不用就把它从核心删掉。
+    case "session.deactivated": break;
   }
+}
+
+// 重拉单个会话的快照缓存（列表里的名字 / 步数 / 状态 / 归档态都从它来）。
+async function refreshSessionInfo(id) {
+  try {
+    const st = await (await fetch(`${core}/sessions/${id}/state`)).json();
+    info.set(id, { spec: st.spec, turn: st.state.turn, status: st.state.status });
+  } catch {
+    // 读不出来（刚被删？）⇒ 摘掉缓存，别留一条陈旧的行。
+    info.delete(id);
+  }
+  renderSessions();
+  if (id === current) openSession(id);
 }
 
 function handleEvent(p) {
@@ -1126,11 +1313,84 @@ $("send").onclick = send;
 $("text").onkeydown = (e) => { if (e.key === "Enter") send(); };
 $("nav-sessions").onclick = () => showView("sessions");
 $("nav-providers").onclick = () => showView("providers");
+
+// ---- 新建会话：选项目（工作目录）+ 起名 ----
+// ⚠️ 两者**都发 `session.create` 的字段**，不是「先建再改绑」——`create` 本来就定工作目录。
+// 工作目录决定落在哪个项目（项目键是它的纯函数），所以「选项目」与「选目录」是同一件事。
+
 $("new").onclick = () => {
-  const cmdId = crypto.randomUUID().slice(0, 8);
-  creating = cmdId;
-  command(cmdId, { kind: "session.create" });
+  $("new-form").hidden = false;
+  $("new-note").textContent = "";
+  renderNewProjectOptions();
+  $("new-title").value = "";
+  $("new-project").focus();
 };
+
+$("new-cancel").onclick = () => { $("new-form").hidden = true; };
+
+$("new-go").onclick = async () => {
+  const note = $("new-note");
+  const id = crypto.randomUUID().slice(0, 8);
+  const cwd = $("new-project").value;
+  const title = $("new-title").value.trim();
+
+  // 项目下拉给的是**绝对路径**（核心收的就是 cwd）。留空的那个占位项不能发。
+  if (!cwd) { note.textContent = "✗ 先选一个项目目录。"; note.className = "note-bad"; return; }
+
+  const payload = { kind: "session.create", cwd };
+  if (title) payload.title = title;   // ⚠️ 空名字**整个键都不发**（不是发一个空串）
+
+  // ⚠️ 走 `commandNow`（要等回执才决定开不开、错了要显示在表单里），
+  // **不设 `creating`**：`onmessage` 里 `pendingAcks` 那条分支**先判且判完就 return**
+  // ⇒ 设了也永远不会被那条 `frame.id === creating` 的分支消费，只会留下一个陈旧的 id。
+  const r = await commandNow(id, payload);
+  if (!r.accepted) {
+    note.textContent = "✗ " + r.reason;
+    note.className = "note-bad";
+    return;
+  }
+  $("new-form").hidden = true;
+
+  try {
+    // ⚠️ **先切 `currentProject` 再打开**：头只订**一个**项目流（`currentProject`）。
+    // 表单允许建到别的项目 ⇒ 不切过去的话，那个会话的实时事件（步、轴、状态）**永远收不到**，
+    // 而且不会自愈——`loadSessions()` 只在 `currentProject === null` 时才认领一个。
+    const st = await (await fetch(`${core}/sessions/${r.sessionId}/state`)).json();
+    currentProject = st.spec.projectKey;
+    await loadSessions();
+    await openSession(r.sessionId);
+  } catch (e) {
+    renderMeta("✗ 会话建好了但打不开：" + (e && e.message ? e.message : e), "error");
+  }
+};
+
+// 项目下拉的选项：**从核心派生**，与左栏分组是同一份数据。
+// ⚠️ **这不是全集**：`GET /projects` 是扫目录派生的，所以**一个会话都没有的项目根本列不出来**
+//    （哪怕那个目录里有 `.lilara/`）。这是核心的现有形状，头这边不假装它是全集——
+//    真要建到一个新目录，去控制台敲 `session create --cwd <目录>`。
+function renderNewProjectOptions() {
+  const sel = $("new-project");
+  sel.innerHTML = "";
+  const seen = new Set();
+
+  for (const [pk, meta] of projects) {
+    if (!meta.dir || seen.has(pk)) continue;
+    seen.add(pk);
+    const o = document.createElement("option");
+    o.value = meta.dir;                       // 核心收的是**目录**，不是项目键
+    o.textContent = `${dirName(meta.dir)}  ${meta.dir}`;
+    sel.appendChild(o);
+  }
+
+  // 没有已知项目时给一个空占位：让「没得选」看得见，而不是发一条空 cwd 出去。
+  if (!sel.options.length) {
+    const o = document.createElement("option");
+    o.value = "";
+    o.textContent = "（还没有已知目录 —— 去控制台敲 session create --cwd <目录>）";
+    sel.appendChild(o);
+  }
+}
+
 $("interrupt").onclick = () => {
   if (current) command(crypto.randomUUID().slice(0, 8), { kind: "session.interrupt", sessionId: current });
 };

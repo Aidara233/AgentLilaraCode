@@ -116,6 +116,78 @@ public class SessionStoreTests : IDisposable
         Assert.Null(_store.TryReadSpec("p1", "bad"));
     }
 
+    // ---- 销毁面要用的四条（提上来的项目枚举 + 存在性 + 删除 + 按 id 找） ----
+
+    // 「存在性」≠「spec.json 读得出来」。损坏的 spec 让 TryReadSpec 返回 null，
+    // 但那个目录是**真实存在**的 ⇒ 拿 TryReadSpec 当存在性判据，坏会话会**永远删不掉**，
+    // 而用户看到的理由是「会话不存在」（一句假话）。
+    [Fact]
+    public void SessionExists_IsTrueForACorruptSpec_UnlikeTryReadSpec()
+    {
+        var badDir = _store.SessionDirectory("p1", "bad");
+        Directory.CreateDirectory(badDir);
+        File.WriteAllText(Path.Combine(badDir, "spec.json"), "{ this is not json");
+
+        Assert.True(_store.SessionExists("p1", "bad"));
+        Assert.Null(_store.TryReadSpec("p1", "bad"));   // 两个判据在这里**必须不一致**
+        Assert.False(_store.SessionExists("p1", "nope"));
+    }
+
+    // 删掉整个目录：三个文件一起走。这是本仓唯一不可逆的动作。
+    [Fact]
+    public void DeleteSession_RemovesTheWholeDirectory()
+    {
+        _store.WriteSpec("p1", Spec());
+        _store.WriteState("p1", State(1));
+        _store.AppendEvent("p1", "s1", Msg("一"));
+
+        Assert.True(_store.DeleteSession("p1", "s1"));
+        Assert.False(Directory.Exists(_store.SessionDirectory("p1", "s1")));
+        Assert.Empty(_store.ListSessions("p1"));
+    }
+
+    // 不存在 ⇒ false（调用方据此说「不存在」，而不是说删成了）。
+    [Fact]
+    public void DeleteSession_OnAMissingSession_ReturnsFalse()
+    {
+        Assert.False(_store.DeleteSession("p1", "nope"));
+    }
+
+    // 只剩 state.json 的**半删目录**也要删得掉——那正是该删的垃圾。
+    [Fact]
+    public void DeleteSession_RemovesAHalfWrittenDirectory()
+    {
+        var dir = _store.SessionDirectory("p1", "orphan");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "state.json"), "{}");
+
+        Assert.True(_store.DeleteSession("p1", "orphan"));
+        Assert.False(Directory.Exists(dir));
+    }
+
+    // 按 id 找会话：**只扫盘、不载入**——跨项目也找得到（会话 id 全局唯一，但盘上没有全局索引）。
+    [Fact]
+    public void FindSession_ScansEveryProject()
+    {
+        _store.WriteSpec("p1", Spec() with { SessionId = "a" });
+        _store.WriteSpec("p2", Spec() with { ProjectKey = "p2", SessionId = "b" });
+
+        Assert.Equal("p1", _store.FindSession("a")!.Value.ProjectKey);
+        Assert.Equal("p2", _store.FindSession("b")!.Value.ProjectKey);
+        Assert.Null(_store.FindSession("nope"));
+    }
+
+    [Fact]
+    public void ListProjects_ReturnsEveryDirectoryUnderProjectsRoot()
+    {
+        Assert.Empty(_store.ListProjects());   // 数据根还没建 ⇒ 空，不是抛
+
+        _store.WriteSpec("p1", Spec() with { SessionId = "a" });
+        _store.WriteSpec("p2", Spec() with { ProjectKey = "p2", SessionId = "b" });
+
+        Assert.Equal(["p1", "p2"], _store.ListProjects().OrderBy(x => x, StringComparer.Ordinal));
+    }
+
     [Fact]
     public void Timeline_AppendsInOrder()
     {

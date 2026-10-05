@@ -29,6 +29,48 @@ public class DiskFormatGoldenTests
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
+    // ⚠️ 上面那条是「不设 title / archivedAt 时逐字节不变」——**加字段不破格式的唯一证据**。
+    // 这一条钉的是设上之后的字节（顺序 = 声明顺序，追加在 `model` 之后）。
+    [Fact]
+    public void SessionSpec_WithTitleAndArchive_KeepsItsExactBytes()
+    {
+        var spec = new SessionSpec
+        {
+            SessionId = "abc123",
+            ProjectKey = "pk1",
+            WorkingDirectory = @"C:\work",
+            CreatedAt = DateTimeOffset.UnixEpoch,
+            Model = Sel(),
+            Title = "重构会话",
+            ArchivedAt = DateTimeOffset.UnixEpoch,
+        };
+
+        Assert.Equal(
+            """{"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
+            System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
+    }
+
+    // `title` 没给（null）而 `archivedAt` 给了：两个键的取舍是**各自独立**的，
+    // 别写成「一个在就两个都写」——那会让没起名的归档会话多出一个 "title":null。
+    [Fact]
+    public void SessionSpec_WithArchiveOnly_OmitsTitleEntirely()
+    {
+        var spec = new SessionSpec
+        {
+            SessionId = "abc123",
+            ProjectKey = "pk1",
+            WorkingDirectory = @"C:\work",
+            CreatedAt = DateTimeOffset.UnixEpoch,
+            Model = Sel(),
+            ArchivedAt = DateTimeOffset.UnixEpoch,
+        };
+
+        var json = System.Text.Json.JsonSerializer.Serialize(spec, Json.Options);
+
+        Assert.DoesNotContain("\"title\"", json);
+        Assert.EndsWith("\"archivedAt\":\"1970-01-01T00:00:00+00:00\"}", json);
+    }
+
     [Fact]
     public void SessionState_KeepsItsExactBytes()
     {

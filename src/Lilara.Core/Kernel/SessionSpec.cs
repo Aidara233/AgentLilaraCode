@@ -36,4 +36,32 @@ public sealed record SessionSpec
     // 可改：`session.configure` 换绑供应商 / 换模型。⚠️ 改 ProviderId 后必须
     // `CoreHost.InvalidateSteppers()`，否则请求会走旧供应商的适配器（旧 key、旧端点）。
     public required ModelSelection Model { get; init; }
+
+    /// <summary>
+    /// 人给会话起的名字（`session.create --title`）。
+    ///
+    /// <para>⚠️ **只在建会话那一刻写一次，此后没有任何命令能改它**——
+    /// 所以也**没有** `session.renamed` 事件可发，头刷新靠重拉快照。
+    /// 「点一下给个临时名」那种做法要丢掉：没有改名命令 ⇒ 名字是**永久**的，
+    /// 工具不该替用户起名。</para>
+    ///
+    /// <para>⚠️ **可空是刻意的，它是磁盘格式不破的唯一原因**：`Json.Options` 的
+    /// `WhenWritingNull` 让「没起名」的 `spec.json` **逐字节不变**，
+    /// 而 `DiskFormatGoldenTests` 钉的就是那几个字节。写成非空字符串会让那条金样红。</para>
+    /// </summary>
+    public string? Title { get; init; }
+
+    /// <summary>
+    /// 归档时刻；`null` = 没归档。
+    ///
+    /// <para>⚠️ **归档是「原地标记」，不是「搬走」**：目录不动，`ListSessions` **照列**它。
+    /// 理由是语义而不是省事——「怎么算一个项目下的会话」只该有一份实现，而归档会话
+    /// 是**完整的**会话（`/state` 读得出、`activate` 载得进、`send` 发得动、`delete` 删得掉）。
+    /// 若 `ListSessions` 开始滤它，**`/claims` 会跟着一起漏**（它也走 `ListSessions`，
+    /// 而归档会话可能仍占着路径）⇒ 用户看到两份自相矛盾的真相。
+    /// ⇒ **过滤挪到显示层**（头折叠、控制台不折叠——那是有意的两种视图）。</para>
+    ///
+    /// <para>⚠️ 可空 ⇒ 老 `spec.json` 逐字节不变（同 <see cref="Title"/>）。</para>
+    /// </summary>
+    public DateTimeOffset? ArchivedAt { get; init; }
 }

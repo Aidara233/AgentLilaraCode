@@ -99,6 +99,36 @@ body {
 .navbtn:hover { color: var(--ink); background: var(--rule-soft); }
 .navbtn.on { color: var(--accent-ink); border-bottom-color: var(--accent); font-weight: 600; }
 
+/* ---------- 左栏的新建表单 ---------- */
+/* ⚠️ 默认收起（`hidden`），点「新建」才开——它是入口不是数据，摊开着会把会话列表淹没。 */
+.newform {
+  padding: 10px var(--pad);
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg);
+}
+.newform label {
+  display: block;
+  margin-bottom: 3px;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.newform select, .newform input {
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 5px 7px;
+  font: 11.5px var(--f-read);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  min-width: 0;
+}
+.newform input { font-family: var(--f-mono); }
+.newform select:focus, .newform input:focus { outline: none; border-color: var(--accent); }
+.newform-actions { display: flex; gap: 6px; }
+.newform-actions button { padding: 4px 10px; font-size: 11.5px; }
+.newform .note { margin-top: 6px; }
+
 /* ---------- 供应商视图：占满工作区 ---------- */
 
 #providers-view {
@@ -135,6 +165,21 @@ body.providers #providers-view { display: block; }
 .pcard .top .pid { font-family: var(--f-mono); font-size: 12.5px; color: var(--ink); flex: 1; }
 .pcard .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
 .pcard .actions button { padding: 4px 9px; font-size: 11.5px; }
+
+/* 右栏里那一排会话级动作（归档 / 删除）。与 .pcard 那排同形，但不在卡片里。 */
+.actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.actions button { padding: 4px 9px; font-size: 11.5px; }
+
+/* 分组头里的「显示归档 (n)」。⚠️ 它必须**看得出是个开关**（默认态下那些行是看不见的，
+   而用户得能发现它们还在）——所以给一点存在感，但别抢过项目名。 */
+.archtoggle {
+  padding: 1px 6px;
+  font-size: 10.5px;
+  color: var(--ink-2);
+  background: var(--bg);
+  border-radius: 999px;
+}
+.archtoggle:hover { color: var(--ink); border-color: var(--ink-3); }
 
 /* 表单：标签在上、控件在下，一行两个。 */
 .form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
@@ -306,6 +351,11 @@ button:disabled:hover { border-color: var(--rule); }
   font-variant-numeric: tabular-nums;
 }
 .srow.active .sturn { color: var(--accent-ink); }
+/* 有名字的行：名字是**要读的** ⇒ 换正文体（id 那种等宽是给随机串用的）。 */
+.srow .sid.named { font-family: var(--f-read); font-size: 12px; color: var(--ink); }
+/* 归档行：弱化，且**看得出它不在常规视野里**（默认被折叠，展开时才见）。 */
+.srow.archived { opacity: .5; }
+.srow.archived .gauge::after { background: var(--rule); }
 
 /* ---------- 中栏：会话 ---------- */
 
@@ -334,6 +384,14 @@ button:disabled:hover { border-color: var(--rule); }
   white-space: nowrap;
 }
 #title.muted { color: var(--ink-3); font-family: var(--f-read); font-size: 13px; }
+/* 有名字时：名字是正题（正文体，因为它要读），id 退成等宽副标题。 */
+#title .tname { font-family: var(--f-read); }
+#title .tid {
+  margin-left: 8px;
+  font-family: var(--f-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+}
 
 .chip {
   display: inline-flex;
@@ -545,6 +603,18 @@ button:disabled:hover { border-color: var(--rule); }
 .claim { display: flex; gap: 8px; font-size: 11.5px; padding: 3px 0; border-bottom: 1px dotted var(--rule-soft); }
 .claim .who { font-family: var(--f-mono); font-size: 10.5px; color: var(--ink-3); flex: none; }
 .claim .p { font-family: var(--f-mono); font-size: 10.5px; color: var(--ink-2); overflow-wrap: anywhere; }
+/* 残声明（主人已经不在盘上了）。⚠️ 用**中性偏告警**的色，不用红：它不会自己变好，
+   但也**没在伤害谁**——它只是一条没人认领的旧数据。见 app.js 的 staleClaims。 */
+.claim .stale {
+  margin-left: auto;
+  flex: none;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--warn-wash);
+  color: var(--warn);
+  font-size: 10px;
+  white-space: nowrap;
+}
 
 .banner {
   padding: 9px 11px;
@@ -641,6 +711,19 @@ button:disabled:hover { border-color: var(--rule); }
     <h4>会话</h4>
     <button id="new" class="btn-primary">新建</button>
   </div>
+  <!-- 新建表单：默认收起。「新建」是个入口不是数据——一进页面就摊开一张空表单
+       会把「我有哪些会话」这件事淹没掉（同供应商视图那张新建卡）。 -->
+  <div id="new-form" class="newform" hidden>
+    <label for="new-project">项目（工作目录）</label>
+    <select id="new-project"></select>
+    <label for="new-title">会话名（可留空）</label>
+    <input id="new-title" placeholder="留空就只有 id" autocomplete="off">
+    <div class="newform-actions">
+      <button id="new-go" class="btn-primary">创建</button>
+      <button id="new-cancel">取消</button>
+    </div>
+    <div id="new-note" class="note"></div>
+  </div>
   <!-- 分组与刻度都由 renderSessions() 画；这里只给一个容器。 -->
   <div id="sessions"></div>
 </aside>
@@ -721,6 +804,8 @@ button:disabled:hover { border-color: var(--rule); }
   <section class="panel">
     <h4>当前会话</h4>
     <div id="sess-detail"><div class="note">未选会话。</div></div>
+    <!-- 归档 / 删除。⚠️ 删除是不可逆的（记录只追加、从不另存），见 app.js 的 deleteSession。 -->
+    <div id="sess-actions" class="actions"></div>
   </section>
 
   <section class="panel">

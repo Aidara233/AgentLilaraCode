@@ -579,6 +579,153 @@ public class CommandDispatcherTests : IDisposable
         Assert.Empty(_adapter.Calls);   // 闸在任何网络动作之前
     }
 
+    // ---- session.create：选项目 + 起名 ----
+
+    // 不给项目 ⇒ 回落核心的工作目录（控制台 `session create` 一直就是这个行为）。
+    [Fact]
+    public async Task SessionCreate_WithoutAProject_LandsInTheWorkingDirectory()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+
+        var r = await d.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+
+        var sessionId = ((Ack.Accepted)r.Ack).SessionId!;
+        var found = host.Store.FindSession(sessionId)!;
+        Assert.Equal(ProjectKey.FromPath(_work), found.Value.ProjectKey);
+        Assert.Equal(Path.GetFullPath(_work), found.Value.Spec.WorkingDirectory);
+    }
+
+    // 给目录 ⇒ 落到**那个**项目里。这是本批新增的自由度。
+    [Fact]
+    public async Task SessionCreate_WithACwd_LandsThere()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var other = Path.Combine(Path.GetTempPath(), "lilara-other-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(other);
+
+        try
+        {
+            var r = await d.DispatchAsync(
+                new CoreCommand.SessionCreate { Cwd = other }, "c", false, CancellationToken.None);
+
+            var sessionId = ((Ack.Accepted)r.Ack).SessionId!;
+            var pk = ProjectKey.FromPath(other);
+
+            Assert.Equal(pk, host.Store.FindSession(sessionId)!.Value.ProjectKey);
+            Assert.Equal([sessionId], host.Store.ListSessions(pk));
+            Assert.Contains(pk, host.Store.ListProjects());
+        }
+        finally
+        {
+            if (Directory.Exists(other)) Directory.Delete(other, recursive: true);
+        }
+    }
+
+    // ⚠️ `session.created` 要发在**新会话自己的项目流**上，不是核心工作目录的。
+    // 头订的是前者；发错了头永远等不到这个事件，新会话不会出现（且不会自愈）。
+    [Fact]
+    public async Task SessionCreate_WithACwd_PublishesOnThatProjectsTopic()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var bus = new EventBus();
+        var d = new CommandDispatcher(host, bus, h => new Stepper(host.Store, _adapter), _ => _adapter);
+        var other = Path.Combine(Path.GetTempPath(), "lilara-other-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(other);
+
+        try
+        {
+            using var sub = bus.Subscribe(EventBus.ProjectTopic(ProjectKey.FromPath(other)));
+
+            await d.DispatchAsync(
+                new CoreCommand.SessionCreate { Cwd = other }, "c", false, CancellationToken.None);
+
+            Assert.True(sub.Reader.TryRead(out var p), "新会话的项目流上必须收到 session.created");
+            Assert.Equal(ProjectKey.FromPath(other),
+                Assert.IsType<WireEvent.SessionCreated>(p.Payload).ProjectKey);
+        }
+        finally
+        {
+            if (Directory.Exists(other)) Directory.Delete(other, recursive: true);
+        }
+    }
+
+    // ⚠️ 目录不存在 ⇒ 拒绝，**不建**目录：建目录是策略，核心不做策略（00 §1.3）。
+    [Fact]
+    public async Task SessionCreate_WithAMissingDirectory_IsRejected_AndCreatesNothing()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var ghost = Path.Combine(Path.GetTempPath(), "lilara-ghost-" + Guid.NewGuid().ToString("N"));
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionCreate { Cwd = ghost }, "c", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(r.Ack);
+        Assert.False(Directory.Exists(ghost), "核心不许替用户建目录");
+    }
+
+    // 相对目录也要落成**绝对**路径——否则 `SessionDirectory` 会拼出一个相对目录、
+    // 会话根本不在数据根里（今天撞不到是因为唯一调用点给的是 `GetCurrentDirectory()`）。
+    [Fact]
+    public async Task SessionCreate_WithARelativeCwd_StoresAnAbsolutePath()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var other = Path.Combine(Path.GetTempPath(), "lilara-rel-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(other);
+        var previous = Directory.GetCurrentDirectory();
+
+        try
+        {
+            // 直接给一个相对路径（`..` 这种也一起证明了会规范化），而不是去改进程的当前目录。
+            var relative = Path.GetRelativePath(previous, other);
+
+            var r = await d.DispatchAsync(
+                new CoreCommand.SessionCreate { Cwd = relative }, "c", false, CancellationToken.None);
+
+            var sessionId = ((Ack.Accepted)r.Ack).SessionId!;
+            var spec = host.Store.FindSession(sessionId)!.Value.Spec;
+
+            Assert.True(Path.IsPathFullyQualified(spec.WorkingDirectory));
+            Assert.Equal(ProjectKey.FromPath(other), ProjectKey.FromPath(spec.WorkingDirectory));
+        }
+        finally
+        {
+            if (Directory.Exists(other)) Directory.Delete(other, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SessionCreate_WithATitle_PersistsIt()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionCreate { Title = "重构会话" }, "c", false, CancellationToken.None);
+
+        var sessionId = ((Ack.Accepted)r.Ack).SessionId!;
+        Assert.Equal("重构会话", host.Store.ReadSpec(ProjectKey.FromPath(_work), sessionId).Title);
+    }
+
+    // ⚠️ 空白标题要落成 **null**，不是 `""`：`Title` 可空正是磁盘格式不破的前提
+    // （null ⇒ `WhenWritingNull` 省掉整个键）；存一个 `""` 进去就不用想着那条了。
+    [Fact]
+    public async Task SessionCreate_WithABlankTitle_StoresNull()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionCreate { Title = "   " }, "c", false, CancellationToken.None);
+
+        var sessionId = ((Ack.Accepted)r.Ack).SessionId!;
+        Assert.Null(host.Store.ReadSpec(ProjectKey.FromPath(_work), sessionId).Title);
+    }
+
     // ---- session.configure：改绑供应商 / 换模型 ----
 
     // 落盘必须真的发生：只改内存的话，重启后会话悄悄退回旧供应商，而用户以为改过了。
@@ -767,6 +914,325 @@ public class CommandDispatcherTests : IDisposable
             new CoreCommand.SessionConfigure("nope", null, "m"), "x", false, CancellationToken.None);
 
         Assert.IsType<Ack.Rejected>(r.Ack);
+    }
+
+    // ---- 销毁面：deactivate / archive / delete ----
+
+    // 把会话推进到「在跑」。⚠️ 走**内存**（`Running` 从不落盘）——这正是要测的那一档：
+    // 磁盘上它还是 Idle，所以只有「看内存」的判据才发现得了它。
+    private static void MakeRunning(CoreHost host, string sessionId) =>
+        host.Activated.Single(h => h.SessionId == sessionId).UpdateState(s => s with { Status = "Running" });
+
+    [Fact]
+    public async Task Deactivate_DropsTheInMemoryCopy_ButLeavesTheDiskAlone()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+        Assert.True(host.TryGetActivated(sessionId, out _));
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionDeactivate(sessionId), "x", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.False(host.TryGetActivated(sessionId, out _));
+        // 磁盘零改动：目录还在、还能再激活。
+        Assert.NotNull(host.Store.FindSession(sessionId));
+        Assert.Equal(sessionId, host.Activate(ProjectKey.FromPath(_work), sessionId).SessionId);
+    }
+
+    // ⚠️ 「不存在」与「本来就没激活」**必须分开**：用户要能分辨自己敲错了 id
+    // 还是那一刀砍在空气上。
+    [Fact]
+    public async Task Deactivate_OnAMissingSession_SaysMissing()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionDeactivate("nope"), "x", false, CancellationToken.None);
+
+        Assert.Contains("不存在", ((Ack.Rejected)r.Ack).Reason);
+    }
+
+    [Fact]
+    public async Task Deactivate_OnAnAlreadyInactiveSession_SaysSo_NotMissing()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+        host.Deactivate(sessionId);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionDeactivate(sessionId), "x", false, CancellationToken.None);
+
+        var reason = ((Ack.Rejected)r.Ack).Reason;
+        Assert.Contains("本来就没激活", reason);
+        Assert.DoesNotContain("不存在", reason);
+    }
+
+    [Fact]
+    public async Task Deactivate_PublishesOnBothTopics()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var bus = new EventBus();
+        var d = new CommandDispatcher(host, bus, h => new Stepper(host.Store, _adapter), _ => _adapter);
+        var sessionId = await CreateSessionAsync(d);
+
+        using var session = bus.Subscribe(EventBus.SessionTopic(sessionId));
+        using var project = bus.Subscribe(EventBus.ProjectTopic(ProjectKey.FromPath(_work)));
+
+        await d.DispatchAsync(new CoreCommand.SessionDeactivate(sessionId), "x", false, CancellationToken.None);
+
+        Assert.True(session.Reader.TryRead(out var s), "会话还在，会话流上要发");
+        Assert.IsType<WireEvent.SessionDeactivated>(s.Payload);
+        Assert.True(project.Reader.TryRead(out _), "项目流上也要发");
+    }
+
+    // 归档：原地标记，`ListSessions` **照列**——这是本批最要紧的不变量
+    //（滤掉它会让 `/claims` 跟着一起漏，用户看到两份自相矛盾的真相）。
+    [Fact]
+    public async Task Archive_MarksInPlace_AndListSessionsStillShowsIt()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionArchive(sessionId), "x", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.NotNull(host.Store.ReadSpec(ProjectKey.FromPath(_work), sessionId).ArchivedAt);
+        Assert.Equal([sessionId], host.Store.ListSessions(ProjectKey.FromPath(_work)));
+    }
+
+    // ⚠️ 三态的关键：`Archived` 不给（null）是**归档**，不是「没给就当没提」。
+    // 这条钉的是「`bool Archived = false` 那个默认值写法」——那样写这条会红。
+    [Fact]
+    public async Task Archive_WithNoArgument_MeansArchive()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionArchive(sessionId), "x", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.NotNull(host.Store.ReadSpec(ProjectKey.FromPath(_work), sessionId).ArchivedAt);
+    }
+
+    [Fact]
+    public async Task Archive_ThenUnarchive_ClearsIt()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+
+        await d.DispatchAsync(new CoreCommand.SessionArchive(sessionId), "x", false, CancellationToken.None);
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionArchive(sessionId, Archived: false), "x", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.Null(host.Store.ReadSpec(ProjectKey.FromPath(_work), sessionId).ArchivedAt);
+    }
+
+    // 幂等**不许当成功**：写成 no-op 的话用户永远分不清「存进去了」与「什么都没发生」。
+    [Fact]
+    public async Task Archive_WhenAlreadyArchived_IsRejected()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+        await d.DispatchAsync(new CoreCommand.SessionArchive(sessionId), "x", false, CancellationToken.None);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionArchive(sessionId), "x", false, CancellationToken.None);
+
+        Assert.Contains("已经归档", ((Ack.Rejected)r.Ack).Reason);
+    }
+
+    [Fact]
+    public async Task Unarchive_WhenNeverArchived_IsRejected()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionArchive(sessionId, Archived: false), "x", false, CancellationToken.None);
+
+        Assert.Contains("本来就没归档", ((Ack.Rejected)r.Ack).Reason);
+    }
+
+    // 取消归档时事件里的 `ArchivedAt` 必须是 **null**——头靠它决定折叠还是展开。
+    [Fact]
+    public async Task Unarchive_PublishesANullArchivedAt()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var bus = new EventBus();
+        var d = new CommandDispatcher(host, bus, h => new Stepper(host.Store, _adapter), _ => _adapter);
+        var sessionId = await CreateSessionAsync(d);
+        await d.DispatchAsync(new CoreCommand.SessionArchive(sessionId), "x", false, CancellationToken.None);
+
+        using var project = bus.Subscribe(EventBus.ProjectTopic(ProjectKey.FromPath(_work)));
+        await d.DispatchAsync(
+            new CoreCommand.SessionArchive(sessionId, Archived: false), "x", false, CancellationToken.None);
+
+        Assert.True(project.Reader.TryRead(out var p));
+        Assert.Null(Assert.IsType<WireEvent.SessionArchived>(p.Payload).ArchivedAt);
+    }
+
+    // ⚠️ **没激活的会话也要能归档**——刻意不为了改一个字段去 `Activate`
+    //（那会产生一份用户没要求的内存副本）。
+    [Fact]
+    public async Task Archive_WorksOnAnInactiveSession_WithoutActivatingIt()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+        host.Deactivate(sessionId);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionArchive(sessionId), "x", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.NotNull(host.Store.ReadSpec(ProjectKey.FromPath(_work), sessionId).ArchivedAt);
+        Assert.False(host.TryGetActivated(sessionId, out _));   // 没有被顺手激活
+    }
+
+    // 三条销毁命令共用「在跑 ⇒ 拒绝」：不是原地掐断——`Stepper` 的收尾会把 state.json
+    // 写回去，留下一个有 state、没 spec 的目录，而 `ListSessions` 静默跳过它。
+    [Theory]
+    [InlineData("deactivate")]
+    [InlineData("archive")]
+    [InlineData("delete")]
+    public async Task DestructiveCommands_RefuseARunningSession(string which)
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+        MakeRunning(host, sessionId);
+
+        CoreCommand command = which switch
+        {
+            "deactivate" => new CoreCommand.SessionDeactivate(sessionId),
+            "archive" => new CoreCommand.SessionArchive(sessionId),
+            _ => new CoreCommand.SessionDelete(sessionId),
+        };
+
+        var r = await d.DispatchAsync(command, "x", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(r.Ack);
+        Assert.Contains("正在跑", ((Ack.Rejected)r.Ack).Reason);
+        // 半删都没发生：目录、激活项都在。
+        Assert.NotNull(host.Store.FindSession(sessionId));
+        Assert.True(host.TryGetActivated(sessionId, out _));
+    }
+
+    [Fact]
+    public async Task Delete_RemovesTheDirectory_AndTheSessionDisappears()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionDelete(sessionId), "x", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.False(host.Store.SessionExists(ProjectKey.FromPath(_work), sessionId));
+        Assert.Empty(host.Store.ListSessions(ProjectKey.FromPath(_work)));
+    }
+
+    [Fact]
+    public async Task Delete_OnAMissingSession_IsRejected()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionDelete("nope"), "x", false, CancellationToken.None);
+
+        Assert.Contains("不存在", ((Ack.Rejected)r.Ack).Reason);
+    }
+
+    // ⚠️ 该会话占的声明要一并释放，并在回执里**点名**——用户可能正靠那几条锁挡着别人。
+    [Fact]
+    public async Task Delete_ReleasesItsClaims_AndNamesThem()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+
+        var claims = new ClaimStore(_work);
+        claims.Save([
+            new Claim(sessionId, ProjectKey.FromPath(_work), Path.Combine(_work, "src", "a.cs"), DateTimeOffset.UtcNow),
+            new Claim("someone-else", ProjectKey.FromPath(_work), Path.Combine(_work, "src", "b.cs"), DateTimeOffset.UtcNow),
+        ]);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionDelete(sessionId), "x", false, CancellationToken.None);
+
+        var note = ((Ack.Accepted)r.Ack).Note!;
+        Assert.Contains("a.cs", note);
+
+        // 自己那条没了，**别人的那条还在**——只摘自己的。
+        var left = new ClaimStore(_work).All();
+        Assert.Equal(["someone-else"], left.Select(c => c.SessionId));
+    }
+
+    // 删除**只发项目流**：会话 topic 上的订阅者已经无处可投，钉在上面是泄漏。
+    [Fact]
+    public async Task Delete_PublishesOnTheProjectTopic_ButNotTheSessionTopic()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var bus = new EventBus();
+        var d = new CommandDispatcher(host, bus, h => new Stepper(host.Store, _adapter), _ => _adapter);
+        var sessionId = await CreateSessionAsync(d);
+
+        using var session = bus.Subscribe(EventBus.SessionTopic(sessionId));
+        using var project = bus.Subscribe(EventBus.ProjectTopic(ProjectKey.FromPath(_work)));
+
+        await d.DispatchAsync(new CoreCommand.SessionDelete(sessionId), "x", false, CancellationToken.None);
+
+        Assert.True(project.Reader.TryRead(out var p));
+        Assert.Equal(sessionId, Assert.IsType<WireEvent.SessionDeleted>(p.Payload).SessionId);
+        Assert.False(session.Reader.TryRead(out _), "会话已经没了，会话流上不该再发");
+    }
+
+    // 声明在自己工作目录的 `claims.json` 里 ⇒ 只需要一个 store；**别扫所有项目**
+    // （那会在别人的目录上做读-改-写）。
+    [Fact]
+    public async Task Delete_LeavesOtherProjectsClaimsAlone()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var other = Path.Combine(Path.GetTempPath(), "lilara-other-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(other);
+
+        try
+        {
+            var mine = await CreateSessionAsync(d);
+            var r = await d.DispatchAsync(
+                new CoreCommand.SessionCreate { Cwd = other }, "c2", false, CancellationToken.None);
+            var theirs = ((Ack.Accepted)r.Ack).SessionId!;
+
+            new ClaimStore(other).Save([
+                new Claim(theirs, ProjectKey.FromPath(other), Path.Combine(other, "x.cs"), DateTimeOffset.UtcNow),
+            ]);
+
+            await d.DispatchAsync(new CoreCommand.SessionDelete(mine), "x", false, CancellationToken.None);
+
+            Assert.Single(new ClaimStore(other).All());   // 别的项目原封不动
+        }
+        finally
+        {
+            if (Directory.Exists(other)) Directory.Delete(other, recursive: true);
+        }
     }
 
     // ---- provider 的模型清单（头的模型下拉靠它） ----

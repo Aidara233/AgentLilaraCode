@@ -96,16 +96,25 @@ public sealed record SessionHandle
 
     public void ExitStep() => Volatile.Write(ref _step, 0);
 
-    public static SessionHandle Create(SessionStore store, string workingDirectory, ModelSelection model)
+    public static SessionHandle Create(
+        SessionStore store, string workingDirectory, ModelSelection model, string? title = null)
     {
-        var projectKey = Kernel.ProjectKey.FromPath(workingDirectory);
+        // ⚠️ **一次取绝对路径，三处共用同一个值**：算 key、写 spec、定目录。
+        // 改之前是**两次独立的** `GetFullPath`（`ProjectKey.FromPath` 内部一次、
+        // `spec.WorkingDirectory` 一次）——两次恰好同意，所以没出过事；但键的判据
+        // （`TrimEnd(分隔符)` + 小写）与存下来的路径本来就**不是**同一个规范化，
+        // 而 `session.create` 现在要接受**任意** cwd ⇒ 把这条隐含依赖收成显式的一行。
+        var fullPath = Path.GetFullPath(workingDirectory);
+        var projectKey = Kernel.ProjectKey.FromPath(fullPath);
         var spec = new SessionSpec
         {
             SessionId = Guid.NewGuid().ToString("N")[..12],
             ProjectKey = projectKey,
-            WorkingDirectory = Path.GetFullPath(workingDirectory),
+            WorkingDirectory = fullPath,
             CreatedAt = DateTimeOffset.UtcNow,
             Model = model,
+            // 没给就是 null ⇒ `WhenWritingNull` 整个键不出现 ⇒ 老金样逐字节不变。
+            Title = title,
         };
         var state = new SessionState
         {
@@ -273,6 +282,13 @@ public sealed record SessionHandle
     /// 原子换 <see cref="Spec"/> **并落盘**——「`session.configure` 的写回点」。
     /// 与 <see cref="UpdateStateAndPersist"/> **同形、同锁**，这不是巧合：
     /// `Spec` 与 `State` 是 handle 上仅有的两份可变数据，同一个交错问题、同一把锁。
+    ///
+    /// <para>⚠️ **`change` 是值级的 `Func&lt;SessionSpec, SessionSpec&gt;`，不是「算好整份再交进来」。**
+    /// 两者曾经都在用，而区别不是风格：**只要 `change` 里要读旧的 <see cref="Spec"/> 的任何一个字段**，
+    /// 引用级那条就得在**调用方**先读一次 `handle.Spec` —— 那一次**在锁外**，
+    /// 于是「读到的旧值」与「被换掉的那份」可以来自不同的两代（正是 <see cref="_gate"/> 要关掉的窗口）。
+    /// `session.configure` 一开始不需要读旧值（它把 `before` 整个捕获了），所以那个洞没露出来；
+    /// 加 `Title` 之后它要在锁内读旧标题 ⇒ 必须走这一条。</para>
     ///
     /// <para>⚠️ **落盘走 `SessionStore.WriteSpec`，它是原子的**（`AtomicFile`：写 `.tmp` 再 `Move`），
     /// 所以崩溃不会留下半截 `spec.json`。这条与 <see cref="Create"/> 里「先 state 后 spec」

@@ -50,8 +50,37 @@ public abstract record CoreCommand
     /// </summary>
     public sealed record ProviderTest(string Id) : CoreCommand;
 
-    /// <summary>**显式动作**——核心不替你决定该有个会话。</summary>
-    public sealed record SessionCreate : CoreCommand;
+    /// <summary>
+    /// 建一个会话。**显式动作**——核心不替你决定该有个会话（`01` §8.1）。
+    ///
+    /// <para>名字 `Cwd` 取自设计（`03` §3 的 `session.create(projectKey?, preset?, cwd?)`）：
+    /// 它就是新会话的**工作目录**，而工作目录决定它落在哪个项目
+    /// （`ProjectKey.FromPath` 是纯函数）——所以「选项目」与「选工作目录」是同一件事。</para>
+    ///
+    /// <para>⚠️ <b>只有一条来路：目录。不给 ⇒ 回落核心的工作目录</b>（控制台 `session create`
+    /// 一直就是这个行为，别改掉它）。</para>
+    ///
+    /// <para>⚠️ <b>为什么没有「按 projectKey 建」那一半</b>：**项目键单独一个字段是没法用的**——
+    /// 键是从路径推出来的，反向推不回去；盘上唯一记着目录的地方是**会话的** `spec.json`，
+    /// 而一个项目可能一个会话都不剩（全删了）。那样的命令会在<i>有时候</i>可用、
+    /// 其余时候报一句用户无从补救的错。头那边本来就有路径（从会话 spec 推的），
+    /// 直接交路径，两边都简单。</para>
+    ///
+    /// <para>⚠️ <b><see cref="Title"/> 只能在这里设一次，此后没有任何命令能改它</b>
+    /// （所以没有 `session.renamed` 事件）。⇒ 别做成「点一下给个临时名」：
+    /// 名字是**永久**的，工具不该替用户起名。</para>
+    /// </summary>
+    public sealed record SessionCreate : CoreCommand
+    {
+        /// <summary>
+        /// 新会话的工作目录（绝对或相对，核心会规范化）。
+        /// **不存在 ⇒ 拒绝，核心不替你建目录**（建目录是策略，`00` §1.3）。
+        /// </summary>
+        public string? Cwd { get; init; }
+
+        /// <summary>会话名，可选（可人为空 ⇒ 存 null，整个键不落盘）。</summary>
+        public string? Title { get; init; }
+    }
 
     public sealed record SessionActivate(string SessionId) : CoreCommand;
 
@@ -82,6 +111,53 @@ public abstract record CoreCommand
     /// 「换过去了但那个供应商连不上」是**业务结果**，走 `error` 事件。</para>
     /// </summary>
     public sealed record SessionConfigure(string SessionId, string? ProviderId, string? ModelId) : CoreCommand;
+
+    /// <summary>
+    /// 把会话**摘出内存**。⚠️ **磁盘上什么都没变**——这正是它与
+    /// <see cref="SessionArchive"/> 的分界：那是持久事实，这只是这份进程的内存账。
+    ///
+    /// <para>⚠️ **在跑 ⇒ 拒绝**，不是「原地掐断」：`Stepper` 的收尾会把 `state.json`
+    /// 写回去，而目录一旦在它眼里「不该存在」，写回就是**半删状态**的制造机。
+    /// 三条销毁命令共用这条判据。</para>
+    ///
+    /// <para>⚠️ **它切出一个读盘窗口**：会话被摘出去之后，一个**还在跑**的会话
+    /// （头那一侧看起来还是「在跑」）若被重拉快照，会落到磁盘那份 **`Idle`**
+    /// ⇒ 用户以为没在跑、再点一次发送 ⇒ 队列两条 ⇒ 烧钱。
+    /// ⇒ 快照端点在激活表 miss 时**必须回落 `Activate`**（`ControlServer.TryFind` 与
+    /// `SessionQueries.StateOf` 的调用方都写了这一条），不许直接交磁盘那份。</para>
+    /// </summary>
+    public sealed record SessionDeactivate(string SessionId) : CoreCommand;
+
+    /// <summary>
+    /// 归档 / 取消归档。<see cref="Archived"/> 是 **`bool?`**：
+    /// <c>null</c> = 归档，<c>false</c> = **取消归档**。
+    ///
+    /// <para>⚠️ **不许把它写成 `bool Archived = false` 那种带默认值的形态。** 那样
+    /// 每一个「只写了 `SessionArchive(id)`」的调用点会**静默变成取消归档**——
+    /// 而这条命令没有别的测试拦得住（默认值让两种意图在类型上长得一样）。
+    /// 三态是刻意的：唯一能撤销归档的方式就是重跑同一条命令。</para>
+    ///
+    /// <para>⚠️ **归档不是销毁**：目录不动、记录一条不少、`ListSessions` **照列**它
+    /// （过滤在显示层：头折叠、控制台不折叠）。所以它**不释放声明**——
+    /// 释放一条不是自己占的锁是越权，而 `session.delete` 才做，因为那时占用者**已经不存在了**。</para>
+    /// </summary>
+    public sealed record SessionArchive(string SessionId, bool? Archived = null) : CoreCommand;
+
+    /// <summary>
+    /// **删掉会话**——目录、记录、状态一起。**不可逆**：`history.jsonl` 是只追加永不重写的，
+    /// 这一刀之后记录就没有了。
+    ///
+    /// <para>⚠️ **在跑 ⇒ 拒绝**（见 <see cref="SessionDeactivate"/> 的理由）。</para>
+    ///
+    /// <para>⚠️ 该会话占的**声明会被一并释放**（在别的会话的工作目录里也可能有），
+    /// 回执里**点名**释放了哪几条。理由：模型失控、占着一堆锁的时候，
+    /// 恰恰是最想删掉那个会话的时候——「有锁就拒」会让这条命令在最需要它的时候用不了。</para>
+    ///
+    /// <para>⚠️ 前端那个「键入 id 才放行」的确认是**防误点**，不是并发屏障：
+    /// 真正的屏障是核心这边「检查 + 删」在同一个调用里（两个核心共享数据根时，
+    /// 前端在离得远的地方做的检查挡不住互删）。</para>
+    /// </summary>
+    public sealed record SessionDelete(string SessionId) : CoreCommand;
 
     /// <summary>占用一片区域。路径可以是相对的，按会话的工作目录解析。</summary>
     /// <param name="Scope">

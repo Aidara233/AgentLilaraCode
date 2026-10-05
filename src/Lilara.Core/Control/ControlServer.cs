@@ -191,12 +191,32 @@ public sealed class ControlServer(
         // 读 spec 不用 TryFind：本类的 TryFind 会 Activate 会话，一个 GET 端点不该产生状态副作用。
         app.MapGet("/claims", () =>
         {
-            var claims = ProjectKeys()
+            var projectKeys = ProjectKeys();
+
+            // ⚠️ **`stale`**：`session.delete` 是两步（先摘声明、再删目录），崩在中间会留下
+            // 「sessionId 指向一个已经不存在的会话」的声明；手删目录、或另一个核心删掉也会。
+            // 它不是半删的会话目录（那个更糟，见 `01` §8），是**过期的项目级数据**——
+            // 今天**不自动清理**（在别人正活跃地写 claims.json 时从别处删条目会打架，
+            // 那属于 GC 一整块的事），但必须**看得见**，否则它会静静地骗人（「这个文件有人占着」）。
+            //
+            // ⚠️ 判据用 `SessionExists`（看**目录**）而不是 `FindSession`（要读得出 spec）：
+            // 后者对**损坏的 spec.json** 返回 null ⇒ 一个真实存在、只是配置坏了的会话
+            // 会被判成「已消失」，它的声明被误报成 stale。
+            var pks = projectKeys.ToList();
+            bool SessionAlive(string sessionId) =>
+                pks.Any(pk => host.Store.SessionExists(pk, sessionId));
+
+            var claims = projectKeys
                 .SelectMany(pk => host.Store.ListSessions(pk)
                     .Select(id => host.Store.TryReadSpec(pk, id)))
                 .Where(spec => spec is not null)
                 .SelectMany(spec => new ClaimStore(spec!.WorkingDirectory).All())
                 .Distinct()
+                .Select(c => new
+                {
+                    c.SessionId, c.ProjectKey, c.Path, c.At,
+                    Stale = !SessionAlive(c.SessionId),
+                })
                 .ToList();
 
             return Results.Json(claims, WireJson.Options);
@@ -428,7 +448,13 @@ public sealed class ControlServer(
         var kind = payload.GetProperty("kind").GetString()!;
         return kind switch
         {
-            "session.create" => new CoreCommand.SessionCreate(),
+            // 两个字段全走 Opt：**键缺失 = 「没给」**（回落规则在 dispatcher）。
+            // 用 GetProperty 会让「只起名、不选目录」这种常见形态抛 KeyNotFoundException。
+            "session.create" => new CoreCommand.SessionCreate
+            {
+                Cwd = Opt(payload, "cwd"),
+                Title = Opt(payload, "title"),
+            },
             "session.activate" => new CoreCommand.SessionActivate(payload.GetProperty("sessionId").GetString()!),
             "session.interrupt" => new CoreCommand.SessionInterrupt(payload.GetProperty("sessionId").GetString()!),
             "session.start" => new CoreCommand.SessionStart(payload.GetProperty("sessionId").GetString()!),
@@ -452,6 +478,16 @@ public sealed class ControlServer(
             "claim.release" => new CoreCommand.ClaimRelease(
                 payload.GetProperty("sessionId").GetString()!,
                 payload.GetProperty("scope").Deserialize<List<string>>(WireJson.Options)!),
+            // ---- 销毁面 ----
+            "session.deactivate" => new CoreCommand.SessionDeactivate(
+                payload.GetProperty("sessionId").GetString()!),
+            // ⚠️ `archived` 走 `OptBool` 而不是 GetProperty：**键缺失 = 归档**（三态的中性那一档）。
+            // 用 `GetProperty(...).GetBoolean()` 会逼着头每次都显式发一个 true，
+            // 而「没给」在这条命令里是**有意义的**（= 归档），不是「用户没填」。
+            "session.archive" => new CoreCommand.SessionArchive(
+                payload.GetProperty("sessionId").GetString()!, OptBool(payload, "archived")),
+            "session.delete" => new CoreCommand.SessionDelete(
+                payload.GetProperty("sessionId").GetString()!),
             "provider.upsert" => new CoreCommand.ProviderUpsert(
                 payload.GetProperty("id").GetString()!,
                 // apiKey 必须走 Opt：GetProperty 在键缺失时抛 KeyNotFoundException，
@@ -476,6 +512,19 @@ public sealed class ControlServer(
         static string? Opt(JsonElement e, string name) =>
             e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
 
+        // 布尔版。⚠️ **只认 `true` / `false` 两个字面量**，其余（缺失 / null / 字符串 `"false"` /
+        // 数字）一律当「没给」⇒ 在 `session.archive` 上就是**归档**。
+        // 把 `"false"` 也认成 false 会开一个「前端传了个字符串也能改语义」的口子，
+        // 而 JSON 里布尔本来就有它自己的形状。与 `Opt` / `OptStringList` 同一个粒度取舍。
+        static bool? OptBool(JsonElement e, string name) => e.TryGetProperty(name, out var v)
+            ? v.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                _ => null,
+            }
+            : null;
+
         // 字符串数组版。⚠️ 与 `Opt` 一样「只认形状对的」：键缺失 / 不是数组 / 元素不是字符串 ⇒ null。
         // 元素不是字符串这一条**不**报错而是整份当没给——与 `Opt` 的取舍一致（`provider.upsert`
         // 的兄弟字段都是这个粒度），且「头传了半份清单」这种形状不会比「没传」更可信。
@@ -497,22 +546,16 @@ public sealed class ControlServer(
     {
         if (host.TryGetActivated(sessionId, out handle!)) return true;
 
-        foreach (var dir in ProjectDirs())
-        {
-            var pk = Path.GetFileName(dir);
-            if (host.Store.TryReadSpec(pk, sessionId) is null) continue;
-            handle = host.Activate(pk, sessionId);
-            return true;
-        }
-        return false;
+        // ⚠️ **miss 时必须回落 `Activate`，不许在这里交磁盘那份。**
+        // `SessionQueries.StateOf` / `CoreHost.TryGetActivated` / `/state` 三处都写着同一条：
+        // 步进行中**磁盘上是 `Idle`**（`Running` 只写内存、到步末才落盘）。
+        // 少了这条回落，一个刚被 `session.deactivate` 摘掉的会话——而头那一侧看着它还在跑——
+        // 会被渲染成「空闲」，用户以为没在跑、**再点一次发送** ⇒ 队列两条 ⇒ 烧钱。
+        if (host.Store.FindSession(sessionId) is not { } found) return false;
+
+        handle = host.Activate(found.ProjectKey, sessionId);
+        return true;
     }
 
-    private IReadOnlyList<string> ProjectKeys() =>
-        ProjectDirs().Select(d => Path.GetFileName(d)!).ToList();
-
-    private IEnumerable<string> ProjectDirs()
-    {
-        var root = host.Store.ProjectsRoot;
-        return Directory.Exists(root) ? Directory.GetDirectories(root) : [];
-    }
+    private IReadOnlyList<string> ProjectKeys() => host.Store.ListProjects();
 }

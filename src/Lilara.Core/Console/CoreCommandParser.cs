@@ -50,6 +50,22 @@ public static class CoreCommandParser
         return t.Length == token.Length || char.IsWhiteSpace(t[token.Length]);
     }
 
+    // 「以 `session` 打头、第二个词恰好是 `create`」——`session create` 词块入口的判据。
+    // 首词走共用的 `StartsWithToken`（与 claim / axis 同一份判据），第二个词单独切。
+    // ⚠️ 判据是**相等不是前缀**：`session creates foo` 必须落回「当消息」——写成
+    // `StartsWith("session create")` 会让它悄悄变成一条建会话命令，而用户以为在发消息。
+    // （这就是本批加测试时发现的既有缺陷；`session activate` 那几条靠尾随空格躲过了它。）
+    private static bool IsSessionCreateVerb(string line)
+    {
+        if (!StartsWithToken(line, "session")) return false;
+
+        // 0 个词 = 光杆 `session`：由 Parse 里那条用法提示接走，这里不认它。
+        var words = line.Trim()["session".Length..]
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+
+        return words.Length >= 1 && string.Equals(words[0], "create", StringComparison.OrdinalIgnoreCase);
+    }
+
     // 「以 axis 打头、第二个词是 set」——axis set 词块入口的判据（首词走共用的 StartsWithToken）。
     // axis settings 落回「普通消息」：set 之后切出的第一个词是 settings 而非 set。
     // 放宽的只有动词大小写——轴名与取值仍由 dispatcher 里的 Axes.TryParse 校验并规范化。
@@ -70,7 +86,12 @@ public static class CoreCommandParser
     {
         var trimmed = line.Trim();
 
-        if (trimmed.StartsWith("session create", StringComparison.Ordinal)) return (new CoreCommand.SessionCreate(), null);
+        // ⚠️ **不能写成裸 `StartsWith("session create")`**：那样 `session creates foo`
+        // 也以它打头 ⇒ 被吞成一条 `session.create`，而**用户以为在发一条消息**。
+        // （这条是本批加测试时才发现的既有缺陷；`session activate` 那几条靠尾随空格躲过了它，
+        //  只有 `create` 因为「光杆形态也必须成立」而躲不过。）
+        // 边界用 `char.IsWhiteSpace`（宽）：窄口径下 `create` 后面跟 Tab 会两边都不认 ⇒ 静默变成消息。
+        if (IsSessionCreateVerb(trimmed)) return ParseSessionCreate(trimmed);
 
         if (trimmed.StartsWith("session activate ", StringComparison.Ordinal))
             return (new CoreCommand.SessionActivate(trimmed["session activate ".Length..].Trim()), null);
@@ -87,6 +108,19 @@ public static class CoreCommandParser
         // 被当成消息发给会话（用户以为设了轴，实际烧了一次模型调用、轴没设）。
         if (IsAxisSetVerb(trimmed))
             return ParseAxisSet(trimmed);
+
+        // ---- 销毁面：三条都只带一个会话 id，判词数就行（id 的合法性在 dispatcher）----
+        // ⚠️ 判据走 `StartsWith` + 尾随空格，与 `session activate` / `interrupt` 同一形状：
+        // 那几条靠这个空格躲开了「session xxxs 被吞成命令」的缺陷（`session create` 躲不过，
+        // 所以它单独有一个 `IsSessionCreateVerb`）。
+        if (trimmed.StartsWith("session deactivate ", StringComparison.Ordinal))
+            return OneWord(trimmed, "session deactivate ", id => new CoreCommand.SessionDeactivate(id));
+
+        if (trimmed.StartsWith("session delete ", StringComparison.Ordinal))
+            return OneWord(trimmed, "session delete ", id => new CoreCommand.SessionDelete(id));
+
+        if (trimmed.StartsWith("session archive ", StringComparison.Ordinal))
+            return ParseSessionArchive(trimmed);
 
         // 光一个 `axis` 不能落回「当成消息」——用户以为在设轴（`axis set` 已被上面截住）。
         if (string.Equals(trimmed, "axis", StringComparison.OrdinalIgnoreCase))
@@ -111,8 +145,10 @@ public static class CoreCommandParser
         if (string.Equals(trimmed, "provider", StringComparison.OrdinalIgnoreCase)
             || string.Equals(trimmed, "session", StringComparison.OrdinalIgnoreCase))
             return (null, "用法：provider list | provider set <id> … | provider delete <id> | provider test <id>"
-                + "\n      session list | session create | session activate <id> | session interrupt <id>"
-                + "\n      session configure <id> [--provider <pid>] [--model <m>]");
+                + "\n      session list | session create [--cwd <目录>] [--title <名>]"
+                + " | session activate <id> | session interrupt <id>"
+                + "\n      session configure <id> [--provider <pid>] [--model <m>]"
+                + "\n      session deactivate <id> | session archive <id> [--unarchive] | session delete <id>");
 
         // 光一个 `provider delete` 不能落回「当成消息」——用户以为删了，而 provider 还在盘上。
         if (string.Equals(trimmed, "provider delete", StringComparison.Ordinal))
@@ -124,6 +160,17 @@ public static class CoreCommandParser
         // 光一个 `session configure` 不能落回「当成消息」——用户以为在改绑，实际烧了一次模型调用。
         if (string.Equals(trimmed, "session configure", StringComparison.Ordinal))
             return (null, "用法：session configure <会话 id> [--provider <pid>] [--model <m>]");
+
+        // ⚠️ **光杆的销毁动词同样不能落回「当成消息」**：`session delete` 若被当成消息发出去，
+        // 用户以为删了，而**会话还在、还烧了一次模型调用**。三条各给各的用法。
+        if (string.Equals(trimmed, "session deactivate", StringComparison.Ordinal))
+            return (null, "用法：session deactivate <会话 id>");
+
+        if (string.Equals(trimmed, "session delete", StringComparison.Ordinal))
+            return (null, "用法：session delete <会话 id>");
+
+        if (string.Equals(trimmed, "session archive", StringComparison.Ordinal))
+            return (null, "用法：session archive <会话 id> [--unarchive]");
 
         if (IsClaimList(trimmed)) return (null, null);
 
@@ -166,6 +213,36 @@ public static class CoreCommandParser
                 : (make(sid, path), null);
     }
 
+    // `session deactivate <id>` / `session delete <id>`：只判「前缀之后恰好一个词」。
+    // 多一个词（或少了）都报错，不猜——猜错的方向是**动错会话**，而这两条一条不可逆、
+    // 一条会丢掉内存里的账。
+    private static (CoreCommand?, string?) OneWord(string line, string prefix, Func<string, CoreCommand> make)
+    {
+        var parts = line[prefix.Length..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+
+        return parts.Length == 1 ? (make(parts[0]), null) : (null, $"用法：{prefix.TrimEnd()} <会话 id>");
+    }
+
+    // `session archive <id> [--unarchive]`
+    //
+    // ⚠️ **`--unarchive` 是标志位，不带值**——所以这里切词而不是用「标志 + 值」成对的循环
+    //（那种循环会把 `--unarchive` 自己当成一个值的键）。
+    // ⚠️ 只有一个词 ⇒ `Archived` 是 **null**（那份三态的中性档 = 归档）。
+    // 别的写法（比如 `--archive true/false`）会把「没给」与「给定 false」混起来，
+    // 而那正是 `SessionArchive` 用 `bool?` 要防的事。
+    private static (CoreCommand?, string?) ParseSessionArchive(string line)
+    {
+        var parts = line["session archive ".Length..]
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+
+        if (parts.Length == 1) return (new CoreCommand.SessionArchive(parts[0]), null);
+
+        if (parts.Length == 2 && string.Equals(parts[1], "--unarchive", StringComparison.OrdinalIgnoreCase))
+            return (new CoreCommand.SessionArchive(parts[0], Archived: false), null);
+
+        return (null, "用法：session archive <会话 id> [--unarchive]");
+    }
+
     // `axis set <sessionId> <axis> <value>`：token 数必须正好 5（切词用 Split(null)，
     // Tab / NBSP 与空格等价，与入口判据同一口径）。少了或多了都报错，
     // 不静默取前三个、也不落回「当成消息」。
@@ -177,6 +254,46 @@ public static class CoreCommandParser
                 + "；取值见 `status`）");
 
         return (new CoreCommand.SessionSetAxis(parts[2], parts[3], parts[4]), null);
+    }
+
+    // `session create [--cwd <目录>] [--title <名>]`
+    //
+    // ⚠️ **光杆的 `session create` 必须继续成立**（今天控制台的默认手感），
+    // 所以这个解析器**不用通用的标志循环**：词数为 2 就是「什么都不给」，直接返回。
+    // 用 `provider set` 那种「从 3 起每次跳两格」的循环会在这里越界。
+    //
+    // ⚠️ 标志名用 `--cwd` 而不是 `--project`：那个值**就是**工作目录，
+    // 而「项目」是它派生出来的（`ProjectKey.FromPath`）。叫 `--project` 会让人
+    // 以为可以传一个项目键进来，而那个形状是**做不了**的（见 `SessionCreate` 的注释）。
+    // 语义校验（目录在不在）**在 dispatcher**，这里只拆词。
+    private static (CoreCommand?, string?) ParseSessionCreate(string line)
+    {
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 2) return (new CoreCommand.SessionCreate(), null);
+
+        string? cwd = null, title = null;
+
+        for (var i = 2; i < parts.Length; i += 2)
+        {
+            if (i + 1 >= parts.Length) return (null, $"参数 {parts[i]} 缺少值。");
+
+            var value = parts[i + 1];
+
+            // 值被下一个标志占了位置 ⇒ 报错（与 `provider set` 同一份守卫）。
+            if (value.StartsWith("--", StringComparison.Ordinal)) return (null, $"参数 {parts[i]} 缺少值。");
+
+            switch (parts[i])
+            {
+                case "--cwd": cwd = value; break;
+                case "--title": title = value; break;
+
+                // 未知标志必须拒绝：拼错的 --cwd 会被静默吞掉、照常建出一个会话，
+                // 而它**落在了核心的工作目录**而不是用户想要的地方。
+                default: return (null, $"未知参数 '{parts[i]}'。");
+            }
+        }
+
+        return (new CoreCommand.SessionCreate { Cwd = cwd, Title = title }, null);
     }
 
     // `provider set <id> [--key <k>] [--model <m>] [--protocol <p>] [--endpoint <u>] [--auth <a>] [--models a,b,c]`

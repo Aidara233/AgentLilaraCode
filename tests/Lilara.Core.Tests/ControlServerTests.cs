@@ -478,6 +478,215 @@ public class ControlServerTests : IAsyncLifetime
         Assert.True(ack.GetProperty("accepted").GetBoolean());
     }
 
+    // ---- 销毁面的线上解析（第三条线）----
+
+    // ⚠️ 这一段单列的理由：`ParseCommand` 是命令的**第三条线**，缺了它头发的帧会落到
+    // `_ => throw`（回一句「认不出的命令」）。dispatcher 与解析器的测试**都测不到这里**——
+    // 那正是「四条线」这条规则存在的原因。
+    [Fact]
+    public async Task Wire_Deactivate_ReachesTheDispatcher()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        await SendAsync(ws, Command("d", "session.deactivate", "\"sessionId\":\"" + sid + "\""));
+        var ack = await AckFor(ws, "d");
+
+        Assert.True(ack.GetProperty("accepted").GetBoolean(), "线上必须认得出 session.deactivate");
+        Assert.False(_host.TryGetActivated(sid, out _));
+    }
+
+    // `archived` 键**缺失** ⇒ 归档（三态的中性档）。写成 GetProperty(...).GetBoolean()
+    // 会让这条帧直接抛 KeyNotFoundException ⇒ 头永远归档不了。
+    [Fact]
+    public async Task Wire_Archive_WithoutTheArchivedKey_MeansArchive()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        var pk = Kernel.ProjectKey.FromPath(_work);
+
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        await SendAsync(ws, Command("a", "session.archive", "\"sessionId\":\"" + sid + "\""));
+        var ack = await AckFor(ws, "a");
+
+        Assert.True(ack.GetProperty("accepted").GetBoolean());
+        Assert.NotNull(_host.Store.ReadSpec(pk, sid).ArchivedAt);
+    }
+
+    [Fact]
+    public async Task Wire_Archive_WithArchivedFalse_MeansUnarchive()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        var pk = Kernel.ProjectKey.FromPath(_work);
+        await _dispatcher.DispatchAsync(new CoreCommand.SessionArchive(sid), "seed", false, CancellationToken.None);
+
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        await SendAsync(ws, Command("u", "session.archive", "\"sessionId\":\"" + sid + "\"", "\"archived\":false"));
+        var ack = await AckFor(ws, "u");
+
+        Assert.True(ack.GetProperty("accepted").GetBoolean());
+        Assert.Null(_host.Store.ReadSpec(pk, sid).ArchivedAt);
+    }
+
+    // ⚠️ `"false"`（**字符串**）不能被当成 false：只认 JSON 的布尔字面量。
+    // 认了的话前端传个字符串就能悄悄改语义——而这条命令的 false 是「取消归档」，
+    // 与「归档」是两个相反的动作。
+    [Fact]
+    public async Task Wire_Archive_WithAStringFalse_IsTreatedAsMissing_SoItArchives()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        var pk = Kernel.ProjectKey.FromPath(_work);
+
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        await SendAsync(ws, Command("s", "session.archive", "\"sessionId\":\"" + sid + "\"", "\"archived\":\"false\""));
+        var ack = await AckFor(ws, "s");
+
+        Assert.True(ack.GetProperty("accepted").GetBoolean());
+        Assert.NotNull(_host.Store.ReadSpec(pk, sid).ArchivedAt);   // 归档了，不是取消
+    }
+
+    [Fact]
+    public async Task Wire_Delete_ReachesTheDispatcher()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        var pk = Kernel.ProjectKey.FromPath(_work);
+
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        await SendAsync(ws, Command("x", "session.delete", "\"sessionId\":\"" + sid + "\""));
+        var ack = await AckFor(ws, "x");
+
+        Assert.True(ack.GetProperty("accepted").GetBoolean());
+        Assert.False(_host.Store.SessionExists(pk, sid));
+    }
+
+    // `session.create` 的两个可空字段：**键缺失 = 回落**，用 GetProperty 会抛。
+    [Fact]
+    public async Task Wire_Create_WithCwdAndTitle_ReachesTheDispatcher()
+    {
+        var other = Path.Combine(Path.GetTempPath(), "lilara-wire-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(other);
+        var pk = Kernel.ProjectKey.FromPath(other);
+
+        try
+        {
+            using var ws = new ClientWebSocket();
+            await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+            // JSON 里的路径要转义反斜杠——手拼的 `"E:\Temp"` 是**非法 JSON**（\T 不是合法转义）。
+            var cwd = other.Replace("\\", "\\\\");
+            await SendAsync(ws, Command("n", "session.create", "\"cwd\":\"" + cwd + "\"", "\"title\":\"wire-made\""));
+            var ack = await AckFor(ws, "n");
+
+            Assert.True(ack.GetProperty("accepted").GetBoolean());
+            var sid = ack.GetProperty("sessionId").GetString()!;
+            var spec = _host.Store.ReadSpec(pk, sid);
+            Assert.Equal("wire-made", spec.Title);
+            Assert.Equal(pk, spec.ProjectKey);
+        }
+        finally
+        {
+            if (Directory.Exists(other)) Directory.Delete(other, recursive: true);
+        }
+    }
+
+    // 光一个 `{"kind":"session.create"}`（一个字段都不给）必须仍然成立——
+    // 这是头今天发的形状，也是「不给就回落」那条契约的最小形态。
+    [Fact]
+    public async Task Wire_Create_WithNoFields_StillWorks()
+    {
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        await SendAsync(ws, """{"kind":"command","id":"bare","payload":{"kind":"session.create"}}""");
+        var ack = await AckFor(ws, "bare");
+
+        Assert.True(ack.GetProperty("accepted").GetBoolean());
+    }
+
+    // ⚠️ `/claims` 必须交出 `stale`：`session.delete` 是两步（先摘声明、再删目录），
+    // 崩在中间会留下「主人已经不在了」的声明。核心**不自动清理**它（那是 GC 的事），
+    // 但**必须看得见**——否则它会静静骗人：「这个文件有人占着」，而那个「人」没了。
+    [Fact]
+    public async Task Claims_FlagsOnesWhoseSessionIsGone()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        var pk = Kernel.ProjectKey.FromPath(_work);
+
+        // 一条主人的会话还在，一条的主人是个不存在的 id。
+        new ClaimStore(_work).Save([
+            new Claim(sid, pk, Path.Combine(_work, "a.cs"), DateTimeOffset.UnixEpoch),
+            new Claim("ghost", pk, Path.Combine(_work, "b.cs"), DateTimeOffset.UnixEpoch),
+        ]);
+
+        using var doc = JsonDocument.Parse(await Client.GetStringAsync(Http("/claims")));
+        var rows = doc.RootElement.EnumerateArray().ToList();
+
+        Assert.False(rows.Single(r => r.GetProperty("path").GetString()!.EndsWith("a.cs"))
+            .GetProperty("stale").GetBoolean());
+        Assert.True(rows.Single(r => r.GetProperty("path").GetString()!.EndsWith("b.cs"))
+            .GetProperty("stale").GetBoolean());
+    }
+
+    // ⚠️ 判据走**目录存在**而不是「spec 读得出来」：损坏的 `spec.json` 让后者返回 null
+    // ⇒ 一个真实存在、只是配置坏了的会话，它**活着的**声明会被误报成 stale。
+    //
+    // ⚠️ 这条测试必须**两个会话共用同一个工作目录**才成立，而这不是凑数：
+    // `/claims` 是**按工作目录**去读 `claims.json` 的，而工作目录只有 `spec.json` 里有。
+    // spec 一坏，那个会话就进不了 `ListSessions` ⇒ **它的工作目录根本不会被访问到**，
+    // 它自己的声明连出现都不会出现（那是 `/claims` 枚举方式的既有性质，不是本批引入的）。
+    // ⇒ 损坏的会话只有在**别人替它把工作目录带进来**时才会出现在列表里，而那时
+    //   `stale` 的判据才有机会判错。**没有这一条，两种判据的行为完全一样、测不出差别。**
+    [Fact]
+    public async Task Claims_DoesNotFlagASessionWhoseSpecIsMerelyCorrupt()
+    {
+        var a = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c1", false, CancellationToken.None);
+        var b = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c2", false, CancellationToken.None);
+        var sidA = ((Ack.Accepted)a.Ack).SessionId!;
+        var sidB = ((Ack.Accepted)b.Ack).SessionId!;
+        var pk = Kernel.ProjectKey.FromPath(_work);
+
+        new ClaimStore(_work).Save([new Claim(sidA, pk, Path.Combine(_work, "a.cs"), DateTimeOffset.UnixEpoch)]);
+
+        // 把 A 的 spec 弄坏：A 的**目录还在**（会话没消失），只是读不出来。
+        File.WriteAllText(Path.Combine(_host.Store.SessionDirectory(pk, sidA), "spec.json"), "{ broken");
+
+        using var doc = JsonDocument.Parse(await Client.GetStringAsync(Http("/claims")));
+        var row = doc.RootElement.EnumerateArray().Single();   // 靠 B 把工作目录带进来
+
+        Assert.Equal(sidA, row.GetProperty("sessionId").GetString());
+        Assert.False(row.GetProperty("stale").GetBoolean(),
+            "损坏 ≠ 消失；误报 stale 会让用户去删一条活着的声明");
+    }
+
+    // 收帧直到找到指定 id 的回执（中间会有事件帧）。
+    private static async Task<JsonElement> AckFor(ClientWebSocket ws, string id)
+    {
+        for (var i = 0; i < 10; i++)
+        {
+            var f = await ReceiveAsync(ws);
+            if (f.GetProperty("kind").GetString() == "ack"
+                && f.TryGetProperty("id", out var got) && got.GetString() == id)
+                return f;
+        }
+        throw new Xunit.Sdk.XunitException($"没有收到 id='{id}' 的回执");
+    }
+
+    // 一条命令帧。⚠️ **用拼接而不是 `$$"""`**：内插原始字符串里，载荷末尾的 `}}` 会被
+    // 当成内插洞的收尾（CS9007）——本文件那几处老测试也踩过同一个坑。
+    // `fields` 是**已经转义好的** JSON 片段（形如 `"sessionId":"abc"`）。
+    private static string Command(string id, string kind, params string[] fields) =>
+        "{\"kind\":\"command\",\"id\":\"" + id + "\",\"payload\":{\"kind\":\"" + kind + "\""
+        + (fields.Length == 0 ? "" : "," + string.Join(",", fields))
+        + "}}";
+
     // 初始轴值必须来自快照：axis.changed 只在订阅之后才有，头刚打开页面时没有事件可等；
     // 少了它五个下拉全空，用户看到的「空」与「默认值」无法区分。
     [Fact]
@@ -553,8 +762,8 @@ public class ControlServerTests : IAsyncLifetime
                 .ToArray();
 
         Assert.Equal(
-            ["CreatedAt:DateTimeOffset", "Model:ModelSelection", "ProjectKey:String",
-             "SessionId:String", "WorkingDirectory:String"],
+            ["ArchivedAt:Nullable`1", "CreatedAt:DateTimeOffset", "Model:ModelSelection",
+             "ProjectKey:String", "SessionId:String", "Title:String", "WorkingDirectory:String"],
             Shape(typeof(SessionSpec)));
 
         // 嵌套那层也要钉——key 加在这里会序列化成 spec.model.apiKey，顶层看不见。

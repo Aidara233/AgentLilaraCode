@@ -15,6 +15,9 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(SpecChanged), "spec.changed")]
 [JsonDerivedType(typeof(ClaimAcquired), "claim.acquired")]
 [JsonDerivedType(typeof(ClaimReleased), "claim.released")]
+[JsonDerivedType(typeof(SessionDeactivated), "session.deactivated")]
+[JsonDerivedType(typeof(SessionArchived), "session.archived")]
+[JsonDerivedType(typeof(SessionDeleted), "session.deleted")]
 [JsonDerivedType(typeof(Error), "error")]
 public abstract record WireEvent
 {
@@ -50,6 +53,47 @@ public abstract record WireEvent
 
     // 业务失败走这里（模型 400 / 上游 503）；回执里的 rejected 只用于「命令本身不合法」。
     public sealed record Error(string SessionId, string Message) : WireEvent;
+
+    // ---- 销毁面（三条都是「会话没了/变了」，不是「会话里发生了什么」）----
+    //
+    // ⚠️ 载荷都是 `(SessionId, ProjectKey)`，与上面那条 `SessionCreated` 对称——
+    // **不是** `SessionSpec` 那种「别的东西也可能变」的形状（那是 `spec.changed` 的活）。
+    //
+    // ⚠️ 三条的**投递范围不一样**，理由见各自的注释。
+
+    /// <summary>
+    /// 会话被摘出内存（`session.deactivate`）。**磁盘上什么都没变**——这正是它与
+    /// <see cref="SessionArchived"/> 的分界：那是持久事实，这只是这一份进程的内存账。
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ 发在**会话流 + 项目流**：会话还在，头可能正开着它。
+    /// ⚠️ 但**头对它的处理是「什么都不做」**——头的界面完全不显示「激活」这件事
+    /// （快照端点会自己回落磁盘）。发它是因为**另一个客户端**（控制台）也在盯这条流，
+    /// 而「摘掉了」对它是可观测的。别因为头不用就把它删掉。
+    /// </remarks>
+    public sealed record SessionDeactivated(string SessionId, string ProjectKey) : WireEvent;
+
+    /// <summary>
+    /// 归档态变了（`session.archive`）。<c>ArchivedAt</c> 为 <c>null</c> = **取消归档**。
+    /// 头据此折叠/展开左栏那一行。
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ 带 `ArchivedAt` 而不是一个 bool：**取消归档**与「从没归档过」在 bool 下是同一个值，
+    /// 而它们是两回事（后者不会产生这条事件，前者会）。
+    /// </remarks>
+    public sealed record SessionArchived(
+        string SessionId, string ProjectKey, DateTimeOffset? ArchivedAt) : WireEvent;
+
+    /// <summary>
+    /// 会话**被删掉了**（`session.delete`）。目录、记录、状态一起没了。
+    /// 头据此把它从列表里拿掉；若它正开着，必须清空中栏。
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ **只发项目流，不发会话流**：会话 topic 上的订阅者**已经无处可投**
+    /// ——那条流之后不会再有这个会话的任何事件，钉在上面是泄漏。
+    /// （`session.created` 那两份投递里「会话流那份」是既有的死投递，本批**不动**它。）
+    /// </remarks>
+    public sealed record SessionDeleted(string SessionId, string ProjectKey) : WireEvent;
 
     // 参数类型必须是 WireEvent（基类）：泛型版在静态类型推断成子类时会静默丢掉判别式。
     public static string StableSerialize(WireEvent value) =>
