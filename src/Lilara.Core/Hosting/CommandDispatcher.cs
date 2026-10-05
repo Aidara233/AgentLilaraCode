@@ -267,11 +267,20 @@ public sealed class CommandDispatcher(
     ///
     /// <para>⚠️ **设备名那一臂在删除路径上是「纵深防御」，不是当前生效的那道防线**——
     /// 别把这条读成「文件系统在这里不安全」。实测（`net10.0`）：`File.Exists("…/providers/NUL.json")`
-    /// 返回 **false 且不抛** ⇒ `ProviderStore.Delete` 的预检先短路，**`File.Delete` 根本走不到**
-    /// （与 `.`/`..` 那条同级：留着是因为**万一预检被去掉**，`File.Delete` 对 `NUL`/`CON`
-    /// 抛的是 `UnauthorizedAccessException`；而 `/abs` 那类没预检则会真的删掉外面的东西）。
-    /// ⚠️ 那它为什么还留着？因为**没有它会回一句假话**：`delete NUL` 会答「没有提供商 'NUL'，无从删除。」
-    /// ——把一个**被拒绝的非法 id** 说成**不存在**，而用户会去翻 `providers/` 找一个本该被拒的输入。</para>
+    /// 返回 **false 且不抛** ⇒ `ProviderStore.Delete` 里那个 `File.Exists` 先短路，
+    /// **`File.Delete` 根本走不到**（与 `.`/`..` 那条同级：留着是因为**万一那道预检被去掉**，
+    /// 实测 `File.Delete` 对 `NUL`/`CON` 抛 `UnauthorizedAccessException`，而 `COM1.json` **不抛**——
+    /// 所以它今天挡的是「将来预检被撤掉」那一格，不是当前这一格）。</para>
+    ///
+    /// <para>⚠️ **别把两道防线说成一个 `预检`**：挡住 `NUL` 这类的是
+    /// **`ProviderStore.Delete` 里的 `File.Exists`**；而挡住 `/abs` 那种**绝对路径**的是
+    /// **本方法上面那道闸**——`PathFor("/abs")` 解析成 `/abs.json`（`Path.Combine` 的第二段带根
+    /// 会把第一段整个丢掉）⇒ **`providers/` 之外**，若那里真有个文件，`File.Exists` 就是 true、
+    /// **那道预检拦不住它**。（两条都实测过。）</para>
+    ///
+    /// <para>⚠️ 那设备名这一臂为什么还留着？因为**没有它会回一句假话**：`delete NUL` 会答
+    /// 「没有提供商 'NUL'，无从删除。」——把一个**被拒绝的非法 id** 说成**不存在**，
+    /// 而用户会去翻 `providers/` 找一个本该被拒的输入。</para>
     ///
     /// <para>⚠️ **不存在 ⇒ 拒绝，不是幂等成功。** 本项目一路在收「静默的成功」：
     /// `provider delet local`（拼错）若回 ✓，用户以为删掉了、其实没删，

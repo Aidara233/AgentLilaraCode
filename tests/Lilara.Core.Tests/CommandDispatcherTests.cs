@@ -373,7 +373,8 @@ public class CommandDispatcherTests : IDisposable
     ///
     /// <para>`Load` 把**损坏**的文件也当作「不存在」⇒ 若有人把 dispatcher 的判据改成
     /// `Load(d.Id) is null`，一个坏配置会**永远删不掉**，而**「把一个坏配置删掉」正是用户最想做的事**。
-    /// ⚠️ 上面三条删除测试**全都抓不到**这个改动：它们用的是**能正常解析**的文件
+    /// ⚠️ **其余三条删除测试全都抓不到**这个改动（`RemovesTheStoredDefinition` / `BoundBySession`
+    /// / `InvalidatesTheCache`——**不都是在本条之上**）：它们用的是**能正常解析**的文件
     /// ⇒ `Load` 非 null、判据照样通过。⇒ 这一条是那块缺口唯一的钉子。</para>
     ///
     /// <para>⚠️ 断言要**落在盘上**（文件真的没了）——只断言 ack 是半条判据。</para>
