@@ -396,8 +396,45 @@ Spec = handle.Spec,
 ⚠️ **头已经抄错一次**：`head/wwwroot/index.html` 的引导文案写死 `--protocol claude-messages`
 ——而 `claude-messages` 只是**默认值**，不是「唯一能用的」，这正是用户第一次配置时踩的坑。
 
-- [ ] **Step 1: 测试**：断言响应含 `protocols`（= `Protocols.All` 的元素）、
-  `authSchemes`（= api-key / bearer）、以及 T1 定下的 `providerIdRule`（人话一句）。
+- [ ] **Step 1: 测试**（写进 `ControlServerTests`）
+
+```csharp
+[Fact]
+public async Task ProviderSchema_CarriesTheTruthItOwns()
+{
+    using var s = JsonDocument.Parse(await Client.GetStringAsync(Http("/provider-schema")));
+
+    // ⚠️ **与真相来源对拍，不写死字面量**——写死的话，这个端点与 `Protocols.All`
+    //    分叉了测试也不会红，而「不许手抄」正是这个端点存在的理由。
+    var protocols = s.RootElement.GetProperty("protocols").EnumerateArray()
+        .Select(e => e.GetString()).ToList();
+    Assert.Equal(Protocols.All, protocols);
+
+    var auth = s.RootElement.GetProperty("authSchemes").EnumerateArray()
+        .Select(e => e.GetString()).ToList();
+    Assert.Equal([AuthSchemes.ApiKey, AuthSchemes.Bearer], auth);
+
+    // ⚠️ **人话规则要含设备名那一档**——它是 T1c 补上的、最容易被漏掉的一类，
+    //    而头要靠这句话**预先**挡掉用户手打的 `NUL`（不然用户撞的是「核心崩了」）。
+    Assert.Contains("设备名", s.RootElement.GetProperty("providerIdRule").GetString());
+}
+
+/// <summary>
+/// ⚠️ **`defaultModel` 有意**不交——它今天**没有可信来源**（核过：`claude-opus-5` 只出现在
+/// `CommandDispatcher` 的兜底那一处，而 `IModelAdapter` 不交默认模型）。
+/// ⇒ 交它 = 要么复制一份（G10），要么**发明**一个来源。
+/// ⚠️ 这条断言是**反向的**，因为「下一个人顺手补上它」是最可能发生的事：
+/// 他觉得 schema 里少个默认模型是缺陷，而**它是有意缺席的**。
+/// </summary>
+[Fact]
+public async Task ProviderSchema_DeliberatelyOmitsTheDefaultModel()
+{
+    using var s = JsonDocument.Parse(await Client.GetStringAsync(Http("/provider-schema")));
+
+    Assert.False(s.RootElement.TryGetProperty("defaultModel", out _));
+    Assert.False(s.RootElement.TryGetProperty("model", out _));
+}
+```
 - [ ] **Step 2–4: 红 → 实现 → 绿**
 
 ```csharp
@@ -458,6 +495,29 @@ if (p.ApiKey is null && existing is null)
 
 ⚠️ `ApiKey` 在 `ProviderDefinition` 上是 `required`——改成 `required` 保留但**构造时必给值**
 （用 `p.ApiKey ?? existing!.ApiKey`），别把 `required` 去掉（那会让别的构造点静默漏填）。
+
+⚠️ **`ControlServer.ParseCommand` 那一处是个陷阱，别漏。** 现在它是：
+
+```csharp
+"provider.upsert" => new CoreCommand.ProviderUpsert(
+    payload.GetProperty("id").GetString()!,
+    payload.GetProperty("apiKey").GetString()!,     // ⚠️ 键【缺失】时 GetProperty 会**抛**，
+    ...                                              //    不是返回 null
+```
+
+⇒ 键缺失时 `JsonElement.GetProperty` 抛 `KeyNotFoundException`（实测的 .NET 行为），
+而**它会被 `HandleCommandAsync` 的 `catch (Exception ex)` 接住**、回一句
+`命令形状不对：…` ⇒ 头收到的是**「形状不对」而不是「省略 key 就是保留旧的」**。
+⇒ **必须把 `apiKey` 并进它旁边那个 `Opt(...)` 辅助**（同一次改，别分两次动这个臂）：
+
+```csharp
+    payload.GetProperty("id").GetString()!,
+    Opt(payload, "apiKey"),                         // ⚠️ 缺失 ⇒ null ⇒ 语义是「保留旧 key」，
+    Opt(payload, "model"), Opt(payload, "protocol"), Opt(payload, "endpoint"), Opt(payload, "auth")),
+```
+⚠️ **测试要覆盖「帧里根本没有 `apiKey` 键」这一条**（不是「`"apiKey": null`」）——
+两个前端里只有控制台走文本解析，**线上是 JSON**，而 JSON 的「省略」就是**键不存在**。
+只测控制台会漏掉这个臂（这正是 G16 那条「两个前端」的形状）。
 
 - [ ] **Step 5: 提交** `feat(core): provider.upsert 的 apiKey 可选（省略=保留旧 key）——头读不到 key，不然永远改不了已有 provider`
 
