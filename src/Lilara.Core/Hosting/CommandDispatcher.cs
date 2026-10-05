@@ -45,6 +45,9 @@ public sealed class CommandDispatcher(
             case CoreCommand.ProviderUpsert p:
                 return HandleProviderUpsert(p, commandId);
 
+            case CoreCommand.ProviderDelete d:
+                return HandleProviderDelete(d, commandId);
+
             case CoreCommand.SessionCreate:
                 return HandleSessionCreate(commandId);
 
@@ -168,9 +171,7 @@ public sealed class CommandDispatcher(
         // ⚠️ 判据住在 dispatcher，不在控制台——控制台与头是两个前端，
         // 放前端会被另一个绕过（本项目的规范，G16）。
         if (!IsSafeProviderId(p.Id))
-            return Reject(id, $"提供商 id '{p.Id}' 不合法：它会变成 providers/ 下的文件名，"
-                + "必须是**非空**、**不含路径语法**（分隔符 / `..` / 非法字符）、"
-                + "且**不是 Windows 设备名**（`NUL` / `CON` / `COM1` …）的单纯文件名。");
+            return Reject(id, UnsafeProviderIdReason(p.Id));
 
         // ⚠️ 语义校验在这里，不在控制台——否则线上能写进坏值。
         if (p.Protocol is not null && !Protocols.All.Contains(p.Protocol))
@@ -244,6 +245,55 @@ public sealed class CommandDispatcher(
         _host.InvalidateSteppers();
 
         return new DispatchResult(new Ack.Accepted { CommandId = id, Note = effectiveProtocol });
+    }
+
+    /// <summary>
+    /// ⚠️ **坏 id 的拒绝理由只此一份**：`provider.upsert` 与 `provider.delete` 共用同一个闸
+    /// （<see cref="IsSafeProviderId"/>）⇒ 理由也该是同一句。两处各写一句会漂，
+    /// 而漂的表现是「**同一个坏 id，两条命令给出不同的解释**」——用户不知道该信哪句。
+    /// </summary>
+    private static string UnsafeProviderIdReason(string id) =>
+        $"提供商 id '{id}' 不合法：它会变成 providers/ 下的文件名，"
+        + "必须是**非空**、**不含路径语法**（分隔符 / `..` / 非法字符）、"
+        + "且**不是 Windows 设备名**（`NUL` / `CON` / `COM1` …）的单纯文件名。";
+
+    /// <summary>
+    /// 删掉一个提供商（`04` §1.1 的 `provider.delete`）。
+    ///
+    /// <para>⚠️ **同一个闸，且必须在「任何文件系统调用之前」。** `ProviderStore.Delete` 走
+    /// 同一个 `PathFor(id)` ⇒ `delete ../escaped` 会删掉 `<数据根>/escaped.json`——
+    /// **`providers/` 之外**的东西。而**删是不可逆的**：闸若漏了或挪到删除之后，
+    /// ack 仍会是 `rejected`，而那个文件**已经没了**。⇒ 闸放在最前面。
+    /// （`delete NUL` 那类设备名同理：`File.Delete` 会抛未捕获异常掀翻常驻进程——
+    /// 别指望文件系统自己安全地失败。）</para>
+    ///
+    /// <para>⚠️ **不存在 ⇒ 拒绝，不是幂等成功。** 本项目一路在收「静默的成功」：
+    /// `provider delet local`（拼错）若回 ✓，用户以为删掉了、其实没删，
+    /// 而下一次发消息用的还是那个凭据。理由里**点名那个 id**——手打了三个 provider 时，
+    /// 光说「没有这个提供商」他不知道是哪一个。</para>
+    ///
+    /// <para>⚠️ **删一个正被会话引用的 provider **不阻止**（R-A：想改啥都行）**——
+    /// 用户可能就是要把一个坏配置删掉，`SessionSpec` 的存在**不构成**「不能删」的理由。
+    /// 但**后果要可见**：删完 `InvalidateSteppers()`，那个会话下次发消息会走
+    /// `StepperResolver` 的「绑定的提供商已不存在」那条路（已实现；`Program.cs` 启动时也报）。</para>
+    /// </summary>
+    private DispatchResult HandleProviderDelete(CoreCommand.ProviderDelete d, string id)
+    {
+        if (!IsSafeProviderId(d.Id))
+            return Reject(id, UnsafeProviderIdReason(d.Id));
+
+        // ⚠️ 判据走 `ProviderStore.Delete` 的返回值（**文件层**：那个文件在不在）——
+        // **别在这里改成 `Load(d.Id) is null`**：`Load` 把损坏的文件也算「不存在」，
+        // 于是坏配置会永远删不掉（见 `ProviderStore.Delete` 的注释）。
+        if (!_host.Providers.Delete(d.Id))
+            return Reject(id, $"没有提供商 '{d.Id}'，无从删除。");
+
+        // ⚠️ **失效点必须在这里**，不能挂在控制台的字符串判据上——那是个**字符串**判据，
+        // 线上的 `provider.delete` 走不到它 ⇒ 缓存**静默失效**，
+        // 用户删了 provider 而会话还在用那份已经删掉的配置跑（与 upsert 同源的理由）。
+        _host.InvalidateSteppers();
+
+        return new DispatchResult(new Ack.Accepted { CommandId = id });
     }
 
     private DispatchResult HandleSessionCreate(string id)

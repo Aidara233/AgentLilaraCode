@@ -198,6 +198,35 @@ public class ReplTests : IDisposable
         Assert.Contains("gemini", _out.ToString());
     }
 
+    /// <summary>
+    /// ⚠️ **控制台的 `provider delete &lt;id&gt;`：文件真的没了，而且用户看得见**（G14 的第 ④ 条线）。
+    ///
+    /// <para>⚠️ **两个判据缺一不可**：
+    /// ① 盘上没了——少了它，「解析成命令但 handler 没接」也算过；
+    /// ② **印了一句话**——`ProviderDelete` 落进 `DispatchAsync` 的 `default`
+    /// 就是 `PrintReply(null)` ⇒ **一声不吭**：用户分不清「删了」与「没反应」，
+    /// 而那正是本项目一路在收的「静默成功」。⇒ 断言**专属措辞**，不是「有输出就行」。</para>
+    /// </summary>
+    [Fact]
+    public async Task ProviderDelete_RemovesTheFileAndSaysSo()
+    {
+        _providers.Save(new ProviderDefinition
+        {
+            Id = "gw",
+            Protocol = Protocols.ClaudeMessages,
+            ApiKey = "sk-x",
+            DefaultModel = "m",
+            Modality = "vision",
+        });
+
+        var repl = NewRepl();
+        await repl.ExecuteAsync("provider delete gw", CancellationToken.None);
+
+        Assert.Null(_providers.Load("gw"));                  // ⚠️ 盘上真没了
+        Assert.Contains("已删除", _out.ToString());          // ⚠️ 而且吭了一声
+        Assert.Contains("gw", _out.ToString());              // ⚠️ 点名删的是哪一个
+    }
+
     [Fact]
     public async Task ProviderSet_RejectsAFlagAsAValue()
     {

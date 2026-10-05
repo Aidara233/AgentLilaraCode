@@ -136,6 +136,13 @@ public sealed class Repl(
                         + $"（{accepted.Note}）。");
                     break;
 
+                // ⚠️ **删成功了要吭一声**：`Ack.Accepted.Reply` 是 null ⇒ 不加这条 case 就落进
+                // `default: PrintReply(null)` ⇒ **一声不吭**。用户分不清「删了」与「没反应」——
+                // 而删是**不可逆**的，「以为删了」的下一步往往是去重配一个已经不在的 id。
+                case CoreCommand.ProviderDelete del:
+                    _out.WriteLine($"✓ 提供商 '{del.Id}' 已删除。");
+                    break;
+
                 case CoreCommand.SessionCreate:
                     // ⚠️ 控制台的「当前会话」在这里被设——**只有控制台自己的动作**能设它。
                     Current = _host.Activated.First(h => h.SessionId == accepted.SessionId);

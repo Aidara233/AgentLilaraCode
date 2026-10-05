@@ -150,6 +150,18 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("provider set ", StringComparison.Ordinal))
             return ParseProviderSet(trimmed);
 
+        // ⚠️ **G14 的第 ④ 条线：控制台语法**（计划裁定 ④：与 `provider set` **对称**）。
+        // 没有它就会造出「配得进、删不掉」的形状——今天正是如此（只能手删文件）。
+        // ⚠️ 代价（若裁定变）：`04` §1.1 的「控制台不多一条命令」若被判定为连对称的删也算，
+        // 则应撤掉这条——但那样 `provider set` 也该只在线上，而它是既有的。
+        if (trimmed.StartsWith("provider delete ", StringComparison.Ordinal))
+            return ParseProviderDelete(trimmed);
+
+        // ⚠️ 「光一个 `provider delete`」不能落回「当成消息」——用户以为删了，
+        // 实际把这行字发给了会话，而 provider **还在盘上**（与 `axis` 那条同一个形状）。
+        if (string.Equals(trimmed, "provider delete", StringComparison.Ordinal))
+            return (null, "用法：provider delete <id>");
+
         if (IsClaimList(trimmed)) return (null, null);
 
         // ⚠️ **入口判据与 `IsClaimList` 共用同一个谓词**（`IsClaimVerb`）——
@@ -300,5 +312,28 @@ public static class CoreCommandParser
         //（G14：`apiKey` 从必填变可选动的是命令的形状，四条线缺一处就是**静默失效**）。
         // 「新 provider 省 key 要拒」那条语义在 dispatcher，**别在这里再写一遍**。
         return (new CoreCommand.ProviderUpsert(id, key, model, protocol, endpoint, auth), null);
+    }
+
+    /// <summary>
+    /// `provider delete &lt;id&gt;`。
+    ///
+    /// <para>⚠️ **与 `provider set` 对称——这是计划裁定 ④**（理由：`provider set` 有控制台语法
+    /// 而 `provider delete` 没有，会造出「配得进、删不掉」的形状；今天只能手删文件）。</para>
+    ///
+    /// <para>⚠️ **id 的合法性不在这里判**：那是 dispatcher 的闸（`IsSafeProviderId`），
+    /// 控制台与头两个前端**共用同一条判据**（G16）。这里只判**词数**——
+    /// 少一个词或多一个词都**报错**、不猜（猜错的方向在这里是**删错东西**）。</para>
+    ///
+    /// <para>⚠️ **入口与 `provider set` 同形状**（`StartsWith("provider delete ")`，`Ordinal`）：
+    /// 那个尾随空格就是词边界（`provider deletex` 进不来，见 `ParserTests` 的反向对照）。</para>
+    /// </summary>
+    private static (CoreCommand?, string?) ParseProviderDelete(string line)
+    {
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        // parts[0]=="provider" · parts[1]=="delete" ⇒ 恰好 3 段才有一个 id。
+        return parts.Length == 3
+            ? (new CoreCommand.ProviderDelete(parts[2]), null)
+            : (null, "用法：provider delete <id>");
     }
 }

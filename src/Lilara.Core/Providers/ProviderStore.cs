@@ -37,8 +37,31 @@ public sealed class ProviderStore(string dataRoot)
         }
     }
 
-    public IReadOnlyList<ProviderDefinition> List()
+    /// <summary>
+    /// 删掉 <paramref name="id"/> 的定义，返回**是否真有一个文件被移除**。
+    ///
+    /// <para>⚠️ **判据是「那个文件在不在」（文件层），不是 `Load(id) is null`。**
+    /// `Load` 把**损坏**的文件也当作「不存在」⇒ 用它会得到一个**永远删不掉的坏配置**，
+    /// 而「把一个坏配置删掉」正是用户最想做的事（也是本任务明确不许加闸的那件事）。
+    /// 调用方（dispatcher）用这个返回值判「不存在 ⇒ 拒绝」。</para>
+    ///
+    /// <para>⚠️ **`id` 的合法性不在这里判**：闸是 `CommandDispatcher.IsSafeProviderId`，
+    /// 在 dispatcher 里、且必须在**调用本方法之前**（控制台与头共用那一条判据，G16）。
+    /// 本方法只做一件事：把 `PathFor(id)` 指到的那个文件移除。</para>
+    /// </summary>
+    public bool Delete(string id)
     {
+        var path = PathFor(id);
+
+        // ⚠️ **先看再删。** `File.Delete` 对不存在的文件是**静默 no-op**（既不抛也不报），
+        // 所以它自己交不出「有没有删掉」这个判据——而调用方要的正是它。
+        if (!File.Exists(path)) return false;
+
+        File.Delete(path);
+        return true;
+    }
+
+    public IReadOnlyList<ProviderDefinition> List()    {
         if (!Directory.Exists(_root)) return [];
 
         return Directory.GetFiles(_root, "*.json")

@@ -346,9 +346,113 @@ public class CommandDispatcherTests : IDisposable
         Assert.Equal(Protocols.OpenAiChat, after.Protocol);       // 而这一项**真的改了**
     }
 
-    /// <summary>挂起的适配器：让测试能精确控制「模型什么时候返回」。</summary>
-    private sealed class GatedAdapter(Func<Task<string>> gate) : Lilara.Core.Adapters.IModelAdapter
+    /// <summary>
+    /// ⚠️ **删掉之后盘上真的没有了**——这一条钉的是「四条线」里 dispatcher 那条的**盘上后果**。
+    ///
+    /// <para>⚠️ **只断言 ack 是半条判据**：ack 说 accepted 而文件还在的那种错，
+    /// 用户以为删了、下次发消息还在用那个凭据（`StepperResolver` 会照旧载入它）。
+    /// ⇒ 判据必须落在盘上（`Load` 为 null / 文件不存在）。</para>
+    /// </summary>
+    [Fact]
+    public async Task ProviderDelete_RemovesTheStoredDefinition()
     {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+
+        var r = await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderDelete("p"), "c", true, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.Null(host.Providers.Load("p"));                       // ⚠️ 读不到了
+        Assert.Empty(host.Providers.List());                        // 且列表里也没了
+    }
+
+    /// <summary>
+    /// ⚠️ **删一个不存在的 id ⇒ `Rejected`，且理由点名那个 id——不是幂等成功。**
+    ///
+    /// <para>理由：本项目一路在收「静默的成功」。`provider delet local`（拼错）若回 ✓，
+    /// 用户以为删掉了、其实没删，而下一次发消息用的还是那个凭据。
+    /// 「点名 id」是必需的：用户手打了三个 provider 时，只说「没有这个提供商」他不知道是哪一个。</para>
+    ///
+    /// <para>⚠️ **不变的那半也要断言**：拒绝时**不许**顺手清缓存、也不许动别的文件——
+    /// 一次没做成的命令不该有任何副作用。</para>
+    /// </summary>
+    [Fact]
+    public async Task ProviderDelete_OfAProviderThatDoesNotExist_IsRejected_NamingTheId()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);                                          // 盘上有 "p"
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+
+        var r = await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderDelete("local"), "c", true, CancellationToken.None);
+
+        var rejected = Assert.IsType<Ack.Rejected>(r.Ack);
+        Assert.Contains("local", rejected.Reason);                   // ⚠️ 理由点名那个 id
+        Assert.NotNull(host.Providers.Load("p"));                    // ⚠️ 别的 provider 一根汗毛没动
+    }
+
+    /// <summary>
+    /// ⚠️ **删一个正被会话引用的 provider 不阻止**（R-A：想改啥都行；用户可能就是要把一个坏配置删掉）
+    /// ——`SessionSpec` 的存在**不构成**「不能删」的理由。
+    ///
+    /// <para>⚠️ 但**后果必须可见**：删完 `InvalidateSteppers()`，被引用的会话下次发消息
+    /// 会走 `StepperResolver` 的「绑定的提供商已不存在」那条路（已实现）。
+    /// 断言那条路真的被走到（`UnconfiguredAdapter`），而不只是「缓存对象换了」——
+    /// 后者在「删了但换了个同样坏的」时也会成立。</para>
+    ///
+    /// <para>⚠️ **必须先 `StepperFor` 一次把缓存捂热**（`before`）：不预热的话缓存里本来就
+    /// 没有该会话那一条 ⇒ 删完再解析**必然**是新对象 ⇒ 这条测试在「`InvalidateSteppers()`
+    /// 被删掉」时**照样绿**（实测：变异 3 下只有隔壁那条红）。预热之后，
+    /// 少了失效的那一句就会把**旧的那个**还回来 ⇒ 这条也红。</para>
+    /// </summary>
+    [Fact]
+    public async Task ProviderDelete_OfAProviderBoundByASession_IsAccepted_NotBlocked()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+        var sessionId = await CreateSessionAsync(dispatcher);        // 会话绑到 "p"
+        host.TryGetActivated(sessionId, out var handle);
+
+        var before = host.StepperFor(handle);                        // ⚠️ 把缓存捂热（见上）
+
+        var r = await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderDelete("p"), "c", true, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);                          // ⚠️ 不阻止（没有「谁在用」的闸）
+        Assert.Null(host.Providers.Load("p"));                       // 而且真删了
+
+        var after = host.StepperFor(handle);                         // 下一次解析走的是……
+        Assert.NotSame(before, after);                               // ⚠️ 缓存真的失效了
+        Assert.IsType<UnconfiguredAdapter>(after.Adapter);           // ⚠️ 「绑定的提供商已不存在」那条路
+    }
+
+    /// <summary>
+    /// ⚠️ **失效点必须在 dispatcher 里**（与 upsert 同源）：挂在控制台的字符串判据上，
+    /// 线上的 `provider.delete` 走不到它 ⇒ 缓存**静默失效**，
+    /// 用户删了 provider 而会话还在用**那个已经被删掉的**配置跑。
+    /// ⚠️ 这条**不建会话**、直接看缓存对象换没换——与上面那条「被引用的会话」分工不同。
+    /// </summary>
+    [Fact]
+    public async Task ProviderDelete_InvalidatesTheStepperCache()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+        var sessionId = await CreateSessionAsync(dispatcher);
+        host.TryGetActivated(sessionId, out var handle);
+
+        var before = host.StepperFor(handle);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderDelete("p"), "c", true, CancellationToken.None);
+
+        Assert.NotSame(before, host.StepperFor(handle));
+    }
+
+    /// <summary>挂起的适配器：让测试能精确控制「模型什么时候返回」。</summary>
+    private sealed class GatedAdapter(Func<Task<string>> gate) : Lilara.Core.Adapters.IModelAdapter    {
         public Lilara.Core.Adapters.ResolvedEndpoint? Endpoint => null;
         public string Protocol => Protocols.ClaudeMessages;
 

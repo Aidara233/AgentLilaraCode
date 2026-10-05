@@ -23,6 +23,18 @@ public abstract record CoreCommand
         string Id, string? ApiKey, string? Model, string? Protocol, string? Endpoint, string? Auth)
         : CoreCommand;
 
+    /// <summary>
+    /// 删掉一个提供商定义（移除 `<数据根>/providers/&lt;id&gt;.json`）。
+    ///
+    /// <para>⚠️ **`Id` 与 <see cref="ProviderUpsert.Id"/> 走的是同一个闸**
+    /// （`CommandDispatcher.IsSafeProviderId`），而这条上更要紧：**删是不可逆的**。
+    /// `Id` 决定删**哪个**文件——坏 id（`../escaped`）会让它在 `providers/` **之外**动手，
+    /// 而那种删除**挽不回来**（`upsert` 用同一个 id 只是把文件写到怪地方，没毁掉别的）。</para>
+    ///
+    /// <para>⚠️ **不存在 ⇒ 拒绝，不是幂等成功**——判据在 dispatcher（两个前端共用）。</para>
+    /// </summary>
+    public sealed record ProviderDelete(string Id) : CoreCommand;
+
     /// <summary>⚠️ **显式动作**——核心不替你决定该有个会话（`01` §8.1）。</summary>
     public sealed record SessionCreate : CoreCommand;
 

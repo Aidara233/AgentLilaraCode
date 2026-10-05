@@ -150,4 +150,49 @@ public class ProviderStoreTests : IDisposable
         Assert.Equal(new[] { "good" }, _store.List().Select(d => d.Id));
         Assert.Null(_store.Load("bad"));
     }
+
+    /// <summary>
+    /// ⚠️ **`Delete` 的返回值是「有没有真的删掉一个文件」，判据在**文件层**，不是 `Load(id) != null`。**
+    ///
+    /// <para>⚠️ 差别不是风格：`Load` 把**损坏**的文件也当作「不存在」。
+    /// 若 dispatcher 用 `Load(...) is null` 来判「不存在 ⇒ 拒绝」，
+    /// 那么一个**损坏的** `providers/&lt;id&gt;.json` **永远删不掉**——
+    /// 而「删掉一个坏配置」正是用户最想做的事（也是本任务明确不许加闸的那件事）。</para>
+    /// </summary>
+    [Fact]
+    public void Delete_RemovesTheFile_AndReportsThatItDid()
+    {
+        _store.Save(Def("gw"));
+
+        Assert.True(_store.Delete("gw"));                       // ⚠️ 真删了 ⇒ true
+        Assert.Null(_store.Load("gw"));                         // 读不到了
+        Assert.False(File.Exists(Path.Combine(_root, "providers", "gw.json")));
+        Assert.Empty(_store.List());
+    }
+
+    /// <summary>
+    /// ⚠️ **不存在 ⇒ `false`**（调用方据此回 rejected，**不是**幂等成功）。
+    /// 这条同时钉住「别用 `File.Delete` 的静默 no-op 当判据」：它对不存在的文件**不抛也不报**。
+    /// </summary>
+    [Fact]
+    public void Delete_OnAnAbsentId_ReportsThatItDidNothing()
+    {
+        Assert.False(_store.Delete("nope"));
+    }
+
+    /// <summary>
+    /// ⚠️ **损坏的 provider 文件必须删得掉**——这一条钉的是上面那条判据的**选取理由**。
+    /// 用 `Load != null` 判存在性的实现，在这里会**返回 false**（`Load` 吞掉 `JsonException` 返回 null）
+    /// ⇒ 坏配置永远删不掉。⇒ 这就是「判据一处、且在文件层」的可观测后果。
+    /// </summary>
+    [Fact]
+    public void Delete_RemovesACorruptFileToo()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "providers"));
+        var bad = Path.Combine(_root, "providers", "bad.json");
+        File.WriteAllText(bad, "{ this is not json");
+
+        Assert.True(_store.Delete("bad"));
+        Assert.False(File.Exists(bad));
+    }
 }

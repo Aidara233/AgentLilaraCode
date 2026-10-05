@@ -460,4 +460,68 @@ public class ParserTests
         var c = Assert.IsType<CoreCommand.ProviderUpsert>(cmd);
         Assert.Equal("sk-abc", c.ApiKey);
     }
+
+    /// <summary>
+    /// ⚠️ **G14 的第 ④ 条线：控制台语法**（`provider delete &lt;id&gt;`）。
+    ///
+    /// <para>⚠️ **判据是「它被解析成命令」——不是「它没报错」。** 少了这一臂，
+    /// 这一行会掉进兜底的 <c>(null, null)</c> ⇒ **当成普通消息发给会话**：
+    /// 用户以为删了，实际烧了一次模型调用，而 provider **还在盘上**、
+    /// 下一次发消息用的还是那个凭据。这正是本任务从头防到尾的「静默接管」。</para>
+    /// </summary>
+    [Fact]
+    public void ProviderDelete_ParsesTheId()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("provider delete p");
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.ProviderDelete>(cmd);
+        Assert.Equal("p", c.Id);
+    }
+
+    /// <summary>
+    /// ⚠️ **少了 id 必须报错，不能落回「当成消息」**（brief 的原话）。
+    ///
+    /// <para>⚠️ **两半都要断言**：只断 <c>Command is null</c> 的话，
+    /// 「报错」与「不是命令形态（⇒ 当消息发出去）」**无法区分**——
+    /// 而后者才是危险的那一支。所以这里同时钉 <c>Error 非 null</c>。</para>
+    /// </summary>
+    [Fact]
+    public void ProviderDelete_WithoutAnId_IsAnError_NotAMessage()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("provider delete");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);   // ⚠️ 不是 (null, null)：那一支会被 Repl 当成消息发出去
+    }
+
+    /// <summary>
+    /// ⚠️ **多给一个词要报错，不许猜**——与 `claim` / `axis set` 对多余词报错同一套理。
+    /// 猜的代价在这里是**删错东西**：`provider delete p q` 若静默取 `p`，
+    /// 用户看到的命令与发生的事不是一回事。
+    /// </summary>
+    [Fact]
+    public void ProviderDelete_WithExtraWords_IsAnError()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("provider delete p q");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    /// <summary>
+    /// ⚠️ **反向对照：词边界。** `provider deletes p` 与 `provider deletep` **不是**这条命令，
+    /// 必须落回 <c>(null, null)</c>（⇒ 当消息）。少了词边界那半边，
+    /// `provider deletex` 也会被切出一个 `x` 来 —— 用户打错的字被静默当成命令。
+    /// </summary>
+    [Theory]
+    [InlineData("provider deletes p")]
+    [InlineData("provider deletep")]
+    public void ProviderDelete_NeedsAWordBoundary(string line)
+    {
+        var (cmd, err) = CoreCommandParser.Parse(line);
+
+        Assert.Null(cmd);
+        Assert.Null(err);   // ⇒ 当成普通消息
+    }
 }

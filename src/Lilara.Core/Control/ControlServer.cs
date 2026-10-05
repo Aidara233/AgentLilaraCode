@@ -603,6 +603,11 @@ public sealed class ControlServer(
                 // 盘上 key 仍是 `k`、协议照改 ⇒ **忽略，不是抹掉、也不是泄露**。
                 Opt(payload, "apiKey"),
                 Opt(payload, "model"), Opt(payload, "protocol"), Opt(payload, "endpoint"), Opt(payload, "auth")),
+            // ⚠️ **线上解析是命令的第三条线**（核心语义在 dispatcher、控制台解析在 `CoreCommandParser`）——
+            // 少一条这条命令就只在别的两条线上存在，而头发的帧会静默落到 `_ => throw`
+            // （回一句「命令形状不对」，删不掉）。与 `provider.upsert` / `claim.release` 同一条纪律。
+            "provider.delete" => new CoreCommand.ProviderDelete(
+                payload.GetProperty("id").GetString()!),
             _ => throw new ArgumentException($"认不出的命令 '{kind}'"),
         };
 

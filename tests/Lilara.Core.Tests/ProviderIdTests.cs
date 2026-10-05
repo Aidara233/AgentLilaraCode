@@ -236,4 +236,62 @@ public class ProviderIdTests : IDisposable
         Assert.True(CommandDispatcher.IsSafeProviderId("CONIN"));
         Assert.True(CommandDispatcher.IsSafeProviderId("CONOUT"));
     }
+
+    /// <summary>
+    /// ⚠️ **删的 id 必须过同一个闸（`IsSafeProviderId`），且必须在任何文件系统调用之前。**
+    ///
+    /// <para>⚠️ **判据落在盘上，不是回执上。** `ProviderStore.Delete` 走同一个
+    /// `PathFor(id)` ⇒ `delete ../escaped` 指向 `<数据根>/escaped.json`——
+    /// **`providers/` 之外**的东西。闸若被去掉（或挪到删除**之后**），ack 仍会是 `rejected`，
+    /// 而**那个文件已经没了**——删**不可逆**，用户挽不回来。
+    /// 「只断言 ack 是半条判据」，说的就是这种错。</para>
+    ///
+    /// <para>⚠️ **诱饵是必须的**：没有它，`File.Exists` 为假 ⇒ 闸删不删都「没事」，
+    /// 这条测试就退化成「断言 ack」——半条判据。有了它，去掉闸会**当场删掉那个文件**。</para>
+    /// </summary>
+    [Fact]
+    public async Task ProviderDelete_WithAPathTraversingId_IsRejected_AndDeletesNothingOutsideProviders()
+    {
+        // 诱饵：`PathFor("../escaped")` 正好指到它。内容也钉住（防「删了又建个空的」那类假绿）。
+        // ⚠️ **`providers/` 必须存在**：`File.Exists` 在**中间目录不存在**时返回 false，
+        // 那样去掉闸也不会删到诱饵——这条测试就**没有区分力**了（闸删不删都绿）。
+        // 这个目录平时由 `ProviderStore.Save` 建（`AtomicFile`），这里直接造出来。
+        Directory.CreateDirectory(Path.Combine(_root, "providers"));
+        var decoy = Path.Combine(_root, "escaped.json");
+        File.WriteAllText(decoy, "别动我");
+
+        var result = await _dispatcher.DispatchAsync(
+            new CoreCommand.ProviderDelete("../escaped"), "t1", awaitCompletion: true, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(result.Ack);
+        Assert.True(File.Exists(decoy), "providers/ 之外的文件被删掉了——闸没有拦在删除之前");
+        Assert.Equal("别动我", File.ReadAllText(decoy));
+    }
+
+    /// <summary>
+    /// ⚠️ 删那条路上的坏 id 一律拒绝（与 upsert 同一张清单的**抽样**，不是全部——
+    /// 全部由 <see cref="ProviderUpsert_WithAnUnsafeId_IsRejected"/> 与真值表钉着）。
+    ///
+    /// <para>⚠️ **本条的判据是「回 rejected」，不是「盘上没被删」**——那些 id
+    /// （`NUL` / `a/b` / `..`）在 `PathFor` 下**指向不存在的东西**，
+    /// 而 `ProviderStore.Delete` 先看 `File.Exists`。
+    /// ⇒ 去掉闸时**它们不会让本条变红**（只有 `../escaped` 那条会，因为它有诱饵）。
+    /// **别把这条读成「闸的证明」**——它证明的是「闸在**结果上**对坏 id 给出拒绝」，
+    /// 而闸的**必要性**由上面那条诱饵测试证明。两条分工不同。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("../escaped")]
+    [InlineData("..")]
+    [InlineData("a/b")]
+    [InlineData("a\\b")]
+    [InlineData("")]
+    [InlineData("NUL")]
+    [InlineData("COM1")]
+    public async Task ProviderDelete_WithAnUnsafeId_IsRejected(string id)
+    {
+        var result = await _dispatcher.DispatchAsync(
+            new CoreCommand.ProviderDelete(id), "t1", awaitCompletion: true, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(result.Ack);
+    }
 }

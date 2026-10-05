@@ -319,11 +319,60 @@ public class ControlServerTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// ⚠️ **线上的 `provider.delete`：三条线里唯一能证明「头发的帧真的能删」的那条。**
+    ///
+    /// <para>⚠️ **判据是两端**：`ack.accepted` **与盘上的后果**。
+    /// 只断言 ack 是**半条判据**——ack 对了而文件还在的那种错，用户以为删了、
+    /// 下次发消息还在用那个凭据（而头也不会有任何提示）。</para>
+    ///
+    /// <para>⚠️ **必须走真的 WS**，不是直接调 dispatcher——`ParseCommand` 缺那一臂时，
+    /// 直接调 dispatcher 的测试**照样绿**（它绕过了解析），而头发的帧会静默落到
+    /// `_ => throw new ArgumentException` ⇒ 回一句「命令形状不对」，删不掉。</para>
+    /// </summary>
+    [Fact]
+    public async Task WebSocket_ProviderDelete_RemovesTheStoredDefinition()
+    {
+        // 前置：`InitializeAsync` 已存下 provider "p"。
+        Assert.NotNull(_host.Providers.Load("p"));
+
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        await SendAsync(ws, """{"kind":"command","id":"d1","payload":{"kind":"provider.delete","id":"p"}}""");
+
+        var ack = await ReceiveAsync(ws);
+        // ⚠️ **理由必须惰性取**：`WhenWritingNull` 把成功回执的 `reason` 整个省略（camelCase），
+        // 直接 `GetProperty("reason")` 会抛 `KeyNotFoundException`——见
+        // `WebSocket_SetAxis_ReachesTheDispatcher` 的同款注释。
+        Assert.True(ack.GetProperty("accepted").GetBoolean(),
+            "provider.delete 的帧没被接受——`ParseCommand` 缺那一臂时它会落进 `_ => throw`："
+            + (ack.TryGetProperty("reason", out var why) ? why.GetString() : "(无 reason 字段)"));
+
+        // ⚠️ **盘上真没了**——只断言 ack 是半条判据。
+        Assert.Null(_host.Providers.Load("p"));
+    }
+
+    /// <summary>
+    /// ⚠️ **线上那条的「不存在 ⇒ 拒绝」**（不是幂等成功），且**理由要点名那个 id**。
+    /// 与 dispatcher 那条同源，但这条走**真 WS**——帧的字段名（`id`）接不上时，
+    /// 只有这条会红（会变成「命令形状不对」而不是「没有提供商 'nope'」）。
+    /// </summary>
+    [Fact]
+    public async Task WebSocket_ProviderDelete_OfAMissingProvider_IsRejectedNamingTheId()
+    {
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        await SendAsync(ws, """{"kind":"command","id":"d2","payload":{"kind":"provider.delete","id":"nope"}}""");
+
+        var ack = await ReceiveAsync(ws);
+        Assert.False(ack.GetProperty("accepted").GetBoolean());
+        Assert.Contains("nope", ack.GetProperty("reason").GetString());
+    }
+
+    /// <summary>
     /// ⚠️ **头断连不影响任何东西**（`03` §1 判据 1）：断开之后核心照常收命令。
     /// </summary>
     [Fact]
-    public async Task HeadDisconnecting_DoesNotAffectTheCore()
-    {
+    public async Task HeadDisconnecting_DoesNotAffectTheCore()    {
         var ws = new ClientWebSocket();
         await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
         await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
