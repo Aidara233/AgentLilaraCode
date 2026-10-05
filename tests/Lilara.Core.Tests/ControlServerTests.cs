@@ -15,12 +15,15 @@ namespace Lilara.Core.Tests;
 /// <summary>
 /// 控制面（`03`）——HTTP 快照 + WS。
 ///
-/// <para>⚠️ 这些测试**真的起一个 Kestrel 并真的连**（短连接、随机端口）。
+/// <para>⚠️ 这些测试**真的起一个 Kestrel 并真的连**（短连接、端口由**系统分配**）。
 /// 理由：控制面的错法大多是「形状对但接不上」——CORS 头、WS 握手、
 /// 帧的序列化、并发写 socket 抛异常。**桩测不到那些**。</para>
 ///
-/// <para>⚠️ 端口用<b>随机</b>的：写死端口会让并行测试互撞，而那条约束是硬的
-/// （见 `ControlServer` 的注释：端口可注入是「集成测试写得出来」的前提）。</para>
+/// <para>⚠️ 端口用 <b>0</b>（让 OS 分配）、**不是** `Random.Next(...)`：写死端口会让并行测试互撞
+/// （见 `ControlServer` 的注释：端口可注入是「集成测试写得出来」的前提），
+/// 而**随机**端口也靠不住——本机 Windows 的 TCP **排除段**（如 `50000-50059`，Hyper-V/WSL 保留）
+/// 落在随机区间里，绑到它会抛 `WSAEACCES`（复审实测：6 次全量跑里红 1 次）。
+/// ⇒ 绑 0、再从启动后的应用读回**系统实际分配的**端口。</para>
 /// </summary>
 public class ControlServerTests : IAsyncLifetime
 {
@@ -52,10 +55,12 @@ public class ControlServerTests : IAsyncLifetime
         _adapter.Reply("好的").Reply("好的").Reply("好的");
         _dispatcher = new CommandDispatcher(_host, _bus, h => new Stepper(_host.Store, _adapter));
 
-        // ⚠️ 随机端口：写死会让并行测试互撞。
-        _port = Random.Shared.Next(20_000, 60_000);
-        _server = new ControlServer(_host, _dispatcher, _bus, _port);
+        // ⚠️ 绑 **0**（让 OS 分配）而不是 `Random.Next(...)`：随机段会撞上 Windows 的 TCP 排除段
+        // （`WSAEACCES`），复审实测 6 次全量跑红 1 次。端口从启动后的应用读回来
+        //（`StartAsync` 返回 `WebApplication`，`Urls` 里是系统**实际**分配的地址）。
+        _server = new ControlServer(_host, _dispatcher, _bus, 0);
         _app = await _server.StartAsync(CancellationToken.None);
+        _port = new Uri(_app.Urls.First()).Port;
     }
 
     private Fakes.FakeAdapter _adapter = null!;
@@ -433,11 +438,12 @@ public class ControlServerTests : IAsyncLifetime
     public async Task WebSocket_HonoursANonDefaultAllowedOrigin()
     {
         // ⚠️ 显式传一个**非默认**的 allowedOrigin ⇒ 钉住「闸读的是参数，不是写死的字面量」。
-        // ⚠️ 建一个**第二个** ControlServer（另起随机端口），别去动既有那个 `_server`。
+        // ⚠️ 建一个**第二个** ControlServer（另起一个系统分配的端口），别去动既有那个 `_server`。
+        // ⚠️ 同 `InitializeAsync`：绑 **0** 再读回**实际**端口，别用 `Random.Next`（会撞排除段）。
         const string mine = "http://127.0.0.1:19999";
-        var port = Random.Shared.Next(20_000, 60_000);
-        var server = new ControlServer(_host, _dispatcher, _bus, port, allowedOrigin: mine);
+        var server = new ControlServer(_host, _dispatcher, _bus, 0, allowedOrigin: mine);
         var app = await server.StartAsync(CancellationToken.None);
+        var port = new Uri(app.Urls.First()).Port;
         try
         {
             // 放行：非默认那个 origin 自己

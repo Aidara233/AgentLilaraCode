@@ -483,6 +483,65 @@ public class CommandDispatcherTests : IDisposable
         Assert.NotSame(before, host.StepperFor(handle));
     }
 
+    /// <summary>
+    /// ⚠️ **C1 回归：删一个正被【别的句柄读着】的 provider，必须回 `Rejected`（带理由），
+    /// 不是把异常抛出 `DispatchAsync`。**
+    ///
+    /// <para>抛出去会一路冒到 `Program.cs` 的主循环（那里**没有** catch）⇒
+    /// 把**常驻进程**（控制台 + 控制面一起）打死。触发面**不需要奇异 id、也不经过 Origin 闸**：
+    /// 本文件那个读写竞态，任何一个网页 `fetch("http://127.0.0.1:7788/providers")` 循环
+    /// 就能按住（HTTP 不做 Origin 校验，CORS 还是 `*`），头自己的轮询同样会按住它。</para>
+    ///
+    /// <para>⚠️ 句柄带 `FileShare.Read`（**不含** `FILE_SHARE_DELETE`）⇒ Windows 上
+    /// `File.Delete` 抛 `IOException`（实测）。句柄持到测试结束 ⇒ 重试仍失败 ⇒ 落到层 2 的定制消息。</para>
+    /// </summary>
+    [Fact]
+    public async Task ProviderDelete_WhileAReadHandleIsOpen_IsRejectedWithAReason_NotAnException()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+
+        var file = Path.Combine(_root, "providers", "p.json");
+        using var hold = File.Open(file, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+        var r = await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderDelete("p"), "c", true, CancellationToken.None);
+
+        var rejected = Assert.IsType<Ack.Rejected>(r.Ack);
+        Assert.Contains("p", rejected.Reason);
+        // ⚠️ 层 2 的**定制**消息——既不是原始异常文本，更不是那句**假话**「没有提供商 'p'」（它在，只是忙）。
+        Assert.Contains("正被占用", rejected.Reason);
+    }
+
+    /// <summary>
+    /// ⚠️ **C1 的第三层（dispatcher 兜底）**：任何 handler 抛出的**意外**异常都必须变成
+    /// `rejected`，不许冒出去打死常驻进程。
+    ///
+    /// <para>这条用「落盘必然失败」逼出它——把 `providers/` 从一个目录换成**同名文件**，
+    /// `AtomicFile.Write` 的 `Directory.CreateDirectory` 必抛 `IOException`。
+    /// ⚠️ 它**必须是意外异常**，而不是某个被接住的业务失败（`DispatchException` 另走一路，
+    /// 那 4 条既有测试钉着它必须**原样抛出**）。⇒ 删掉 catch-all 时**只有这条**红。</para>
+    /// </summary>
+    [Fact]
+    public async Task UnexpectedExceptionFromAHandler_BecomesARejection_NotAnEscapingException()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+
+        // 让落盘必然失败：`providers/` 从目录换成一个同名文件 ⇒ `CreateDirectory` 抛 `IOException`。
+        var providersPath = Path.Combine(_root, "providers");
+        Directory.Delete(providersPath, recursive: true);
+        File.WriteAllText(providersPath, "not a directory");
+
+        var r = await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderUpsert("q", "k", null, null, null, null), "c", true, CancellationToken.None);
+
+        var rejected = Assert.IsType<Ack.Rejected>(r.Ack);
+        Assert.Contains("命令执行时出错", rejected.Reason);
+    }
+
     /// <summary>挂起的适配器：让测试能精确控制「模型什么时候返回」。</summary>
     private sealed class GatedAdapter(Func<Task<string>> gate) : Lilara.Core.Adapters.IModelAdapter    {
         public Lilara.Core.Adapters.ResolvedEndpoint? Endpoint => null;

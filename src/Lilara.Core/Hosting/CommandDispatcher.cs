@@ -40,37 +40,73 @@ public sealed class CommandDispatcher(
     public async Task<DispatchResult> DispatchAsync(
         CoreCommand command, string commandId, bool awaitCompletion, CancellationToken ct)
     {
-        switch (command)
+        // ⚠️ **兜底（backstop）：这里是常驻进程唯一的最后一道闸。**
+        // 上面每一个 handler 都在 `Program.cs` 的 `while (true) { await repl.ExecuteAsync(...) }`
+        // 里被调用，而**那一层没有任何 catch**——handler 里逃出来的任何异常都会掀翻
+        // **同时托管控制台与控制面的那个进程**。
+        //
+        // ⚠️⚠️ **这个失败类已经打死进程两次**（都是实测）：
+        //   ① Windows 设备名（`provider set NUL --key k` ⇒ 未捕获 `UnauthorizedAccessException`）；
+        //   ② 删一个正被并发读按住的文件（`File.Delete` ⇒ `IOException`，2000 次里 1623 次）。
+        // ⇒ 计划里**早就点名**这是缺的那一块（`Repl.ExecuteAsync` 只接 `DispatchException` /
+        //   `ModelCallFailedException`，`Program.cs` 没有 catch）——这里把它补上。
+        //
+        // ⚠️ 两个 `when` 都不是可选的：
+        //   · **取消要原样冒出去**：`Stepper` 的中断路依赖它传导
+        //     （见 `HandleSessionSendAsync` 自己那句 `catch (OperationCanceledException) when (stepCts.IsCancellationRequested)`）。
+        //   · **`DispatchException` 是既有的「业务失败」出口，也必须原样冒出去**——
+        //     `04` §1.1 / `03` §3 把它与 `rejected` 分得很清（rejected = 命令不合法；
+        //     DispatchException = 命令没错、这次没成，控制台印一行人话）。把它折成 `rejected`
+        //     会让「上游 503」变成「你的命令写错了」——**四条既有测试钉着这条必须抛出**
+        //     （`ModelFailure_ThrowsDispatchExceptionNotRejected` 等）。
+        // ⇒ 兜底只接**意外**异常，不接那两条**已定义**的路。
+        try
         {
-            case CoreCommand.ProviderUpsert p:
-                return HandleProviderUpsert(p, commandId);
+            switch (command)
+            {
+                case CoreCommand.ProviderUpsert p:
+                    return HandleProviderUpsert(p, commandId);
 
-            case CoreCommand.ProviderDelete d:
-                return HandleProviderDelete(d, commandId);
+                case CoreCommand.ProviderDelete d:
+                    return HandleProviderDelete(d, commandId);
 
-            case CoreCommand.SessionCreate:
-                return HandleSessionCreate(commandId);
+                case CoreCommand.SessionCreate:
+                    return HandleSessionCreate(commandId);
 
-            case CoreCommand.SessionActivate a:
-                return HandleSessionActivate(a, commandId);
+                case CoreCommand.SessionActivate a:
+                    return HandleSessionActivate(a, commandId);
 
-            case CoreCommand.SessionSend s:
-                return await HandleSessionSendAsync(s, commandId, awaitCompletion, ct);
+                case CoreCommand.SessionSend s:
+                    return await HandleSessionSendAsync(s, commandId, awaitCompletion, ct);
 
-            case CoreCommand.SessionStart st:
-                return HandleSessionStart(st, commandId);
+                case CoreCommand.SessionStart st:
+                    return HandleSessionStart(st, commandId);
 
-            case CoreCommand.SessionInterrupt i:
-                return HandleSessionInterrupt(i, commandId);
+                case CoreCommand.SessionInterrupt i:
+                    return HandleSessionInterrupt(i, commandId);
 
-            case CoreCommand.SessionSetAxis x:
-                return HandleSessionSetAxis(x, commandId);
+                case CoreCommand.SessionSetAxis x:
+                    return HandleSessionSetAxis(x, commandId);
 
-            case CoreCommand.ClaimAcquire a: return HandleClaimAcquire(a, commandId);
-            case CoreCommand.ClaimRelease r: return HandleClaimRelease(r, commandId);
+                case CoreCommand.ClaimAcquire a: return HandleClaimAcquire(a, commandId);
+                case CoreCommand.ClaimRelease r: return HandleClaimRelease(r, commandId);
 
-            default:
-                return Reject(commandId, $"认不出的命令：{command.GetType().Name}");
+                default:
+                    return Reject(commandId, $"认不出的命令：{command.GetType().Name}");
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;   // ⚠️ 取消不是错误——原样冒出去（见上）
+        }
+        catch (DispatchException)
+        {
+            throw;   // ⚠️ 业务失败的既有出口——原样冒出去（见上）
+        }
+        catch (Exception ex)
+        {
+            // 意外异常：**变成人话回执，进程活着**。⚠️ 只接这一格，别把上面两条也吞进来。
+            return Reject(commandId, $"命令执行时出错：{ex.Message}");
         }
     }
 
@@ -300,7 +336,25 @@ public sealed class CommandDispatcher(
         // ⚠️ 判据走 `ProviderStore.Delete` 的返回值（**文件层**：那个文件在不在）——
         // **别在这里改成 `Load(d.Id) is null`**：`Load` 把损坏的文件也算「不存在」，
         // 于是坏配置会永远删不掉（见 `ProviderStore.Delete` 的注释）。
-        if (!_host.Providers.Delete(d.Id))
+        //
+        // ⚠️ **并发读撞上时给一句定制的话，而不是让异常冒出去。**
+        // `Delete` 已经重试过（与 `AtomicFile.Write` 同款），仍失败说明那个文件**真的被别的句柄按住**
+        // （`FileShare.Read` 不含 `FILE_SHARE_DELETE`）——而这是本项目的**常态**：
+        // 头的轮询 / 任何网页的 `fetch(GET /providers)` 都能按住它。
+        // ⚠️ **别把这条失败退回成 `false`**：那是「没有提供商 'x'，无从删除。」——对一次**暂时占用**是**假话**。
+        // 这里把**真正的原因**（忙）讲出来。⚠️ 之所以接两种异常：sharing violation 抛 `IOException`，
+        // 没带 `FILE_SHARE_DELETE` 的句柄抛 `UnauthorizedAccessException`。
+        bool deleted;
+        try
+        {
+            deleted = _host.Providers.Delete(d.Id);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return Reject(id, $"无法删除提供商 '{d.Id}'：文件正被占用（可能有并发读）。稍后再试。");
+        }
+
+        if (!deleted)
             return Reject(id, $"没有提供商 '{d.Id}'，无从删除。");
 
         // ⚠️ **失效点必须在这里**，不能挂在控制台的字符串判据上——那是个**字符串**判据，

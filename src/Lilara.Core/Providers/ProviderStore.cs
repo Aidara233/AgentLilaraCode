@@ -48,6 +48,17 @@ public sealed class ProviderStore(string dataRoot)
     /// <para>⚠️ **`id` 的合法性不在这里判**：闸是 `CommandDispatcher.IsSafeProviderId`，
     /// 在 dispatcher 里、且必须在**调用本方法之前**（控制台与头共用那一条判据，G16）。
     /// 本方法只做一件事：把 `PathFor(id)` 指到的那个文件移除。</para>
+    ///
+    /// <para>⚠️ **删要重试，和写一样。** Windows 上目标被别的句柄读着时（`FileShare.Read`
+    /// **不含** `FILE_SHARE_DELETE`），`File.Delete` 抛 `IOException`——而**读是本项目的常态**：
+    /// 头的轮询会 GET `/providers`、任何网页也能 `fetch` 它（HTTP 不做 Origin 校验）。
+    /// 这个竞态**实测过**：2000 次删除里 1623 次抛。工程里同一个竞态在
+    /// <see cref="AtomicFile.Write"/> 已经解决过一次（那里为 state.json 与 HTTP 快照端点并存而重试），
+    /// 这里是它的**删除那一半**——重试参数与那里**逐字一致**（3 次退避后重抛）。</para>
+    ///
+    /// <para>⚠️⚠️ **失败必须重抛，不许返回 `false`。** 调用方把 `false` 读成
+    /// 「没有提供商 'x'，无从删除。」——那对一次**暂时的占用**是**假话**（文件在，只是忙）。
+    /// 重抛保住理由的诚实，由 dispatcher 把它翻译成人话（见 `HandleProviderDelete`）。</para>
     /// </summary>
     public bool Delete(string id)
     {
@@ -57,8 +68,21 @@ public sealed class ProviderStore(string dataRoot)
         // 所以它自己交不出「有没有删掉」这个判据——而调用方要的正是它。
         if (!File.Exists(path)) return false;
 
-        File.Delete(path);
-        return true;
+        // ⚠️ 与 `AtomicFile.Write` **同款**的暂时锁重试：两种异常都要接
+        //（sharing violation ⇒ `IOException`；没带 `FILE_SHARE_DELETE` ⇒ `UnauthorizedAccessException`），
+        // 短退避重试；仍失败则**异常照抛**（理由见上面的 `<para>`）。
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                File.Delete(path);
+                return true;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && attempt < 3)
+            {
+                Thread.Sleep(10 * (attempt + 1));
+            }
+        }
     }
 
     public IReadOnlyList<ProviderDefinition> List()    {
