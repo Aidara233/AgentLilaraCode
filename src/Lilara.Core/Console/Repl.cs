@@ -60,6 +60,13 @@ public sealed class Repl(
     /// ⚠️ **它不再是核心的缓存失效判据**。失效点是 `CommandDispatcher` 的 `provider.upsert`
     /// ——挂在字符串判据上会让线上的 `provider.upsert` 走不到它，缓存就**静默失效**。
     /// 换句话说：这个谓词现在只影响**一行字印不印**，不影响正确性。
+    ///
+    /// <para>⚠️ **`provider delete` 有意**不**扩进这个谓词**（T7 评审核过）：谓词只服务
+    /// `provider set` 之后的重印。删掉当前 provider 之后重印端点是**没有意义的**——
+    /// 调用点 `PrintEndpoint` 经 `StepperResolver` 现解析、`Endpoint is null` 时**提前返回**
+    /// ⇒ 删完再印**什么都不会印**，而屏幕上**过时的那一行照样留着**。
+    /// ⇒ 扩谓词**不改变任何可观测行为**。真修法是另一条「当前会话的 provider 没了」的提示，
+    /// 超出本批次——**不是**往这里加一个字符串。</para>
     /// </summary>
     public static bool IsProviderSetCommand(string line) =>
         line.Trim().StartsWith("provider set ", StringComparison.Ordinal);
