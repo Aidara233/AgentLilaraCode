@@ -528,6 +528,36 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Empty(slots.GetProperty("floating").EnumerateArray());
     }
 
+    [Fact]
+    public async Task State_CarriesTheWholeSpec()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;      // ⚠️ 分派型命令只在这个回执里给身份
+
+        using var s = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/state")));
+        var spec = s.RootElement.GetProperty("spec");
+
+        // ⚠️ **整份 `SessionSpec` 交出去**（R-A：头要什么由头决定，核心不做子集裁剪）。
+        // ⚠️ 线上是 **camelCase**（`WireJson.Options`）——键名按它写，别按 C# 属性名。
+        Assert.Equal(sid, spec.GetProperty("sessionId").GetString());
+        Assert.False(string.IsNullOrEmpty(spec.GetProperty("projectKey").GetString()));
+        Assert.False(string.IsNullOrEmpty(spec.GetProperty("workingDirectory").GetString()));
+        Assert.NotEqual(default, spec.GetProperty("createdAt").GetDateTimeOffset());
+
+        var model = spec.GetProperty("model");
+        // ⚠️ 值来自测试**预置的那个 provider**（`"p"` / `DefaultModel = "m"`）——
+        // 写死它们同时钉住了「spec 里的模型就是该会话实际绑的那份」。
+        Assert.Equal("p", model.GetProperty("providerId").GetString());
+        Assert.Equal("m", model.GetProperty("modelId").GetString());
+        Assert.Equal(Protocols.ClaudeMessages, model.GetProperty("protocol").GetString());
+        Assert.False(string.IsNullOrEmpty(model.GetProperty("effort").GetString()));
+        Assert.True(model.GetProperty("maxTokens").GetInt32() > 0);
+
+        // ⚠️ **G12**：key 不在 `SessionSpec` 里（它住 `providers/*.json`）
+        // ⇒ 「整份交出去」这件事**天生不泄 key**——这条断言把那句话钉成可执行的。
+        Assert.False(spec.TryGetProperty("apiKey", out _));
+    }
+
     /// <summary>
     /// ⚠️ **`GET /axes` 是头唯一的轴来源**（G8：头不许手抄）。
     /// 少了它，头里那份手抄的 `AXES` 常量就是第二份契约——而 `Axes.cs:8` 明说「不许手抄」。
