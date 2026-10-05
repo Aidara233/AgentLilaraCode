@@ -263,9 +263,15 @@ public sealed class CommandDispatcher(
     /// <para>⚠️ **同一个闸，且必须在「任何文件系统调用之前」。** `ProviderStore.Delete` 走
     /// 同一个 `PathFor(id)` ⇒ `delete ../escaped` 会删掉 `<数据根>/escaped.json`——
     /// **`providers/` 之外**的东西。而**删是不可逆的**：闸若漏了或挪到删除之后，
-    /// ack 仍会是 `rejected`，而那个文件**已经没了**。⇒ 闸放在最前面。
-    /// （`delete NUL` 那类设备名同理：`File.Delete` 会抛未捕获异常掀翻常驻进程——
-    /// 别指望文件系统自己安全地失败。）</para>
+    /// ack 仍会是 `rejected`，而那个文件**已经没了**。⇒ 闸放在最前面。</para>
+    ///
+    /// <para>⚠️ **设备名那一臂在删除路径上是「纵深防御」，不是当前生效的那道防线**——
+    /// 别把这条读成「文件系统在这里不安全」。实测（`net10.0`）：`File.Exists("…/providers/NUL.json")`
+    /// 返回 **false 且不抛** ⇒ `ProviderStore.Delete` 的预检先短路，**`File.Delete` 根本走不到**
+    /// （与 `.`/`..` 那条同级：留着是因为**万一预检被去掉**，`File.Delete` 对 `NUL`/`CON`
+    /// 抛的是 `UnauthorizedAccessException`；而 `/abs` 那类没预检则会真的删掉外面的东西）。
+    /// ⚠️ 那它为什么还留着？因为**没有它会回一句假话**：`delete NUL` 会答「没有提供商 'NUL'，无从删除。」
+    /// ——把一个**被拒绝的非法 id** 说成**不存在**，而用户会去翻 `providers/` 找一个本该被拒的输入。</para>
     ///
     /// <para>⚠️ **不存在 ⇒ 拒绝，不是幂等成功。** 本项目一路在收「静默的成功」：
     /// `provider delet local`（拼错）若回 ✓，用户以为删掉了、其实没删，

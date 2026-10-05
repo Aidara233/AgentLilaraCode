@@ -369,6 +369,37 @@ public class CommandDispatcherTests : IDisposable
     }
 
     /// <summary>
+    /// ⚠️ **损坏的 provider 文件必须删得掉**——这一条钉的是「判据是**文件层**，不是 `Load is null`」。
+    ///
+    /// <para>`Load` 把**损坏**的文件也当作「不存在」⇒ 若有人把 dispatcher 的判据改成
+    /// `Load(d.Id) is null`，一个坏配置会**永远删不掉**，而**「把一个坏配置删掉」正是用户最想做的事**。
+    /// ⚠️ 上面三条删除测试**全都抓不到**这个改动：它们用的是**能正常解析**的文件
+    /// ⇒ `Load` 非 null、判据照样通过。⇒ 这一条是那块缺口唯一的钉子。</para>
+    ///
+    /// <para>⚠️ 断言要**落在盘上**（文件真的没了）——只断言 ack 是半条判据。</para>
+    /// </summary>
+    [Fact]
+    public async Task ProviderDelete_OfACorruptProviderFile_IsAccepted_NotRejected()
+    {
+        var (host, _) = NewHarness();
+        // ⚠️ **不能走 `Providers.Save`**（那写的必定是合法 JSON）——直接往盘上写一个坏文件。
+        var dir = Path.Combine(_root, "providers");
+        Directory.CreateDirectory(dir);
+        var file = Path.Combine(dir, "broken.json");
+        File.WriteAllText(file, "{ 这不是合法 JSON");
+
+        // ⚠️ 先确认前提成立：`Load` 对它是 null（所以「改成 Load」会把它当不存在）。
+        Assert.Null(host.Providers.Load("broken"));
+
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+        var r = await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderDelete("broken"), "c", true, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);        // ⚠️ 改了判据这里会变 Rejected
+        Assert.False(File.Exists(file));           // ⚠️ 且盘上真的没了
+    }
+
+    /// <summary>
     /// ⚠️ **删一个不存在的 id ⇒ `Rejected`，且理由点名那个 id——不是幂等成功。**
     ///
     /// <para>理由：本项目一路在收「静默的成功」。`provider delet local`（拼错）若回 ✓，
