@@ -391,8 +391,11 @@ Spec = handle.Spec,
 **Files:** `src/Lilara.Core/Control/ControlServer.cs` · 其测试
 
 ⚠️ **它不是「可选的美化」，是「不许手抄」的执行面**：头要渲染配置表单就必须知道
-「合法协议 / 合法 auth / 各协议默认模型」，而这些的真相来源在核心
-（`Protocols.All` / `AuthSchemes` / **`AdapterFactory` 的默认模型**）。
+「**合法协议** / **合法 auth**」——而这两样的真相来源在核心（`Protocols.All` / `AuthSchemes`）。
+⚠️ ⚠️ **`defaultModel` 有意**不交**——它今天**没有可信来源**（详见下面 Step 2–4 的注释与那条反向断言）。
+别把「各协议默认模型」读成清单的一项：**最初写的计划里有它，核过之后删掉了**；
+头要预填模型，应当从 `/providers` 拿**用户已在用的那个 provider 的** `defaultModel`。
+
 ⚠️ **头已经抄错一次**：`head/wwwroot/index.html` 的引导文案写死 `--protocol claude-messages`
 ——而 `claude-messages` 只是**默认值**，不是「唯一能用的」，这正是用户第一次配置时踩的坑。
 
