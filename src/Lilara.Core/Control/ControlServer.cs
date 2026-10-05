@@ -88,7 +88,10 @@ public sealed class ControlServer(
         }, WireJson.Options));
 
         // 核心自述：版本 + 真正在接受的那个 origin + 两个端点的 URL。
-        // origin 读**实例值**（不是默认常量）——`--allowed-origin` 换过之后，这里必须跟着变。
+        // origin 读**实例值**（不是默认常量）——构造参数换过之后，这里必须跟着变。
+        // ⚠️ 构造参数今天由 `AllowedOriginResolver` 从环境变量解析（`Program.cs` 的调用点）。
+        // **核心不解析任何命令行参数**——所以这里没有 `--allowed-origin` 那样的旗标，
+        // 配置一律走环境变量。别在这一行写一个不存在的旗标名：那会让读注释的人以为有这么个入口。
         app.MapGet("/info", () => Results.Json(new
         {
             DataRoot = host.DataRoot,
@@ -242,7 +245,11 @@ public sealed class ControlServer(
             Protocols = Protocols.All,
             // ⚠️ 从 `AuthSchemes.All` 读，**不是**手写的 `new[] { … }`——那份加常量时不会跟上。
             AuthSchemes = AuthSchemes.All,
-            ProviderIdRule = "单个文件名：不含路径分隔符，不能是 . 或 ..，也不是 CON/NUL/COM1/CONIN$ 这类 Windows 设备名",
+            // ⚠️ 缺省认证方式也要交：不交的话头要么手抄（会漂），要么把下拉留空。
+            DefaultAuthScheme = AuthSchemes.Default,
+            // ⚠️ 文案与谓词同处一地（`CommandDispatcher.ProviderIdRule`）——别在这里内联，
+            // 那份曾经内联在此，改谓词的人看不见它 ⇒ 人话会静默变成假话。
+            ProviderIdRule = CommandDispatcher.ProviderIdRule,
         }, WireJson.Options));
     }
 
@@ -271,8 +278,13 @@ public sealed class ControlServer(
             && !string.Equals(origin, allowedOrigin, StringComparison.OrdinalIgnoreCase))
         {
             // 失败要能自解释：响应体说明被接受的是哪个页面（启动横幅里也印了同一个值）。
+            // ⚠️ **但这句只有非浏览器客户端看得到**：WS 握手被拒时浏览器**不把响应体交给页面 JS**，
+            // 页面只会走 `onclose`。所以横幅才是浏览器用户的自解释渠道——
+            // 头那边会去拉 `/info` 比对 `location.origin`，把原因显示在页面上。
             ctx.Response.StatusCode = (int)HttpStatusCode.Forbidden;
-            await ctx.Response.WriteAsync($"本核心只接受来自 {allowedOrigin} 的页面。");
+            await ctx.Response.WriteAsync(
+                $"本核心只接受来自 {allowedOrigin} 的页面。若是浏览器页面，"
+                + "请对照核心启动横幅里印的那一行（页面本身看不到这句响应体）。");
             return;
         }
 
@@ -443,7 +455,10 @@ public sealed class ControlServer(
         }
     }
 
-    private static CoreCommand ParseCommand(JsonElement payload)
+    // ⚠️ `internal` 而不是 `private`：`CommandSurfaceTests` 直接调它来钉「线上每条 kind 都
+    // 造出它该造的那个类型」——**调真函数，不在测试里复刻一层判据**（复刻品总比真货少几行，
+    // 而少的那几行恰恰是没人在看的）。仅可见性放开，行为不动。
+    internal static CoreCommand ParseCommand(JsonElement payload)
     {
         var kind = payload.GetProperty("kind").GetString()!;
         return kind switch

@@ -8,6 +8,11 @@ namespace Lilara.Core.Tests;
 
 // id 必须是单纯的文件名：PathFor(id) => _root/{id}.json，未校验的 ../escaped 会落到数据根之外；
 // 校验必须在 dispatcher（控制台与头共用的入口），放前端会被另一个绕过。
+//
+// ⚠️ **这些用例跨平台确定，不会在 Linux 上翻**：判据 `CommandDispatcher.IsWindowsDeviceName`
+// 是**纯字符串**的（按 Windows 的设备名形状拒绝），不依赖 `Path` 或文件系统 ⇒ 哪个平台跑都拒。
+// 反过来说，**后果**才是平台相关的（Linux 上 `NUL` 本来是正常文件名，这里照样拒）——
+// 那是刻意的：数据根可能被同步到别的平台，判据必须取两边都安全的那一侧。
 public class ProviderIdTests : IDisposable
 {
     private readonly string _root =

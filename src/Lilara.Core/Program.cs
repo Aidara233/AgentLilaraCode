@@ -1,3 +1,4 @@
+using System.Text;
 using Lilara.Core.Protocol;
 using Lilara.Core.Control;
 using Lilara.Core.Console;
@@ -6,6 +7,16 @@ using Lilara.Core.Storage;
 using Lilara.Core.Kernel;
 using Lilara.Core.Session;
 using Microsoft.AspNetCore.Builder;
+
+// ⚠️ **控制台的 stdin/stdout 要显式设成 UTF-8**，否则非 ASCII 的 provider id 在控制台上根本打不进来：
+// `provider set COM¹ --key k` 会写成 `COM鹿.json`（读进来时已被代码页编坏），
+// 而计划里明确要求放行的 `本地` 会变成 `鏈`。⇒「`本地` 必须放行」在那之前是**空头支票**。
+// ⚠️ **既有测试测不出来**：`ProviderIdTests` 喂的是字符串常量、绕过了控制台 ⇒ 全绿。
+// ⚠️ 这行**无法用单元测试钉**（编码是进程级的；改完再读回来只证明「设上了」，不证明「往返正确」）
+// ⇒ 验收只能靠手工 E2E（见本批的验证清单）。
+// 两个编码器都接受**被重定向的标准流**（实测：`sleep 4000 | ... lilara` 那种起法不抛异常）。
+Console.InputEncoding = Encoding.UTF8;
+Console.OutputEncoding = Encoding.UTF8;
 
 var dataRoot = DataRoot.Resolve();
 Directory.CreateDirectory(dataRoot);
@@ -71,18 +82,22 @@ var port = int.TryParse(Environment.GetEnvironmentVariable("LILARA_PORT"), out v
     ? p
     : ControlServer.DefaultPort;
 
-var controlServer = new ControlServer(host, dispatcher, bus, port);
+// ⚠️ WS 的 Origin 白名单**必须跟着头的端口走**，否则改头端口 ⇒ 浏览器 origin 变了 ⇒ 核心静默拒绝。
+// 解析器照 `EndpointResolver` 的先例：纯函数 + 返回值带来源，调用方必须印出来。
+var allowedOrigin = AllowedOriginResolver.Resolve();
+
+var controlServer = new ControlServer(host, dispatcher, bus, port, allowedOrigin.Origin);
 WebApplication? api = null;
 try
 {
     api = await controlServer.StartAsync(CancellationToken.None);
     Console.WriteLine($"  控制面 {controlServer.Url}（头连这个；只监听本机）");
     // ⚠️ **WS 只接受这个 origin 的页面**（见 `ControlServer.MapWebSocket` 的注释）。
-    // 印出来是为了**失败能自解释**：页面从别的 origin（例如 `localhost:7790`）打开时会被拒，
-    // 用户得能看见被接受的到底是哪一个——否则只能瞎猜。
-    // ⚠️ 这里读的是**实例值**（`AllowedOrigin`），不是默认常量——否则将来 origin 可配时，
+    // 印出来是为了**失败能自解释**：WS 握手被拒时浏览器**不把响应体交给页面 JS**，
+    // 页面只会「已断开·重连中」地无限重试 ⇒ 用户唯一能看到原因的渠道就是**这行横幅**。
+    // ⚠️ 这里读的是**实例值**（`AllowedOrigin`），不是默认常量——否则 origin 可配时，
     // 横幅会印一个闸其实**拒绝**的 origin，而用户恰好靠横幅自解释失败原因。
-    Console.WriteLine($"  WS 只接受来自 {controlServer.AllowedOrigin} 的页面；其它 origin 的网页会被拒。");
+    Console.WriteLine($"  WS 只接受来自 {controlServer.AllowedOrigin} 的页面（{AllowedOriginResolver.Describe(allowedOrigin.Source)}）。");
 }
 catch (Exception ex)
 {

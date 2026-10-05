@@ -27,7 +27,12 @@ app.UseStaticFiles();
 app.MapGet("/config.json", () => Results.Json(new { core }));
 
 await app.StartAsync();
+// ⚠️ 端口**必须印**，而且要说清「这就是核心要放行的那个 origin」：
+// 核心的 WS 白名单要跟着这个端口走（`LILARA_HEAD_PORT`），对不上时**握手会被静默拒绝**
+//（浏览器不把 403 响应体交给页面 JS）⇒ 用户只能靠对这两行横幅来排查。
+// 核心那边会印它实际接受的那个 origin，两行放在一起看即可。
 Console.WriteLine($"LILARA 头 — http://127.0.0.1:{port}");
+Console.WriteLine($"  页面 origin http://127.0.0.1:{port}（核心的 WS 白名单必须包含它）");
 Console.WriteLine($"  核心 {core}（页面直连它，头不代理）");
 await app.WaitForShutdownAsync();
 return 0;

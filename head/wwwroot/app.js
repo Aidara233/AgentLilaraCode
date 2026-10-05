@@ -890,6 +890,24 @@ async function loadCoreFacts() {
   }
 }
 
+// 断开时去问一句「为什么」，而不是永远「已断开 · 3 秒后重连」。
+//
+// ⚠️ **必须自己去问**：WS 握手被核心拒绝时（Origin 白名单，见核心的 `MapWebSocket`），
+// 浏览器**不把 403 响应体交给页面 JS**——页面只看到 onclose，因此永远拿不到原因。
+// 核心已经把「它接受哪个 origin」交在 `/info` 里了，这里只是把它读出来。
+//
+// ⚠️ **只说证据支持得住的话**：/info 拿不到 ⇒ 多半是核心没起来，那就不改文案——
+// 此时说「origin 被拒」是编的。拿得到、且与 `location.origin` 对不上，断开才几乎一定是这个原因。
+//（`location.origin` 正是浏览器放进 `Origin` 头的那个值，不必再推导一遍。）
+async function diagnoseOrigin() {
+  let i;
+  try { i = await (await fetch(core + "/info")).json(); } catch { return; }
+  if (wsReady) return;   // 这趟 fetch 期间重连成功了，别拿过期的诊断盖掉「已连接」
+  if (!i.allowedOrigin || i.allowedOrigin === location.origin) return;
+  $("status").textContent = `连不上：核心只接受来自 ${i.allowedOrigin} 的页面（当前 ${location.origin}）`;
+  $("status").className = "chip down";
+}
+
 // ---- 轴（义务 4 的落点） ----
 // 轴表、标签、inContext 都从核心拉（单一真相来源是核心的 Axes.Table，头不许手抄）：
 // 核心交 { name, label, values, inContext }，头只画控件。
@@ -1126,6 +1144,7 @@ function connect() {
     wsReady = false;
     $("status").textContent = "已断开 · 3 秒后重连";
     $("status").className = "chip down";
+    diagnoseOrigin();          // 不给原因就是这个形状的全部问题（见函数注释）
     setTimeout(connect, 3000);
   };
 

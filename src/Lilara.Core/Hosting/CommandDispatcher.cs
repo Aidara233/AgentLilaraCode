@@ -125,6 +125,16 @@ public sealed class CommandDispatcher(
         && !IsWindowsDeviceName(id);
 
     /// <summary>
+    /// 「合法 id 长什么样」的人话，**与谓词同处一地**——照 <c>Axes.LabelOf</c> /
+    /// <c>EndpointResolver.Describe</c> 的先例（标签住在定义旁边）。
+    ///
+    /// <para>⚠️ 它曾经**只住在** `/provider-schema` 那条 `MapGet` 里（离谓词很远）。改谓词的人
+    /// 看不见它 ⇒ 那句人话会静默变成假话，而头的表单文案与拒绝理由都是照它写的。</para>
+    /// </summary>
+    internal const string ProviderIdRule =
+        "单个文件名：不含路径分隔符，不能是 . 或 ..，也不是 CON/NUL/COM1/CONIN$ 这类 Windows 设备名";
+
+    /// <summary>
     /// Windows 设备名：真二进制里是「未捕获异常掀翻常驻进程」（`COM1` ⇒ `\\.\COM1` 抛
     /// `FileNotFoundException`；`NUL` ⇒ `\\.\NUL` 抛 `UnauthorizedAccessException`）。
     /// 取「第一个点之前」那一段，不是 `Path.GetFileNameWithoutExtension`——`NUL.txt.txt.json`

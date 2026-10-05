@@ -744,8 +744,236 @@ public class ControlServerTests : IAsyncLifetime
         Assert.True(model.GetProperty("maxTokens").GetInt32() > 0);
 
         // key 不在 SessionSpec 里（它住 providers/*.json）⇒「整份交出去」天生不泄 key。
+        // ⚠️ 但这条**只是「没有 apiKey 这个键名」**——字段一改名它就失效。
+        // 真正钉住「不泄 key」的是下面那条哨兵式的 `State_NeverLeaksTheKey`（同 `/providers` 的做法）。
         Assert.False(spec.TryGetProperty("apiKey", out _));
     }
+
+    // 「整份 spec 交出去也不泄 key」这条，用**哨兵串**钉——不是「没有 apiKey 这个键名」
+    //（那种判据一改名就失效，`/providers` 那边早就换掉了）。
+    // ⚠️ 哨兵必须**真的设进 provider**，否则 spec 根本不提它、这条就是空真。
+    [Fact]
+    public async Task State_NeverLeaksTheKey()
+    {
+        const string sentinel = "SENTINEL-8f3a2b1c-DO-NOT-LEAK";
+        _host.Providers.Save(new ProviderDefinition
+        {
+            Id = "leaky", Protocol = Protocols.ClaudeMessages, ApiKey = sentinel,
+            DefaultModel = "m", Modality = "vision",
+        });
+
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        // 把会话改绑到那个带哨兵的提供商——否则 spec 里根本不提它。
+        var cfg = await _dispatcher.DispatchAsync(
+            new CoreCommand.SessionConfigure(sid, "leaky", null), "cfg", false, CancellationToken.None);
+        Assert.IsType<Ack.Accepted>(cfg.Ack);
+
+        var body = await Client.GetStringAsync(Http($"/sessions/{sid}/state"));
+
+        Assert.DoesNotContain(sentinel, body);
+
+        // 反向那半不能省：只断言「不含哨兵」的话，「这个端点其实什么都没交」也能过。
+        // 提供商 **id** 是看得见的（它要被显示），**key** 看不见——这两件事要分开钉。
+        Assert.Contains("leaky", body);
+    }
+
+    // ════════════════ 守卫 B：11 个快照端点的键集 ════════════════
+    //
+    // 为什么要有这一组：`ControlServer` 的 11 个 `MapGet` 交的都是**内联匿名类型**，
+    // 往 `new { … }` 里加一个字段**不会被任何测试发现** ⇒ `03 §6` 那份 schema 必腐。
+    // 这组把「交出去的键恰好是这些」钉成可执行的，于是文档腐了会红。
+    //
+    // ⚠️ 与 `SessionSpec_HasExactlyTheseProperties` 不是同一套理：那里反射 **CLR 属性集**
+    //（null 也看得见），这里数的是**序列化出来的键**——`WhenWritingNull` 会省掉 null ⇒
+    // **可空字段必须先设上**，否则这条测试测的是「这个数据碰巧长什么样」。
+
+    // 一个「每个可空字段都设上」的 provider ⇒ 键集最大、最稳定。
+    private void SeedFullProvider() => _host.Providers.Save(new ProviderDefinition
+    {
+        Id = "full", Protocol = Protocols.ClaudeMessages, ApiKey = "k",
+        DefaultModel = "m", Modality = "vision",
+        Endpoint = "http://127.0.0.1:1/v1", AuthScheme = AuthSchemes.Bearer,
+        Models = ["m1", "m2"],
+    });
+
+    private static string[] KeysOf(JsonElement obj) =>
+        obj.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray();
+
+    private static void AssertKeysOf(JsonElement obj, params string[] expected)
+    {
+        Assert.Equal(JsonValueKind.Object, obj.ValueKind);
+        Assert.Equal(expected.OrderBy(n => n, StringComparer.Ordinal), KeysOf(obj));
+    }
+
+    // 数组：钉**每一项**的键集。
+    // ⚠️ `NotEmpty` 不能省：空数组上「每项都满足」是**空真**，而空恰恰是最常见的状态
+    //（`/claims` 没声明文件时就是 []）⇒ 少了这一句这条测试零区分力。
+    private static void AssertEachItemKeysOf(JsonElement arr, params string[] expected)
+    {
+        Assert.Equal(JsonValueKind.Array, arr.ValueKind);
+        var items = arr.EnumerateArray().ToList();
+        Assert.NotEmpty(items);
+        foreach (var item in items) AssertKeysOf(item, expected);
+    }
+
+    // 字符串数组（`/projects` 这类）：正确契约是「每项都是字符串」，不是「每项都有某些键」。
+    private static void AssertEachItemIsString(JsonElement arr)
+    {
+        Assert.Equal(JsonValueKind.Array, arr.ValueKind);
+        Assert.NotEmpty(arr.EnumerateArray());
+        Assert.All(arr.EnumerateArray(), e => Assert.Equal(JsonValueKind.String, e.ValueKind));
+    }
+
+    private async Task<JsonElement> GetJson(string path) =>
+        (await JsonDocument.ParseAsync(await Client.GetStreamAsync(Http(path)))).RootElement.Clone();
+
+    [Fact]
+    public async Task Snapshot_Health_CarriesExactlyTheseKeys() =>
+        AssertKeysOf(await GetJson("/health"), "ok", "dataRoot", "workingDirectory", "sessions");
+
+    [Fact]
+    public async Task Snapshot_Info_CarriesExactlyTheseKeys()
+    {
+        var root = await GetJson("/info");
+        AssertKeysOf(root, "dataRoot", "workingDirectory", "coreVersion", "allowedOrigin", "endpoints");
+
+        // 嵌套那层也要钉：`endpoints` 里加个字段，顶层键集**看不见**。
+        AssertKeysOf(root.GetProperty("endpoints"), "http", "ws");
+
+        // ⚠️ `/info` 交的 origin 必须**来自解析器**（今天的默认），不是端点里内联的第三份字面量。
+        // 这条把「核心放行的 origin」与「核心自述的 origin」钉成同一个值。
+        Assert.Equal(AllowedOriginResolver.Resolve().Origin, root.GetProperty("allowedOrigin").GetString());
+    }
+
+    // 数组型端点的「每项是字符串」——不伪造键集断言。
+    [Fact]
+    public async Task Snapshot_Projects_IsAnArrayOfStrings()
+    {
+        // ⚠️ **得先有项目**，否则 `/projects` 是空数组、`NotEmpty` 会红。
+        //（这正是那条守卫的用途：空数组上「每项都是字符串」是空真。）
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        Assert.IsType<Ack.Accepted>(created.Ack);
+
+        AssertEachItemIsString(await GetJson("/projects"));
+    }
+
+    [Fact]
+    public async Task Snapshot_ProjectSessions_IsAnArrayOfStrings()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        Assert.IsType<Ack.Accepted>(created.Ack);
+
+        AssertEachItemIsString(await GetJson($"/projects/{ProjectKey.FromPath(_work)}/sessions"));
+    }
+
+    [Fact]
+    public async Task Snapshot_State_CarriesExactlyTheseKeys()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        var root = await GetJson($"/sessions/{sid}/state");
+        AssertKeysOf(root, "sessionId", "state", "highWater", "axes", "spec", "slots");
+
+        // ⚠️ 嵌套那层也钉：往 `slots` / `model` 里加字段，顶层看不见。
+        //（`spec` 自己那层**不在这里钉**——它归 `SessionSpec_HasExactlyTheseProperties` +
+        //  `State_CarriesTheWholeSpec` 管；在这里再来一份是重复的守位，只会多一处要改。）
+        AssertKeysOf(root.GetProperty("slots"), "system", "premier", "floating");
+        AssertKeysOf(root.GetProperty("spec").GetProperty("model"),
+            "providerId", "modelId", "protocol", "effort", "maxTokens");
+    }
+
+    [Fact]
+    public async Task Snapshot_History_CarriesExactlyTheseKeys()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        // 让步真的走完 ⇒ rendered 非空（空数组上钉「每项」是空真）。
+        await _dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sid, [new Block.TextBlock("hi")]), "s", awaitCompletion: true, CancellationToken.None);
+
+        var root = await GetJson($"/sessions/{sid}/history");
+        AssertKeysOf(root, "highWater", "rendered");
+
+        // `rendered` 的每一项来自 `ControlServer.Render`（核心渲染、头只显示）——
+        // 在这里钉它的键集，加字段会红。（`blocks` 自己那层归 `BlockTests`，不重复守。）
+        AssertEachItemKeysOf(root.GetProperty("rendered"), "from", "at", "blocks");
+    }
+
+    [Fact]
+    public async Task Snapshot_Queue_CarriesExactlyTheseKeys()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        AssertKeysOf(await GetJson($"/sessions/{sid}/queue"), "isRunning", "queueDepth");
+    }
+
+    // ⚠️ `/axes` 的每项**随轴而变**：数值范围轴（温度）多一个 `range`，枚举轴没有。
+    // ⇒ 期望值从 `Axes.RangeOf` 现算，并且**两支都要真的走到**——
+    // 否则 `else` 那支会静默变成死代码，而它恰恰是五条轴共用的那条。
+    [Fact]
+    public async Task Snapshot_Axes_CarriesExactlyTheseKeys()
+    {
+        var root = await GetJson("/axes");
+        AssertKeysOf(root, "axes", "alertSafety", "alertFrom");
+
+        var items = root.GetProperty("axes").EnumerateArray().ToList();
+        Assert.NotEmpty(items);
+
+        foreach (var a in items)
+        {
+            var name = a.GetProperty("name").GetString()!;
+            var expected = Axes.RangeOf(name) is null
+                ? new[] { "label", "name", "values", "inContext" }
+                : ["label", "name", "values", "inContext", "range"];
+            Assert.Equal(expected.OrderBy(n => n, StringComparer.Ordinal), KeysOf(a));
+        }
+
+        // 两支都走到（少了这句，一个只有枚举轴的实现也能让上面全绿）。
+        Assert.Contains(items, a => Axes.RangeOf(a.GetProperty("name").GetString()!) is not null);
+        Assert.Contains(items, a => Axes.RangeOf(a.GetProperty("name").GetString()!) is null);
+    }
+
+    [Fact]
+    public async Task Snapshot_Claims_CarriesExactlyTheseKeys()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        await _dispatcher.DispatchAsync(new CoreCommand.ClaimAcquire(sid, ["src/x.cs"]), "c2", false, CancellationToken.None);
+
+        AssertEachItemKeysOf(await GetJson("/claims"), "sessionId", "projectKey", "path", "at", "stale");
+    }
+
+    // ⚠️ `/providers` 的键集**随数据而变**（可空字段不设会被 `WhenWritingNull` 省掉）⇒
+    // 必须先播一个「字段全设上」的 provider，否则钉的是「碰巧只有 5 个键」。
+    [Fact]
+    public async Task Snapshot_Providers_CarriesExactlyTheseKeys()
+    {
+        SeedFullProvider();
+
+        var item = (await GetJson("/providers")).EnumerateArray()
+            .Single(e => e.GetProperty("id").GetString() == "full");
+
+        AssertKeysOf(item, "id", "protocol", "defaultModel", "endpoint", "authScheme", "modality", "models", "hasApiKey");
+    }
+
+    // 缺省供应商（可空字段全不设）的键集**更小**——这条把「省略」也钉住：
+    // 若哪天有人给 `Endpoint` 加个非空默认值，上面那条仍绿而这条会红。
+    [Fact]
+    public async Task Snapshot_Providers_OmitsNullFields()
+    {
+        var item = (await GetJson("/providers")).EnumerateArray()
+            .Single(e => e.GetProperty("id").GetString() == "p");   // InitializeAsync 播的那个
+
+        AssertKeysOf(item, "id", "protocol", "defaultModel", "modality", "hasApiKey");
+    }
+
+    [Fact]
+    public async Task Snapshot_ProviderSchema_CarriesExactlyTheseKeys() =>
+        AssertKeysOf(await GetJson("/provider-schema"), "protocols", "authSchemes", "defaultAuthScheme", "providerIdRule");
 
     // SessionSpec 的属性集就是这几样——将来谁往里加一个凭据字段，这条会红。
     // 只靠 Assert.False(spec.TryGetProperty("apiKey")) 不够：WhenWritingNull 会省掉值为 null 的键；
@@ -830,7 +1058,7 @@ public class ControlServerTests : IAsyncLifetime
         Assert.False(s.RootElement.TryGetProperty("model", out _));
     }
 
-    // 端点交的键就这三个，一个不多——任何会被序列化出来的新增键都会让这条红。
+    // 端点交的键就这四个，一个不多——任何会被序列化出来的新增键都会让这条红。
     // 限定词「会被序列化出来的」不是修辞：值为 null 的新增字段不会被序列化，这条看不见它。
     // 它与 SessionSpec_HasExactlyTheseProperties 不是同一套理：那里反射 CLR 属性集（null 也看得见），这里数的是序列化出来的键。
     [Fact]
@@ -839,8 +1067,13 @@ public class ControlServerTests : IAsyncLifetime
         using var s = JsonDocument.Parse(await Client.GetStringAsync(Http("/provider-schema")));
 
         Assert.Equal(
-            ["authSchemes", "protocols", "providerIdRule"],
+            ["authSchemes", "defaultAuthScheme", "protocols", "providerIdRule"],
             s.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal));
+
+        // ⚠️ 判据文案与缺省认证方式都要**来自定义处**，不能是在端点里内联的第二份。
+        //（内联那份会腐：改谓词的人看不见它，而头的表单文案是照它写的。）
+        Assert.Equal(CommandDispatcher.ProviderIdRule, s.RootElement.GetProperty("providerIdRule").GetString());
+        Assert.Equal(AuthSchemes.Default, s.RootElement.GetProperty("defaultAuthScheme").GetString());
     }
 
     // /providers 要把「端点决定数据发去哪」交出来，hasApiKey 让表单显示「已配置」而不是一个空框。

@@ -61,7 +61,8 @@ public sealed class ProviderStore(string dataRoot)
         }
     }
 
-    public IReadOnlyList<ProviderDefinition> List()    {
+    public IReadOnlyList<ProviderDefinition> List()
+    {
         if (!Directory.Exists(_root)) return [];
 
         return Directory.GetFiles(_root, "*.json")

@@ -33,10 +33,12 @@ public sealed class Repl(
 
     private SessionHandle? _current;
 
-    // 纯控制台的显示刷新判据（provider set 之后要重印端点那一行）；
+    // 纯控制台的显示刷新判据（provider set 之后要重印端点那一行）。
+    // ⚠️ **判据住在解析器那边**（`CoreCommandParser.IsProviderSetVerb`）——两边各写一份会漂，
+    // 而漂的那一边是静默的：这里不认 `provider<TAB>set` 的话，端点那一行就不印了，
+    // 用户看不到「端点刚刚被环境变量接管」（「别静默接管」正是靠那行字兑现的）。
     // 只影响一行字印不印，不影响正确性。provider delete 有意不扩进来。
-    public static bool IsProviderSetCommand(string line) =>
-        line.Trim().StartsWith("provider set ", StringComparison.Ordinal);
+    public static bool IsProviderSetCommand(string line) => CoreCommandParser.IsProviderSetVerb(line);
 
     public async Task<bool> ExecuteAsync(string line, CancellationToken ct)
     {

@@ -1,3 +1,4 @@
+using System.Text;
 using Lilara.Core.Kernel;
 using Lilara.Core.Hosting;
 
@@ -8,9 +9,6 @@ namespace Lilara.Core.Console;
 // 返回错误字符串而不是打印：打印是前端形态，头不该继承控制台的措辞。
 public static class CoreCommandParser
 {
-    // `claim list` 是控制台的查询，不是核心命令（不做 claim.list）：解析器返回 (null,null)，
-    // 由 Repl 拦截处理。判据必须由 Repl 与解析器共用——两边各写一份会漂
-    //（大小写 / 空白口径不同 ⇒ claim LIST 落进 AsMessage，被当成消息发给模型）。
     // `claim list` 是控制台的查询，不是核心命令（不做 claim.list）：解析器返回 (null,null)，
     // 由 Repl 拦截处理。判据必须由 Repl 与解析器共用——两边各写一份会漂
     //（大小写 / 空白口径不同 ⇒ claim LIST 落进 AsMessage，被当成消息发给模型）。
@@ -37,6 +35,35 @@ public static class CoreCommandParser
     //（由 IsClaimList 与 Parse 的 claim 分支共用）。边界用 char.IsWhiteSpace（宽）：
     // 窄口径下 claim + NBSP + 路径会两边都不认 ⇒ 当成消息发给模型。
     public static bool IsClaimVerb(string line) => StartsWithToken(line, "claim");
+
+    // 把所有「空白串」折叠成**单个普通空格**。`Parse` 入口调它一次，于是下面那一排
+    // 字面前缀判据与各种切词器**口径一致**（空格 / Tab / NBSP 等价，与 `StartsWithToken`
+    // 的 `char.IsWhiteSpace` 同义），而不必逐条去放宽谓词。
+    //
+    // ⚠️ 只折叠**空白**，不动别的字符：消息正文不经过这里（调用方用的是自己那份 `trimmed`），
+    // 所以即便将来有人把消息喂进来也不会被改写。
+    // ⚠️ 不用 `string.Join(' ', Split((char[]?)null))`：那样要为每行分配一个数组；
+    // 这里的行都很短，直接扫一遍更省事，也顺手避免了对空行的特判（空行返回空串）。
+    private static string Normalize(string line)
+    {
+        var sb = new StringBuilder(line.Length);
+        var inWhitespace = false;
+        foreach (var ch in line)
+        {
+            if (char.IsWhiteSpace(ch))
+            {
+                // 连续空白折叠成一个；开头的空白也一并丢掉（等价于原来的 `Trim`）。
+                if (!inWhitespace && sb.Length > 0) sb.Append(' ');
+                inWhitespace = true;
+            }
+            else
+            {
+                sb.Append(ch);
+                inWhitespace = false;
+            }
+        }
+        return sb.ToString();
+    }
 
     // 「以 token 打头、且它后面是分隔符或行尾」——claim 与 axis 两个词块入口共用的判据。
     // 首词大小写不敏感：放宽只是多认一条命令（可见），收紧会让这行字静默变成消息（不可见）。
@@ -66,6 +93,19 @@ public static class CoreCommandParser
         return words.Length >= 1 && string.Equals(words[0], "create", StringComparison.OrdinalIgnoreCase);
     }
 
+    // 「以 provider 打头、第二个词是 set」——`provider set` 词块入口的判据（首词走共用的 StartsWithToken）。
+    // ⚠️ **`Repl` 也用它**（决定 `provider set` 之后要不要重印端点那一行）：两边各写一份会漂，
+    // 而**漂的那一边是静默的**——`provider<TAB>set` 若在这里认、在 `Repl` 不认，
+    // 用户就看不到「端点刚刚被环境变量接管了」那行字（「别静默接管」那条硬约束正是靠它兑现的）。
+    public static bool IsProviderSetVerb(string line)
+    {
+        if (!StartsWithToken(line, "provider")) return false;
+
+        var words = line.Trim()["provider".Length..]
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return words.Length >= 1 && string.Equals(words[0], "set", StringComparison.OrdinalIgnoreCase);
+    }
+
     // 「以 axis 打头、第二个词是 set」——axis set 词块入口的判据（首词走共用的 StartsWithToken）。
     // axis settings 落回「普通消息」：set 之后切出的第一个词是 settings 而非 set。
     // 放宽的只有动词大小写——轴名与取值仍由 dispatcher 里的 Axes.TryParse 校验并规范化。
@@ -84,7 +124,19 @@ public static class CoreCommandParser
     // currentSessionId 是控制台专有的输入：claim src/foo 里没有会话 id，由控制台补上当前会话。
     public static (CoreCommand? Command, string? Error) Parse(string line, string? currentSessionId = null)
     {
-        var trimmed = line.Trim();
+        // ⚠️ **归一化放在这里、只放一处**：字面前缀的入口判据（下面那一排 `StartsWith("provider delete ")`）
+        // 只认空格，而同文件另一批判据走宽口径（`StartsWithToken` / `Split((char[]?)null)`）。
+        // 口径不一致的后果是**静默的**：`provider delete<TAB>p` 两边都不认 ⇒ 掉进 `Repl.AsMessage`
+        // ⇒ 当成消息发给模型（用户以为删了、provider 还在盘上、还烧一次调用）。
+        //
+        // ⚠️ **为什么不逐条把谓词改宽**：切词器是混着的——`Split((char[]?)null,…)`（宽）7 处、
+        // `Split(' ',…)`（窄）5 处，且 `ParseProviderSet` / `ParseSessionConfigure` 有**无守卫的
+        // `parts[2]`**。只放宽谓词、不放宽切词器 ⇒ 那两处会 `IndexOutOfRangeException`
+        // 掀翻常驻进程（`Repl` 只接 `DispatchException`）。归一化一次到位，且**没有**这条新崩溃路径。
+        //
+        // ⚠️ **不会污染消息正文**：调用方拿的是它自己那份未归一化的 `trimmed`
+        //（`Repl` 的 `AsMessage(trimmed)`），本函数的归一化只在本函数内部有效。
+        var trimmed = Normalize(line).Trim();
 
         // ⚠️ **不能写成裸 `StartsWith("session create")`**：那样 `session creates foo`
         // 也以它打头 ⇒ 被吞成一条 `session.create`，而**用户以为在发一条消息**。
