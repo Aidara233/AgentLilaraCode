@@ -571,21 +571,33 @@ public class ControlServerTests : IAsyncLifetime
     ///
     /// <para>⚠️ **这条是白名单**：加字段就得来改它。那正是要的——`SessionSpec` 是
     /// **写进每个会话目录**的东西，加字段该是有意识的动作，不是顺手。</para>
+    ///
+    /// <para>⚠️ **钉的是「名字 + 类型」，不只是名字**（复审点出的残余缺口）：
+    /// 只比名字的话，有人把已有的 `ProviderId: string` 改成持有 `ApiKey` 的
+    /// `ProviderDefinition`——**名字集合一模一样、守卫照样绿**，而
+    /// `spec.model.providerId.apiKey` 就这么序列化出去了。
+    /// ⇒ `shape` 里带上 `PropertyType.Name`，那一次修改会**当场红**。</para>
     /// </summary>
     [Fact]
     public void SessionSpec_HasExactlyTheseProperties_SoNoCredentialCanHide()
     {
-        static string[] Names(Type t) =>
-            t.GetProperties().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray();
+        // ⚠️ **名字 + 类型**，并按名字定序（反射的属性顺序不保证 ⇒ 不定序会偶发红）。
+        static string[] Shape(Type t) =>
+            t.GetProperties()
+                .Select(p => $"{p.Name}:{p.PropertyType.Name}")
+                .OrderBy(s => s, StringComparer.Ordinal)
+                .ToArray();
 
         Assert.Equal(
-            ["CreatedAt", "Model", "ProjectKey", "SessionId", "WorkingDirectory"],
-            Names(typeof(SessionSpec)));
+            ["CreatedAt:DateTimeOffset", "Model:ModelSelection", "ProjectKey:String",
+             "SessionId:String", "WorkingDirectory:String"],
+            Shape(typeof(SessionSpec)));
 
         // ⚠️ **嵌套那层也要钉**——key 加在这里会序列化成 `spec.model.apiKey`，顶层看不见。
         Assert.Equal(
-            ["Effort", "MaxTokens", "ModelId", "Protocol", "ProviderId"],
-            Names(typeof(ModelSelection)));
+            ["Effort:String", "MaxTokens:Int32", "ModelId:String",
+             "Protocol:String", "ProviderId:String"],
+            Shape(typeof(ModelSelection)));
     }
 
     /// <summary>
