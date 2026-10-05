@@ -754,7 +754,7 @@ async function loadCoreFacts() {
   }
 }
 
-// ---- 五轴（义务 4 的落点） ----
+// ---- 轴（义务 4 的落点） ----
 // 轴表、标签、inContext 都从核心拉（单一真相来源是核心的 Axes.Table，头不许手抄）：
 // 核心交 { name, label, values, inContext }，头只画控件。
 
