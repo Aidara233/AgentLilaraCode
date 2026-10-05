@@ -720,4 +720,49 @@ public class ControlServerTests : IAsyncLifetime
         // 判据是「命令真的生效了」，不只是「回执说 accepted」。
         Assert.Empty(new ClaimStore(_work).All());
     }
+
+    // ---- 自检端点：跑在哪个数据根 / 哪个 workdir / 哪个 origin ----
+
+    [Fact]
+    public async Task Health_ReportsTheDataRootAndWorkingDirectory()
+    {
+        var json = await Client.GetStringAsync(Http("/health"));
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        Assert.True(root.GetProperty("ok").GetBoolean());
+        // 「我配了 provider 怎么看不到」的答案来源就是这两个字段。
+        Assert.Equal(_root, root.GetProperty("dataRoot").GetString());
+        Assert.Equal(_work, root.GetProperty("workingDirectory").GetString());
+        Assert.Equal(JsonValueKind.Number, root.GetProperty("sessions").ValueKind);
+    }
+
+    // origin 读的必须是**实例值**，不是默认常量——换过 allowedOrigin 的服务器上要跟着变。
+    [Fact]
+    public async Task Info_ReportsTheOriginThisServerActuallyAccepts()
+    {
+        var json = await Client.GetStringAsync(Http("/info"));
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        Assert.Equal(_root, root.GetProperty("dataRoot").GetString());
+        Assert.Equal(ControlServer.DefaultAllowedOrigin, root.GetProperty("allowedOrigin").GetString());
+        Assert.False(string.IsNullOrWhiteSpace(root.GetProperty("coreVersion").GetString()));
+        // 两个端点的 URL 都要给——头靠它才知道 WS 该连哪。
+        Assert.Contains("/ws", root.GetProperty("endpoints").GetProperty("ws").GetString());
+    }
+
+    // ---- provider.test 的线上那一线 ----
+
+    [Fact]
+    public async Task WebSocket_ProviderTest_ForAMissingProvider_IsRejectedNamingTheId()
+    {
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        await SendAsync(ws, """{"kind":"command","id":"t1","payload":{"kind":"provider.test","id":"nope"}}""");
+
+        var ack = await ReceiveAsync(ws);
+        Assert.False(ack.GetProperty("accepted").GetBoolean());
+        Assert.Contains("nope", ack.GetProperty("reason").GetString());
+    }
 }

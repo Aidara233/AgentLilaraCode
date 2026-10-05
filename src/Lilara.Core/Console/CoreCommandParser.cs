@@ -11,12 +11,25 @@ public static class CoreCommandParser
     // `claim list` 是控制台的查询，不是核心命令（不做 claim.list）：解析器返回 (null,null)，
     // 由 Repl 拦截处理。判据必须由 Repl 与解析器共用——两边各写一份会漂
     //（大小写 / 空白口径不同 ⇒ claim LIST 落进 AsMessage，被当成消息发给模型）。
-    public static bool IsClaimList(string line)
-    {
-        if (!IsClaimVerb(line)) return false;
+    // `claim list` 是控制台的查询，不是核心命令（不做 claim.list）：解析器返回 (null,null)，
+    // 由 Repl 拦截处理。判据必须由 Repl 与解析器共用——两边各写一份会漂
+    //（大小写 / 空白口径不同 ⇒ claim LIST 落进 AsMessage，被当成消息发给模型）。
+    public static bool IsClaimList(string line) => IsListVerb(line, "claim");
 
-        var t = line.Trim();
-        var words = t["claim".Length..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+    // `provider list` / `session list` 同 `claim list`：控制台本地查询，解析器返回 (null,null)。
+    // ⚠️ 挡在 `Parse` 之前是**必须的**——不挡的话这些行走完 `Parse` 得到 (null,null)，
+    // 而 `Repl` 会把 (null,null) 当成「不是命令」⇒ 当普通消息发给模型（白烧一次调用、什么都没发生）。
+    public static bool IsProviderList(string line) => IsListVerb(line, "provider");
+    public static bool IsSessionList(string line) => IsListVerb(line, "session");
+
+    // 三条本地查询共用的判据：「以 token 打头、后面**恰好一个词**且是 list」。
+    // 走 StartsWithToken（宽口径边界）⇒ provider<TAB>list / provider list<NBSP> 都认。
+    private static bool IsListVerb(string line, string token)
+    {
+        if (!StartsWithToken(line, token)) return false;
+
+        var words = line.Trim()[token.Length..]
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         return words.Length == 1 && string.Equals(words[0], "list", StringComparison.OrdinalIgnoreCase);
     }
 
@@ -81,9 +94,26 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("provider delete ", StringComparison.Ordinal))
             return ParseProviderDelete(trimmed);
 
+        // `provider test <id>`：**动作**，与前两条不同——它带副作用（发一次网络请求）⇒ 走命令通道。
+        // 参数少一个或词数不对都报错，不猜（猜错的方向是拿别人的配置去打网络）。
+        if (trimmed.StartsWith("provider test ", StringComparison.Ordinal))
+            return ParseProviderTest(trimmed);
+
+        // 三条本地查询（provider / session / claim）+ 光杆动词，都不能落回「当成消息」
+        // （用户以为在列东西，实际烧了一次模型调用）。
+        if (IsProviderList(trimmed)) return (null, null);
+        if (IsSessionList(trimmed)) return (null, null);
+        if (string.Equals(trimmed, "provider", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, "session", StringComparison.OrdinalIgnoreCase))
+            return (null, "用法：provider list | provider set <id> … | provider delete <id> | provider test <id>"
+                + "\n      session list | session create | session activate <id> | session interrupt <id>");
+
         // 光一个 `provider delete` 不能落回「当成消息」——用户以为删了，而 provider 还在盘上。
         if (string.Equals(trimmed, "provider delete", StringComparison.Ordinal))
             return (null, "用法：provider delete <id>");
+
+        if (string.Equals(trimmed, "provider test", StringComparison.Ordinal))
+            return (null, "用法：provider test <id>");
 
         if (IsClaimList(trimmed)) return (null, null);
 
@@ -189,5 +219,16 @@ public static class CoreCommandParser
         return parts.Length == 3
             ? (new CoreCommand.ProviderDelete(parts[2]), null)
             : (null, "用法：provider delete <id>");
+    }
+
+    // `provider test <id>`：同 `provider delete`，只判词数。id 的合法性（含设备名）由 dispatcher 的
+    // `IsSafeProviderId` 判——**别在这里再抄一份**（唯一的差别是它只发请求、不删东西，代价小）。
+    private static (CoreCommand?, string?) ParseProviderTest(string line)
+    {
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        return parts.Length == 3
+            ? (new CoreCommand.ProviderTest(parts[2]), null)
+            : (null, "用法：provider test <id>");
     }
 }

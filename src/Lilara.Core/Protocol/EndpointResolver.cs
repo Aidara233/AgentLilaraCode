@@ -20,6 +20,18 @@ public sealed record ResolvedEndpoint(string Url, EndpointSource Source);
 // 官方地址只能在这里写一次。
 public static class EndpointResolver
 {
+    /// <summary>
+    /// 端点来源的中文标签。**与 <see cref="EndpointSource"/> 的定义同处一地**——
+    /// 照 <c>Axes.LabelOf</c> 的先例（标签住在定义旁边）。控制台与 dispatcher 都要印它，
+    /// 各写一份会漂（改一个来源名而漏改一处，用户看到的理由就静默错了）。
+    /// </summary>
+    public static string Describe(EndpointSource source) => source switch
+    {
+        EndpointSource.Configured => "来自 provider 配置",
+        EndpointSource.Environment => "来自环境变量",
+        _ => "官方地址",
+    };
+
     /// <summary>必须与 SDK 实际去读的那个名字一致，否则又变回静默接管。</summary>
     public const string EnvVar = "ANTHROPIC_BASE_URL";
 

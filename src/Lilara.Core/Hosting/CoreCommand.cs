@@ -29,6 +29,17 @@ public abstract record CoreCommand
     /// </summary>
     public sealed record ProviderDelete(string Id) : CoreCommand;
 
+    /// <summary>
+    /// 用该提供商的配置发一次**最小请求**，回答「通不通 + 为什么」。
+    ///
+    /// ⚠️ **它不是命令不合法那一类**（`Ack.Rejected`）——「provider 不存在 / id 不合法」才是；
+    /// 「连不上 / 401 / 上游 5xx」是**业务结果**，走 `Ack.Accepted` 的 `Note`（`03` §3 的硬约束：
+    /// `rejected` 只用于命令本身不合法）。否则一次网络抖动会被说成「你的命令写错了」。
+    ///
+    /// ⚠️ 它**不改任何状态**、也不删东西——与 <see cref="ProviderDelete"/> 只共用一个 id 闸。
+    /// </summary>
+    public sealed record ProviderTest(string Id) : CoreCommand;
+
     /// <summary>**显式动作**——核心不替你决定该有个会话。</summary>
     public sealed record SessionCreate : CoreCommand;
 

@@ -33,6 +33,12 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
     public string WorkingDirectory { get; } = workingDirectory;
 
     /// <summary>
+    /// 数据根。暴露出来是为了**诊断**：核心跑在哪个数据根上，是「为什么我看不到我配的 provider」
+    /// 这类问题唯一的答案来源（`GET /info` 与启动横幅都用它）。
+    /// </summary>
+    public string DataRoot { get; } = dataRoot;
+
+    /// <summary>
     /// 载入一个会话并登记；已激活则返回**同一个实例**。
     /// 幂等是硬要求：两个实例会让 `State` 分叉，而 `State` 是可变属性。
     /// </summary>

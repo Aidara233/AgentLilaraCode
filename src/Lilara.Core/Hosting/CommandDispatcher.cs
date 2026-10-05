@@ -12,12 +12,22 @@ namespace Lilara.Core.Hosting;
 /// 文本形态的守卫（`--` 开头 / 末尾缺值 / 未知标志）住在控制台的解析器里；
 /// 语义校验（未知协议 / 未知 auth）在这里，否则线上 `provider.upsert` 能写进坏值。
 /// </summary>
+/// <param name="createAdapter">
+/// 按 provider 定义造适配器。**可选，默认就是生产那条路**（<see cref="AdapterFactory.Create"/>）。
+/// 存在的理由与 <paramref name="resolveStepper"/> 一样：`provider.test` 要真发一次请求，
+/// 不给测试留注入口就只能靠打真网络——那不是单元测试。
+/// </param>
 public sealed class CommandDispatcher(
-    CoreHost host, EventBus bus, Func<SessionHandle, Stepper> resolveStepper)
+    CoreHost host,
+    EventBus bus,
+    Func<SessionHandle, Stepper> resolveStepper,
+    Func<ProviderDefinition, IModelAdapter>? createAdapter = null)
 {
     private readonly CoreHost _host = host;
     private readonly EventBus _bus = bus;
     private readonly Func<SessionHandle, Stepper> _resolveStepper = resolveStepper;
+    private readonly Func<ProviderDefinition, IModelAdapter> _createAdapter =
+        createAdapter ?? AdapterFactory.Create;
 
     /// <summary>
     /// 分派一条命令。
@@ -41,6 +51,9 @@ public sealed class CommandDispatcher(
 
                 case CoreCommand.ProviderDelete d:
                     return HandleProviderDelete(d, commandId);
+
+                case CoreCommand.ProviderTest t:
+                    return await HandleProviderTestAsync(t, commandId, ct);
 
                 case CoreCommand.SessionCreate:
                     return HandleSessionCreate(commandId);
@@ -231,6 +244,88 @@ public sealed class CommandDispatcher(
         _host.InvalidateSteppers();
 
         return new DispatchResult(new Ack.Accepted { CommandId = id });
+    }
+
+    /// <summary>
+    /// 连通性自检：用该提供商的配置发一次最小请求，把结果翻成一句人话。
+    ///
+    /// ⚠️ **失败不走 `Rejected`**：按 `03` §3，`rejected` 只用于**命令本身不合法**
+    /// （provider 不存在 / id 不合法 ⇒ 那两条才是 Rejected）。「连不上 / 401 / 上游 5xx」是
+    /// **业务结果**，走 `Accepted` 的 `Note`——否则一次网络抖动会被说成「你的命令写错了」。
+    ///
+    /// ⚠️ **超时必须短**：控制台是同步等的（`awaitCompletion: true`），
+    /// 用调用方的 token 等一个坏端点会让提示符看起来卡死。10 秒是「连不上」与「模型慢」的分界。
+    /// </summary>
+    private async Task<DispatchResult> HandleProviderTestAsync(
+        CoreCommand.ProviderTest t, string id, CancellationToken ct)
+    {
+        // 同一个闸，且在任何网络动作之前：坏 id 会变成 providers/ 下的文件名，而我们要拿它读盘拿定义。
+        if (!IsSafeProviderId(t.Id))
+            return Reject(id, UnsafeProviderIdReason(t.Id));
+
+        // 「损坏的文件也算不存在」在这里是对的：测试一个读不出来的配置，结论就是「配不出来」。
+        var provider = _host.Providers.Load(t.Id);
+        if (provider is null)
+            return Reject(id, $"没有提供商 '{t.Id}'。先 `provider set {t.Id} --key <key>` 配一个。");
+
+        // 适配器是从 provider 定义现造的（不走 stepper 缓存）——自检的意义就是验证**当前配置**，
+        // 拿缓存里那份可能过期的适配器等于没测。
+        IModelAdapter adapter;
+        try
+        {
+            adapter = _createAdapter(provider);
+        }
+        catch (Exception ex) when (ex is ModelCallFailedException or ArgumentException)
+        {
+            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = $"✗ 配不出适配器：{ex.Message}" });
+        }
+
+        // 端点必须在请求之前印出来——「生效端点必须说得出来」那条硬约束（EndpointResolver 的契约）。
+        var where = adapter.Endpoint is { } ep
+            ? $"{ep.Url}（{EndpointResolver.Describe(ep.Source)}）"
+            : "（占位适配器，无端点）";
+
+        // 最小请求：一条固定探针 + 小 max_tokens。
+        // ⚠️ 时间线不能空——`ClaudeRequestBuilder` 对空时间线直接抛（「时间线为空」）。
+        var probe = new ModelRequest
+        {
+            ModelId = provider.DefaultModel,
+            MaxTokens = 16,
+            Protocol = adapter.Protocol,
+            Effort = Axes.ValuesOf(Axes.Effort)![0],   // 取最低档：自检不该挑贵的跑
+            SystemBlocks = [],
+            Timeline =
+            [
+                new TimelineEvent.MessageEvent
+                {
+                    At = DateTimeOffset.UtcNow,
+                    From = Speaker.User,
+                    Blocks = [new Block.TextBlock("ping")],
+                },
+            ],
+        };
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+
+        try
+        {
+            var reply = await adapter.CallAsync(probe, timeout.Token);
+            return new DispatchResult(new Ack.Accepted
+            {
+                CommandId = id,
+                Note = $"✓ 通（{provider.DefaultModel} @ {where}）"
+                    + (reply.Refused ? "，但模型拒答了这次探针" : ""),
+            });
+        }
+        catch (Exception ex)
+        {
+            // 超时与真失败分开说：前者是「端点在，但没在 10 秒内答」，后者是「根本连不上 / 被拒」。
+            var why = timeout.IsCancellationRequested && !ct.IsCancellationRequested
+                ? "10 秒内没有响应（端点没起，或上游太慢）"
+                : ex.Message;
+            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = $"✗ 不通（{where}）：{why}" });
+        }
     }
 
     private DispatchResult HandleSessionCreate(string id)

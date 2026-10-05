@@ -28,7 +28,8 @@ public class CommandDispatcherTests : IDisposable
     private (CoreHost Host, CommandDispatcher Dispatcher) NewHarness()
     {
         var host = new CoreHost(_root, _work);
-        return (host, new CommandDispatcher(host, new EventBus(), _ => new Stepper(host.Store, _adapter)));
+        return (host, new CommandDispatcher(
+            host, new EventBus(), _ => new Stepper(host.Store, _adapter), _ => _adapter));
     }
 
     private static void SaveProvider(CoreHost host, string protocol = Protocols.ClaudeMessages) =>
@@ -512,5 +513,69 @@ public class CommandDispatcherTests : IDisposable
         Assert.Equal(1, end.Turn);
         // 拒答不产生模型消息——只有那条用户消息
         Assert.Single(payloads.OfType<WireEvent.MessageAppended>());
+    }
+
+    // ---- provider.test：自检的失败是**业务结果**，不是命令不合法 ----
+
+    [Fact]
+    public async Task ProviderTest_WhenTheModelAnswers_IsAcceptedWithAReachableNote()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        _adapter.Reply("pong");
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.ProviderTest("p"), "t", true, CancellationToken.None);
+
+        var ack = Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.Contains("通", ack.Note);
+        // 自检不能跳过请求：真的发了一次（否则「通」是假的）。
+        Assert.Single(_adapter.Calls);
+    }
+
+    // ⚠️ 这条钉住 03 §3 的分界：连不上是**业务结果**，走 Accepted{Note}，
+    // **绝不能是 Rejected**——否则一次网络抖动会被说成「你的命令写错了」。
+    [Fact]
+    public async Task ProviderTest_WhenTheCallFails_IsStillAccepted_NotRejected()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        _adapter.Throws(new ModelCallFailedException("连不上上游"));
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.ProviderTest("p"), "t", true, CancellationToken.None);
+
+        var ack = Assert.IsType<Ack.Accepted>(r.Ack);   // ← 不是 Rejected
+        Assert.Contains("不通", ack.Note);
+        Assert.Contains("连不上上游", ack.Note);
+    }
+
+    [Fact]
+    public async Task ProviderTest_ForAMissingProvider_IsRejected()
+    {
+        var (_, d) = NewHarness();
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.ProviderTest("p"), "t", true, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(r.Ack);
+        Assert.Contains("没有提供商", ((Ack.Rejected)r.Ack).Reason);
+    }
+
+    // 同一个闸：坏 id 在任何网络动作之前就被挡下（它本可以是 providers/ 之外的路径）。
+    [Theory]
+    [InlineData("../escaped")]
+    [InlineData("NUL")]
+    [InlineData("a/b")]
+    public async Task ProviderTest_WithAnUnsafeId_IsRejectedWithoutCallingTheModel(string id)
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.ProviderTest(id), "t", true, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(r.Ack);
+        Assert.Empty(_adapter.Calls);   // 闸在任何网络动作之前
     }
 }

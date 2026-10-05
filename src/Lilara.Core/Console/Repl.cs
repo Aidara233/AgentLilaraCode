@@ -51,6 +51,9 @@ public sealed class Repl(
         if (trimmed == "status") { PrintStatus(); return true; }
         // 判据与解析器共用（IsClaimList）：各写一份会漂 ⇒ claim LIST 被当成消息发给模型。
         if (CoreCommandParser.IsClaimList(trimmed)) { PrintClaims(); return true; }
+        // 同 claim list：本地盘点，不走命令通道。判据共用 ⇒ 差一个空格不会被当成消息。
+        if (CoreCommandParser.IsProviderList(trimmed)) { PrintProviders(); return true; }
+        if (CoreCommandParser.IsSessionList(trimmed)) { PrintSessions(); return true; }
 
         var (parsed, parseError) = CoreCommandParser.Parse(trimmed, Current?.SessionId);
         if (parseError is not null) { _out.WriteLine(parseError); return true; }
@@ -123,6 +126,12 @@ public sealed class Repl(
 
                 case CoreCommand.ClaimRelease release:
                     _out.WriteLine($"✓ 已释放 {string.Join("、", release.Scope)}");
+                    break;
+
+                // 连通性自检的结果在 Note 里（成功与「通了但不通」都走 Accepted——
+                // 按 03 §3，「连不上」是业务结果不是命令不合法，见 HandleProviderTest）。
+                case CoreCommand.ProviderTest test:
+                    _out.WriteLine(accepted.Note ?? $"提供商 '{test.Id}' 已测试。");
                     break;
 
                 default:
@@ -204,5 +213,42 @@ public sealed class Repl(
         if (claims.Count == 0) { _out.WriteLine("（没有声明）"); return; }
 
         foreach (var c in claims) _out.WriteLine($"{c.SessionId}  {c.Path}");
+    }
+
+    // 盘点提供商。**只印 Url，不印 ApiKey**——key 能改不能看（用户裁定）。
+    // 端点的来源也要印：这是「生效端点必须说得出来」那条硬约束的落点（EndpointResolver 的契约）。
+    private void PrintProviders()
+    {
+        var providers = _host.Providers.List();
+        if (providers.Count == 0) { _out.WriteLine("（还没有配置提供商）"); return; }
+
+        foreach (var p in providers)
+        {
+            var endpoint = EndpointResolver.Resolve(p.Endpoint);
+            _out.WriteLine($"{p.Id} · {p.Protocol} · {p.DefaultModel}"
+                + $" · {endpoint.Url}（{EndpointResolver.Describe(endpoint.Source)}）"
+                + (p.HasApiKey ? " · 有 key" : " · ⚠️ 无 key"));
+        }
+    }
+
+    // 盘点本项目下的会话。`已激活` 与 `当前` 是两个不同的事实：
+    // 前者是「在内存激活表里」，后者是「控制台的 Current 指着它」——别合并成一个词。
+    private void PrintSessions()
+    {
+        var projectKey = ProjectKey.FromPath(_host.WorkingDirectory);
+        var ids = _host.Store.ListSessions(projectKey);
+        if (ids.Count == 0) { _out.WriteLine("（本项目下还没有会话）"); return; }
+
+        var activated = _host.Activated.Select(h => h.SessionId).ToHashSet(StringComparer.Ordinal);
+
+        foreach (var sid in ids)
+        {
+            var spec = _host.Store.TryReadSpec(projectKey, sid);
+            var state = _host.Store.ReadState(projectKey, sid);
+
+            _out.WriteLine($"{sid} · 第 {state.Turn} 步 · {spec?.Model.ModelId ?? "?"}"
+                + (activated.Contains(sid) ? " · 已激活" : "")
+                + (sid == Current?.SessionId ? " · 当前" : ""));
+        }
     }
 }

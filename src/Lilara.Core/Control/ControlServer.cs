@@ -75,6 +75,29 @@ public sealed class ControlServer(
 
     private void MapSnapshots(WebApplication app)
     {
+        // 自检**最先**列：核心跑在哪个数据根、哪个工作目录、几个会话在内存里。
+        // 「我配了 provider 怎么看不到」这类问题，九成是数据根不对——这是它唯一的答案来源。
+        // ⚠️ dataRoot / workingDirectory 是本机绝对路径，在 CORS(*) 下可读——沿用 `/state` 早就
+        // 接受的同一个取舍（它一直在交出 WorkingDirectory），且只绑 127.0.0.1。
+        app.MapGet("/health", () => Results.Json(new
+        {
+            Ok = true,
+            DataRoot = host.DataRoot,
+            WorkingDirectory = host.WorkingDirectory,
+            Sessions = host.Activated.Count(),
+        }, WireJson.Options));
+
+        // 核心自述：版本 + 真正在接受的那个 origin + 两个端点的 URL。
+        // origin 读**实例值**（不是默认常量）——`--allowed-origin` 换过之后，这里必须跟着变。
+        app.MapGet("/info", () => Results.Json(new
+        {
+            DataRoot = host.DataRoot,
+            WorkingDirectory = host.WorkingDirectory,
+            CoreVersion = typeof(ControlServer).Assembly.GetName().Version?.ToString() ?? "?",
+            AllowedOrigin = allowedOrigin,
+            Endpoints = new { Http = Url, Ws = $"ws://{BindAddress}:{port}/ws" },
+        }, WireJson.Options));
+
         // 每个快照都带该 topic 的 seq 高水位：头拿它去 subscribe(since:)，
         // 「拉快照 → 订阅」之间落的事件才不漏不重。
         app.MapGet("/projects", () => Results.Json(ProjectKeys(), WireJson.Options));
@@ -424,6 +447,9 @@ public sealed class ControlServer(
                 Opt(payload, "model"), Opt(payload, "protocol"), Opt(payload, "endpoint"), Opt(payload, "auth")),
             // 同 provider.upsert / claim.release：线上解析是第三条线。
             "provider.delete" => new CoreCommand.ProviderDelete(
+                payload.GetProperty("id").GetString()!),
+            // 连通性自检。与 provider.delete 同形（只带 id）。
+            "provider.test" => new CoreCommand.ProviderTest(
                 payload.GetProperty("id").GetString()!),
             _ => throw new ArgumentException($"认不出的命令 '{kind}'"),
         };

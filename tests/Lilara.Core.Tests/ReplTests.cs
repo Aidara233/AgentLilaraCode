@@ -37,7 +37,8 @@ public class ReplTests : IDisposable
     private Repl NewRepl()
     {
         var host = new CoreHost(_root, _work);
-        var dispatcher = new CommandDispatcher(host, new EventBus(), _ => new Stepper(_store, _adapter));
+        var dispatcher = new CommandDispatcher(
+            host, new EventBus(), _ => new Stepper(_store, _adapter), _ => _adapter);
         return new Repl(host, dispatcher, _ => new Stepper(_store, _adapter), _out);
     }
 
@@ -73,7 +74,8 @@ public class ReplTests : IDisposable
         });
 
         var host = new CoreHost(_root, _work);
-        var dispatcher = new CommandDispatcher(host, new EventBus(), _ => new Stepper(_store, _adapter));
+        var dispatcher = new CommandDispatcher(
+            host, new EventBus(), _ => new Stepper(_store, _adapter), _ => _adapter);
         var repl = new Repl(host, dispatcher, _ => new Stepper(_store, _adapter), _out);
         var session = SessionHandle.Create(
             _store, _work, _providers.ToSelection(_providers.Load("claude")!, null, "high", 16000));
@@ -565,6 +567,124 @@ public class ReplTests : IDisposable
 
         Assert.Contains("other", _out.ToString());   // 真的印了声明列表
         // 拦下来了 ⇒ 没有命令被派发 ⇒ 适配器没被碰。
+        Assert.Empty(_adapter.Calls);
+    }
+
+    // ---- provider list / session list：本地盘点，不走命令通道 ----
+
+    [Fact]
+    public async Task ProviderList_PrintsIdEndpointAndWhetherThereIsAKey()
+    {
+        _providers.Save(new ProviderDefinition
+        {
+            Id = "local", Protocol = Protocols.ClaudeMessages, ApiKey = "sk-secret-value",
+            DefaultModel = "deepseek-flash", Modality = "vision",
+            Endpoint = "http://127.0.0.1:15721",
+        });
+
+        var repl = NewRepl();
+        await repl.ExecuteAsync("provider list", CancellationToken.None);
+
+        var text = _out.ToString();
+        Assert.Contains("local", text);
+        Assert.Contains("http://127.0.0.1:15721", text);   // 生效端点必须看得见
+        Assert.Contains("有 key", text);
+        // ⚠️ **key 能改不能看**——「不打印」只有这样才证得了。
+        Assert.DoesNotContain("sk-secret-value", text);
+    }
+
+    [Fact]
+    public async Task ProviderList_WithNoProviders_SaysSo()
+    {
+        var repl = NewRepl();
+
+        await repl.ExecuteAsync("provider list", CancellationToken.None);
+
+        Assert.Contains("还没有配置提供商", _out.ToString());
+    }
+
+    // ⚠️ 守在解析器那一条：`provider list` 若没被拦下，会走完 Parse 得到 (null,null)、
+    // 被 AsMessage 当成**消息发给模型**（白烧一次调用，用户以为在列东西）。
+    [Fact]
+    public async Task ProviderList_IsNotSentToTheModel()
+    {
+        var (repl, _, _) = NewHarness();
+
+        await repl.ExecuteAsync("provider   list", CancellationToken.None);   // 宽口径：连续空白也认
+
+        Assert.Contains("claude", _out.ToString());
+        Assert.Empty(_adapter.Calls);
+    }
+
+    [Fact]
+    public async Task SessionList_PrintsSessionsOfThisProjectWithTheirTurn()
+    {
+        var (repl, _, session) = NewHarness();
+
+        await repl.ExecuteAsync("session list", CancellationToken.None);
+
+        var text = _out.ToString();
+        Assert.Contains(session.SessionId, text);
+        Assert.Contains("第 0 步", text);
+        Assert.Contains("当前", text);   // NewHarness 把 console 的 Current 设成它
+    }
+
+    [Fact]
+    public async Task SessionList_WithNoSessions_SaysSo()
+    {
+        var repl = NewRepl();
+
+        await repl.ExecuteAsync("session list", CancellationToken.None);
+
+        Assert.Contains("还没有会话", _out.ToString());
+    }
+
+    // ---- provider test：连通性自检（动作 ⇒ 走命令通道） ----
+
+    [Fact]
+    public async Task ProviderTest_WhenTheModelAnswers_SaysItIsReachable()
+    {
+        _adapter.Reply("pong");
+        var (repl, _, _) = NewHarness();   // NewHarness 已存了 provider 'claude'
+
+        await repl.ExecuteAsync("provider test claude", CancellationToken.None);
+
+        var text = _out.ToString();
+        Assert.Contains("✓ 通", text);
+        Assert.Contains("claude-opus-5", text);
+    }
+
+    [Fact]
+    public async Task ProviderTest_WhenTheCallFails_SaysWhyNotJustFails()
+    {
+        _adapter.Throws(new Lilara.Core.Protocol.ModelCallFailedException("连不上上游"));
+        var (repl, _, _) = NewHarness();
+
+        await repl.ExecuteAsync("provider test claude", CancellationToken.None);
+
+        Assert.Contains("✗ 不通", _out.ToString());
+        Assert.Contains("连不上上游", _out.ToString());
+    }
+
+    [Fact]
+    public async Task ProviderTest_ForAnUnknownProvider_IsRejected()
+    {
+        var (repl, _, _) = NewHarness();
+
+        await repl.ExecuteAsync("provider test nope", CancellationToken.None);
+
+        Assert.Contains("没有提供商", _out.ToString());
+    }
+
+    // `provider test` 少一个 id 必须报用法，不能落回「当成消息发给模型」。
+    [Fact]
+    public async Task ProviderTest_WithoutAnId_SaysTheUsageAndDoesNotCallTheModel()
+    {
+        var (repl, _, _) = NewHarness();
+
+        await repl.ExecuteAsync("provider test", CancellationToken.None);
+
+        Assert.Contains("用法", _out.ToString());
         Assert.Empty(_adapter.Calls);
     }
 }
