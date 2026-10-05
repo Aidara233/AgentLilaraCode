@@ -680,23 +680,23 @@ public class ControlServerTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// ⚠️ **端点交的键就这三个，一个不多**——任何新键都会让这条红。
+    /// ⚠️ **端点交的键就这三个，一个不多**——任何**新增的**键都会让这条红。
     ///
-    /// <para>⚠️ **为什么不能只靠 `Assert.False(TryGetProperty("defaultModel"))`**：那是**缺字段型**断言，
-    /// 而 `WireJson.Options` 带 `WhenWritingNull` ⇒ 加一个**值为 null** 的字段时键会被整个省掉、
-    /// 那条照样绿。（加了非 null 的值它才抓得住。）</para>
+    /// <para>⚠️ **它多守住的是什么**：原来的 `Assert.False(TryGetProperty("defaultModel"))` 只看**两个写死的名字**
+    /// ⇒ 「新增一个**名字不叫** `defaultModel` / `model` 的**非空**键」它看不见。
+    /// 实测：给端点加 `DefaultModelHint = "claude-opus-5"` ⇒ **只有这条红**（键集合变 4 个），另外两条绿。</para>
     ///
-    /// <para>⚠️ 与 `SessionSpec_HasExactlyTheseProperties_…` 是**同一套理**：
-    /// 那里反射 CLR 属性集，这里没有类型可反射（匿名对象）⇒ **就钉序列化出来的键集合**。
-    /// 两者都**与 `WhenWritingNull` 无关**。</para>
+    /// <para>⚠️⚠️ **但它看不见「值为 null 的字段」那一格——别把这条当成已经守住了。**
+    /// 实测：给端点加 `DefaultModel = (string?)null` ⇒ **三条全绿**；
+    /// 真二进制 + curl 观测到的线上 JSON **仍然只有这三个键**
+    ///（`WhenWritingNull` 把 null 键整个省掉，线上契约根本没变）。</para>
     ///
-    /// <para>⚠️⚠️ **实测订正（R1 变异，别转抄上面那句的推论）：这条也**看不见** null 那一格。**
-    /// 给端点加 `DefaultModel = (string?)null` 后跑这三条 —— **三条全绿**；且真二进制 + curl 观测到的
-    /// 线上 JSON **仍然只有这三个键**（`WhenWritingNull` 把 null 键整个省掉，线上契约根本没变）。
-    /// ⇒ 这条真正多守住的，是**名字不叫 `defaultModel` / `model` 的**新增非空键：
-    /// 实测加 `DefaultModelHint = "claude-opus-5"`，**只有这条红**（键集合变 4 个），另外两条绿。
-    /// ⇒ 要连「值为 null 的字段」一起守，只有一个办法：把它变成**有 CLR 形状可反射的命名类型**
-    ///（匿名对象今天做不到）——那超出本 Minor 的范围，**别把这条当成已经守住了 null**。</para>
+    /// <para>⚠️ ⇒ 它与 T3 的 `SessionSpec_HasExactlyTheseProperties_…` **不是同一套理**，
+    /// 别把两者写成「都绕开了 `WhenWritingNull`」：
+    /// 那里**反射 CLR 属性集**（与序列化选项无关，**null 也看得见**），
+    /// 这里**数的是序列化出来的键**（`WhenWritingNull` 一省，**键就数不出来**）。
+    /// ⇒ 要连「值为 null 的字段」一起守，只有一条路：把它变成**有 CLR 形状可反射的命名类型**
+    ///（匿名对象今天做不到）——那是另一件事，超出本 Minor 的范围。</para>
     /// </summary>
     [Fact]
     public async Task ProviderSchema_CarriesExactlyTheseKeys()
