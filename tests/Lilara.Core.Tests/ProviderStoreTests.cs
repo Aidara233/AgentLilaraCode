@@ -197,7 +197,7 @@ public class ProviderStoreTests : IDisposable
     }
 
     /// <summary>
-    /// ⚠️ **`ProviderDefinition` 的落盘形状白名单**——T6 那次磁盘静默变更的根。
+    /// ⚠️ **`ProviderDefinition` 的属性形状**——T6 那次磁盘静默变更的根。
     ///
     /// <para>为什么有它：`ProviderStore.Save` 用 `Canonical.Json.Options` **直接**序列化本类型，
     /// 而那份设置**没有** `IgnoreReadOnlyProperties`。T6 往本类型加了个派生属性 `HasApiKey`，
@@ -205,28 +205,47 @@ public class ProviderStoreTests : IDisposable
     /// 而全量测试全绿**：`DiskFormatGoldenTests` 只覆盖 `SessionSpec` / `SessionState` /
     /// `TimelineEvent` / `Block`（**不含本类型**），本文件其余测试是往返 / 旧格式加载、
     /// **从不断言写出的字节**，而记录相等又不看派生属性（它没有后备字段）⇒ 多出的键**不影响任何断言**。
-    /// ⇒ 当时用 `[JsonIgnore]` 堵住了**那一个属性**，**没堵住那一类**：下次再加字段 / 派生属性，
-    /// 磁盘格式会再次静默变更而**没有东西会红**。这条就是堵那一类的。</para>
+    /// ⇒ 当时用 `[JsonIgnore]` 堵住了**那一个属性**，**没堵住那一类**。这条就是堵那一类的。</para>
     ///
-    /// <para>⚠️ **纯反射，与序列化选项无关**：`PropertyNamingPolicy` / `WhenWritingNull` /
-    /// `IgnoreReadOnlyProperties` 怎么改都动不了它——它钉的是「这个类型**声明了哪些属性**」，
-    /// 于是「加字段」被强制成一次**有意识的动作**，而不是顺手。</para>
+    /// <para>⚠️ **两份清单，各钉一件事，缺一不可**（两份**都**按 `StringComparer.Ordinal` 定序——
+    /// 反射的属性顺序不保证，不定序会偶发红；**排序键是整条 `Name:Type` 串**，
+    /// 不是 `Name`——按名字排会把 `HasApiKey` 之类放错位置）：</para>
+    /// <list type="bullet">
+    /// <item><b>① <c>DeclaredShape</c>：全部声明的属性</b>（含带 `[JsonIgnore]` 的
+    /// ——它仍是 CLR 属性 ⇒ 照样在 `GetProperties()` 里）。**加任何属性都会红**，
+    /// 这正是 T6 那一类。它钉的是「**声明**了什么」，于是「加字段」被强制成一次
+    /// **有意识的动作**，而不是顺手。</item>
+    /// <item><b>② <c>PersistedShape</c>：会被写盘的那些</b>（滤掉带 `[JsonIgnore]` 的）。
+    /// **把某个属性上的 `[JsonIgnore]` 摘掉会红**——这正是 ① **盖不住**的那一格：
+    /// 摘 `[JsonIgnore]` **不改属性集** ⇒ ① 8=8 照样绿，而那个属性**从此刻起就落盘了**
+    /// （T6 的 `hasApiKey` 被写进盘，就是这么开始的）。
+    /// ⚠️ 反向读这条也成立：`HasApiKey` 今天带 `[JsonIgnore]` ⇒ 它**不在** ② 里；
+    /// **一旦有人把它的 `[JsonIgnore]` 摘掉（= 那次修复的逆），它就重新出现在 ② 里 ⇒ ② 当场红**。</item>
+    /// </list>
     ///
-    /// <para>⚠️ **`HasApiKey` 也在白名单里**（它带 `[JsonIgnore]`，但仍是 CLR 属性 ⇒ 照样出现在
-    /// `GetProperties()` 里）。**这是有意的**：白名单钉的是「**声明**了什么」，
-    /// `[JsonIgnore]` 管的是「**写不写盘**」——**是另一层**。若把 `[JsonIgnore]` 的成员滤出白名单，
-    /// 那「加/去属性」就要在这一处分两种情况判，而**把 `HasApiKey` 上的 `[JsonIgnore]` 摘掉**
-    /// （**正是 T6 的原始形态**：派生属性 + 落盘）时白名单**反而不动** ⇒ 恰好漏掉本任务要防的那次改动。
-    /// ⇒ 一概收进来，「声明」这一点才是一份完整、无条件的清单。</para>
+    /// <para>⚠️ **两份都纯反射，与序列化选项无关**：`PropertyNamingPolicy` / `WhenWritingNull` /
+    /// `IgnoreReadOnlyProperties` 怎么改都动不了它们。（② 认的是**声明上的** `[JsonIgnore]`，
+    /// 不是「`Json.Options` 最终写不写它」——`Json.Options` 层面的改动**不在本守卫内**。）</para>
     ///
-    /// <para>⚠️ **名字 + 类型**，并按 Ordinal 定序（反射的属性顺序不保证 ⇒ 不定序会偶发红）。
-    /// 只钉名字的话，把 `ApiKey: string` 换成**别的持有 key 的类型**不会红。</para>
+    /// <para>⚠️ **名字 + 类型**，不只是名字：只钉名字的话，把 `ApiKey: string` 换成
+    /// **别的持有 key 的类型**不会红。注意本测试钉的是**属性集这一层**，
+    /// 不是「盘上的确切字节」——后者是 `DiskFormatGoldenTests` 那一层的活。</para>
     /// </summary>
     [Fact]
-    public void ProviderDefinition_HasExactlyTheseProperties_SoTheOnDiskShapeIsPinned()
+    public void ProviderDefinition_HasExactlyTheseProperties()
     {
-        static string[] Shape(Type t) =>
+        // ① 声明的属性（含带 [JsonIgnore] 的）——「加了属性」红这一条。
+        static string[] DeclaredShape(Type t) =>
             t.GetProperties()
+                .Select(p => $"{p.Name}:{p.PropertyType.Name}")
+                .OrderBy(s => s, StringComparer.Ordinal)
+                .ToArray();
+
+        // ② 会被写盘的属性（滤掉带 [JsonIgnore] 的）——「摘掉 [JsonIgnore]」红这一条。
+        static string[] PersistedShape(Type t) =>
+            t.GetProperties()
+                .Where(p => !p.IsDefined(
+                    typeof(System.Text.Json.Serialization.JsonIgnoreAttribute), inherit: true))
                 .Select(p => $"{p.Name}:{p.PropertyType.Name}")
                 .OrderBy(s => s, StringComparer.Ordinal)
                 .ToArray();
@@ -234,6 +253,12 @@ public class ProviderStoreTests : IDisposable
         Assert.Equal(
             ["ApiKey:String", "AuthScheme:String", "DefaultModel:String", "Endpoint:String",
              "HasApiKey:Boolean", "Id:String", "Modality:String", "Protocol:String"],
-            Shape(typeof(ProviderDefinition)));
+            DeclaredShape(typeof(ProviderDefinition)));
+
+        // ⚠️ `HasApiKey` **刻意不在**这条里——它今天带 `[JsonIgnore]`。
+        Assert.Equal(
+            ["ApiKey:String", "AuthScheme:String", "DefaultModel:String", "Endpoint:String",
+             "Id:String", "Modality:String", "Protocol:String"],
+            PersistedShape(typeof(ProviderDefinition)));
     }
 }
