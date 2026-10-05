@@ -635,6 +635,51 @@ public class ControlServerTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// ⚠️ **它不是「可选的美化」，是「不许手抄」的执行面**：头要渲染配置表单就必须知道
+    /// 「**合法协议** / **合法 auth**」——而这两样的真相来源在核心
+    ///（`Protocols.All` / `AuthSchemes`）。
+    /// ⚠️ 头已经抄错一次：`head/wwwroot/index.html` 的引导文案写死 `--protocol claude-messages`，
+    /// 而它只是**默认值**，不是「唯一能用的」——那正是用户第一次配置时踩的坑。
+    /// </summary>
+    [Fact]
+    public async Task ProviderSchema_CarriesTheTruthItOwns()
+    {
+        using var s = JsonDocument.Parse(await Client.GetStringAsync(Http("/provider-schema")));
+
+        // ⚠️ **与真相来源对拍，不写死字面量**——写死的话，这个端点与 `Protocols.All`
+        //    分叉了测试也不会红，而「不许手抄」正是这个端点存在的理由。
+        // ⚠️ `!` 是必须的：`GetString()` 返回 `string?`，而 `Protocols.All` 是
+        //    `IReadOnlyList<string>`（非空）⇒ 不加会报 CS8620，本项目 `-warnaserror` 下即错误。
+        var protocols = s.RootElement.GetProperty("protocols").EnumerateArray()
+            .Select(e => e.GetString()!).ToList();
+        Assert.Equal(Protocols.All, protocols);
+
+        var auth = s.RootElement.GetProperty("authSchemes").EnumerateArray()
+            .Select(e => e.GetString()).ToList();
+        Assert.Equal([AuthSchemes.ApiKey, AuthSchemes.Bearer], auth);
+
+        // ⚠️ **人话规则要含设备名那一档**——它是 T1c 补上的、最容易被漏掉的一类，
+        //    而头要靠这句话**预先**挡掉用户手打的 `NUL`（不然用户撞的是「核心崩了」）。
+        Assert.Contains("设备名", s.RootElement.GetProperty("providerIdRule").GetString());
+    }
+
+    /// <summary>
+    /// ⚠️ **`defaultModel` 有意**不交——它今天**没有可信来源**（核过：`claude-opus-5` 只出现在
+    /// `CommandDispatcher` 的兜底那一处，而 `IModelAdapter` 不交默认模型）。
+    /// ⇒ 交它 = 要么复制一份（G10），要么**发明**一个来源。
+    /// ⚠️ 这条断言是**反向的**，因为「下一个人顺手补上它」是最可能发生的事：
+    /// 他觉得 schema 里少个默认模型是缺陷，而**它是有意缺席的**。
+    /// </summary>
+    [Fact]
+    public async Task ProviderSchema_DeliberatelyOmitsTheDefaultModel()
+    {
+        using var s = JsonDocument.Parse(await Client.GetStringAsync(Http("/provider-schema")));
+
+        Assert.False(s.RootElement.TryGetProperty("defaultModel", out _));
+        Assert.False(s.RootElement.TryGetProperty("model", out _));
+    }
+
+    /// <summary>
     /// ⚠️ **没有 `claims.json` 时返回 `[]`，不是 404 也不是 500**——
     /// 「这个项目没人声明任何东西」是合法且**最常见**的形态。
     /// </summary>

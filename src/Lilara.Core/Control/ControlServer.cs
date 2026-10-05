@@ -2,9 +2,11 @@ using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using Lilara.Core.Adapters;
 using Lilara.Core.Control;
 using Lilara.Core.Hosting;
 using Lilara.Core.Persistence;
+using Lilara.Core.Providers;
 using Lilara.Core.Session;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -278,6 +280,25 @@ public sealed class ControlServer(
         // 还开着 CORS（`*`）。只回「有没有」，不回「是什么」。
         app.MapGet("/providers", () =>
             Results.Json(host.Providers.List().Select(p => new { p.Id, p.Protocol, p.DefaultModel }), WireJson.Options));
+
+        // ⚠️ **头渲染配置表单的真相来源**（「不许手抄」的执行面）：合法协议 / 合法 auth
+        // 的真相都在核心（`Protocols.All` / `AuthSchemes`），头手抄过一次而且**抄错了**——
+        // `head/wwwroot/index.html` 的引导文案写死 `--protocol claude-messages`，
+        // 而它只是**默认值**，不是「唯一能用的」。
+        //
+        // ⚠️ **不交 `defaultModel`——因为它今天没有可信来源。**
+        // 核到的事实：`claude-opus-5` 这个字面量**只出现在 `CommandDispatcher.cs` 一处**
+        //（`ProviderUpsert` 的兜底），而 `IModelAdapter` **不交**默认模型。
+        // ⇒ 它不是「第二份副本」（G10 那种），它是**唯一那份**，住在命令的兜底里。
+        // ⇒ 在 schema 里交它 = 要么复制一份（G10），要么**发明**一个来源。
+        // **两条都不做**：如实不交。头要预填模型，从 `/providers` 拿**已有那个 provider 的**
+        // `defaultModel`——那是**用户实际在用的值**，比任何全局默认都准。
+        app.MapGet("/provider-schema", () => Results.Json(new
+        {
+            Protocols = Protocols.All,
+            AuthSchemes = new[] { AuthSchemes.ApiKey, AuthSchemes.Bearer },
+            ProviderIdRule = "单个文件名：不含路径分隔符，不能是 . 或 ..，也不是 CON/NUL/COM1/CONIN$ 这类 Windows 设备名",
+        }, WireJson.Options));
     }
 
     /// <summary>
