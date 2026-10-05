@@ -59,6 +59,11 @@ public sealed class ProviderStore(string dataRoot)
     /// <para>⚠️⚠️ **失败必须重抛，不许返回 `false`。** 调用方把 `false` 读成
     /// 「没有提供商 'x'，无从删除。」——那对一次**暂时的占用**是**假话**（文件在，只是忙）。
     /// 重抛保住理由的诚实，由 dispatcher 把它翻译成人话（见 `HandleProviderDelete`）。</para>
+    ///
+    /// <para>⚠️ **「不许返回 `false`」那半有钉子**（`ProviderDelete_WhileAReadHandleIsOpen_…` 断言的
+    /// 「正被占用」那句）；**「重试 vs 立即重抛」那半没有**——它只收窄生产端的窗口、不改可观测语义，
+    /// 而**为它写时序测试会引入 flaky**（本仓库刚为一个随机端口的 flaky 测试付过账）。
+    /// ⇒ **这是刻意的取舍，不是遗漏**；若将来要钉，只能钉「耗时不小于退避下限」那种下界，且会绑死退避常数。</para>
     /// </summary>
     public bool Delete(string id)
     {

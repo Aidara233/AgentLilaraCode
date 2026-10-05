@@ -152,8 +152,10 @@ public static class CoreCommandParser
 
         // ⚠️ **G14 的第 ④ 条线：控制台语法**（计划裁定 ④：与 `provider set` **对称**）。
         // 没有它就会造出「配得进、删不掉」的形状——今天正是如此（只能手删文件）。
-        // ⚠️ 代价（若裁定变）：`04` §1.1 的「控制台不多一条命令」若被判定为连对称的删也算，
-        // 则应撤掉这条——但那样 `provider set` 也该只在线上，而它是既有的。
+        // ⚠️ 代价（若裁定变）：控制台此前**确实比 `03` §3 多几条**（`quit`/`status`/`claim list` 是本机查询），
+        // 再多这一条是**对称**的考量；若哪天判定连对称的删也不该有，则应撤掉——
+        // 但那样 `provider set` 也该只在线上，而它是既有的。
+        // ⚠️ （`docs/04` 原先那句「控制台…不多一条命令」已被改准——它当时就是假的。）
         if (trimmed.StartsWith("provider delete ", StringComparison.Ordinal))
             return ParseProviderDelete(trimmed);
 
