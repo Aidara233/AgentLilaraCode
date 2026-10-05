@@ -2,6 +2,7 @@ using Lilara.Core.Kernel;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Json;
 
 namespace Lilara.Core.Protocol.OpenAi;
 
@@ -77,10 +78,12 @@ public sealed class OpenAiHttp
     /// <summary>把 HTTP 失败翻译成一句人话。</summary>
     internal static string Describe(HttpStatusCode status, string body) => status switch
     {
+        // 401/403 把上游的原话带上——真正的病因常常只在那里
+        //（实测：`"cause":"API Key 所属分组已删除"`，而笼统的「没有权限」让人无从下手）。
         HttpStatusCode.Unauthorized =>
-            "API key 无效或已吊销（401）。检查 provider 配置里的 key。",
+            "API key 无效或已吊销（401）。检查 provider 配置里的 key。" + UpstreamSays(body),
         HttpStatusCode.Forbidden =>
-            "这个 key 没有访问该模型的权限（403）。",
+            "这个 key 没有访问该模型的权限（403）。" + UpstreamSays(body),
         HttpStatusCode.NotFound =>
             "端点或模型不存在（404）。检查 provider 的 endpoint 与 model。",
         HttpStatusCode.TooManyRequests =>
@@ -89,6 +92,39 @@ public sealed class OpenAiHttp
             $"上游 {(int)status}。这是临时的，重试即可。",
         _ => $"模型调用失败（{(int)status}）：{Truncate(body)}",
     };
+
+    // 上游说了一句话就带上它。空/读不出 ⇒ 空串（不印半截「上游说：」）。
+    internal static string UpstreamSays(string body)
+    {
+        var detail = Detail(body);
+        return detail.Length == 0 ? "" : $" 上游说：{detail}";
+    }
+
+    // 从错误体里抠人话。两种形状都见：`{"error":{"message":"…"}}`（OpenAI 规范）
+    // 与 `{"error":"…"}`（简写，本机网关实测有）。
+    // ⚠️ 全程 ValueKind 判据：`TryGetProperty` 在非对象元素上抛
+    //（三位协议链路的 T6/T8 都踩过这个坑）。
+    internal static string Detail(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return Truncate(body);
+            if (!root.TryGetProperty("error", out var err)) return Truncate(body);
+
+            if (err.ValueKind == JsonValueKind.String) return Truncate(err.GetString() ?? "");
+            if (err.ValueKind == JsonValueKind.Object
+                && err.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.String)
+                return Truncate(m.GetString() ?? "");
+
+            return Truncate(body);
+        }
+        catch (JsonException)
+        {
+            return Truncate(body);
+        }
+    }
 
     internal static string Truncate(string s) => s.Length <= 200 ? s : s[..200] + "…";
 }

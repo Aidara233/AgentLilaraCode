@@ -78,6 +78,18 @@ public sealed class ClaudeAdapter : IModelAdapter
             "被限流了（429）。等一会儿再试。",
         Anthropic.Exceptions.Anthropic5xxException =>
             "上游 5xx。这是临时的，重试即可。",
+
+        // 上游回了**不符合 Anthropic 规范的响应体**时，SDK 内部的 STJ 会抛这句
+        //（实测：本机网关 401 回 `{"error":"Authentication required"}`——规范要求 `error` 是
+        // **对象**、里面再放 `type`/`message`，而它是个**字符串**；SDK 去读 `.error.type` 就抛在这）。
+        // ⚠️ 它不是 `AnthropicException` 子类（**认不出 HTTP 状态码**）⇒ 不接的话会落进兜底，
+        // 把 STJ 的机器话原样吐给用户——「模型调用失败：The requested operation requires an
+        // element of type 'Object'…」。那条消息里**没有一个字**能指向真正的原因。
+        _ when ex.Message.Contains("requires an element of type", StringComparison.Ordinal) =>
+            "上游回的响应体不符合 Anthropic 规范（没能读出错误的对象结构）。"
+            + "多半是**端点不对**，或**认证没被接受**——本机网关通常只认 `--auth bearer`，"
+            + "官方 anthropic.com 只认 `--auth api-key`。",
+
         _ => $"模型调用失败：{ex.Message}",
     };
 }

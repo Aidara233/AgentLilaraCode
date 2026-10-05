@@ -243,4 +243,19 @@ public class ClaudeAdapterTests
 
         Assert.Contains("totally unknown", described);
     }
+
+    // ⚠️ 上游回了**不符合 Anthropic 规范的错误体**时，SDK 内部的 STJ 抛这句；
+    // 它不是 AnthropicException 子类 ⇒ 原先落进兜底，把机器话原样吐给用户（实测踩过）。
+    // 判据是**实测的那句原话**：`"error"` 是字符串（规范要对象）时 SDK 报的就是它。
+    [Fact]
+    public void Describe_ExplainsTheNonStandardErrorBodyInsteadOfLeakingStjJargon()
+    {
+        var described = ClaudeAdapter.Describe(new InvalidOperationException(
+            "The requested operation requires an element of type 'Object', but the target element has type 'String'."));
+
+        Assert.Contains("不符合 Anthropic 规范", described);
+        Assert.Contains("bearer", described);              // 指向最可能的原因
+        // 机器话不该原样透出去——那正是这次要修的。
+        Assert.DoesNotContain("requires an element of type", described);
+    }
 }

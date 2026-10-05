@@ -92,4 +92,46 @@ public class OpenAiHttpDescribeTests
 
         Assert.Equal(new string('z', 200) + "…", result);
     }
+
+    // ---- 上游原话要带上：真正的病因常常只在那里 ----
+    // ⚠️ 体是**实测原样抄下来的**（本机网关 403），不是我编的一个「像那么回事」的形状——
+    // 我第一版就编错了：以为 `cause` 是独立字段，其实它**包在 `error.message` 的文本里**。
+    [Fact]
+    public void Describe_Forbidden_IncludesWhatTheUpstreamSaid()
+    {
+        const string body = """{"error":{"message":"CC Switch local proxy failed while handling Codex endpoint /chat/completions. Provider: 高数; model: x; upstream_status: HTTP 521; cause: 上游错误 (521):","type":"upstream_error","code":"cc_switch_upstream_error"}}""";
+
+        var message = OpenAiHttp.Describe(HttpStatusCode.Forbidden, body);
+
+        Assert.Contains("上游错误 (521)", message);   // 真正的病因只在 error.message 里
+    }
+
+    // `error` 是**字符串**（简写）也要认——本机网关 401 就回 `{"error":"Authentication required"}`。
+    [Fact]
+    public void Detail_AcceptsTheStringShorthand()
+    {
+        Assert.Equal("Authentication required",
+            OpenAiHttp.Detail("""{"error":"Authentication required"}"""));
+    }
+
+    [Fact]
+    public void Detail_ReadsTheStandardObjectShape()
+    {
+        Assert.Equal("bad key",
+            OpenAiHttp.Detail("""{"error":{"message":"bad key","type":"invalid_request_error"}}"""));
+    }
+
+    // 非对象根 / 坏 JSON 都不能抛——`TryGetProperty` 在非对象上会直接抛（三位协议链路的 T6/T8 踩过）。
+    [Theory]
+    [InlineData("[1,2,3]")]
+    [InlineData("\"just a string\"")]
+    [InlineData("42")]
+    [InlineData("not json at all")]
+    [InlineData("")]
+    public void Detail_NeverThrowsOnNonObjectBodies(string body)
+    {
+        var ex = Record.Exception(() => OpenAiHttp.Detail(body));
+
+        Assert.Null(ex);
+    }
 }
