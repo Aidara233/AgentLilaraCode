@@ -559,6 +559,36 @@ public class ControlServerTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// ⚠️ **`SessionSpec` 的属性集就是这几样——将来谁往里加一个凭据字段，这条会红。**
+    ///
+    /// <para>为什么不能只靠 `Assert.False(spec.TryGetProperty("apiKey"))`：那条是**缺字段型**断言，
+    /// 而 `WireJson.Options` 带 `WhenWritingNull` ⇒ 加一个**为 null** 的 `string? ApiKey`
+    /// 时键会被整个省掉、那条照样绿。（加了**非 null** 的值它才抓得住。）</para>
+    ///
+    /// <para>⚠️ **反射而不是枚举 JSON**：key 若加在**嵌套**类型上，会变成 `spec.model.apiKey`——
+    /// 顶层的 `TryGetProperty` 看不见它。属性集这条**两层一起钉**，
+    /// 且**与序列化选项无关**（改 `JsonSerializerOptions` 也动不了它）。</para>
+    ///
+    /// <para>⚠️ **这条是**白名单**：加字段就得来改它。那正是要的——`SessionSpec` 是
+    /// **写进每个会话目录**的东西，加字段该是有意识的动作，不是顺手。</para>
+    /// </summary>
+    [Fact]
+    public void SessionSpec_HasExactlyTheseProperties_SoNoCredentialCanHide()
+    {
+        static string[] Names(Type t) =>
+            t.GetProperties().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray();
+
+        Assert.Equal(
+            ["CreatedAt", "Model", "ProjectKey", "SessionId", "WorkingDirectory"],
+            Names(typeof(SessionSpec)));
+
+        // ⚠️ **嵌套那层也要钉**——key 加在这里会序列化成 `spec.model.apiKey`，顶层看不见。
+        Assert.Equal(
+            ["Effort", "MaxTokens", "ModelId", "Protocol", "ProviderId"],
+            Names(typeof(ModelSelection)));
+    }
+
+    /// <summary>
     /// ⚠️ **`GET /axes` 是头唯一的轴来源**（G8：头不许手抄）。
     /// 少了它，头里那份手抄的 `AXES` 常量就是第二份契约——而 `Axes.cs:8` 明说「不许手抄」。
     ///
