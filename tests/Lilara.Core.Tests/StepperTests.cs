@@ -218,4 +218,64 @@ public class StepperTests : IDisposable
         Assert.Equal("Idle", handle.State.Status);
         Assert.Equal(1, _store.ReadState(handle.ProjectKey, handle.SessionId).Turn);
     }
+
+    // ---- 温度：轴 → 请求 的那个**接缝**在本文件里验 ----
+    // ⚠️ 这里断的是**真的 Stepper** 交出去的 `ModelRequest`（`FakeAdapter.Calls`），
+    // 不是构造器的纯函数——「构造器会写 temperature」与「Stepper 真的把轴值交过去了」
+    // 是两件事，中间那一跳（`Axes.NumberOrNull` + 轴名）正是最容易漏的地方。
+
+    // 默认温度 1.0（两家 API 各自的默认）⇒ 值也是 1.0（不是 null——轴**总是**有值，
+    // 「不发」的决定发生在构造器那一层，见 `Build_WithoutATemperature_OmitsTheKeyEntirely`）。
+    [Fact]
+    public async Task Step_PassesTheTemperatureAxisIntoTheRequest()
+    {
+        var handle = NewSession();
+        _adapter.Reply("ok");
+
+        await _stepper.StepAsync(handle, "hi", CancellationToken.None);
+
+        Assert.Equal(1.0, _adapter.Calls[0].Temperature);
+    }
+
+    // 改轴之后**下一次**请求必须带上新值——这条才是「设了有用」的证明。
+    [Fact]
+    public async Task Step_AfterSetAxis_SendsTheNewTemperature()
+    {
+        var handle = NewSession();
+
+        handle.UpdateStateAndPersist(_store, s => s with
+        {
+            Axes = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal)
+            {
+                [Axes.Temperature] = "0.3",
+            },
+        });
+
+        _adapter.Reply("ok");
+        await _stepper.StepAsync(handle, "hi", CancellationToken.None);
+
+        Assert.Equal(0.3, _adapter.Calls[0].Temperature);
+    }
+
+    // ⚠️ 轴被写坏（手改 `state.json`）时**不发**那个字段，而不是发个 NaN 或抛异常。
+    // `Axes.NumberOrNull` 对越界/非数字一律给 null，于是这一格退化成「没设过温度」——
+    // 那是对的方向（漏发 ≠ 发个错值）。
+    [Fact]
+    public async Task Step_WithAGarbageTemperatureAxis_OmitsItInsteadOfThrowing()
+    {
+        var handle = NewSession();
+
+        handle.UpdateStateAndPersist(_store, s => s with
+        {
+            Axes = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal)
+            {
+                [Axes.Temperature] = "NaN",
+            },
+        });
+
+        _adapter.Reply("ok");
+        await _stepper.StepAsync(handle, "hi", CancellationToken.None);
+
+        Assert.Null(_adapter.Calls[0].Temperature);
+    }
 }

@@ -16,7 +16,7 @@ public class OpenAiChatRequestTests
     private static ModelRequest Req(params TimelineEvent[] tl) => new()
     {
         Protocol = Protocols.OpenAiChat,
-        ModelId = "deepseek-flash", MaxTokens = 16000, Effort = "high",
+        ModelId = "deepseek-flash", MaxTokens = 16000, Effort = "high", Temperature = null,
         SystemBlocks = [], Timeline = tl,
     };
 
@@ -208,5 +208,28 @@ public class OpenAiChatRequestTests
     {
         // 路径和协议串一样是线上契约，必须由字面量守，不能引用自己的常量。
         Assert.Equal("/v1/chat/completions", OpenAiChatRequest.Path);
+    }
+
+    // ---- 温度 ----
+
+    [Fact]
+    public void Build_WithATemperature_WritesItAsANumber()
+    {
+        var req = Req(Msg(Speaker.User, new Block.TextBlock("hi"))) with { Temperature = 0.7 };
+
+        var root = Parse(OpenAiChatRequest.Build(req));
+
+        Assert.Equal(0.7, root.GetProperty("temperature").GetDouble());
+    }
+
+    // ⚠️ `null` 必须**整个键都不出现**——不是写成 JSON 的 `null`。
+    // 手搓的 `JsonObject` 不走 `WhenWritingNull`，写成 `null` 上游会 400（那是「显式设为空」）。
+    // 这条同时钉住了「没设过温度的请求与加这个特性之前逐字节相同」。
+    [Fact]
+    public void Build_WithoutATemperature_OmitsTheKeyEntirely()
+    {
+        var root = Parse(OpenAiChatRequest.Build(Req(Msg(Speaker.User, new Block.TextBlock("hi")))));
+
+        Assert.False(root.TryGetProperty("temperature", out _));
     }
 }

@@ -27,6 +27,11 @@ public static class OpenAiResponsesRequest
             ["max_output_tokens"] = request.MaxTokens,
         };
 
+        // 同 Chat：`null` 不写这个键。⚠️ **字段名两条 OpenAI 协议都叫 `temperature`**——
+        // 与 `max_tokens` → `max_output_tokens` 那次改名不同，这里不要照抄那个改法。
+        if (request.Temperature is { } temperature)
+            body["temperature"] = temperature;
+
         // 系统提示走顶层 instructions（不占一条消息）。空时不发这个字段，而不是发个空串：
         // 判空必须落在拼接后的文本上，非空输入若全是非文本块会拼出空串。
         var systemText = string.Concat(

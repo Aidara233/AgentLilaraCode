@@ -296,6 +296,9 @@ public sealed class CommandDispatcher(
             MaxTokens = 16,
             Protocol = adapter.Protocol,
             Effort = Axes.ValuesOf(Axes.Effort)![0],   // 取最低档：自检不该挑贵的跑
+            // 自检**不带温度**：探针要验的是「这个供应商通不通」，不是「用户此刻的采样偏好」。
+            // 带上它反而会让「自检失败」多一种可疑原因（某个模型不认某个温度）。
+            Temperature = null,
             SystemBlocks = [],
             Timeline =
             [

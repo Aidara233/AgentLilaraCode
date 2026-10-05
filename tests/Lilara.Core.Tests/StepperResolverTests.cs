@@ -80,6 +80,7 @@ public class StepperResolverTests : IDisposable
                     MaxTokens = 16000,
                     Protocol = Protocols.ClaudeMessages,
                     Effort = "high",
+                    Temperature = null,
                     SystemBlocks = [],
                     Timeline = [],
                 },

@@ -16,6 +16,17 @@ public sealed record ModelRequest
     /// <summary>思考强度轴，映射到协议参数——绝不进上下文。</summary>
     public required string Effort { get; init; }
 
+    /// <summary>
+    /// 采样温度（`temperature` 轴）。`null` = **本次不发这个字段**。
+    ///
+    /// <para>⚠️ `null` 与「发一个默认值」**不是**同一件事：三个构造器都按
+    /// 「`null` 就不写这个键」实现，所以没设过的会话发出去的请求**逐字节**与加这条之前相同。
+    /// 这正是磁盘/线上格式能保持不变的原因。</para>
+    ///
+    /// <para>⚠️ 它由 `Axes.NumberOrNull` 从**轴**换算而来（不是从 spec）。</para>
+    /// </summary>
+    public required double? Temperature { get; init; }
+
     /// <summary>系统块。核心不带提示词，最小闭环恒为空；「块数恒定」说的是最多各 1 块，不是非有不可。</summary>
     public required IReadOnlyList<Block> SystemBlocks { get; init; }
 

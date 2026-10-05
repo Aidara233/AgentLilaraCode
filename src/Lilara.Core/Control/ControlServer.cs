@@ -168,6 +168,10 @@ public sealed class ControlServer(
         // 头唯一的轴来源（不许手抄轴表）：标签与告警的两端都从核心交出去，头里写字面量会静默失效。
         // alertFrom 是「起始档」，头的判据要按 values.indexOf 的档位序比（权限是单调阶梯）。
         // ⇒ values 的顺序（= 档位序）也是契约的一部分，别排序。
+        // ⚠️ `range` 非空 ⇒ 这是一条**数值范围**轴：头应当画数字输入而不是下拉。
+        // 但**即使有 range，`values` 也照样是那张网格**（见 `Axes.Grid` 的注释）——
+        // 所以一个不认识 range 的头**画出来仍然是对的**（21 个选项的下拉），不会崩。
+        // 这条是刻意的：让核心能先上线，头后跟。
         app.MapGet("/axes", () => Results.Json(new
         {
             Axes = Kernel.Axes.Names.Select(n => new
@@ -176,6 +180,7 @@ public sealed class ControlServer(
                 Label = Kernel.Axes.LabelOf(n),
                 Values = Kernel.Axes.ValuesOf(n),
                 InContext = Kernel.Axes.InContext(n),
+                Range = Kernel.Axes.RangeOf(n),
             }),
             AlertSafety = Kernel.Axes.AlertSafety,
             AlertFrom = Kernel.Axes.AlertFrom,

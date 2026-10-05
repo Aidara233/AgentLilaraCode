@@ -35,6 +35,12 @@ public static class OpenAiChatRequest
             ["messages"] = messages,
         };
 
+        // `null` ⇒ **不写这个键**（与「发一个默认值」不是一回事）。
+        // ⚠️ 必须显式判空：手搓的 `JsonObject` 不走 `Json.Options` 的 `WhenWritingNull`，
+        // 直接赋 `null` 会写成 JSON 的 `null`——那是**另一个**值，上游会 400。
+        if (request.Temperature is { } temperature)
+            body["temperature"] = temperature;
+
         return body.ToJsonString(Json.Options);
     }
 

@@ -72,12 +72,14 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
                 // 而轴是**活**的（`session.setAxis` 改的就是它）。
                 // 按 Spec 读的话，用户在头上把 effort 拨到 `max`、头显示 `max`，
                 // 而**请求里发的还是建会话时那个值**——「设了没用」，且无从发现。
-                // ⚠️ 其余四条轴**不进请求**（`01` §3.5：只有 effort 是纯机械轴），
-                // 所以这里只读一条。将来哪条轴有了机械层，在这里加它的读取。
+                // ⚠️ 五条轴里只有 effort 与 temperature 进请求（`01` §3.5：纯机械轴）。
+                // ⚠️ **加一条有机械层的轴 = 加这里的一行 + 三个构造器各一行**——
+                // 这条规则可 grep（搜 `NumberOrNull`）。别指望有别的机制替你接上。
                 // ⚠️ `!` 是 **`Load` / `Create` 的契约**：它们保证 `State.Axes` 非空
                 // （见 `SessionState.Axes` 的注释）；能拿到 null 的只有手工 `new SessionHandle`，
                 // 那不是运行时路径。
                 Effort = handle.State.Axes![Axes.Effort],
+                Temperature = Axes.NumberOrNull(Axes.Temperature, handle.State.Axes![Axes.Temperature]),
                 SystemBlocks = [], // 04 §1.3：核心自带零内容
                 Timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
             };

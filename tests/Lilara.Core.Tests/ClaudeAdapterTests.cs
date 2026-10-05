@@ -26,6 +26,7 @@ public class ClaudeAdapterTests
         MaxTokens = 1024,
         Protocol = Protocols.ClaudeMessages,
         Effort = "high",
+        Temperature = null,
         SystemBlocks = [],
         Timeline = [],
     };

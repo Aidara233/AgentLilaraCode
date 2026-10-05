@@ -20,6 +20,25 @@ public static class ClaudeRequestBuilder
             Messages = BuildMessages(request.Timeline, request.Protocol),
             System = BuildSystem(request.SystemBlocks),
             OutputConfig = new OutputConfig { Effort = ToEffort(request.Effort) },
+
+            // ⚠️ **两个事实同时成立，别只记一个：**
+            //
+            // ① **SDK 把这个属性标成过时**（编译器 CS0618，原文）：
+            //    「Models released after Claude Opus 4.6 do not support setting temperature.
+            //      A value of 1.0 will be accepted for backwards compatibility,
+            //      all other values will be rejected with a 400 error.」
+            // ② **但是**——本项目实际用的端点（本机网关）**实测接受**它：
+            //    0.7 / 1.5 / 2.0 全部 200，2.5 与 -0.1 才 400（`Axes.Temperature` 的范围就是这么量出来的），
+            //    且**与 `output_config.effort` 同时发也不报错**。
+            //
+            // ⇒ 判断：既然用的是网关而不是官方 API，就**发**（否则这条轴在这个项目上是个静默的摆设）。
+            // ⚠️ **代价要写在明处**：若把这个 provider 指向**官方** anthropic.com 且模型是 4.6 之后的，
+            // 那么**非 1.0 的温度会被 400**。到那时这条 pragma 就是该回头的地方。
+            // （`#pragma` 是**必须**的：`TreatWarningsAsErrors` 下这个过时警告会挡住整个构建。
+            //  收窄到这一行，别在文件头关——那样会连带盖掉将来真正的过时警告。）
+#pragma warning disable CS0618
+            Temperature = request.Temperature,
+#pragma warning restore CS0618
         };
     }
 

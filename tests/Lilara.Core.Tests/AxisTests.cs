@@ -3,14 +3,17 @@ using Lilara.Core.Session;
 
 namespace Lilara.Core.Tests;
 
-// 五轴的唯一真相来源；钉的是「枚举与它声明的取值一致」。
+// 轴的唯一真相来源；钉的是「枚举与它声明的取值一致」。
 public class AxisTests
 {
     [Fact]
-    public void FiveAxes_AreExactlyTheOnesTheDocNames()
+    public void Axes_AreExactlyTheOnesTheDocNames()
     {
         // 顺序决定快照里轴的排列，也就决定头的渲染顺序——顺序不稳等于每步重排。
-        Assert.Equal(["initiative", "permission", "safety", "verify", "effort"], Axes.Names);
+        // ⚠️ "temperature" 是本表第一条**数值范围**轴（01 §3.5），排在最后 = 渲染在最后。
+        Assert.Equal(
+            ["initiative", "permission", "safety", "verify", "effort", "temperature"],
+            Axes.Names);
     }
 
     [Fact]
@@ -18,6 +21,21 @@ public class AxisTests
     {
         foreach (var axis in Axes.Names)
             Assert.True(Axes.ValuesOf(axis)!.Count >= 2, $"轴 {axis} 至少要两个取值，否则它不是轴");
+    }
+
+    // ⚠️ **数值轴也必须有非空 Values**——这条钉的是「别把非枚举塞进 ValuesOf 的 null 里」。
+    // 若数值轴返回 null，那么「未知轴」与「非枚举轴」就混成一个 null，
+    // 而上面那条的 `ValuesOf(axis)!` 会当场 NRE；头那边 `for (const v of a.values)` 会
+    // **静默炸掉整个轴面板**（TypeError 不冒泡到任何可见的地方）。
+    [Fact]
+    public void NumericAxis_StillHandsOutANonEmptyGrid()
+    {
+        var values = Axes.ValuesOf(Axes.Temperature);
+
+        Assert.NotNull(values);
+        Assert.NotEmpty(values!);
+        Assert.Equal("0.0", values![0]);      // 网格两端按步长的位数补齐（步长 0.1 ⇒ 一位小数）
+        Assert.Equal("2.0", values[^1]);
     }
 
     [Fact]
@@ -200,14 +218,121 @@ public class AxisTests
 
     // 「只有 effort 不进上下文」需要守卫：只断言 effort 侧是 false 时，
     // 把 InContext 写成恒 false 全部测试仍绿，而头上五个下拉全被画灰。
+    // ⚠️ temperature 是**第二条** false 的轴（同样是纯请求参数，与 effort 同侧）。
     [Theory]
     [InlineData(Axes.Initiative, true)]
     [InlineData(Axes.Permission, true)]
     [InlineData(Axes.Safety, true)]
     [InlineData(Axes.Verify, true)]
     [InlineData(Axes.Effort, false)]
+    [InlineData(Axes.Temperature, false)]
     public void InContext_IsTrueForEveryAxisExceptEffort(string axis, bool expected) =>
         Assert.Equal(expected, Axes.InContext(axis));
+
+    // ---- 数值范围轴 ----
+
+    // ⚠️ 网格与解析器必须**互相覆盖**：每个网格值都要能被 TryParse 接受、且规范化成它自己。
+    // 这是浮点最容易悄悄错的地方（`7 * 0.1` 是 `0.7000000000000001`），
+    // 而错了的表现是「头下拉里的值和用户手打同一个数，核心却说不合法」。
+    [Fact]
+    public void EveryGridValue_RoundTripsThroughTryParse()
+    {
+        foreach (var v in Axes.ValuesOf(Axes.Temperature)!)
+        {
+            Assert.True(Axes.TryParse(Axes.Temperature, v, out var canonical), $"网格值 {v} 被自己拒了");
+            Assert.Equal(v, canonical);
+        }
+    }
+
+    [Theory]
+    [InlineData("0", "0.0")]
+    [InlineData("0.7", "0.7")]
+    [InlineData("1", "1.0")]      // 手打整数也要规范化成网格那个拼法
+    [InlineData("2", "2.0")]
+    [InlineData(" 1.5 ", "1.5")]  // 前后空白：double.TryParse 默认允许，规范化后落回网格拼法
+    public void Temperature_ParsesAndNormalizes(string input, string expected)
+    {
+        Assert.True(Axes.TryParse(Axes.Temperature, input, out var canonical));
+        Assert.Equal(expected, canonical);
+    }
+
+    // 越界必须拒（实测本机网关的范围就是 [0,2]，见 Axes.Temperature 的注释）。
+    [Theory]
+    [InlineData("2.1")]
+    [InlineData("-0.1")]
+    [InlineData("100")]
+    public void Temperature_OutOfRange_IsRefused(string input) =>
+        Assert.False(Axes.TryParse(Axes.Temperature, input, out _));
+
+    // ⚠️ **落在网格之间要拒，不能悄悄吸附**：0.75 存成 0.8 是另一种行为，而用户不会知道。
+    [Fact]
+    public void Temperature_OffTheGrid_IsRefused_NotSilentlySnapped()
+    {
+        Assert.False(Axes.TryParse(Axes.Temperature, "0.75", out var canonical));
+        Assert.Equal("", canonical);
+    }
+
+    [Theory]
+    [InlineData("abc")]
+    [InlineData("")]
+    [InlineData("0,7")]     // 逗号小数：InvariantCulture 下不合法（区域设置在这里没有话语权）
+    [InlineData("1e1")]     // 科学计数法在范围外
+    [InlineData("NaN")]
+    [InlineData("Infinity")]
+    public void Temperature_NonNumeric_IsRefused(string input) =>
+        Assert.False(Axes.TryParse(Axes.Temperature, input, out _));
+
+    // 数值轴的合法值文案**不是**把网格拼出来（21 个数印进错误信息没法读）——给范围与步长。
+    [Fact]
+    public void LegalValuesText_ForANumericAxis_ShowsTheRange_NotTheWholeGrid()
+    {
+        var text = Axes.LegalValuesText(Axes.Temperature);
+
+        Assert.Contains("0", text);
+        Assert.Contains("2", text);
+        Assert.Contains("0.1", text);            // 步长是用户真正需要的信息
+        Assert.DoesNotContain("|", text);        // 不是枚举那种竖线清单
+        Assert.True(text.Length < 40, $"数值轴的文案不该是一长串：{text}");
+    }
+
+    // RangeOf 的 null **不表示未知轴**——这个区别要钉住，否则有人会把
+    // `RangeOf(x) is not null` 当成「轴存在」的判据，于是五条枚举轴全被判成不存在。
+    [Fact]
+    public void RangeOf_IsNullForEnumeratedAxes_ButTheAxisStillExists()
+    {
+        Assert.Null(Axes.RangeOf(Axes.Safety));
+        Assert.True(Axes.IsKnown(Axes.Safety));       // ← 存在性要用 IsKnown 判
+        Assert.False(Axes.IsNumeric(Axes.Safety));
+
+        Assert.NotNull(Axes.RangeOf(Axes.Temperature));
+        Assert.True(Axes.IsNumeric(Axes.Temperature));
+
+        Assert.Null(Axes.RangeOf(null));              // 未知轴
+        Assert.Null(Axes.RangeOf("mood"));
+    }
+
+    // NumberOrNull 是「轴 → 请求」那条路上唯一的转换点。
+    [Fact]
+    public void NumberOrNull_ConvertsCanonicalStrings_AndRejectsTheRest()
+    {
+        Assert.Equal(0.7, Axes.NumberOrNull(Axes.Temperature, "0.7"));
+        Assert.Equal(2.0, Axes.NumberOrNull(Axes.Temperature, "2.0"));
+
+        Assert.Null(Axes.NumberOrNull(Axes.Temperature, "3"));      // 越界
+        Assert.Null(Axes.NumberOrNull(Axes.Temperature, "0,7"));    // 区域设置不许插话
+        Assert.Null(Axes.NumberOrNull(Axes.Safety, "dev"));         // 枚举轴没有数值
+        Assert.Null(Axes.NumberOrNull("mood", "1"));                // 未知轴
+        Assert.Null(Axes.NumberOrNull(Axes.Temperature, null));
+    }
+
+    // 默认值必须是 1.0（两家 API 各自的默认采样温度）——**不是**看着更讨喜的 0.7，
+    // 那会把每一个既有会话的采样行为悄悄改掉（用户从没要求过）。
+    [Fact]
+    public void Temperature_Default_IsTheNeutralOne()
+    {
+        Assert.Equal("1.0", Axes.Defaults()[Axes.Temperature]);
+        Assert.Equal(1.0, Axes.NumberOrNull(Axes.Temperature, Axes.Defaults()[Axes.Temperature]));
+    }
 
     // permission 的档位顺序是契约：头的跨轴告警按 values.indexOf 判档位，
     // 重排或插入第 6 档会让头给出错误档位而测试不红。

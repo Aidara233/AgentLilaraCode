@@ -1,9 +1,11 @@
 namespace Lilara.Core.Kernel;
 
+using System.Globalization;
+
 /// <summary>
-/// 行为控制轴（`01` §3.5）——**五轴的唯一真相来源**。
+/// 行为控制轴（`01` §3.5）——**轴的唯一真相来源**。
 ///
-/// <para>⚠️ 它是一张**表**，不是五个独立的散落判断。轴名、中文名、合法值、默认值、
+/// <para>⚠️ 它是一张**表**，不是几条独立的散落判断。轴名、中文名、合法值、默认值、
 /// 进不进上下文**五样放在一起**（见 <see cref="Spec"/>），是因为它们必须同步演进：
 /// 加一个档而忘了改默认值或错误信息，正是这类表最常见的漂移。
 /// 任何别处要用这些值（头的下拉、控制台的解析、错误信息）都**从这张表读**，不许手抄。</para>
@@ -16,6 +18,11 @@ namespace Lilara.Core.Kernel;
 /// <para>⚠️ **`effort` 在表里，但它不进上下文**（`01` §3.5：纯请求参数）。
 /// 它仍然是一条轴：用户要能改它，机械层（请求参数）也要跟着变。
 /// 「给头看 ≠ 给模型看」——头显示它是正确的，把它塞进提示词才是错的。</para>
+///
+/// <para>⚠️ **有一条轴是「数值范围」而不是「枚举档」**（<see cref="Temperature"/>）。
+/// 它照样有 <see cref="Values"/>——那是一张**由范围生成的网格**，不是手抄的清单。
+/// 这样做的理由见 <see cref="Grid"/>：`ValuesOf` 的「未知 → null」契约因此一个字不用动，
+/// 头也就不用为「这条轴的 values 可能是 null」加分支（那是会静默炸掉整个面板的一类改动）。</para>
 /// </summary>
 public static class Axes
 {
@@ -25,11 +32,29 @@ public static class Axes
     public const string Verify = "verify";
     public const string Effort = "effort";
 
+    /// <summary>
+    /// 温度（采样参数）。**与 effort 同侧**：有机械层（进请求）、零上下文暴露（`InContext: false`）。
+    ///
+    /// <para>⚠️ **它是本表第一条「数值范围」轴**，取值不像别的轴那样是一个能穷举的枚举档列表。
+    /// 范围 <c>[0, 2]</c> 是**实测**的（本机网关对 2.5 回
+    /// <c>Invalid temperature value, the valid range of temperature is [0, 2]</c>），
+    /// 且实测**温度与 `output_config.effort`（思考）同时发不报错**——
+    /// 这条要写下来，因为「Anthropic 官方的 thinking 与 temperature 互斥」是会被人套用过来的说法，
+    /// 而**本项目用的端点不是官方那个**。</para>
+    /// </summary>
+    public const string Temperature = "temperature";
+
     /// <summary>安全轴里代表「生产」的档名（`01` §3.5 的跨轴告警的一端）。</summary>
     public const string AlertSafety = "prod";
 
     /// <summary>权限轴里「授权及以上」的**起始档**（`01` §3.5 的跨轴告警的另一端）。</summary>
     public const string AlertFrom = "authorized";
+
+    /// <summary>
+    /// 一条**数值范围**轴的形状。<see cref="Values"/> 由它派生（<see cref="Grid"/>），不手抄。
+    /// <see cref="Step"/> 同时是**合法性的判据**：落在网格之间的值（如 0.75）会被拒，而不是悄悄吸到最近的档。
+    /// </summary>
+    public sealed record NumericRange(double Min, double Max, double Step);
 
     /// <summary>
     /// 轴的**全部**静态事实，按渲染顺序排（`01` §3.5 表格的顺序）。
@@ -41,12 +66,60 @@ public static class Axes
     /// 且每个值都被 <see cref="Array.AsReadOnly{T}"/> 包过一层：交出去的是**只读视图**，
     /// 调用方拿不到可写数组——否则改一处就等于改了**进程级静态表**（`TryParse` /
     /// `LegalValuesText` 以及**任何从本表读的调用方**会一起变，且**不报错**）。</para>
+    ///
+    /// <para>⚠️ <see cref="Range"/> 非空 ⇒ 这是一条**数值范围轴**，此时 <see cref="Values"/>
+    /// **必定**是 <see cref="Grid"/> 出来的那张只读网格（构造时由 <see cref="Numeric"/> 保证）。
+    /// 反过来说：**别手工构造「Range 非空但 Values 是手抄清单」的行**。</para>
     /// </summary>
     private sealed record Spec(
-        string Name, string Label, IReadOnlyList<string> Values, string Default, bool InContext);
+        string Name, string Label, IReadOnlyList<string> Values, string Default, bool InContext,
+        NumericRange? Range = null);
+
+    /// <summary>温度的范围与步长。⚠️ **唯一一份**——`Values` 网格由它生成，别在别处再列一遍 0.0…2.0。</summary>
+    private static readonly NumericRange TempRange = new(Min: 0, Max: 2, Step: 0.1);
 
     /// <summary>
-    /// 五轴的**唯一**一张表。顺序**就是**渲染顺序（`01` §3.5 表格），别按字母排。
+    /// 数值范围轴的**值网格**。⚠️ 它是 `Values` 的唯一来源——手抄 21 个值就是把「范围」这件事
+    /// 复制成两份，改范围时必漏一处（正是 `ToEffort` 那个已知缺陷的同一形状）。
+    ///
+    /// <para>⚠️ **这条设计是为了保住 `ValuesOf` 的 null 契约**：若数值轴返回 `null`，
+    /// 那么「未知轴」与「非枚举轴」两种 null 就混成一个，而
+    /// `AxisTests.EveryAxis_HasAtLeastTwoValues` 的 `ValuesOf(axis)!` 会**当场 NRE**，
+    /// 头的 `for (const v of a.values)` 会**静默炸掉整个轴面板**。
+    /// 生成网格之后，`ValuesOf` 对所有**已知**轴都非空，null 依旧只表示「未知」。</para>
+    /// </summary>
+    private static IReadOnlyList<string> Grid(NumericRange r)
+    {
+        var count = (int)Math.Round((r.Max - r.Min) / r.Step);
+        var values = new string[count + 1];
+        for (var i = 0; i <= count; i++) values[i] = Format(r.Min + i * r.Step, r.Step);
+        return Array.AsReadOnly(values);
+    }
+
+    /// <summary>
+    /// 数值 → 规范串。**唯一**的规范化拼法（`TryParse` 的数值分支与 <see cref="Grid"/> 共用），
+    /// 所以「网格里的值」与「用户敲进来的值」规范化之后**逐字相同**。
+    ///
+    /// <para>⚠️ 小数位数**由步长追出来**（步长 0.1 ⇒ 一位小数），不是写死的 `"0.##"`：
+    /// 后者会让 `1.0` 印成 `"1"`，于是网格看起来是 `0.9, 1, 1.1`——不一致，且
+    /// 「用户敲 1、表里是 1.0」这种差异会渗进 `state.json`。</para>
+    ///
+    /// <para>⚠️ **InvariantCulture 是硬要求**：区域设置会把小数点写成逗号，
+    /// 于是 `state.json` 里出现 `"0,7"`，而它再也读不回来。</para>
+    /// </summary>
+    private static string Format(double v, double step)
+    {
+        var decimals = 0;
+        for (var s = step; s < 1 - 1e-9 && decimals < 6; s *= 10) decimals++;
+        return v.ToString("F" + decimals, CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>数值范围轴的一行。⚠️ `Values` 从这里派生——别绕过它手写一行。</summary>
+    private static Spec Numeric(string name, string label, NumericRange range, string @default) =>
+        new(name, label, Grid(range), @default, InContext: false, Range: range);
+
+    /// <summary>
+    /// 轴的**唯一**一张表。顺序**就是**渲染顺序（`01` §3.5 表格），别按字母排。
     /// </summary>
     private static readonly IReadOnlyList<Spec> Table =
     [
@@ -89,10 +162,16 @@ public static class Axes
         // ⇒ 两个集合应当**相等**（本表 5 档 = `ToEffort` 的 5 条臂）。
         // ⚠️ `01` §3.5 只写三档（低/中/高），这里取五档是**故意的**：**文档待对齐**；
         // 多出来的两档是 SDK 已有的能力，不是这里新造的。
-        // ⚠️ `effort` 是**唯一** `InContext = false` 的（`01` §3.5：纯请求参数，不进上下文）。
+        // ⚠️ `effort` 是**唯一** `InContext = false` 的枚举轴（`01` §3.5：纯请求参数，不进上下文）。
         new(Effort, "思考强度",
             Array.AsReadOnly<string>(["low", "medium", "high", "xhigh", "max"]),
             "high", InContext: false),
+
+        // 温度。⚠️ 这是**第二条** `InContext = false` 的轴（纯请求参数，与 effort 同侧）。
+        // 默认 `1.0` = **两家 API 各自的默认采样温度** ⇒ 发它等于不发（按值等价），
+        // 于是「从未设过温度的老会话」行为不变。⚠️ 这也是为什么默认值**不是**看着更讨喜的 0.7：
+        // 那会把每一个既有会话的采样行为**悄悄改掉**，而用户从没要求过。
+        Numeric(Temperature, "温度", TempRange, @default: "1.0"),
     ];
 
     /// <summary>按轴名找那一行。<see langword="null"/> 与未知轴都返回 <see langword="null"/>。</summary>
@@ -157,15 +236,61 @@ public static class Axes
     /// </summary>
     public static bool IsKnown(string? axis) => Find(axis) is not null;
 
-    /// <summary>该轴的合法取值。<see langword="null"/> = 未知轴。返回的是**只读视图**，改不动。</summary>
+    /// <summary>
+    /// 该轴的合法取值。<see langword="null"/> = **未知轴**（这条契约一个字没动）。
+    /// 返回的是**只读视图**，改不动。
+    ///
+    /// <para>⚠️ **数值范围轴也走这里**，交出的是一张由范围生成的网格（见 <see cref="Grid"/>）——
+    /// 它**不是** null。别把「非枚举」塞进这个 null 里去：那样「未知」与「非枚举」就分不开了，
+    /// 而下面的 <see cref="RangeOf"/> 正是靠区分它们才有意义。</para>
+    /// </summary>
     public static IReadOnlyList<string>? ValuesOf(string? axis) => Find(axis)?.Values;
 
-    /// <summary>合法值清单（错误信息用）。⚠️ 从表里拼，不手抄。</summary>
-    public static string LegalValuesText(string? axis) =>
-        ValuesOf(axis) is { } v ? string.Join("|", v) : "";
+    /// <summary>
+    /// 该轴是不是**数值范围**轴，是就给出范围，否则 <see langword="null"/>。
+    ///
+    /// <para>⚠️ **注意这里 null 的含义与 <see cref="ValuesOf"/> 不同**：那个 null 表示「**未知轴**」，
+    /// 这个 null 表示「**已知，但不是数值轴**」。所以判「轴存不存在」要用
+    /// <see cref="IsKnown"/>，**不要**用 `RangeOf(...) is not null`——那会把五条枚举轴
+    /// 全判成不存在。</para>
+    /// </summary>
+    public static NumericRange? RangeOf(string? axis) => Find(axis)?.Range;
 
     /// <summary>
-    /// 校验并规范化（`PROD` → `prod`）。
+    /// 该轴的值**是不是数值**（头据此画数字输入而不是下拉）。
+    /// ⚠️ 未知轴返回 false——与 <see cref="IsKnown"/> 的「未知即假」同向。
+    /// </summary>
+    public static bool IsNumeric(string? axis) => Find(axis)?.Range is not null;
+
+    /// <summary>合法值清单（错误信息用）。⚠️ 从表里拼，不手抄。</summary>
+    public static string LegalValuesText(string? axis) => Find(axis) switch
+    {
+        null => "",
+        // 数值轴**不能**把整张网格用 `|` 拼出来——21 个数印进一句错误信息就没法读了。
+        // 给范围与步长（那才是用户要知道的东西）。⚠️ 措辞与枚举轴不同是**故意的**。
+        { Range: { } r } => $"{r.Min}~{r.Max} 之间的数值（步长 {r.Step}）",
+        { Values: var v } => string.Join("|", v),
+    };
+
+    /// <summary>
+    /// 轴上的规范串 → <see cref="double"/>。不是数值轴 / 解析不出来 ⇒ <see langword="null"/>。
+    ///
+    /// <para>⚠️ 这是「轴 → 请求」那条路上**唯一**的转换点（`Stepper` 用它读温度）。
+    /// 别在构造器里各写一遍 `double.Parse`：那样区域设置、越界判据、失败处理会各漂各的，
+    /// 而这三个恰恰是最容易悄悄出错的地方。</para>
+    /// </summary>
+    public static double? NumberOrNull(string? axis, string? canonical)
+    {
+        if (Find(axis)?.Range is not { } r || canonical is null) return null;
+
+        return double.TryParse(canonical, NumberStyles.Float, CultureInfo.InvariantCulture, out var d)
+            && d >= r.Min && d <= r.Max
+            ? d
+            : null;
+    }
+
+    /// <summary>
+    /// 校验并规范化（`PROD` → `prod`；`0.70` → `0.7`）。
     ///
     /// <para>⚠️ **两半的大小写策略是刻意不同的，别"统一"成一个：**</para>
     /// <list type="bullet">
@@ -176,11 +301,18 @@ public static class Axes
     /// </list>
     /// <para>所以 `TryParse("safety", "PROD")` 为真，而 `TryParse("Safety", "dev")` 为假。
     /// 两句都由 <c>AxisTests</c> 各钉一条，改动前先看那两条。</para>
+    ///
+    /// <para>⚠️ **数值轴走的是另一条分支**（大小写那套对它不适用）：解析成 `double`、
+    /// 查范围、**吸附到步长网格**，并且**拒绝落在网格之间的值**。
+    /// 拒绝而不是静默吸附——用户敲 `0.75`（步长 0.1）时，悄悄存成 `0.8` 是**另一种**行为，
+    /// 而他不会知道。（吸附只用来吸收浮点噪声：`0.1` 加十次不是精确的 `1.0`。）</para>
     /// </summary>
     public static bool TryParse(string? axis, string value, out string canonical)
     {
         canonical = "";
         if (Find(axis) is not { } spec) return false;   // ⚠️ null 键会让 `Dictionary` 抛，见 IsKnown 的注释
+
+        if (spec.Range is { } range) return TryParseNumeric(range, value, out canonical);
 
         foreach (var v in spec.Values)
         {
@@ -189,6 +321,35 @@ public static class Axes
             return true;
         }
         return false;
+    }
+
+    /// <summary>数值分支：解析 → 查区间 → 复验「本来就在网格上」→ 规范化。</summary>
+    private static bool TryParseNumeric(NumericRange r, string value, out string canonical)
+    {
+        canonical = "";
+
+        if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var d))
+            return false;
+
+        // ⚠️ **必须显式挡 `NaN` / `±Infinity`**：`double.TryParse("NaN")` 是**成功**的，
+        // 而接下来每一句与 NaN 的比较都是 `false` ⇒ **区间检查与网格检查会双双放行**，
+        // 于是 `"NaN"` 被当成合法值存进 `state.json`、再原样发去 API。
+        // （Infinity 那半会被区间检查挡住——`inf > Max` 为真——但 `IsFinite` 一句把两条都管了。）
+        // 这个洞是**测试抓出来的**，不是看出来的。
+        if (!double.IsFinite(d)) return false;
+
+        if (d < r.Min || d > r.Max) return false;
+
+        // ⚠️ **要求「本来就在网格上」，不是「吸附过去」**：`0.75`（步长 0.1）必须**被拒**，
+        // 不能悄悄存成 `0.8`——那是另一种行为，而用户不会知道。
+        // 容差 `1e-9` 只用来吸收浮点噪声（`7 * 0.1` 是 `0.7000000000000001`，不是 `0.7`），
+        // 比半个步长小得多，所以「正中间」那类值照样落网。
+        var steps = Math.Round((d - r.Min) / r.Step);
+        var snapped = r.Min + steps * r.Step;
+        if (Math.Abs(snapped - d) > 1e-9) return false;
+
+        canonical = Format(snapped, r.Step);
+        return true;
     }
 
     /// <summary>

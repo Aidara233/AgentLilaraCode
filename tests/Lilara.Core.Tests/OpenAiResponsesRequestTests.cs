@@ -13,7 +13,7 @@ public class OpenAiResponsesRequestTests
     private static ModelRequest Req(params TimelineEvent[] tl) => new()
     {
         Protocol = Protocols.OpenAiResponses,
-        ModelId = "deepseek-flash", MaxTokens = 16000, Effort = "high",
+        ModelId = "deepseek-flash", MaxTokens = 16000, Effort = "high", Temperature = null,
         SystemBlocks = [], Timeline = tl,
     };
 
@@ -216,5 +216,26 @@ public class OpenAiResponsesRequestTests
     {
         // 路径和协议串一样是线上契约，必须由字面量守，不能引用自己的常量。
         Assert.Equal("/v1/responses", OpenAiResponsesRequest.Path);
+    }
+
+    // ---- 温度 ----
+    // ⚠️ 字段名两条 OpenAI 协议**都**是 `temperature`——别照抄 max_tokens→max_output_tokens 那次改名。
+
+    [Fact]
+    public void Build_WithATemperature_WritesItAsANumber()
+    {
+        var req = Req(Msg(Speaker.User, new Block.TextBlock("hi"))) with { Temperature = 1.5 };
+
+        var root = Parse(OpenAiResponsesRequest.Build(req));
+
+        Assert.Equal(1.5, root.GetProperty("temperature").GetDouble());
+    }
+
+    [Fact]
+    public void Build_WithoutATemperature_OmitsTheKeyEntirely()
+    {
+        var root = Parse(OpenAiResponsesRequest.Build(Req(Msg(Speaker.User, new Block.TextBlock("hi")))));
+
+        Assert.False(root.TryGetProperty("temperature", out _));
     }
 }

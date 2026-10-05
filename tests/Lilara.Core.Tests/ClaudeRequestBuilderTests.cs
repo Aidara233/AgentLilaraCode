@@ -23,9 +23,34 @@ public class ClaudeRequestBuilderTests
         MaxTokens = 16000,
         Protocol = Protocols.ClaudeMessages,
         Effort = "high",
+        Temperature = null,
         SystemBlocks = [],
         Timeline = timeline,
     };
+
+    // ---- 温度 ----
+    // ⚠️ 这里用的是 SDK 的 `Temperature`——它在 12.51.0 里被标了 `[Obsolete]`
+    // （原文：4.6 之后的模型不支持设温度，只有 1.0 被接受，其余 400）。
+    // 而本项目实际用的**网关实测接受**它，所以适配器照发（理由见 `ClaudeRequestBuilder.Build` 的注释）。
+    // 测试跟着那条决定走：这里断的就是「发得出去」。
+#pragma warning disable CS0618
+    [Fact]
+    public void Build_PassesTemperature()
+    {
+        var built = ClaudeRequestBuilder.Build(
+            Request(Msg(Speaker.User, "hi")) with { Temperature = 0.3 });
+
+        Assert.Equal(0.3, built.Temperature);
+    }
+
+    [Fact]
+    public void Build_WithoutATemperature_LeavesItNull()
+    {
+        var built = ClaudeRequestBuilder.Build(Request(Msg(Speaker.User, "hi")));
+
+        Assert.Null(built.Temperature);
+    }
+#pragma warning restore CS0618
 
     // 取出消息的内容块列表；推理块必须与文本块按顺序一起回放，string 快路径表达不了。
     private static IReadOnlyList<ContentBlockParam> BlocksOf(MessageParam m)
