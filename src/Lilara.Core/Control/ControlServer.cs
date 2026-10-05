@@ -279,7 +279,16 @@ public sealed class ControlServer(
         // ⚠️ **`apiKey` 绝不进响应**：它是本机秘密，而头的页面在浏览器里、
         // 还开着 CORS（`*`）。只回「有没有」，不回「是什么」。
         app.MapGet("/providers", () =>
-            Results.Json(host.Providers.List().Select(p => new { p.Id, p.Protocol, p.DefaultModel }), WireJson.Options));
+            Results.Json(host.Providers.List().Select(p => new
+            {
+                p.Id, p.Protocol, p.DefaultModel,
+                // ⚠️ **端点与认证方式要交**——端点决定数据发去哪（核心自己每次 `provider set`
+                //    都印一行端点），头看不到就无从核对。`modality` 同理是配置的一部分。
+                p.Endpoint, p.AuthScheme, p.Modality,
+                // ⚠️ **key 只回「有没有」，不回「是什么」**（用户裁定 R-B：能改不能看）。
+                //    有了它，表单能显示「已配置」而不是一个空框（空框会让人以为没配、然后重填一遍）。
+                HasApiKey = !string.IsNullOrEmpty(p.ApiKey),
+            }), WireJson.Options));
 
         // ⚠️ **头渲染配置表单的真相来源**（「不许手抄」的执行面）：合法协议 / 合法 auth
         // 的真相都在核心（`Protocols.All` / `AuthSchemes`），头手抄过一次而且**抄错了**——
@@ -578,7 +587,12 @@ public sealed class ControlServer(
                 payload.GetProperty("scope").Deserialize<List<string>>(WireJson.Options)!),
             "provider.upsert" => new CoreCommand.ProviderUpsert(
                 payload.GetProperty("id").GetString()!,
-                payload.GetProperty("apiKey").GetString()!,
+                // ⚠️ **`apiKey` 必须走 `Opt(...)`，不能用 `GetProperty`。**
+                // `JsonElement.GetProperty` 在**键缺失**时抛 `KeyNotFoundException`（实测），
+                // 而那会被 `HandleCommandAsync` 的 `catch` 接住、回一句「命令形状不对：…」——
+                // 但线上的「省略」就是**键不存在**（不是 `"apiKey": null`），
+                // 正确语义是「保留旧 key」（R-B）。用 `GetProperty` 会让头**永远改不了已有 provider**。
+                Opt(payload, "apiKey"),
                 Opt(payload, "model"), Opt(payload, "protocol"), Opt(payload, "endpoint"), Opt(payload, "auth")),
             _ => throw new ArgumentException($"认不出的命令 '{kind}'"),
         };

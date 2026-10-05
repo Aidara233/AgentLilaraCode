@@ -239,6 +239,71 @@ public class CommandDispatcherTests : IDisposable
         Assert.NotSame(before, host.StepperFor(handle));
     }
 
+    /// <summary>
+    /// ⚠️ **省略 key = 保留旧 key**（R-B：头读不到 key，不该逼它重发）。
+    /// 头改协议时**必须**能不带 key 走通——不然它永远改不了已有 provider。
+    /// </summary>
+    [Fact]
+    public async Task ProviderUpsert_WithoutApiKey_KeepsTheStoredOne()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);                                       // 既有 provider（key="k"）
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderUpsert("p", null, null, Protocols.OpenAiChat, null, null),
+            "c", true, CancellationToken.None);
+
+        var after = host.Providers.Load("p")!;
+        Assert.Equal("k", after.ApiKey);                          // ⚠️ 盘上**仍是旧 key**
+        Assert.Equal(Protocols.OpenAiChat, after.Protocol);       // 而这一项**真的改了**
+    }
+
+    /// <summary>
+    /// ⚠️ 新 provider **必须**给 key：否则会存下一个**发不出去的配置**，比拒绝更糟
+    /// （用户以为配好了，第一次发消息才炸）。
+    /// </summary>
+    [Fact]
+    public async Task ProviderUpsert_WithoutApiKey_ForANewProvider_IsRejected()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+
+        var r = await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderUpsert("brand-new", null, null, null, null, null),
+            "c", true, CancellationToken.None);
+
+        var rejected = Assert.IsType<Ack.Rejected>(r.Ack);
+        Assert.Contains("brand-new", rejected.Reason);            // ⚠️ 理由要**点名那个 id**——
+                                                                  // 用户手打了三个 provider 时，光说「必须给 key」不够
+        Assert.Null(host.Providers.Load("brand-new"));            // ⚠️ 且**没有半成品落盘**
+    }
+
+    /// <summary>
+    /// ⚠️ **第三条不是凑数**：`InvalidateSteppers()` 挂在 `HandleProviderUpsert` 的**末尾**，
+    /// 而「省略 key」这条路径最自然的写法就是**提前 return** ⇒ **改了协议但缓存没失效**
+    /// = 用旧适配器发新协议（正是本文件里 `ProviderUpsert_InvalidatesTheStepperCache` 防的那件事，
+    /// 换了个入口回来）。
+    /// ⇒ 范本就在上面那条，**唯一的区别是这次不带 key**。
+    /// </summary>
+    [Fact]
+    public async Task ProviderUpsert_WithoutApiKey_StillInvalidatesSteppers()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+        var sessionId = await CreateSessionAsync(dispatcher);
+        host.TryGetActivated(sessionId, out var handle);
+
+        var before = host.StepperFor(handle);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderUpsert("p", null, null, Protocols.OpenAiChat, null, null),
+            "c", true, CancellationToken.None);
+
+        Assert.NotSame(before, host.StepperFor(handle));          // ⚠️ 缓存必须换掉
+    }
+
     /// <summary>挂起的适配器：让测试能精确控制「模型什么时候返回」。</summary>
     private sealed class GatedAdapter(Func<Task<string>> gate) : Lilara.Core.Adapters.IModelAdapter
     {

@@ -428,4 +428,36 @@ public class ParserTests
         Assert.Null(cmd);
         Assert.Null(err);   // ⇒ 当成普通消息
     }
+
+    /// <summary>
+    /// ⚠️ **`--key` 不再是必填**（R-B：能改不能看 ⇒ 头/控制台都不该被逼着重发 key）。
+    /// 省略 ⇒ <c>ApiKey</c> 为 null ⇒ dispatcher 的语义是「保留旧的」；
+    /// 而**新** provider 省略 key 由 dispatcher 拒绝（理由点名 id）——那在 `CommandDispatcherTests` 里。
+    ///
+    /// <para>⚠️ **这条钉的是四条线里的「控制台」那条**（`CoreCommandParser`）。
+    /// 只留 `--key` 必填的话，控制台会回一句「用法：… --key …」而**头那条路照常**——
+    /// 两个前端分叉，正是 G14/G16 要防的「静默失效」。线上那条在 `ControlServerTests`。</para>
+    /// </summary>
+    [Fact]
+    public void ProviderSet_WithoutKey_IsStillACommand_WithANullKey()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("provider set p --protocol openai-chat");
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.ProviderUpsert>(cmd);
+        Assert.Equal("p", c.Id);
+        Assert.Null(c.ApiKey);                       // ⚠️ 「省略」到这里就是 null（= 保留旧的）
+        Assert.Equal("openai-chat", c.Protocol);     // 而本次真的改的那一项照常带上
+    }
+
+    /// <summary>⚠️ 反向那半：显式给 key 仍然要落到命令上——别为了「可选」把它丢了。</summary>
+    [Fact]
+    public void ProviderSet_WithKey_StillCarriesIt()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("provider set p --key sk-abc");
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.ProviderUpsert>(cmd);
+        Assert.Equal("sk-abc", c.ApiKey);
+    }
 }

@@ -11,11 +11,16 @@ namespace Lilara.Core.Hosting;
 public abstract record CoreCommand
 {
     /// <summary>
-    /// 配置提供商。⚠️ 除 <paramref name="Id"/> 与 <paramref name="ApiKey"/> 外**都可空**——
+    /// 配置提供商。⚠️ 除 <paramref name="Id"/> 外**都可空**——
     /// null 表示「本次没提到」，落盘时要**保留旧值**（整文件覆盖会抹掉手写配置）。
+    ///
+    /// <para>⚠️ <paramref name="ApiKey"/> 也是可空的，语义是**省略 = 保留已存的那个 key**
+    /// （用户裁定 R-B：key 能改不能看 ⇒ 头读不到 key，不该逼它重发才能改协议）。
+    /// ⚠️ 而**新** provider 省略 key 必须被拒（存一个发不出去的配置比拒绝更糟）——
+    /// 那条语义在 dispatcher，**别照此在别处放行**。</para>
     /// </summary>
     public sealed record ProviderUpsert(
-        string Id, string ApiKey, string? Model, string? Protocol, string? Endpoint, string? Auth)
+        string Id, string? ApiKey, string? Model, string? Protocol, string? Endpoint, string? Auth)
         : CoreCommand;
 
     /// <summary>⚠️ **显式动作**——核心不替你决定该有个会话（`01` §8.1）。</summary>

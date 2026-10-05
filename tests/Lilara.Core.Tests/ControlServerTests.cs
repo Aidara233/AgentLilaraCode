@@ -255,6 +255,44 @@ public class ControlServerTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// ⚠️ **线上的 `provider.upsert`：省略 `apiKey` = 保留旧 key。**
+    ///
+    /// <para>⚠️ 判据是「帧里**根本没有** `apiKey` 键」——**不是** `"apiKey": null`。
+    /// 线上是 JSON，而 JSON 的「省略」就是这个形状；只有控制台走文本解析。
+    /// 只测控制台会漏掉线上这个臂，而这正是 G16 那条「两个前端」的形状。</para>
+    ///
+    /// <para>⚠️ 走**真的 WS**，不是直接调 dispatcher——后者在接线缺失时会照样绿。
+    /// 实现前这条必须红，且红的方式应当是「命令形状不对：The given key was not present…」
+    ///（`JsonElement.GetProperty` 对**缺失**的键**抛** `KeyNotFoundException`，实测行为）。</para>
+    /// </summary>
+    [Fact]
+    public async Task WebSocket_ProviderUpsert_WithoutTheApiKeyKey_KeepsTheStoredOne()
+    {
+        // 前置：`InitializeAsync` 已存下 provider "p"（key="k"、协议 claude-messages）。
+        Assert.Equal("k", _host.Providers.Load("p")!.ApiKey);
+
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        // ⚠️ 帧里**没有** `apiKey` 键——「省略」是键不存在，不是值为 null。
+        await SendAsync(ws, "{\"kind\":\"command\",\"id\":\"u1\",\"payload\":{\"kind\":\"provider.upsert\","
+            + "\"id\":\"p\",\"protocol\":\"openai-chat\"}}");
+
+        var ack = await ReceiveAsync(ws);
+        // ⚠️ **理由必须惰性取**：`WhenWritingNull` 把成功回执的 `reason` 整个省略（camelCase），
+        // 直接 `GetProperty("reason")` 会抛 `KeyNotFoundException`——见
+        // `WebSocket_SetAxis_ReachesTheDispatcher` 的同款注释。
+        Assert.True(ack.GetProperty("accepted").GetBoolean(),
+            "省略 apiKey 的帧被回了「命令形状不对」——`ParseCommand` 那臂还在用 `GetProperty(\"apiKey\")`："
+            + (ack.TryGetProperty("reason", out var why) ? why.GetString() : "(无 reason 字段)"));
+
+        // ⚠️ 判据是**盘上的后果**，不只是回执说 accepted：
+        //    协议真的改了，而 key 仍是旧的（不是被 null 抹成空）。
+        var after = _host.Providers.Load("p")!;
+        Assert.Equal(Protocols.OpenAiChat, after.Protocol);
+        Assert.Equal("k", after.ApiKey);
+    }
+
+    /// <summary>
     /// ⚠️ **头断连不影响任何东西**（`03` §1 判据 1）：断开之后核心照常收命令。
     /// </summary>
     [Fact]
@@ -708,6 +746,64 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Equal(
             ["authSchemes", "protocols", "providerIdRule"],
             s.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal));
+    }
+
+    /// <summary>
+    /// ⚠️ **`/providers` 要把「端点决定数据发去哪」这件事交出来**（核心自己每次 `provider set`
+    /// 都印一行端点），头看不到就无从核对；`hasApiKey` 让表单显示「已配置」而不是一个
+    /// 会让人重填一遍的空框。
+    ///
+    /// <para>⚠️ **端点与认证方式显式设上**——它们是可空的，而 `WhenWritingNull`
+    ///（`WireJson.Options`）会把 null 的键整个省掉 ⇒ 不设的话，红的是**测法**、不是端点。</para>
+    /// </summary>
+    [Fact]
+    public async Task Providers_CarriesEverythingButTheKey()
+    {
+        // ⚠️ 端点与认证方式**显式设上**——它们是可空的，而 `WhenWritingNull` 会把 null 的键整个省掉。
+        _host.Providers.Save(new ProviderDefinition
+        {
+            Id = "full", Protocol = Protocols.ClaudeMessages, ApiKey = "k",
+            DefaultModel = "m", Modality = "vision",
+            Endpoint = "http://127.0.0.1:1/v1", AuthScheme = AuthSchemes.Bearer,
+        });
+
+        using var a = JsonDocument.Parse(await Client.GetStringAsync(Http("/providers")));
+        var p = a.RootElement.EnumerateArray().Single(e => e.GetProperty("id").GetString() == "full");
+
+        Assert.Equal(Protocols.ClaudeMessages, p.GetProperty("protocol").GetString());
+        Assert.Equal("m", p.GetProperty("defaultModel").GetString());
+        Assert.Equal("http://127.0.0.1:1/v1", p.GetProperty("endpoint").GetString());
+        Assert.Equal(AuthSchemes.Bearer, p.GetProperty("authScheme").GetString());
+        Assert.Equal("vision", p.GetProperty("modality").GetString());
+        Assert.True(p.GetProperty("hasApiKey").GetBoolean());
+    }
+
+    /// <summary>
+    /// ⚠️ **G12 的可执行判据：key 能改不能看**（用户裁定 R-B）。
+    /// </summary>
+    [Fact]
+    public async Task Providers_NeverLeaksTheKey()
+    {
+        // ⚠️ **哨兵串**：一个不可能偶然出现的值。**别用「不含 apiKey 字样」那种弱判据**——
+        //    字段一改名它就失效了。
+        const string sentinel = "SENTINEL-8f3a2b1c-DO-NOT-LEAK";
+        _host.Providers.Save(new ProviderDefinition
+        {
+            Id = "leaky", Protocol = Protocols.ClaudeMessages, ApiKey = sentinel,
+            DefaultModel = "m", Modality = "vision",
+        });
+
+        var body = await Client.GetStringAsync(Http("/providers"));
+
+        // ⚠️ 断言**字节里**不含它——这是 G12「可写不可读」唯一可执行的判据。
+        Assert.DoesNotContain(sentinel, body);
+        Assert.DoesNotContain(sentinel[..16], body);
+
+        // ⚠️ **反向那半不能省**：只断言「不含哨兵」的话，「这个端点什么都没交」也能过。
+        using var a = JsonDocument.Parse(body);
+        var p = a.RootElement.EnumerateArray().Single(e => e.GetProperty("id").GetString() == "leaky");
+        Assert.True(p.GetProperty("hasApiKey").GetBoolean());   // 「有 key」这件事要看得见
+        Assert.False(p.TryGetProperty("apiKey", out _));        // 而「是什么」不行
     }
 
     /// <summary>

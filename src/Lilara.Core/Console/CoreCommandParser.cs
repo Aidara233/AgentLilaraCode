@@ -233,7 +233,13 @@ public static class CoreCommandParser
     }
 
     /// <summary>
-    /// `provider set &lt;id&gt; --key &lt;k&gt; [--model &lt;m&gt;] [--protocol &lt;p&gt;] [--endpoint &lt;u&gt;] [--auth &lt;a&gt;]`
+    /// `provider set &lt;id&gt; [--key &lt;k&gt;] [--model &lt;m&gt;] [--protocol &lt;p&gt;] [--endpoint &lt;u&gt;] [--auth &lt;a&gt;]`
+    ///
+    /// <para>⚠️ **`--key` 不是必填**（用户裁定 R-B：key 能改不能看 ⇒ 头读不到 key，
+    /// 不该逼它重发才能改协议）。省略 ⇒ <c>ApiKey</c> 为 null，语义是「保留旧 key」。
+    /// ⚠️ 那条语义的**守卫在 dispatcher**，不在这里：**新** provider 省 key 会被
+    /// dispatcher 拒绝并点名 id（控制台与头两个前端吃同一套）。
+    /// ⇒ 这里**只管拆词**，不再自己拦一道——否则线上那条路与这里分叉（G14：四条线）。</para>
     /// </summary>
     private static (CoreCommand?, string?) ParseProviderSet(string line)
     {
@@ -289,11 +295,10 @@ public static class CoreCommandParser
             }
         }
 
-        if (key is null)
-            return (null, "用法：provider set <id> --key <key> [--model <model>] "
-                + $"[--protocol <{string.Join("|", Protocols.All)}>] [--endpoint <url>] "
-                + $"[--auth {AuthSchemes.ApiKey}|{AuthSchemes.Bearer}]");
-
+        // ⚠️ **这里不再要求 `--key`**（原来有一道 `if (key is null) return (null, "用法：… --key …")`）。
+        // 留着它，控制台会回一句「用法」而**头那条路照常** ⇒ 两个前端分叉
+        //（G14：`apiKey` 从必填变可选动的是命令的形状，四条线缺一处就是**静默失效**）。
+        // 「新 provider 省 key 要拒」那条语义在 dispatcher，**别在这里再写一遍**。
         return (new CoreCommand.ProviderUpsert(id, key, model, protocol, endpoint, auth), null);
     }
 }

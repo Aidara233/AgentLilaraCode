@@ -186,6 +186,16 @@ public sealed class CommandDispatcher(
         // （Endpoint / Modality / DefaultModel / Protocol 都是操作者配置）。
         var existing = _host.Providers.Load(p.Id);
 
+        // ⚠️ **新 provider 必须给 key，已有 provider 省略即保留**（用户裁定 R-B：头读不到 key，
+        // 不该逼它重发）。两条方向不对称，所以判据要**一起**看 `p.ApiKey` 与 `existing`：
+        //   · 新 provider 省 key ⇒ 存下一个**发不出去的配置**（用户以为配好了，第一次发消息才炸）
+        //     ⇒ 比拒绝更糟，**必须拒**。⚠️ 理由要**点名那个 id**——用户手打了三个 provider 时，
+        //     光说「必须给 key」他不知道自己错在哪一个。
+        //   · 已有 provider 省 key ⇒ 保留旧 key（这正是 R-B 要的那条路）。
+        // ⚠️ **这条要在 `Save` 之前**：拒绝时盘上不许留下半成品。
+        if (p.ApiKey is null && existing is null)
+            return Reject(id, $"新提供商 '{p.Id}' 必须给 --key。");
+
         // ⚠️「存得下、发不出」那个旧顾虑，对**从命令进来的值**已由上面两道闸解决。
         // 但**手写进 providers/<id>.json 的未知协议绕过了闸**，而下面的 existing?.Protocol
         // 会让它**原样保留**——那一半由 AdapterFactory 在**发消息时**给人话兜底。
@@ -195,7 +205,11 @@ public sealed class CommandDispatcher(
         {
             Id = p.Id,
             Protocol = effectiveProtocol,
-            ApiKey = p.ApiKey,
+            // ⚠️ `ProviderDefinition.ApiKey` 是 **`required`——保留它，别去掉**：
+            // 去掉会让别的构造点**静默漏填**（那正是 `required` 存在的理由）。
+            // 这里**构造时必给值**：省略（null）时用上面那个 already-loaded 的旧 key；
+            // `existing!` 的 `!` 由上面的拒绝守卫保证——走到这里时 `existing` 不可能为 null。
+            ApiKey = p.ApiKey ?? existing!.ApiKey,
             DefaultModel = p.Model ?? existing?.DefaultModel ?? "claude-opus-5",
             Modality = existing?.Modality ?? "vision",
             Endpoint = p.Endpoint ?? existing?.Endpoint,
