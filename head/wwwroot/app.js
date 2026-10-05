@@ -2,10 +2,18 @@
 // 头是可替换件——履行义务即可，其余是实现自由。
 //
 // ⚠️ 按 `05` §4 四条义务逐条对（`05` §11 引这里当判据——⚠️ **改义务状态时改这里，别删**）：
-//   ① 两个槽位原样显示 —— 做了（并排，空的也显示）
-//   ② 声明可见         —— 做了（保守：只做「声明主动」那一格）
+//   ① 两个槽位原样显示 —— 做了（并排、常驻、空的也显示。⚠️ 不许改成折叠：归位错误只在并排时看得出）
+//   ② 声明可见         —— 做了（保守：只做「声明主动」那一格；冲突顶到右栏）
 //   ③ 审批走独立流     —— 阻塞：核心侧闸门不存在，页面明说而不是显示空壳
 //   ④ 安全轴显眼       —— 做了（右栏最上 + 跨轴告警）
+//
+// ---- 本版着重三块：提供商 / 会话 / 项目 ----------------------------------
+// 其余（审批、附件、控制点、工具）不实现，只留结构位置（右栏 .panel + 底部状态栏）。
+//
+// ⚠️ 本文件**不许出现轴名字面量**（"safety" / "permission"）：
+//   轴表、标签、告警线的两端**全部从 `GET /axes` 来**（G8：单一真相来源是核心的 `Axes.Table`）。
+//   2026-10-05 之前这里有 `"safety"` 与两处 `"permission"` 手抄副本 —— 改核心轴名会让
+//   头**静默**不画安全轴、不报警（判据恒 false）。现在一律 `AXES.find(...)` / `AXES.some(...)`。
 
 const $ = (id) => document.getElementById(id);
 
@@ -16,10 +24,17 @@ let current = null;                 // 当前会话 id（视图，非真相）
 let epoch = 0;                      // 每次 openSession 自增，用来区分同 id 的并发重入
 let creating = null;                // 刚发出的 session.create 的命令 id
 let currentProject = null;
-const sessions = new Map();         // sessionId -> { projectKey }（派生索引）
+const sessions = new Map();         // sessionId -> { projectKey }（派生索引，次序 = 显示次序）
 const cursors = new Map();          // topic -> lastSeq，每流一个游标
 const claims = new Map();           // sessionId -> Set<path>（声明）
 let axes = {};                      // 当前会话的轴值
+
+// 派生视图缓存：不发事件的东西靠它渲染（项目名 / 步数 / 状态）。
+const projects = new Map();         // pk -> { dir?, count }
+const info = new Map();             // sid -> { spec?, turn, status }
+let providers = [];
+const provNotes = new Map();        // providerId -> { text, ok }（最近一次自检的结果）
+const testCmd = new Map();          // 命令 id -> providerId（回执认得回来）
 
 // ---- 引导：核心启动后没有会话与提供商，「配置提供商 → 建初始会话」是头的策略 ----
 // bootstrap() 有两个入口（首屏 IIFE 与 onopen 自恢复）且不可重入 ⇒ 用一次性承诺去重；
@@ -35,10 +50,11 @@ async function runBootstrap() {
   // 轴表先拉：AXES 为空则右栏画不出任何控件。
   await loadAxes();
   await loadSessions();
+  await loadProviders();
+  loadCoreFacts();                  // 底栏是自述，不阻塞引导 —— 失败了也只是底栏空着
 
   // ① 没有提供商就不能做别的（引导页挡住其余操作）
-  const providers = await (await fetch(core + "/providers")).json();
-  if (!providers || providers.length === 0) { showOnboarding(); return; }
+  if (providers.length === 0) { showOnboarding(); return; }
   hideOnboarding();
 
   // ② 当前项目下有会话？
@@ -57,26 +73,46 @@ async function runBootstrap() {
 }
 
 function showOnboarding() {
-  $("onboarding").style.display = "block";
+  $("onboarding").hidden = false;
   $("text").disabled = true;
   $("send").disabled = true;
 }
 
 function hideOnboarding() {
-  $("onboarding").style.display = "none";
+  $("onboarding").hidden = true;
   $("text").disabled = false;
   $("send").disabled = false;
 }
 
+// ---- 会话：列表是「派生」的（05 §6.1） ----------------------------------
+// 全局会话列表 = 对 GET /projects 的每个 pk 取 sessions 的并集；分组名从 spec.workingDirectory 反推。
+
 async function loadSessions() {
-  // 全局会话列表是派生的：对每个项目取 sessions 的并集。
-  const projects = await (await fetch(core + "/projects")).json();
+  const pks = await (await fetch(core + "/projects")).json();
   sessions.clear();
-  for (const pk of projects) {
+  projects.clear();
+  for (const pk of pks) {
     if (currentProject === null) currentProject = pk;
     const ids = await (await fetch(`${core}/projects/${pk}/sessions`)).json();
+    projects.set(pk, { count: ids.length });
     for (const id of ids) sessions.set(id, { projectKey: pk });
   }
+
+  // 项目名 = 该会话的工作目录。只对「还没知道」的会话各拉一次。
+  for (const id of sessions.keys()) {
+    if (info.has(id) && info.get(id).spec) continue;
+    try {
+      const st = await (await fetch(`${core}/sessions/${id}/state`)).json();
+      info.set(id, {
+        spec: st.spec,
+        turn: st.state.turn,
+        status: st.state.status,
+      });
+      const p = projects.get(st.spec.projectKey);
+      if (p && !p.dir) p.dir = st.spec.workingDirectory;
+    } catch { /* 单个会话读不出来不该拖垮整张列表 */ }
+  }
+
   renderSessions();
 
   // 在这里补订项目流。重复订阅是安全的：核心对同 topic 换掉旧的，
@@ -84,16 +120,87 @@ async function loadSessions() {
   if (currentProject) subscribe(`project:${currentProject}`, null);
 }
 
+// 目录名当项目名（完整路径放在 title 里 —— 本机绝对路径不该占一整行）。
+function dirName(p) {
+  if (!p) return "";
+  const m = String(p).replace(/[\\/]+$/, "").match(/[^\\/]+$/);
+  return m ? m[0] : String(p);
+}
+
+// ISO 时间戳 → 本机短格式。⚠️ 不截字符串：那只是**文本**，与用户所在的时区无关
+//（核心交的是 UTC 的 "+00:00"）。先解析再说。
+function shortTime(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 function renderSessions() {
   const box = $("sessions");
   box.innerHTML = "";
-  if (sessions.size === 0) { box.innerHTML = '<div class="muted">还没有会话</div>'; return; }
-  for (const id of sessions.keys()) {
-    const el = document.createElement("div");
-    el.className = "session" + (id === current ? " active" : "");
-    el.textContent = id;
-    el.onclick = () => openSession(id);
-    box.appendChild(el);
+  if (sessions.size === 0) {
+    box.innerHTML = '<div class="muted" style="padding:8px 0">还没有会话</div>';
+    return;
+  }
+
+  // 一把尺：所有刻度按同一最大值算，长短才可比。
+  let maxTurn = 1;
+  for (const v of info.values()) maxTurn = Math.max(maxTurn, v.turn || 0);
+
+  const groups = new Map();
+  for (const [id, s] of sessions) {
+    if (!groups.has(s.projectKey)) groups.set(s.projectKey, []);
+    groups.get(s.projectKey).push(id);
+  }
+
+  for (const [pk, ids] of groups) {
+    const meta = projects.get(pk) || {};
+    const g = document.createElement("div");
+    g.className = "pgroup";
+
+    const head = document.createElement("div");
+    head.className = "pgroup-head";
+    head.title = meta.dir || pk;
+    const nm = document.createElement("span");
+    nm.className = "pname";
+    nm.textContent = meta.dir ? dirName(meta.dir) : "…";
+    const key = document.createElement("span");
+    key.className = "pkey";
+    key.textContent = pk.slice(0, 8);
+    const cnt = document.createElement("span");
+    cnt.className = "pcount";
+    cnt.textContent = ids.length;
+    head.append(nm, key, cnt);
+    g.appendChild(head);
+
+    for (const id of ids) {
+      const v = info.get(id) || {};
+
+      const row = document.createElement("div");
+      row.className = "srow" + (id === current ? " active" : "");
+      row.title = id + (v.status ? ` · ${v.status}` : "");
+
+      // 刻度：横杠的高度 = 这一步数 / 本栏最大步数。
+      const gauge = document.createElement("span");
+      gauge.className = "gauge";
+      gauge.style.setProperty("--t", v.turn || 0);
+      gauge.style.setProperty("--max", maxTurn);
+
+      const sid = document.createElement("span");
+      sid.className = "sid";
+      sid.textContent = id.slice(0, 8);
+
+      const turn = document.createElement("span");
+      turn.className = "sturn";
+      turn.textContent = v.turn === undefined ? "·" : `#${v.turn}`;
+
+      row.append(gauge, sid, turn);
+      row.onclick = () => openSession(id);
+      g.appendChild(row);
+    }
+    box.appendChild(g);
   }
 }
 
@@ -108,8 +215,10 @@ async function openSession(id) {
   await connected();
   if (gen !== epoch) return;
   current = id;
+  $("interrupt").disabled = false;   // 没选中会话时它是死的 —— 别让它看起来可点（点了也没事，只是会骗人）
   renderSessions();
   $("title").textContent = id;
+  $("title").classList.remove("muted");
   $("timeline").innerHTML = "";
 
   const state = await (await fetch(`${core}/sessions/${id}/state`)).json();
@@ -119,9 +228,17 @@ async function openSession(id) {
   // turn 追加进已经清空的那条时间线里。
   if (gen !== epoch) return;
 
+  // 派生缓存与面板都更新（供左栏刻度与右栏三块用）。
+  info.set(id, { spec: state.spec, turn: state.state.turn, status: state.state.status });
+  const p = projects.get(state.spec.projectKey);
+  if (p && !p.dir) p.dir = state.spec.workingDirectory;
+
   renderSlots(state.slots);
   renderAxes(state.axes);
+  renderSessionPanel(state);
+  renderProjectPanel(state);
   setStatus(state.state.status, state.state.turn);
+  renderSessions();
   for (const turn of history.rendered) renderTurn(turn.from, turn.blocks);
 
   await loadClaims();
@@ -141,22 +258,51 @@ function subscribe(topic, since) {
 
 // ---- 渲染：核心渲染，头只显示 ----
 
+// ⚠️ 抽文本这一步**不在**核心的读取点里（`SessionQueries` 只有 ModelBody / UserBody），
+//    所以这里是**手抄的第二副本**（见 `实现现状.md` §四）。改核心的措辞要同时改这里。
+const EMPTY_BODY = "（这一步没有正文输出）";
+
 function textOf(blocks) {
   return (blocks || []).filter((b) => b.kind === "text").map((b) => b.text).join("");
+}
+
+function bodyOf(blocks) {
+  return textOf(blocks) || EMPTY_BODY;
 }
 
 function renderTurn(from, blocks, cls) {
   const el = document.createElement("div");
   el.className = "turn " + (cls || from);
-  el.textContent = (from === "user" ? "你  " : "⏺  ") + (textOf(blocks) || "（这一步没有正文输出）");
-  $("timeline").appendChild(el);
-  $("timeline").scrollTop = $("timeline").scrollHeight;
+
+  const who = document.createElement("div");
+  who.className = "who";
+  who.textContent = from === "user" ? "你" : "⏺";
+
+  const body = document.createElement("div");
+  body.className = "body";
+  body.textContent = bodyOf(blocks);
+
+  el.append(who, body);
+  appendTimeline(el);
 }
 
 function renderMeta(text, cls) {
   const el = document.createElement("div");
   el.className = "turn meta " + (cls || "");
-  el.textContent = text;
+
+  const who = document.createElement("div");
+  who.className = "who";
+  who.textContent = "·";
+
+  const body = document.createElement("div");
+  body.className = "body";
+  body.textContent = text;
+
+  el.append(who, body);
+  appendTimeline(el);
+}
+
+function appendTimeline(el) {
   $("timeline").appendChild(el);
   $("timeline").scrollTop = $("timeline").scrollHeight;
 }
@@ -164,8 +310,12 @@ function renderMeta(text, cls) {
 function renderSlots(slots) {
   // 空的也要显示：区分「核心没配提示词」与「头坏了」。
   const fmt = (b) => (b && b.length ? b.map(textOf).join("") : "（空）");
-  $("slot-system").textContent = slots ? fmt(slots.system) : "（空）";
-  $("slot-premier").textContent = slots ? fmt(slots.premier) : "（空）";
+  const put = (el, v) => {
+    el.textContent = v;
+    el.classList.toggle("empty", v === "（空）");
+  };
+  put($("slot-system"), slots ? fmt(slots.system) : "（空）");
+  put($("slot-premier"), slots ? fmt(slots.premier) : "（空）");
   // 浮动槽正文由核心给；核心尚无装配器 ⇒ 恒空，如实显示「尚未实现」。
   $("floating-body").textContent = slots && slots.floating && slots.floating.length
     ? slots.floating.map(textOf).join("")
@@ -173,12 +323,161 @@ function renderSlots(slots) {
 }
 
 function setStatus(status, turn) {
-  $("status").textContent = `${status} · 第 ${turn} 步`;
+  const el = $("status");
+  el.textContent = `${status} · 第 ${turn} 步`;
+  el.className = "chip " + (status === "Running" ? "running" : "live");
+}
+
+// ---- 右栏三块：提供商 / 会话 / 项目 ----
+
+function kv(dl, pairs) {
+  dl.innerHTML = "";
+  for (const [k, v, dim] of pairs) {
+    const dt = document.createElement("dt");
+    dt.textContent = k;
+    const dd = document.createElement("dd");
+    dd.textContent = v === null || v === undefined || v === "" ? "（未设）" : String(v);
+    if (dim || v === null || v === undefined || v === "") dd.classList.add("dim");
+    dl.append(dt, dd);
+  }
+}
+
+async function loadProviders() {
+  providers = await (await fetch(core + "/providers")).json();
+  renderProviders();
+}
+
+function renderProviders() {
+  const box = $("prov-list");
+  box.innerHTML = "";
+  if (providers.length === 0) {
+    const n = document.createElement("div");
+    n.className = "note";
+    n.textContent = "还没有提供商。在核心终端里执行 `provider set <id> --key <key>`。";
+    box.appendChild(n);
+    return;
+  }
+  for (const p of providers) {
+    const wrap = document.createElement("div");
+    wrap.style.marginBottom = "9px";
+
+    const head = document.createElement("div");
+    head.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:2px";
+    const name = document.createElement("span");
+    name.className = "sid";
+    name.style.cssText = "font-size:12px;color:var(--ink);flex:1";
+    name.textContent = p.id;
+
+    // 「它通不通」是这一块最要紧的问题——核心上一批刚加的 `provider.test` 正是为它。
+    // 不填任何参数：用的是 provider 自己配置里的 key 与端点（key 能改不能看，浏览器自然也不持有）。
+    const test = document.createElement("button");
+    test.textContent = "自检";
+    test.style.cssText = "padding:3px 8px;font-size:11px";
+    test.onclick = () => {
+      const cid = crypto.randomUUID().slice(0, 8);
+      testCmd.set(cid, p.id);
+      provNotes.set(p.id, { text: "正在测…", ok: null });
+      renderProviders();
+      command(cid, { kind: "provider.test", id: p.id });
+    };
+    head.append(name, test);
+
+    const dl = document.createElement("dl");
+    dl.className = "kv";
+    // ⚠️ apiKey 永远不显示 —— GET /providers 只给 hasApiKey（key 能改不能看）。
+    //    端点 / 认证方式是配置的一部分，要看得见才能核对（端点是「为什么连不上」的头号嫌疑）。
+    kv(dl, [
+      ["协议", p.protocol],
+      ["模型", p.defaultModel],
+      ["端点", p.endpoint],
+      ["认证", p.authScheme],
+      ["密钥", p.hasApiKey ? "已配置" : "未配置", !p.hasApiKey],
+    ]);
+
+    wrap.append(head, dl);
+
+    // 自检结果**就地**落在该 provider 下面：核心回的是这句就够回答「通不通 + 为什么」。
+    const note = provNotes.get(p.id);
+    if (note) {
+      const n = document.createElement("div");
+      n.className = "note";
+      n.style.cssText = "margin-top:4px;line-height:1.6";
+      if (note.ok === true) n.style.color = "var(--accent-ink)";
+      if (note.ok === false) n.style.color = "var(--danger)";
+      n.textContent = note.text;   // 自带 ✓/✗ 前缀，别再补一个
+      wrap.appendChild(n);
+    }
+
+    box.appendChild(wrap);
+  }
+}
+
+function renderSessionPanel(state) {
+  const spec = state.spec || {};
+  const st = state.state || {};
+  const p = providers.find((x) => x.id === spec.model?.providerId);
+  const dl = document.createElement("dl");
+  dl.className = "kv";
+  kv(dl, [
+    ["会话", spec.sessionId],
+    ["提供商", spec.model?.providerId],
+    ["模型", spec.model?.modelId],
+    ["协议", spec.model?.protocol ?? p?.protocol],
+    ["思考强度", spec.model?.effort],
+    ["创建", shortTime(spec.createdAt)],
+  ]);
+  $("sess-detail").innerHTML = "";
+  $("sess-detail").appendChild(dl);
+}
+
+function renderProjectPanel(state) {
+  const spec = state.spec || {};
+  const dl = document.createElement("dl");
+  dl.className = "kv";
+  kv(dl, [
+    ["工作目录", spec.workingDirectory],
+    ["项目键", spec.projectKey],
+  ]);
+  $("proj-detail").innerHTML = "";
+  $("proj-detail").appendChild(dl);
+}
+
+// ---- 底栏：核心自述（GET /info + /health） ----
+// 「我配了 provider 怎么看不到」这类问题九成是**数据根不对** —— 这是它唯一的答案来源。
+
+async function loadCoreFacts() {
+  try {
+    const i = await (await fetch(core + "/info")).json();
+    $("bar-core").innerHTML = "";
+    const b1 = document.createElement("b"); b1.textContent = "控制面";
+    const s1 = document.createElement("span"); s1.textContent = ` ${i.endpoints?.http ?? core}`;
+    $("bar-core").append(b1, s1);
+
+    $("bar-dataroot").innerHTML = "";
+    const b2 = document.createElement("b"); b2.textContent = "数据根";
+    const s2 = document.createElement("span"); s2.textContent = ` ${i.dataRoot ?? "?"}`;
+    $("bar-dataroot").append(b2, s2);
+    $("bar-dataroot").title = i.dataRoot ?? "";
+
+    $("bar-cwd").innerHTML = "";
+    const b3 = document.createElement("b"); b3.textContent = "工作目录";
+    const s3 = document.createElement("span"); s3.textContent = ` ${dirName(i.workingDirectory)}`;
+    $("bar-cwd").append(b3, s3);
+    $("bar-cwd").title = i.workingDirectory ?? "";
+
+    $("bar-version").innerHTML = "";
+    const b4 = document.createElement("b"); b4.textContent = "版本";
+    const s4 = document.createElement("span"); s4.textContent = ` ${i.coreVersion ?? "?"}`;
+    $("bar-version").append(b4, s4);
+  } catch {
+    $("bar-core").innerHTML = '<b>控制面</b> <span class="bad">读不到 /info</span>';
+  }
 }
 
 // ---- 五轴（义务 4 的落点） ----
 // 轴表、标签、inContext 都从核心拉（单一真相来源是核心的 Axes.Table，头不许手抄）：
 // 核心交 { name, label, values, inContext }，头只画控件。
+
 let AXES = [];
 async function loadAxes() {
   // 一次拉取拿到三样：轴表 + 告警线的两端（必须真的赋值，否则又成硬编码副本）。
@@ -192,6 +491,9 @@ async function loadAxes() {
 // 但若 loadAxes() 失败或没跑，占位值就真的在用 ⇒ 取空串（永不触发）：宁可漏报。
 let ALERT_SAFETY = "";
 let ALERT_FROM   = "";
+
+// ⚠️ 轴名**不写字面量**，一律回去查核心给的表。
+const axisNamed = (n) => AXES.find((a) => a.name === n);
 
 function renderAxes(values) {
   axes = values || {};
@@ -223,7 +525,9 @@ function renderAxes(values) {
     // 安全轴在右栏最上面单独一份，这里跳过它免得出现两个控件；标签也要填（从核心来）。
     // #ax-safety 在 HTML 里就是那个 <select> 本身（不是容器）⇒ 必须 replaceWith，
     // 不能 appendChild（否则得到重复 id，且用户看见的是外层那个空下拉）。
-    if (a.name === "safety") {
+    // ⚠️ 判据是「这条轴的取值里含着告警线那一端」——**不是**比 "safety" 字面量：
+    //    轴名归核心，头这里只能按核心给的数据认。
+    if (a.values.includes(ALERT_SAFETY)) {
       $("ax-safety-label").textContent = a.label;
       $("ax-safety").replaceWith(sel);
       continue;
@@ -238,24 +542,25 @@ function renderAxes(values) {
 
 // 跨轴告警：安全=生产 + 权限≥授权 → 告警（纯提示、不联动）。
 // 判据用档位序（下标 ≥ ALERT_FROM 的下标）而不是枚举值——权限轴加档时枚举写法会漏。
-function alertFromIndex() {
-  const perm = AXES.find((a) => a.name === "permission");
-  return perm ? perm.values.indexOf(ALERT_FROM) : -1;
+function permAxis() {
+  // ⚠️ 同样不写字面量：权限轴 = 取值里含着告警起始档的那条。
+  return AXES.find((a) => a.values.includes(ALERT_FROM));
 }
 
 function renderAlert() {
-  const perm = AXES.find((a) => a.name === "permission");
-  const at = perm ? perm.values.indexOf(axes.permission) : -1;
+  const perm = permAxis();
+  const at = perm ? perm.values.indexOf(axes[perm.name]) : -1;
 
   // indexOf 找不到返回 -1，而 at >= -1 恒真 ⇒ 必须守 from >= 0；
   // ALERT_SAFETY === "" 表示核心还没把告警线交过来，那时不该按占位值判断。
-  const from = alertFromIndex();
-  const ready = ALERT_SAFETY !== "" && from >= 0;
-  const risky = ready && axes.safety === ALERT_SAFETY && at >= from;
+  const from = perm ? perm.values.indexOf(ALERT_FROM) : -1;
+  const safetyAxis = AXES.find((a) => a.values.includes(ALERT_SAFETY));
+  const ready = ALERT_SAFETY !== "" && from >= 0 && !!safetyAxis;
+  const risky = ready && axes[safetyAxis.name] === ALERT_SAFETY && at >= from;
 
   $("safety-row").className = risky ? "alert" : "";
   $("alert").textContent = risky
-    ? "⚠️ 生产环境 + 权限 ≥ 授权：高危操作会被**自动放行**。确认这是你要的。"
+    ? "⚠️ 生产环境 + 权限 ≥ 授权：高危操作会被自动放行。确认这是你要的。"
     : "";
 }
 
@@ -287,13 +592,13 @@ function renderClaims() {
   $("claim-conflicts").innerHTML = "";
   for (const line of conflicts) {
     const el = document.createElement("div");
-    el.className = "banner";
+    el.className = "banner warn";
     el.textContent = "⚠️ 声明冲突 — " + line;
     $("claim-conflicts").appendChild(el);
   }
 
   const box = $("claims");
-  box.innerHTML = claims.size === 0 ? '<div class="muted">（没有声明）</div>' : "";
+  box.innerHTML = claims.size === 0 ? '<div class="note">（没有声明）</div>' : "";
   for (const [sid, set] of claims) {
     for (const p of set) {
       const el = document.createElement("div");
@@ -301,9 +606,11 @@ function renderClaims() {
       // p 来自磁盘上的 claims.json 路径，不是标记 ⇒ 用 textContent，不用 innerHTML。
       const who = document.createElement("span");
       who.className = "who";
-      who.textContent = sid;
-      el.appendChild(who);
-      el.appendChild(document.createTextNode(" " + p));
+      who.textContent = sid.slice(0, 8);
+      const path = document.createElement("span");
+      path.className = "p";
+      path.textContent = p;
+      el.append(who, path);
       box.appendChild(el);
     }
   }
@@ -335,6 +642,8 @@ function connect() {
     // 第一句就置位：下面的 subscribe() 与 openSession() 都同步读它。
     wsReady = true;
     $("status").textContent = "已连接";
+    $("status").className = "chip live";
+    loadCoreFacts();
 
     // currentProject === null 是「核心当时没起来」的信号：在这里补跑 bootstrap()
     //（去重靠 bootPromise）——既处理首屏两条路的并发，也做核心后起时的自恢复。
@@ -346,13 +655,15 @@ function connect() {
     // 重连必须重拉会话列表：since: null 只要从现在起的事件，断线窗口里（控制台）
     // 建的会话补不回来，也不会自愈。重复订阅安全（同 topic 换掉旧的）。
     loadSessions();
+    loadProviders();
     subscribe(`project:${currentProject}`, null);
     if (current) openSession(current);   // 重连一律拉快照重建（唯一的降级路径）
   };
 
   ws.onclose = () => {
     wsReady = false;
-    $("status").textContent = "已断开（3 秒后重连）";
+    $("status").textContent = "已断开 · 3 秒后重连";
+    $("status").className = "chip down";
     setTimeout(connect, 3000);
   };
 
@@ -370,6 +681,22 @@ function connect() {
         // 且留下未观测 rejection。
         loadSessions().then(() => openSession(frame.sessionId))
                       .catch((e) => renderMeta("✗ " + e.message, "error"));
+      }
+      // note 是「业务结果」（provider 自检这类）——有就显示，别吞掉。
+      // ⚠️ provider.test 的**失败也走 accepted{note}**（连不上/401 是业务结果，不是命令写错），
+      //    所以自检的成败只能从 note 的**内容**读，读不出 ok 标志。判据是核心那句固定开头。
+      if (frame.accepted && frame.id && testCmd.has(frame.id)) {
+        const pid = testCmd.get(frame.id);
+        testCmd.delete(frame.id);
+        const note = (frame.note || "").trim();
+        // ⚠️ 成不成**不能自己判**（比如 `!note.includes("不通")`）——那样「✗ 配不出适配器」
+        //    会被判成成功。核心的 note **自带 ✓/✗ 前缀**，照着读就行：这正是
+        //    「同一事实别在两处各推一遍」那条（核心已经在 note 里说清楚了）。
+        const ok = note.startsWith("✓") ? true : note.startsWith("✗") ? false : null;
+        provNotes.set(pid, { text: note, ok });
+        renderProviders();
+      } else if (frame.accepted && frame.note) {
+        renderMeta("ℹ " + frame.note);
       }
       if (!frame.accepted) renderMeta("✗ " + frame.reason, "error");
       return;
@@ -399,7 +726,8 @@ function connect() {
 
 function handleProjectEvent(p) {
   switch (p.kind) {
-    case "session.created": loadSessions(); break;
+    case "session.created":
+      loadSessions(); break;
     // 声明变化必须刷新右栏，否则「谁在动哪些文件」只在开页面那一刻是对的。
     case "claim.acquired":
     case "claim.released": loadClaims(); break;
@@ -427,7 +755,11 @@ function handleEvent(p) {
       break;
 
     case "session.state":
-      if (p.sessionId === current) setStatus(p.status, p.turn);
+      if (p.sessionId === current) {
+        setStatus(p.status, p.turn);
+        const v = info.get(p.sessionId);
+        if (v) { v.turn = p.turn; v.status = p.status; renderSessions(); }
+      }
       break;
 
     case "axis.changed":
