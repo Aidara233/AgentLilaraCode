@@ -2,7 +2,6 @@ using Lilara.Core.Kernel;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
-using Lilara.Core.Providers;
 
 namespace Lilara.Core.Protocol.OpenAi;
 
