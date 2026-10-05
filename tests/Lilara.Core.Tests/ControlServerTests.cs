@@ -569,7 +569,7 @@ public class ControlServerTests : IAsyncLifetime
     /// 顶层的 `TryGetProperty` 看不见它。属性集这条**两层一起钉**，
     /// 且**与序列化选项无关**（改 `JsonSerializerOptions` 也动不了它）。</para>
     ///
-    /// <para>⚠️ **这条是**白名单**：加字段就得来改它。那正是要的——`SessionSpec` 是
+    /// <para>⚠️ **这条是白名单**：加字段就得来改它。那正是要的——`SessionSpec` 是
     /// **写进每个会话目录**的东西，加字段该是有意识的动作，不是顺手。</para>
     /// </summary>
     [Fact]
