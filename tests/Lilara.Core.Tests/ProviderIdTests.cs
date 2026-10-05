@@ -52,12 +52,12 @@ public class ProviderIdTests : IDisposable
     [InlineData(".")]
     [InlineData("..")]
     [InlineData("a\0b")]              // 内嵌 NUL
-    [InlineData("NUL")]               // ⚠️ Windows 设备名：写入**静默消失**（回 ✓ 而盘上无文件）
-    [InlineData("nul")]               // ⚠️ 设备名判定**大小写不敏感**（实测一样消失）
+    [InlineData("NUL")]               // ⚠️ Windows 设备名：`ProviderStore.Save` 抛未捕获异常 ⇒ **掀翻常驻进程**
+    [InlineData("nul")]               // ⚠️ 设备名判定**大小写不敏感**（实测同样掀翻进程）
     [InlineData("CON.json")]          // ⚠️ 要**去掉扩展名再比**（`PathFor` 还会再拼一个 `.json`）
-    [InlineData("NUL.txt.txt.json")]  // ⚠️ 实测同样静默消失；`GetFileNameWithoutExtension` 会放行它
+    [InlineData("NUL.txt.txt.json")]  // ⚠️ 同样是设备名；`GetFileNameWithoutExtension` 会**放行**它
     [InlineData("NUL  .json")]        // ⚠️ 尾随**空格**再带扩展名——`TrimEnd` 那一半
-    [InlineData("COM1.json")]         // ⚠️ 这一族走的是**抛异常**（FileNotFoundException），不是静默
+    [InlineData("COM1.json")]         // ⚠️ 同族，抛 FileNotFoundException('\\.\COM1')
     [InlineData("PRN")]               // ⚠️ 覆盖缺口：原先无任何用例碰 PRN/AUX 分支 ⇒ 删掉那两行**变异存活**
     [InlineData("AUX")]
     [InlineData("LPT9")]              // ⚠️ 下边界那一族也要有一条
@@ -171,16 +171,43 @@ public class ProviderIdTests : IDisposable
     public void IsSafeProviderId_RejectsSuperscriptDigits_ButNotOtherDigitForms()
     {
         var sup1 = new string((char)0x00B9, 1);   // ¹
+        var sup2 = new string((char)0x00B2, 1);   // ²
         var sup3 = new string((char)0x00B3, 1);   // ³
 
-        // 设备名（实测走 AtomicFile 抛异常 ⇒ 必须拒）
+        // ⚠️ **三个上标逐个钉**：只钉 ¹/³ 的话，删掉 `or '²'` 是**存活变异**
+        //    （复审点出的——这正是「分支零覆盖」那条标准，别只铺我随手想到的那两个）。
         Assert.False(CommandDispatcher.IsSafeProviderId("COM" + sup1));
+        Assert.False(CommandDispatcher.IsSafeProviderId("COM" + sup2));
+        Assert.False(CommandDispatcher.IsSafeProviderId("LPT" + sup1));
+        Assert.False(CommandDispatcher.IsSafeProviderId("LPT" + sup2));
         Assert.False(CommandDispatcher.IsSafeProviderId("LPT" + sup3));
 
         // ⚠️ 反向：别的「数字」写法**不是**设备名（实测都正常写入）⇒ 必须放行
         Assert.True(CommandDispatcher.IsSafeProviderId("COM" + (char)0x2074));  // ⁴
         Assert.True(CommandDispatcher.IsSafeProviderId("COM" + (char)0xFF11));  // １ 全角
         Assert.True(CommandDispatcher.IsSafeProviderId("COM" + (char)0x0661));  // ١ 阿拉伯-印度
+    }
+
+    /// <summary>
+    /// ⚠️ **上标那条必须也走 dispatcher 一遍**（与 `CONIN$` / `PRN` / `AUX` 同一标准）。
+    ///
+    /// <para>复审点出：上标原先**只在谓词层**被钉，而别的不安全 id 都是**两层都钉**
+    /// （`ProviderUpsert_WithAnUnsafeId_IsRejected` + 真值表）。
+    /// ⇒ 只钉谓词层的缺口是：**闸被挪到写入之后**时没人发现——
+    /// 谓词全绿，而设备路径上的异常照样掀翻进程。</para>
+    ///
+    /// <para>⚠️ 上标是**易混淆字符** ⇒ 用 `(char)` 拼、不写字面量；并**同时钉住它到底是什么码位**，
+    /// 免得哪天构造写错而测试静默变成「跟 `COM1` 一样」的重复用例。</para>
+    /// </summary>
+    [Fact]
+    public async Task ProviderUpsert_WithASuperscriptDeviceId_IsRejectedThroughTheDispatcher()
+    {
+        Assert.Equal(0x00B9, "¹"[0]);   // ⚠️ 先证明这个字面量就是 U+00B9（不然下面测的是别的东西）
+
+        var cmd = new CoreCommand.ProviderUpsert("COM" + (char)0x00B9, "k", null, null, null, null);
+        var result = await _dispatcher.DispatchAsync(cmd, "t1", awaitCompletion: true, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(result.Ack);
     }
 
     /// <summary>
