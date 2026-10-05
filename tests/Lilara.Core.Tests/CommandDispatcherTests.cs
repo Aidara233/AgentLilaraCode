@@ -304,6 +304,48 @@ public class CommandDispatcherTests : IDisposable
         Assert.NotSame(before, host.StepperFor(handle));          // ⚠️ 缓存必须换掉
     }
 
+    /// <summary>
+    /// ⚠️ **空串与「缺失」等价**（都是「没给」）——判据必须与 `/providers` 的 `hasApiKey`
+    /// **共用同一个词**（`IsNullOrEmpty`）。两处漂过一次：守卫用 `is null`，于是
+    /// **新** provider 带一个空串就**绕过守卫**、被 Accepted、存下一个**空 key**——
+    /// 正是上面那条注释要防的「存一个发不出去的配置，比拒绝更糟」。
+    /// </summary>
+    [Fact]
+    public async Task ProviderUpsert_WithAnEmptyApiKey_ForANewProvider_IsRejected()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+
+        var r = await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderUpsert("brand-new", "", null, null, null, null),
+            "c", true, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(r.Ack);                       // ⚠️ 不是 Accepted（空 key 发不出去）
+        Assert.Null(host.Providers.Load("brand-new"));            // ⚠️ 不留半成品
+    }
+
+    /// <summary>
+    /// ⚠️ **已有 provider 带空串 ⇒ 保留旧 key，不是抹掉**。
+    /// 这正是 R-B 那条失败路径的**另一扇门**：头读不到 key ⇒ 一个天真的表单把空输入框原样提交
+    /// ⇒ 旧判据（`p.ApiKey ?? existing!.ApiKey`）判 `""` 非 null ⇒ **把存着的 key 覆盖成空**。
+    /// </summary>
+    [Fact]
+    public async Task ProviderUpsert_WithAnEmptyApiKey_KeepsTheStoredOne()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);                                       // 既有 provider（key="k"）
+        var dispatcher = new CommandDispatcher(host, new EventBus(), host.StepperFor);
+
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ProviderUpsert("p", "", null, Protocols.OpenAiChat, null, null),
+            "c", true, CancellationToken.None);
+
+        var after = host.Providers.Load("p")!;
+        Assert.Equal("k", after.ApiKey);                          // ⚠️ 空输入框不该抹掉 key
+        Assert.Equal(Protocols.OpenAiChat, after.Protocol);       // 而这一项**真的改了**
+    }
+
     /// <summary>挂起的适配器：让测试能精确控制「模型什么时候返回」。</summary>
     private sealed class GatedAdapter(Func<Task<string>> gate) : Lilara.Core.Adapters.IModelAdapter
     {

@@ -193,7 +193,20 @@ public sealed class CommandDispatcher(
         //     光说「必须给 key」他不知道自己错在哪一个。
         //   · 已有 provider 省 key ⇒ 保留旧 key（这正是 R-B 要的那条路）。
         // ⚠️ **这条要在 `Save` 之前**：拒绝时盘上不许留下半成品。
-        if (p.ApiKey is null && existing is null)
+        //
+        // ⚠️⚠️ **判据是 `IsNullOrEmpty`，不是 `is null`——空串与缺失等价（都是「没给」）。**
+        // 它与下面落的盘、以及 `/providers` 的 `hasApiKey` 是**同一个词**，刻意的：
+        // 这三处**漂过一次**，而后果各是一条失败路径——
+        //   · 守卫用 `is null` ⇒ 新 id 带 `""` **绕过守卫**、被 Accepted、存下一个**空 key**
+        //     （正是上面那句「存一个发不出去的配置」）；
+        //   · 落盘用 `p.ApiKey ?? existing!.ApiKey` ⇒ 已有 provider 带 `""` 时 `""` 非 null
+        //     ⇒ **把存着的 key 覆盖成空**——R-B 那条失败路径（头读不到 key ⇒ 一个天真的表单
+        //     提交空输入框就把 key 抹了）从另一扇门进来。
+        // ⚠️ 线上那个 `Opt(...)` 对 `{"apiKey": ""}` 返回 `""`（`JsonValueKind.String` 对空串也为真），
+        // ⇒ 两个前端都会走到这里，所以判据必须在**这一处**收口。
+        // ⚠️ **别改成 `IsNullOrWhiteSpace`**：那是**第三个**判据（`/providers` 用的是 `IsNullOrEmpty`），
+        // 会把两层又拆开。空白串是另一个问题，不在本处顺手改。
+        if (string.IsNullOrEmpty(p.ApiKey) && existing is null)
             return Reject(id, $"新提供商 '{p.Id}' 必须给 --key。");
 
         // ⚠️「存得下、发不出」那个旧顾虑，对**从命令进来的值**已由上面两道闸解决。
@@ -207,9 +220,11 @@ public sealed class CommandDispatcher(
             Protocol = effectiveProtocol,
             // ⚠️ `ProviderDefinition.ApiKey` 是 **`required`——保留它，别去掉**：
             // 去掉会让别的构造点**静默漏填**（那正是 `required` 存在的理由）。
-            // 这里**构造时必给值**：省略（null）时用上面那个 already-loaded 的旧 key；
-            // `existing!` 的 `!` 由上面的拒绝守卫保证——走到这里时 `existing` 不可能为 null。
-            ApiKey = p.ApiKey ?? existing!.ApiKey,
+            // 这里**构造时必给值**：**空串与缺失等价**（都是「没给」）⇒ 用上面已载入的旧 key；
+            // 判据与守卫、以及 `/providers` 的 `hasApiKey` **共用同一个词**（见上面那段注释）。
+            // `existing!` 的 `!` 由守卫保证——走到这里时，若 `IsNullOrEmpty(p.ApiKey)` 为真，
+            // `existing` 不可能为 null（那个组合已经被拒了）。
+            ApiKey = string.IsNullOrEmpty(p.ApiKey) ? existing!.ApiKey : p.ApiKey,
             DefaultModel = p.Model ?? existing?.DefaultModel ?? "claude-opus-5",
             Modality = existing?.Modality ?? "vision",
             Endpoint = p.Endpoint ?? existing?.Endpoint,

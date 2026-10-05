@@ -293,6 +293,32 @@ public class ControlServerTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// ⚠️ **线上那条：帧里 `apiKey` 是【空串】**（「键完全缺失」那条是上面另一条测试）。
+    /// ⇒ 两个前端（G16）：只测 dispatcher 会漏掉「线上那条把 `""` 变成 null、或反过来」的情形。
+    /// </summary>
+    [Fact]
+    public async Task WebSocket_ProviderUpsert_WithAnEmptyApiKey_KeepsTheStoredOne()
+    {
+        // 前置：`InitializeAsync` 已存下 provider "p"（key="k"、协议 claude-messages）。
+        Assert.Equal("k", _host.Providers.Load("p")!.ApiKey);
+
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        // ⚠️ `"apiKey":""`——是**空串**，不是缺失。
+        await SendAsync(ws, "{\"kind\":\"command\",\"id\":\"u2\",\"payload\":{\"kind\":\"provider.upsert\","
+            + "\"id\":\"p\",\"protocol\":\"openai-chat\",\"apiKey\":\"\"}}");
+
+        var ack = await ReceiveAsync(ws);
+        Assert.True(ack.GetProperty("accepted").GetBoolean(),
+            "空串 apiKey 的帧没被接受——"
+            + (ack.TryGetProperty("reason", out var why) ? why.GetString() : "(无 reason 字段)"));
+
+        var after = _host.Providers.Load("p")!;
+        Assert.Equal("k", after.ApiKey);                          // ⚠️ 空串不该抹掉旧 key
+        Assert.Equal(Protocols.OpenAiChat, after.Protocol);
+    }
+
+    /// <summary>
     /// ⚠️ **头断连不影响任何东西**（`03` §1 判据 1）：断开之后核心照常收命令。
     /// </summary>
     [Fact]

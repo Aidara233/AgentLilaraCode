@@ -592,6 +592,14 @@ public sealed class ControlServer(
                 // 而那会被 `HandleCommandAsync` 的 `catch` 接住、回一句「命令形状不对：…」——
                 // 但线上的「省略」就是**键不存在**（不是 `"apiKey": null`），
                 // 正确语义是「保留旧 key」（R-B）。用 `GetProperty` 会让头**永远改不了已有 provider**。
+                // ⚠️ **刻意的取舍（不是疏漏）**：`Opt` 只认字符串，所以 `{"apiKey": 12345}` 这类
+                // **非字符串**值会被当成「没给」、**静默忽略**（改前那臂是
+                // `GetProperty("apiKey").GetString()!`——非字符串时 `GetProperty` 不抛，
+                // 是 `GetString()` 抛，被 `HandleCommandAsync` 那个 catch-all 接住 ⇒「命令形状不对」）。
+                // 之所以接受这次严格性的回退：**与 `model` / `protocol` / `endpoint` / `auth`
+                // 四个兄弟字段的行为一致**（它们一直是这么处理的）。
+                // ⚠️ **实测过**（真 WS + 真核心，帧 `"apiKey":12345`）：`accepted=True`、无 `reason`、
+                // 盘上 key 仍是 `k`、协议照改 ⇒ **忽略，不是抹掉、也不是泄露**。
                 Opt(payload, "apiKey"),
                 Opt(payload, "model"), Opt(payload, "protocol"), Opt(payload, "endpoint"), Opt(payload, "auth")),
             _ => throw new ArgumentException($"认不出的命令 '{kind}'"),
