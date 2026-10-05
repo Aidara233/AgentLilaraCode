@@ -208,8 +208,9 @@ public class ProviderStoreTests : IDisposable
     /// ⇒ 当时用 `[JsonIgnore]` 堵住了**那一个属性**，**没堵住那一类**。这条就是堵那一类的。</para>
     ///
     /// <para>⚠️ **两份清单，各钉一件事，缺一不可**（两份**都**按 `StringComparer.Ordinal` 定序——
-    /// 反射的属性顺序不保证，不定序会偶发红；**排序键是整条 `Name:Type` 串**，
-    /// 不是 `Name`——按名字排会把 `HasApiKey` 之类放错位置）：</para>
+    /// 反射的属性顺序不保证，不定序会偶发红；**排序键是整条 `Name:Type` 串**）。
+    /// ⚠️ **当前这八个属性，按名字排与按 `Name:Type` 排结果相同**（实测：没有任何名字是另一个的前缀，
+    /// 那是两者唯一会分叉的条件）⇒ 用整串是**防将来**的写法，不是修当下的错。</para>
     /// <list type="bullet">
     /// <item><b>① <c>DeclaredShape</c>：全部声明的属性</b>（含带 `[JsonIgnore]` 的
     /// ——它仍是 CLR 属性 ⇒ 照样在 `GetProperties()` 里）。**加任何属性都会红**，
