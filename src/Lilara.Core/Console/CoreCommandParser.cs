@@ -78,6 +78,11 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("session interrupt ", StringComparison.Ordinal))
             return (new CoreCommand.SessionInterrupt(trimmed["session interrupt ".Length..].Trim()), null);
 
+        // `session configure <id> [--provider <pid>] [--model <m>]`——改绑供应商 / 换模型。
+        // 标志风格与 `provider set` 一致（同为「可空 = 保留」语义，手感该一样）。
+        if (trimmed.StartsWith("session configure ", StringComparison.Ordinal))
+            return ParseSessionConfigure(trimmed);
+
         // 动词判据走宽口径切词：字面前缀只认空格，axis<TAB>set / axis set<NBSP> 会掉进兜底，
         // 被当成消息发给会话（用户以为设了轴，实际烧了一次模型调用、轴没设）。
         if (IsAxisSetVerb(trimmed))
@@ -106,7 +111,8 @@ public static class CoreCommandParser
         if (string.Equals(trimmed, "provider", StringComparison.OrdinalIgnoreCase)
             || string.Equals(trimmed, "session", StringComparison.OrdinalIgnoreCase))
             return (null, "用法：provider list | provider set <id> … | provider delete <id> | provider test <id>"
-                + "\n      session list | session create | session activate <id> | session interrupt <id>");
+                + "\n      session list | session create | session activate <id> | session interrupt <id>"
+                + "\n      session configure <id> [--provider <pid>] [--model <m>]");
 
         // 光一个 `provider delete` 不能落回「当成消息」——用户以为删了，而 provider 还在盘上。
         if (string.Equals(trimmed, "provider delete", StringComparison.Ordinal))
@@ -114,6 +120,10 @@ public static class CoreCommandParser
 
         if (string.Equals(trimmed, "provider test", StringComparison.Ordinal))
             return (null, "用法：provider test <id>");
+
+        // 光一个 `session configure` 不能落回「当成消息」——用户以为在改绑，实际烧了一次模型调用。
+        if (string.Equals(trimmed, "session configure", StringComparison.Ordinal))
+            return (null, "用法：session configure <会话 id> [--provider <pid>] [--model <m>]");
 
         if (IsClaimList(trimmed)) return (null, null);
 
@@ -230,5 +240,38 @@ public static class CoreCommandParser
         return parts.Length == 3
             ? (new CoreCommand.ProviderTest(parts[2]), null)
             : (null, "用法：provider test <id>");
+    }
+
+    // `session configure <会话 id> [--provider <pid>] [--model <m>]`
+    // 只管拆词：省略某个标志 ⇒ null，语义是「保留旧值」（与 `provider set` 逐字同构）。
+    // 「两个都没给 ⇒ 拒」的守卫在 dispatcher，不在这里——线上也要吃同一条。
+    private static (CoreCommand?, string?) ParseSessionConfigure(string line)
+    {
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var sessionId = parts[2];
+
+        string? provider = null, model = null;
+
+        // 从 3 起每次跳两格（标志与值成对；parts[1] == "configure"）。
+        for (var i = 3; i < parts.Length; i += 2)
+        {
+            if (i + 1 >= parts.Length) return (null, $"参数 {parts[i]} 缺少值。");
+
+            var value = parts[i + 1];
+
+            // 值被下一个标志占了位置 ⇒ 报错。由此「值以 -- 开头」不再可能——故意的取舍。
+            if (value.StartsWith("--", StringComparison.Ordinal)) return (null, $"参数 {parts[i]} 缺少值。");
+
+            switch (parts[i])
+            {
+                case "--provider": provider = value; break;
+                case "--model": model = value; break;
+
+                // 未知标志必须拒绝：拼错的 --provder 会被静默吞掉、照常回 ✓，改绑**没发生**而用户以为发生了。
+                default: return (null, $"未知参数 '{parts[i]}'。");
+            }
+        }
+
+        return (new CoreCommand.SessionConfigure(sessionId, provider, model), null);
     }
 }

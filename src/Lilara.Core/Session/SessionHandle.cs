@@ -10,7 +10,21 @@ namespace Lilara.Core.Session;
 public sealed record SessionHandle
 {
     public required string ProjectKey { get; init; }
-    public required SessionSpec Spec { get; init; }
+
+    /// <summary>
+    /// 会话的模型选择（绑哪个供应商、哪个模型、协议快照、Token 预算）。
+    ///
+    /// <para>⚠️ **可变**——`session.configure` 的落点。但**只能走 <see cref="UpdateSpecAndPersist"/>**，
+    /// 与 <see cref="State"/> 是同一条纪律，理由也是同一个（见 <c>_gate</c>）。</para>
+    ///
+    /// <para>⚠️ 它**曾经是 `init`-only**，旁边那句注释写着「创建时写一次，此后不可变」。
+    /// 那个形状逼出了一个**坏状态**：`provider.delete` 是**刻意不阻止**的
+    /// （理由见 `CommandDispatcher.HandleProviderDelete`：删完让后果可见），
+    /// 于是「会话绑的供应商没了」是一条**设计好的落点**——而那时**没有任何办法改绑**，
+    /// 只能手改 `spec.json`。改绑就是那条落点缺的另一半。</para>
+    /// </summary>
+    public required SessionSpec Spec { get; set; }
+
     public required SessionState State { get; set; }
     public required string Directory { get; init; }
 
@@ -203,9 +217,10 @@ public sealed record SessionHandle
     }
 
     /// <summary>
-    /// ⚠️ **对 <see cref="State"/> 的「读 → 造副本 → 写回」必须走这一把锁。**
+    /// ⚠️ **对 handle 上那两份可变数据（<see cref="State"/> 与 <see cref="Spec"/>）的
+    /// 「读 → 造副本 → 写回」都必须走这一把锁。**
     ///
-    /// <para>为什么：`State` 是**可变字段**（宿主的激活表里存的是这个 handle 的**引用**，
+    /// <para>为什么：它们是**可变字段**（宿主的激活表里存的是这个 handle 的**引用**，
     /// 所以外形不能换成 `handle = handle with { … }`，见 `CommandDispatcher.HandleSessionSetAxis`
     /// 的注释）。而 `session.setAxis` 与 `Stepper` 各做一次读-改-写、**互不共享锁**——
     /// `setAxis` 刻意不拿会话闸（`01` §3.5 要求轴即时生效），而 `Stepper` 拿的那把闸
@@ -214,11 +229,16 @@ public sealed record SessionHandle
     /// 丢 `Turn`，或把状态**永久卡在 `Running`**（终审 I2）。</para>
     ///
     /// <para>把这三步收进一把私有锁里，交错在结构上就不存在了。</para>
+    ///
+    /// <para>⚠️ **它曾经叫 `_stateGate`**，因为那时它只管 <see cref="State"/>。
+    /// `session.configure` 让 <see cref="Spec"/> 成了**第二个**可变字段，
+    /// 于是同一个问题有了第二个实例——**沿用这一把锁，不另立一把**：
+    /// 两条独立的锁会让「改 spec」与「改 state」又能交错，而那正是本锁存在的理由。</para>
     /// </summary>
-    private readonly object _stateGate = new();
+    private readonly object _gate = new();
 
     /// <summary>
-    /// **原子换 `State`**：读、改、写全在 <see cref="_stateGate"/> 里。
+    /// **原子换 `State`**：读、改、写全在 <see cref="_gate"/> 里。
     /// 返回换过之后的那份（就是字段里那份——别在调用点再读一遍，那可能已经是**下一次**改动后的值）。
     ///
     /// <para>⚠️ **任何打开 `State` 的读-改-写都必须走这里或 <see cref="UpdateStateAndPersist"/>**，
@@ -226,7 +246,7 @@ public sealed record SessionHandle
     /// </summary>
     public SessionState UpdateState(Func<SessionState, SessionState> change)
     {
-        lock (_stateGate) { State = change(State); return State; }
+        lock (_gate) { State = change(State); return State; }
     }
 
     /// <summary>
@@ -241,11 +261,36 @@ public sealed record SessionHandle
     public SessionState UpdateStateAndPersist(
         SessionStore store, Func<SessionState, SessionState> change, string? persistedStatus = null)
     {
-        lock (_stateGate)
+        lock (_gate)
         {
             State = change(State);
             store.WriteState(ProjectKey, persistedStatus is null ? State : State with { Status = persistedStatus });
             return State;
+        }
+    }
+
+    /// <summary>
+    /// 原子换 <see cref="Spec"/> **并落盘**——「`session.configure` 的写回点」。
+    /// 与 <see cref="UpdateStateAndPersist"/> **同形、同锁**，这不是巧合：
+    /// `Spec` 与 `State` 是 handle 上仅有的两份可变数据，同一个交错问题、同一把锁。
+    ///
+    /// <para>⚠️ **落盘走 `SessionStore.WriteSpec`，它是原子的**（`AtomicFile`：写 `.tmp` 再 `Move`），
+    /// 所以崩溃不会留下半截 `spec.json`。这条与 <see cref="Create"/> 里「先 state 后 spec」
+    /// 的顺序理由无关——那个顺序防的是**两条写之间**崩溃；这里只写一条。</para>
+    ///
+    /// <para>⚠️ **没有 `persistedStatus` 那种参数**：`Spec` 里没有 `Status` 这种
+    /// 「内存专有取值」（`Running` 只写内存、从不落盘）。所以不需要钉回。</para>
+    ///
+    /// <para>⚠️ 返回换过之后的那份（就是字段里那份）——**别在调用点再读一遍 `handle.Spec`**，
+    /// 那可能已经是**下一次**改动后的值了。与 <see cref="UpdateState"/> 的约定一致。</para>
+    /// </summary>
+    public SessionSpec UpdateSpecAndPersist(SessionStore store, Func<SessionSpec, SessionSpec> change)
+    {
+        lock (_gate)
+        {
+            Spec = change(Spec);
+            store.WriteSpec(ProjectKey, Spec);
+            return Spec;
         }
     }
 
@@ -256,7 +301,7 @@ public sealed record SessionHandle
     /// </summary>
     public void SaveState(SessionStore store)
     {
-        lock (_stateGate) store.WriteState(ProjectKey, State);
+        lock (_gate) store.WriteState(ProjectKey, State);
     }
 
     /// <summary>
@@ -287,6 +332,6 @@ public sealed record SessionHandle
     /// </summary>
     public void SaveAxes(SessionStore store)
     {
-        lock (_stateGate) store.WriteState(ProjectKey, State with { Status = "Idle" });
+        lock (_gate) store.WriteState(ProjectKey, State with { Status = "Idle" });
     }
 }

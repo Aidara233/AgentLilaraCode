@@ -434,6 +434,12 @@ public sealed class ControlServer(
                 payload.GetProperty("axis").GetString()!,
                 payload.GetProperty("value").GetString()!),
             // 同 session.setAxis：线上解析是第三条线。
+            // providerId / model 走 Opt：**键缺失 = 「保留旧值」**（与 provider.upsert 同一条语义）。
+            // 用 GetProperty 会在头只想换模型、不提 provider 时抛 KeyNotFoundException。
+            "session.configure" => new CoreCommand.SessionConfigure(
+                payload.GetProperty("sessionId").GetString()!,
+                Opt(payload, "providerId"), Opt(payload, "model")),
+            // 同 session.setAxis：线上解析是第三条线。
             // 只有 release、没有 acquire（头的认领走控制台）；字段名是 scope（数组），不是 path。
             "claim.release" => new CoreCommand.ClaimRelease(
                 payload.GetProperty("sessionId").GetString()!,

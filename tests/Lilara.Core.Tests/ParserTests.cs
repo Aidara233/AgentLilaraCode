@@ -369,4 +369,61 @@ public class ParserTests
         Assert.Null(cmd);
         Assert.Null(err);   // ⇒ 当成普通消息
     }
+
+    // ---- session configure：改绑供应商 / 换模型 ----
+
+    [Fact]
+    public void SessionConfigure_ParsesBothFlags()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session configure abc123 --provider p2 --model m9");
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.SessionConfigure>(cmd);
+        Assert.Equal("abc123", c.SessionId);
+        Assert.Equal("p2", c.ProviderId);
+        Assert.Equal("m9", c.ModelId);
+    }
+
+    // 省略的标志到命令上就是 null（= 保留旧值），与 `provider set` 逐字同构。
+    [Fact]
+    public void SessionConfigure_WithOnlyOneFlag_LeavesTheOtherNull()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session configure abc123 --provider p2");
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.SessionConfigure>(cmd);
+        Assert.Equal("p2", c.ProviderId);
+        Assert.Null(c.ModelId);
+    }
+
+    // ⚠️ 未知标志必须报错。拼错的 `--provder` 若被静默吞掉，命令会照常发出去、回一句 ✓，
+    // 而**改绑根本没发生**——用户以为换了供应商，实际还在旧的上面。
+    [Fact]
+    public void SessionConfigure_WithAnUnknownFlag_IsAnError()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session configure abc123 --provder p2");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    // 光一个 `session configure` 不能落回「当成消息」——用户以为在改绑，实际烧了一次模型调用。
+    [Fact]
+    public void SessionConfigure_WithoutArguments_IsAnError()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session configure");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    // 反向对照：词边界。session configures … 必须落回 (null, null)（⇒ 当消息）。
+    [Fact]
+    public void SessionConfigure_NeedsAWordBoundary()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session configures abc123 --provider p2");
+
+        Assert.Null(cmd);
+        Assert.Null(err);
+    }
 }

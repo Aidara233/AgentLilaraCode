@@ -119,6 +119,14 @@ public sealed class Repl(
                     if (Current is not null && Current.SessionId == set.SessionId) PrintStatus();
                     break;
 
+                // 改绑也是「立刻重印」那一类：右栏显示的模型选择刚变了。
+                // ⚠️ Note 里是 `provider / model`——**不是**「请求已经换过去了」：
+                // 在途那一步跑的还是旧供应商（见 HandleSessionConfigure 的注释）。
+                case CoreCommand.SessionConfigure cfg:
+                    _out.WriteLine($"✓ {cfg.SessionId} 的模型选择已更新（{accepted.Note}）");
+                    if (Current is not null && Current.SessionId == cfg.SessionId) PrintStatus();
+                    break;
+
                 // 声明成功要吭一声：Accepted.Reply 是 null，否则用户分不清「占了」与「没反应」。
                 case CoreCommand.ClaimAcquire acquire:
                     _out.WriteLine($"✓ 已占 {string.Join("、", acquire.Scope)}");

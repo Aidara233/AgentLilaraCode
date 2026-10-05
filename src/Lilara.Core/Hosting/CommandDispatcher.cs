@@ -73,6 +73,9 @@ public sealed class CommandDispatcher(
                 case CoreCommand.SessionSetAxis x:
                     return HandleSessionSetAxis(x, commandId);
 
+                case CoreCommand.SessionConfigure c:
+                    return HandleSessionConfigure(c, commandId);
+
                 case CoreCommand.ClaimAcquire a: return HandleClaimAcquire(a, commandId);
                 case CoreCommand.ClaimRelease r: return HandleClaimRelease(r, commandId);
 
@@ -556,6 +559,75 @@ public sealed class CommandDispatcher(
             new WireEvent.AxisChanged(handle.SessionId, x.Axis, canonical));
 
         return new DispatchResult(new Ack.Accepted { CommandId = id });
+    }
+
+    /// <summary>
+    /// 改会话的模型选择（换绑供应商 / 换模型）。
+    ///
+    /// <para>⚠️ **不拿会话闸、`IsRunning` 也不拒绝**——与 <see cref="HandleSessionSetAxis"/> 同一条理由。
+    /// 但**后果与 setAxis 不同，必须说清**：进行中的那一步**已经构造完 <c>ModelRequest</c> 了**，
+    /// 所以改绑**落在下一步**，不是立刻。「立刻生效」是假的——别让下一个人以为改了就马上换掉在途的调用。</para>
+    ///
+    /// <para>⚠️ 换供应商后**必须** `InvalidateSteppers()`：stepper 按 **sessionId** 缓存
+    ///（`CoreHost.StepperFor`），里面那把适配器是**旧供应商**的（旧 key、旧端点）。
+    /// 不失效的话请求会照旧发去老地方——那是「数据发给了别人」级别的事，不是显示问题。
+    /// ⚠️ 但**只在 `ProviderId` 真的变了才失效**：`Stepper.StepAsync` 每步从 spec 现读
+    /// `ModelId`，所以只换模型不需要失效，白清一次会把别的会话的缓存也连累掉。</para>
+    /// </summary>
+    private DispatchResult HandleSessionConfigure(CoreCommand.SessionConfigure c, string id)
+    {
+        if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
+
+        // 两个都没给 ⇒ 这不是一次「成功的 no-op」，是一次没说清的命令。拒绝，别静默成功。
+        if (string.IsNullOrWhiteSpace(c.ProviderId) && string.IsNullOrWhiteSpace(c.ModelId))
+            return Reject(id, "没说要改什么。用法：session configure <会话> [--provider <id>] [--model <id>]");
+
+        // 换绑到一个**不存在**的供应商必须拒绝。⚠️ 这一条是本命令存在的主要理由之一：
+        // `provider.delete` 刻意不阻止删除被引用的供应商（理由见 HandleProviderDelete），
+        // 于是「会话绑的供应商没了」是设计好的落点——而**这条命令是唯一的补救**。
+        // 放行一个指向不存在供应商的绑定，等于把那个坏状态**又写了一遍**。
+        ProviderDefinition? target = null;
+        if (!string.IsNullOrWhiteSpace(c.ProviderId))
+        {
+            target = _host.Providers.Load(c.ProviderId);
+            if (target is null)
+                return Reject(id, $"没有提供商 '{c.ProviderId}'。先 `provider set {c.ProviderId} --key <key>`，或 `provider list` 看看有哪些。");
+        }
+
+        var before = handle.Spec.Model;
+
+        // 两个字段都是「null = 保留旧值」——照 `provider.upsert` 的语义。
+        // ⚠️ 同一个表达式**算一次、用两次**（比较 + 落盘）：写成两遍会在只改一处时静默分叉。
+        var providerChanged = !string.IsNullOrWhiteSpace(c.ProviderId) && c.ProviderId != before.ProviderId;
+        var nextProviderId = string.IsNullOrWhiteSpace(c.ProviderId) ? before.ProviderId : c.ProviderId!;
+        var nextModelId = string.IsNullOrWhiteSpace(c.ModelId) ? before.ModelId : c.ModelId!;
+
+        // Protocol 是**供应商定义的快照**，换供应商时必须跟着重取，否则它和 ProviderId 不同代。
+        // ⚠️ 它**不是**「现在真的走哪条协议」——`Stepper` 取适配器的 Protocol（provider 定义
+        // 可以被 `provider set --protocol` 改掉）。这里只是让快照跟上此刻的定义。
+        var nextProtocol = target?.Protocol ?? before.Protocol;
+
+        var next = before with
+        {
+            ProviderId = nextProviderId,
+            ModelId = nextModelId,
+            Protocol = nextProtocol,
+        };
+
+        // 同值不是迁移 ⇒ 不发事件（与 `session.setAxis` 同一条约定）。
+        if (next == before)
+            return new DispatchResult(new Ack.Accepted { CommandId = id });
+
+        // 改内存 + 落盘在**同一个临界区**里（`UpdateSpecAndPersist`），与 `State` 共用一把锁。
+        handle.UpdateSpecAndPersist(_host.Store, s => s with { Model = next });
+
+        // ⚠️ 失效点在这里，不能挂在控制台的字符串判据上——线上 `session.configure` 走不到它 ⇒ 缓存静默失效。
+        if (providerChanged) _host.InvalidateSteppers();
+
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.SpecChanged(handle.SessionId, next));
+
+        return new DispatchResult(new Ack.Accepted { CommandId = id, Note = $"{next.ProviderId} / {next.ModelId}" });
     }
 
     /// <summary>

@@ -12,6 +12,7 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(MessageAppended), "message.appended")]
 [JsonDerivedType(typeof(StateChanged), "session.state")]
 [JsonDerivedType(typeof(AxisChanged), "axis.changed")]
+[JsonDerivedType(typeof(SpecChanged), "spec.changed")]
 [JsonDerivedType(typeof(ClaimAcquired), "claim.acquired")]
 [JsonDerivedType(typeof(ClaimReleased), "claim.released")]
 [JsonDerivedType(typeof(Error), "error")]
@@ -34,6 +35,13 @@ public abstract record WireEvent
 
     // 只在真的迁移时发：重复设同一个值是 no-op，不发事件。头据此更新显示。
     public sealed record AxisChanged(string SessionId, string Axis, string Value) : WireEvent;
+
+    // `session.configure` 改了模型选择（换绑供应商 / 换模型）。
+    // ⚠️ **载荷只带 `Model`，不带整个 `SessionSpec`**：spec 里能变的**只有这一块**
+    //（SessionId / ProjectKey / WorkingDirectory / CreatedAt 出生即定）。
+    // 带整份会让头以为「别的那几项也可能变」，去写它根本不该有的更新逻辑。
+    // ⚠️ 与 `axis.changed` 同一条约定：**只在真的变了才发**（同样值不发）。
+    public sealed record SpecChanged(string SessionId, ModelSelection Model) : WireEvent;
 
     // 发到项目流：谁在动哪些文件，跨会话才有意义。
     public sealed record ClaimAcquired(string SessionId, string Path) : WireEvent;

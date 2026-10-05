@@ -578,4 +578,194 @@ public class CommandDispatcherTests : IDisposable
         Assert.IsType<Ack.Rejected>(r.Ack);
         Assert.Empty(_adapter.Calls);   // 闸在任何网络动作之前
     }
+
+    // ---- session.configure：改绑供应商 / 换模型 ----
+
+    // 落盘必须真的发生：只改内存的话，重启后会话悄悄退回旧供应商，而用户以为改过了。
+    [Fact]
+    public async Task Configure_ChangesTheModel_AndPersistsItToDisk()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionConfigure(sessionId, null, "other-model"), "x", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+
+        // 内存里换了，且**盘上也换了**——两个都断，只断一个漏得掉「只改内存」。
+        var reloaded = SessionHandle.Load(host.Store, ProjectKey.FromPath(_work), sessionId);
+        Assert.Equal("other-model", reloaded.Spec.Model.ModelId);
+    }
+
+    // 换供应商必须让 stepper 缓存失效——否则下一步仍走**旧供应商的适配器**（旧 key、旧端点）。
+    //
+    // ⚠️ 这条必须走**真的** `host.StepperFor`，不能注入一个自己的 lambda：
+    // 第一版我注入了一个「记下 providerId 再返回 stepper」的 lambda，**它是绿的，而变异也是绿的**——
+    // 因为那个 lambda 每次 send 都被调、绕过了 `CoreHost._steppers` 那层缓存，
+    // 于是「缓存没失效」这个缺陷根本不在我的判据里（探针 ≠ 被测物）。
+    // 现在的判据是**缓存里那把适配器的身份**：同一个 handle 取两次 stepper，
+    // 中间改绑 ⇒ 必须是**两个不同实例**（或至少是换了供应商的实例）。
+    [Fact]
+    public async Task Configure_ToAnotherProvider_ReResolvesTheStepper()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);   // id = "p"
+        host.Providers.Save(new ProviderDefinition
+        {
+            Id = "p2", Protocol = Protocols.OpenAiChat, ApiKey = "k2", DefaultModel = "m2", Modality = "vision",
+        });
+
+        // 生产那条路：dispatcher 用 host.StepperFor（走缓存），适配器注入只为不联网。
+        var d = new CommandDispatcher(host, new EventBus(), host.StepperFor, _ => _adapter);
+
+        var r = await d.DispatchAsync(new CoreCommand.SessionCreate(), "c1", false, CancellationToken.None);
+        var sessionId = ((Ack.Accepted)r.Ack).SessionId!;
+        var handle = host.Activated.Single(h => h.SessionId == sessionId);
+
+        // 第一次解析 → 进缓存。
+        var first = host.StepperFor(handle);
+        Assert.Equal("p", handle.Spec.Model.ProviderId);
+
+        await d.DispatchAsync(
+            new CoreCommand.SessionConfigure(sessionId, "p2", null), "x", false, CancellationToken.None);
+
+        // ⚠️ 这里必须重新取——缓存没失效的话拿回来的是**同一把**旧 stepper（旧适配器）。
+        var second = host.StepperFor(handle);
+
+        Assert.NotSame(first, second);
+        Assert.Equal("p2", handle.Spec.Model.ProviderId);
+    }
+
+    // 反向那半：**只换模型**（同一个供应商）**不该**清缓存——白清会把别的会话的缓存也连累掉。
+    // ⚠️ 这条与上一条是一对：只断「换供应商要失效」的话，
+    // 把 InvalidateSteppers() 写成无条件的也会绿。
+    [Fact]
+    public async Task Configure_ToTheSameProvider_KeepsTheCachedStepper()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var d = new CommandDispatcher(host, new EventBus(), host.StepperFor, _ => _adapter);
+
+        var r = await d.DispatchAsync(new CoreCommand.SessionCreate(), "c1", false, CancellationToken.None);
+        var sessionId = ((Ack.Accepted)r.Ack).SessionId!;
+        var handle = host.Activated.Single(h => h.SessionId == sessionId);
+
+        var first = host.StepperFor(handle);
+
+        await d.DispatchAsync(
+            new CoreCommand.SessionConfigure(sessionId, null, "some-other-model"), "x", false, CancellationToken.None);
+
+        Assert.Same(first, host.StepperFor(handle));
+        Assert.Equal("some-other-model", handle.Spec.Model.ModelId);
+    }
+
+    // 换供应商时 Protocol 快照要跟着重取——否则它和 ProviderId 不同代，快照端点交出去的就是假话。
+    [Fact]
+    public async Task Configure_ToAnotherProvider_ReSnapshotsTheProtocol()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        host.Providers.Save(new ProviderDefinition
+        {
+            Id = "p2", Protocol = Protocols.OpenAiChat, ApiKey = "k2", DefaultModel = "m2", Modality = "vision",
+        });
+        var sessionId = await CreateSessionAsync(d);
+
+        Assert.Equal(Protocols.ClaudeMessages, host.Store.ReadSpec(ProjectKey.FromPath(_work), sessionId).Model.Protocol);
+
+        await d.DispatchAsync(
+            new CoreCommand.SessionConfigure(sessionId, "p2", null), "x", false, CancellationToken.None);
+
+        Assert.Equal(Protocols.OpenAiChat, host.Store.ReadSpec(ProjectKey.FromPath(_work), sessionId).Model.Protocol);
+    }
+
+    [Fact]
+    public async Task Configure_PublishesSpecChanged()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var bus = new EventBus();
+        var d = new CommandDispatcher(host, bus, h => new Stepper(host.Store, _adapter), _ => _adapter);
+
+        var r = await d.DispatchAsync(new CoreCommand.SessionCreate(), "c1", false, CancellationToken.None);
+        var sessionId = ((Ack.Accepted)r.Ack).SessionId!;
+        using var sub = bus.Subscribe(EventBus.SessionTopic(sessionId));
+
+        await d.DispatchAsync(
+            new CoreCommand.SessionConfigure(sessionId, null, "m9"), "x", false, CancellationToken.None);
+
+        Assert.True(sub.Reader.TryRead(out var p), "改绑必须发 spec.changed——头靠它更新右栏");
+        var evt = Assert.IsType<WireEvent.SpecChanged>(p.Payload);
+        Assert.Equal("m9", evt.Model.ModelId);
+    }
+
+    // 同值不是迁移 ⇒ 不发事件（与 setAxis 同一条约定）。
+    [Fact]
+    public async Task Configure_ToTheSameModel_PublishesNothing()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        var bus = new EventBus();
+        var d = new CommandDispatcher(host, bus, h => new Stepper(host.Store, _adapter), _ => _adapter);
+
+        var r = await d.DispatchAsync(new CoreCommand.SessionCreate(), "c1", false, CancellationToken.None);
+        var sessionId = ((Ack.Accepted)r.Ack).SessionId!;
+
+        // 建会话用的就是 provider 的 DefaultModel（"m"）⇒ 再设一次 "m" 是同值。
+        _ = await d.DispatchAsync(
+            new CoreCommand.SessionConfigure(sessionId, null, "m"), "x1", false, CancellationToken.None);
+
+        using var sub = bus.Subscribe(EventBus.SessionTopic(sessionId));
+        await d.DispatchAsync(
+            new CoreCommand.SessionConfigure(sessionId, null, "m"), "x2", false, CancellationToken.None);
+
+        Assert.False(sub.Reader.TryRead(out _), "设成同一个值不该发事件");
+    }
+
+    // 两个都没给 ⇒ 拒绝，不是「成功的 no-op」（那是把没说清的命令说成做成了）。
+    [Fact]
+    public async Task Configure_WithNeitherFieldIsRejected()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionConfigure(sessionId, null, null), "x", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(r.Ack);
+    }
+
+    // 换绑到一个**不存在**的供应商必须拒绝：这条命令正是为了修「绑的供应商没了」那个坏状态，
+    // 放行等于把坏状态又写一遍。
+    [Fact]
+    public async Task Configure_ToAMissingProvider_IsRejected_AndLeavesTheSessionAlone()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        var sessionId = await CreateSessionAsync(d);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionConfigure(sessionId, "ghost", null), "x", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(r.Ack);
+        Assert.Contains("ghost", ((Ack.Rejected)r.Ack).Reason);
+        // 被拒就不能动盘：否则用户看到一个「没换成功」却已经换掉的会话。
+        Assert.Equal("p", host.Store.ReadSpec(ProjectKey.FromPath(_work), sessionId).Model.ProviderId);
+    }
+
+    // 会话不存在 ⇒ rejected（命令本身不合法）。
+    [Fact]
+    public async Task Configure_WithAnUnknownSession_IsRejected()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.SessionConfigure("nope", null, "m"), "x", false, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(r.Ack);
+    }
 }

@@ -57,6 +57,22 @@ public abstract record CoreCommand
     /// </summary>
     public sealed record SessionSetAxis(string SessionId, string Axis, string Value) : CoreCommand;
 
+    /// <summary>
+    /// 改会话的模型选择：换绑供应商 / 换模型。
+    ///
+    /// <para>⚠️ **两个字段都可空，null = 「本次没提到」= 保留旧值**——与
+    /// <see cref="ProviderUpsert"/> 同一条语义（那两个前端各发各的，不该被逼着回传全量）。
+    /// 两个都是 null ⇒ **拒绝**（「没说要改什么」不是一次成功的 no-op）。</para>
+    ///
+    /// <para>⚠️ **为什么不给 `SessionCreate` 加参数**：改绑是新会话与老会话**共用**的动作。
+    /// 让 `create` 也收 provider 就会产生**第二条设置模型的路**，两条路 = 两套默认值处理 = 迟早分叉。
+    /// 头的建会话流程因此是 `create` → 立刻 `configure`。</para>
+    ///
+    /// <para>⚠️ **不是「命令不合法」的那一类**，除非：会话不存在 / 供应商不存在 / 两个参数都没给。
+    /// 「换过去了但那个供应商连不上」是**业务结果**，走 `error` 事件。</para>
+    /// </summary>
+    public sealed record SessionConfigure(string SessionId, string? ProviderId, string? ModelId) : CoreCommand;
+
     /// <summary>占用一片区域。路径可以是相对的，按会话的工作目录解析。</summary>
     /// <param name="Scope">
     /// **名字与形状都照协议**：release 的形参写作 `scope: [...]` ⇒ 它是**列表**。
