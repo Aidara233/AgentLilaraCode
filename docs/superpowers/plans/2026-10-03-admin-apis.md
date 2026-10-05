@@ -336,8 +336,39 @@ if (!string.IsNullOrEmpty(origin) && !string.Equals(origin, allowedOrigin, Strin
 而**头只拿得到前两样与策略**——`modelId` / `providerId` / `workingDirectory` / `createdAt` **一个都没有**。
 后果实测过：用户问「怎么切换提供商」，头**答不出来**。
 
-- [ ] **Step 1: 测试**：断言 `/state` 的响应含 `spec.sessionId` / `spec.projectKey` /
-  `spec.workingDirectory` / `spec.createdAt` / `spec.model.{providerId,modelId,protocol,effort,maxTokens}`。
+- [ ] **Step 1: 测试**（写进 `ControlServerTests`，它已有随机端口 + `Client` + `Http()` + `_dispatcher` 的脚手架）
+
+```csharp
+[Fact]
+public async Task State_CarriesTheWholeSpec()
+{
+    var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+    var sid = ((Ack.Accepted)created.Ack).SessionId!;      // ⚠️ 分派型命令只在这个回执里给身份
+
+    using var s = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/state")));
+    var spec = s.RootElement.GetProperty("spec");
+
+    // ⚠️ **整份 `SessionSpec` 交出去**（R-A：头要什么由头决定，核心不做子集裁剪）。
+    // ⚠️ 线上是 **camelCase**（`WireJson.Options`）——键名按它写，别按 C# 属性名。
+    Assert.Equal(sid, spec.GetProperty("sessionId").GetString());
+    Assert.False(string.IsNullOrEmpty(spec.GetProperty("projectKey").GetString()));
+    Assert.False(string.IsNullOrEmpty(spec.GetProperty("workingDirectory").GetString()));
+    Assert.NotEqual(default, spec.GetProperty("createdAt").GetDateTimeOffset());
+
+    var model = spec.GetProperty("model");
+    // ⚠️ 值来自测试**预置的那个 provider**（`"p"` / `DefaultModel = "m"`）——
+    // 写死它们同时钉住了「spec 里的模型就是该会话实际绑的那份」。
+    Assert.Equal("p", model.GetProperty("providerId").GetString());
+    Assert.Equal("m", model.GetProperty("modelId").GetString());
+    Assert.Equal(Protocols.ClaudeMessages, model.GetProperty("protocol").GetString());
+    Assert.False(string.IsNullOrEmpty(model.GetProperty("effort").GetString()));
+    Assert.True(model.GetProperty("maxTokens").GetInt32() > 0);
+
+    // ⚠️ **G12**：key 不在 `SessionSpec` 里（它住 `providers/*.json`）
+    // ⇒ 「整份交出去」这件事**天生不泄 key**——这条断言把那句话钉成可执行的。
+    Assert.False(spec.TryGetProperty("apiKey", out _));
+}
+```
 - [ ] **Step 2–4: 红 → 实现 → 绿**
 
 ```csharp
@@ -485,6 +516,32 @@ app.MapGet("/providers", () =>
 `provider set` 有控制台语法，而 `provider delete` 没有会造出「配得进、删不掉」的形状
 （今天就是这样：只能手删文件）。⚠️ **代价（若错）**：`04` §1.1 的「控制台不多一条命令」
 若被判定为连对称的删也算，则应撤掉——但那样 `provider set` 也该只在线上，而它是既有的。
+
+```csharp
+// ---- 线上那条（ControlServerTests 里，真起 Kestrel 真连 WS）----
+// ⚠️ 用既有那套 WS 脚手架；断言的是**两端**：ack 与盘上的后果。
+var upsert = new CoreCommand.ProviderUpsert("p", "k", "m", null, null, null);
+await _dispatcher.DispatchAsync(upsert, "u", false, CancellationToken.None);
+Assert.NotNull(_host.Providers.Load("p"));
+
+// 发 provider.delete（**要四条线都通**：记录 → dispatcher → 线上解析 → 控制台语法）
+var del = await SendCommand(Id(), new { kind = "provider.delete", id = "p" });   // 用既有 WS 收发 helper
+Assert.True(del.Ack.Accepted);
+Assert.Null(_host.Providers.Load("p"));      // ⚠️ **盘上真没了**——只断言 ack 是半条判据
+
+// ---- 控制台那条（ProviderIdTests 或 ReplTests 里）----
+// ⚠️ G14 的 ④：`provider delete p` 必须**被解析成命令**，不能落回「当成消息发出去」
+var (cmd, err) = CoreCommandParser.Parse("provider delete p");
+Assert.Null(err);
+Assert.Equal("p", Assert.IsType<CoreCommand.ProviderDelete>(cmd).Id);
+Assert.Null(CoreCommandParser.Parse("provider delete").Command);   // 少了 id ⇒ 报错，不落回消息
+```
+
+⚠️ **删的测试必须断言「文件真没了」**（上面 `Load` 那句）——**只断言 ack 是半条判据**：
+ack 对了而文件还在的那种错，用户以为删了、下次发消息还在用那个凭据。
+⚠️ **反向也要一条**：删一个**不存在**的 id ⇒ `Rejected`、且理由点名那个 id
+（判据：本项目一路在收「静默的成功」——`provider delet local`（拼错）回 ✓ 的话，
+用户以为删了、其实没删）。
 
 - [ ] **Step 2–4: 红 → 实现 → 绿**
 
