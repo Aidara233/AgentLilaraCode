@@ -332,7 +332,7 @@ if (!string.IsNullOrEmpty(origin) && !string.Equals(origin, allowedOrigin, Strin
 
 **Files:** `src/Lilara.Core/Control/ControlServer.cs`（`/sessions/{id}/state`）· 其测试
 
-⚠️ **控制台 `status` 印四样**（会话 id · `Status`/`Turn` · **模型** · **目录** · 策略），
+⚠️ **控制台 `status` 印这几样**（会话 id · `Status`/`Turn` · **模型** · **目录** · 策略），
 而**头只拿得到前两样与策略**——`modelId` / `providerId` / `workingDirectory` / `createdAt` **一个都没有**。
 后果实测过：用户问「怎么切换提供商」，头**答不出来**。
 
