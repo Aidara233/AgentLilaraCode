@@ -115,10 +115,10 @@ public sealed class CommandDispatcher(
     /// **探针 ≠ 被测物，要验证就调那个函数。**
     ///
     /// <para>⚠️ **取「第一个点之前」那一段，不是 `Path.GetFileNameWithoutExtension`。**
-    /// 实测 `NUL.txt.txt.json` 同样静默消失，而 `GetFileNameWithoutExtension` 给出 `NUL.txt.txt`
-    /// ⇒ 会**放行**它。判据要盖过系统的怪癖，不是刚好合上它。</para>
+    /// 实测 `NUL.txt.txt.json` **同样是设备名**（一样抛、一样掀翻进程），而 `GetFileNameWithoutExtension`
+    /// 给出 `NUL.txt.txt` ⇒ 会**放行**它。判据要盖过系统的怪癖，不是刚好合上它。</para>
     ///
-    /// <para>⚠️ 判定 = **大小写不敏感**（实测 `nul.json` 一样消失）+ `TrimEnd()`（`NUL  .json` 也消失）
+    /// <para>⚠️ 判定 = **大小写不敏感**（实测 `nul.json` 一样是设备名）+ `TrimEnd()`（`NUL  .json` 同样是）
     /// + **相等、不是前缀**——实测 `NULx` / `COM1x` / `COM10` / `LPT10` / `console` / `connect`
     /// 都是**正常文件**，前缀型会把这一大片正当 id 一起误杀；保留表只有 **1–9 与 `¹²³`**
     /// （`COM0` / `LPT0` / `COM10` / `LPT10` 实测都能正常写入）。</para>

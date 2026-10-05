@@ -202,7 +202,12 @@ public class ProviderIdTests : IDisposable
     [Fact]
     public async Task ProviderUpsert_WithASuperscriptDeviceId_IsRejectedThroughTheDispatcher()
     {
-        Assert.Equal(0x00B9, "¹"[0]);   // ⚠️ 先证明这个字面量就是 U+00B9（不然下面测的是别的东西）
+        // ⚠️ **这一句钉的是字面量，不是被测输入**——输入是下一行用 `(char)0x00B9` 构造的（数字，
+        //    工具链碰不到）。所以它今天**不守护本用例的保真度**。
+        //    它的价值是**前瞻的**：`"COM¹"` 这种写法比 `"COM" + (char)0x00B9` 好读得多，
+        //    所以「顺手清理」成字面量是大概率事件；那一刻若字面量已被工具链弄坏，
+        //    会**在这里当场失败**，而不是静默变成跟 `COM1` 一样的重复用例（那种绿了什么都没测）。
+        Assert.Equal(0x00B9, "¹"[0]);
 
         var cmd = new CoreCommand.ProviderUpsert("COM" + (char)0x00B9, "k", null, null, null, null);
         var result = await _dispatcher.DispatchAsync(cmd, "t1", awaitCompletion: true, CancellationToken.None);
