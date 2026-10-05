@@ -287,7 +287,8 @@ public sealed class ControlServer(
                 p.Endpoint, p.AuthScheme, p.Modality,
                 // ⚠️ **key 只回「有没有」，不回「是什么」**（用户裁定 R-B：能改不能看）。
                 //    有了它，表单能显示「已配置」而不是一个空框（空框会让人以为没配、然后重填一遍）。
-                HasApiKey = !string.IsNullOrEmpty(p.ApiKey),
+                // ⚠️ 判据走 `ProviderDefinition.HasApiKey`——**一处定义、三处调用**（见 R2）。
+                HasApiKey = p.HasApiKey,
             }), WireJson.Options));
 
         // ⚠️ **头渲染配置表单的真相来源**（「不许手抄」的执行面）：合法协议 / 合法 auth

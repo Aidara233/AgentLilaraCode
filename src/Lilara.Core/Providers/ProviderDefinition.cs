@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Lilara.Core.Providers;
 
 /// <summary>
@@ -37,4 +39,28 @@ public sealed record ProviderDefinition
     /// ⚠️ 可空——老 providers/*.json 没这个字段，缺失按 <see cref="AuthSchemes.Default"/> 处理。
     /// </summary>
     public string? AuthScheme { get; init; }
+
+    /// <summary>
+    /// ⚠️ **「有没有 key」全项目只此一份判据——别在别处再拼一遍。**
+    ///
+    /// <para>它曾经被拼成两份、而且漂了：守卫用 `is null`、`/providers` 用 `!IsNullOrEmpty`
+    /// ⇒ `"apiKey": ""` 既**绕过守卫**（存下空 key），又**抹掉已有 provider 的 key**。
+    /// ⇒ 空串与缺失**等价**（都是「没给」）。</para>
+    ///
+    /// <para>⚠️ **别改成 `IsNullOrWhiteSpace`**：那是**第三个**判据（本判据故意不管空白串），
+    /// 一改就又变成两份拼写。空白串是另一个问题。</para>
+    /// </summary>
+    public static bool HasKey(string? apiKey) => !string.IsNullOrEmpty(apiKey);
+
+    /// <summary>
+    /// ⚠️ 转发到 <see cref="HasKey"/>——**别在这里再拼一遍 `IsNullOrEmpty`**。
+    ///
+    /// <para>⚠️ `[JsonIgnore]` **不是可选的**：`ProviderStore.Save` 用 `Canonical.Json.Options`
+    /// 直接序列化本类型，而那份设置**没有** `IgnoreReadOnlyProperties` ⇒ 少了它，
+    /// 每个 `providers/&lt;id&gt;.json` 会**多出一个 `hasApiKey` 键**（实测见报告 R2.2）——
+    /// 磁盘格式的一次静默变更，而**现有测试没有一条会红**（`DiskFormatGoldenTests` 不含本类型）。
+    /// 它是**派生值、不是数据** ⇒ 本就不该落盘。</para>
+    /// </summary>
+    [JsonIgnore]
+    public bool HasApiKey => HasKey(ApiKey);
 }
