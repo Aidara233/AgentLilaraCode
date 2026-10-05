@@ -1,7 +1,7 @@
 using System.Text.Json.Serialization;
 using Lilara.Core.Kernel;
 
-namespace Lilara.Core.Control;
+namespace Lilara.Core.Hosting;
 
 // 控制面三层里的「事件」层。刻意不继承 TimelineEvent / Block（而是包含块列表）：
 // 多态判别式表取自静态声明类型，继承会让派生类的判别式静默丢失、产出错形状。
