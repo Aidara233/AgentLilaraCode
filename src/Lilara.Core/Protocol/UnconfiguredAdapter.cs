@@ -1,4 +1,4 @@
-namespace Lilara.Core.Adapters;
+namespace Lilara.Core.Protocol;
 
 // 没有可用适配器时的占位：让命令面能起来——没配提供商时仍要能收 provider set 与 session create，
 // 否则引导会自锁。

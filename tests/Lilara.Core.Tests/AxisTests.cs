@@ -96,7 +96,7 @@ public class AxisTests
         Directory.CreateDirectory(root);
         try
         {
-            var store = new Lilara.Core.Persistence.SessionStore(root);
+            var store = new Lilara.Core.Storage.SessionStore(root);
             var pk = Lilara.Core.Kernel.ProjectKey.FromPath(@"C:\work");
             store.WriteState(pk, new Lilara.Core.Kernel.SessionState
             {
@@ -135,7 +135,7 @@ public class AxisTests
         Directory.CreateDirectory(root);
         try
         {
-            var store = new Lilara.Core.Persistence.SessionStore(root);
+            var store = new Lilara.Core.Storage.SessionStore(root);
             var pk = Lilara.Core.Kernel.ProjectKey.FromPath(@"C:\work");
             store.WriteState(pk, new Lilara.Core.Kernel.SessionState
             {

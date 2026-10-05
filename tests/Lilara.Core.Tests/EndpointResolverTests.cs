@@ -1,4 +1,4 @@
-using Lilara.Core.Adapters;
+using Lilara.Core.Protocol;
 
 namespace Lilara.Core.Tests;
 

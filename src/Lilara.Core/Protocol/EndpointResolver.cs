@@ -1,4 +1,4 @@
-namespace Lilara.Core.Adapters;
+namespace Lilara.Core.Protocol;
 
 public enum EndpointSource
 {

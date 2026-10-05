@@ -1,5 +1,5 @@
 using Lilara.Core.Kernel;
-using Lilara.Core.Adapters;
+using Lilara.Core.Protocol;
 using CanonicalBlock = Lilara.Core.Kernel.Block;
 
 namespace Lilara.Core.Tests.Fakes;

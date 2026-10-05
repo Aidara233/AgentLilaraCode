@@ -1,9 +1,10 @@
+using Lilara.Core.Kernel;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using Lilara.Core.Providers;
 
-namespace Lilara.Core.Adapters.OpenAi;
+namespace Lilara.Core.Protocol.OpenAi;
 
 // OpenAI 两条链路共用的 HTTP 层：唯一出现 HttpClient 的地方，纯函数层绝不知道网络存在。
 // 认证缺省是 Bearer（OpenAI 兼容端点的通用约定），与 Claude 的 x-api-key 相反。

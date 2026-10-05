@@ -1,4 +1,4 @@
-namespace Lilara.Core.Persistence;
+namespace Lilara.Core.Storage;
 
 // 全局数据根：LILARA_HOME ?? ~/.lilara（Windows 下 ~ = %USERPROFILE%）。
 // 每个 OS 用户一份，天然隔离，不需要额外的换用户机制。

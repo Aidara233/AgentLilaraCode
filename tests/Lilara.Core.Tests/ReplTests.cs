@@ -1,9 +1,9 @@
-using Lilara.Core.Adapters;
+using Lilara.Core.Protocol;
 using Lilara.Core.Hosting;
-using Lilara.Core.Adapters.Claude;
+using Lilara.Core.Protocol.Claude;
 using Lilara.Core.Kernel;
 using Lilara.Core.Console;
-using Lilara.Core.Persistence;
+using Lilara.Core.Storage;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
 using Lilara.Core.Tests.Fakes;
@@ -373,7 +373,7 @@ public class ReplTests : IDisposable
     [Fact]
     public async Task ModelFailure_PrintsOneLineAndKeepsReplAlive()
     {
-        _adapter.Throws(new Lilara.Core.Adapters.ModelCallFailedException("上游 503。这是临时的，重试即可。"));
+        _adapter.Throws(new Lilara.Core.Protocol.ModelCallFailedException("上游 503。这是临时的，重试即可。"));
         var repl = ReplWithSession();
 
         var keepGoing = await repl.ExecuteAsync("你好", CancellationToken.None);
@@ -386,7 +386,7 @@ public class ReplTests : IDisposable
     [Fact]
     public async Task ModelFailure_LeavesStatusAtIdleNotRunning()
     {
-        _adapter.Throws(new Lilara.Core.Adapters.ModelCallFailedException("上游 503"));
+        _adapter.Throws(new Lilara.Core.Protocol.ModelCallFailedException("上游 503"));
         var repl = ReplWithSession();
         await repl.ExecuteAsync("你好", CancellationToken.None);
         _out.GetStringBuilder().Clear();
@@ -473,7 +473,7 @@ public class ReplTests : IDisposable
     public async Task ClaimList_PrintsTheClaimsInTheWorkingDirectory()
     {
         var (repl, _, session) = NewHarness();
-        new Lilara.Core.Persistence.ClaimStore(session.Spec.WorkingDirectory)
+        new Lilara.Core.Storage.ClaimStore(session.Spec.WorkingDirectory)
             .Save([new Lilara.Core.Kernel.Claim("other", "pk", @"c:\repo\src", DateTimeOffset.UnixEpoch)]);
 
         await repl.ExecuteAsync("claim list", CancellationToken.None);
@@ -558,7 +558,7 @@ public class ReplTests : IDisposable
     public async Task ClaimList_InAnyUpperCase_IsNotSentAsAMessage()
     {
         var (repl, _, session) = NewHarness();
-        new Lilara.Core.Persistence.ClaimStore(session.Spec.WorkingDirectory)
+        new Lilara.Core.Storage.ClaimStore(session.Spec.WorkingDirectory)
             .Save([new Lilara.Core.Kernel.Claim("other", "pk", @"c:\repo\src", DateTimeOffset.UnixEpoch)]);
 
         await repl.ExecuteAsync("claim LIST", CancellationToken.None);

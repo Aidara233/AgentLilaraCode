@@ -1,4 +1,4 @@
-namespace Lilara.Core.Adapters;
+namespace Lilara.Core.Protocol;
 
 // 上游协议适配器：内建焊死在代码里，不做插件——出去的协议是产品形状，不该可换。
 public interface IModelAdapter

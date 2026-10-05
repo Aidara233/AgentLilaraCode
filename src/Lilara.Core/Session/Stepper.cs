@@ -1,5 +1,5 @@
-using Lilara.Core.Adapters;
-using Lilara.Core.Persistence;
+using Lilara.Core.Protocol;
+using Lilara.Core.Storage;
 using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Session;

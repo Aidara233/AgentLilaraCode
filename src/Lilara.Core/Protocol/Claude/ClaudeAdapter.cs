@@ -2,7 +2,7 @@ using Anthropic;
 using Lilara.Core.Kernel;
 using Lilara.Core.Providers;
 
-namespace Lilara.Core.Adapters.Claude;
+namespace Lilara.Core.Protocol.Claude;
 
 // Claude Messages 适配器：走官方 C# SDK，不手搓 HTTP。构造请求 → 发出去 → 映射回来，翻译逻辑全在两个纯函数里。
 public sealed class ClaudeAdapter : IModelAdapter

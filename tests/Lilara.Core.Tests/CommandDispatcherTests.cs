@@ -1,8 +1,8 @@
-using Lilara.Core.Adapters;
+using Lilara.Core.Protocol;
 using Lilara.Core.Control;
 using Lilara.Core.Kernel;
 using Lilara.Core.Hosting;
-using Lilara.Core.Persistence;
+using Lilara.Core.Storage;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
 using Lilara.Core.Tests.Fakes;
@@ -130,7 +130,7 @@ public class CommandDispatcherTests : IDisposable
     {
         var (host, _) = NewHarness();
         SaveProvider(host);
-        _adapter.Throws(new Lilara.Core.Adapters.ModelCallFailedException("上游 503"));
+        _adapter.Throws(new Lilara.Core.Protocol.ModelCallFailedException("上游 503"));
 
         var dispatcher = new CommandDispatcher(host, new EventBus(), h => new Stepper(host.Store, _adapter));
         var sessionId = await CreateSessionAsync(dispatcher);
@@ -440,15 +440,15 @@ public class CommandDispatcherTests : IDisposable
     }
 
     // 挂起的适配器：让测试能精确控制「模型什么时候返回」。
-    private sealed class GatedAdapter(Func<Task<string>> gate) : Lilara.Core.Adapters.IModelAdapter    {
-        public Lilara.Core.Adapters.ResolvedEndpoint? Endpoint => null;
+    private sealed class GatedAdapter(Func<Task<string>> gate) : Lilara.Core.Protocol.IModelAdapter    {
+        public Lilara.Core.Protocol.ResolvedEndpoint? Endpoint => null;
         public string Protocol => Protocols.ClaudeMessages;
 
-        public async Task<Lilara.Core.Adapters.ModelReply> CallAsync(
-            Lilara.Core.Adapters.ModelRequest request, CancellationToken ct)
+        public async Task<Lilara.Core.Protocol.ModelReply> CallAsync(
+            Lilara.Core.Protocol.ModelRequest request, CancellationToken ct)
         {
             var text = await gate();
-            return new Lilara.Core.Adapters.ModelReply
+            return new Lilara.Core.Protocol.ModelReply
             {
                 Blocks = [new Block.TextBlock(text)],
                 StopReason = "end_turn",

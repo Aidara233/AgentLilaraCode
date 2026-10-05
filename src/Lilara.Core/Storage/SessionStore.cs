@@ -1,7 +1,7 @@
 using System.Text.Json;
 using Lilara.Core.Kernel;
 
-namespace Lilara.Core.Persistence;
+namespace Lilara.Core.Storage;
 
 // 会话在磁盘上的落点：
 //   <数据根>/projects/<projectKey>/sessions/<sessionId>/{spec.json, state.json, history.jsonl}

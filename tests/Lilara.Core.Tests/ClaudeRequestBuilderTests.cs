@@ -1,6 +1,6 @@
 using System.Text.Json;
-using Lilara.Core.Adapters;
-using Lilara.Core.Adapters.Claude;
+using Lilara.Core.Protocol;
+using Lilara.Core.Protocol.Claude;
 using Lilara.Core.Kernel;
 using Anthropic.Models.Messages;
 using AnthropicRole = Anthropic.Models.Messages.Role;

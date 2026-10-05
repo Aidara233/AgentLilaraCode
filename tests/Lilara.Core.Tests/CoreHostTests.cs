@@ -1,9 +1,9 @@
 using Lilara.Core.Kernel;
-using Lilara.Core.Adapters;
-using Lilara.Core.Adapters.Claude;
-using Lilara.Core.Adapters.OpenAi;
+using Lilara.Core.Protocol;
+using Lilara.Core.Protocol.Claude;
+using Lilara.Core.Protocol.OpenAi;
 using Lilara.Core.Hosting;
-using Lilara.Core.Persistence;
+using Lilara.Core.Storage;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
 

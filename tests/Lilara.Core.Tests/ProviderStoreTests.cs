@@ -1,5 +1,5 @@
 using Lilara.Core.Kernel;
-using Lilara.Core.Adapters;
+using Lilara.Core.Protocol;
 using Lilara.Core.Providers;
 
 namespace Lilara.Core.Tests;

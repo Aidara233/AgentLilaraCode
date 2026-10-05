@@ -1,6 +1,6 @@
 using Lilara.Core.Kernel;
 
-namespace Lilara.Core.Adapters;
+namespace Lilara.Core.Protocol;
 
 // 一次模型调用要的全部东西：核心发全量 canonical，适配器负责翻译成具体协议。
 public sealed record ModelRequest

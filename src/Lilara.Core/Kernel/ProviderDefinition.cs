@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace Lilara.Core.Providers;
+namespace Lilara.Core.Kernel;
 
 // 提供商定义，存全局（含 key）；会话只存「引用 + 选择」，不存 key。
 public sealed record ProviderDefinition

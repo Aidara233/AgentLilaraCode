@@ -1,7 +1,7 @@
 using System.Text.Json;
 using Lilara.Core.Kernel;
 
-namespace Lilara.Core.Adapters.OpenAi;
+namespace Lilara.Core.Protocol.OpenAi;
 
 // OpenAI Chat 响应 → canonical。纯函数：同一段 JSON 进，同一个 ModelReply 出。
 // 本机网关实测过的形状：正常 finish_reason:"stop"；截断给 content:""（空串，不是 null）+ "length"；

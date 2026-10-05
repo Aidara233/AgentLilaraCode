@@ -1,8 +1,8 @@
 using Lilara.Core.Kernel;
 using System.Net;
 using Anthropic.Exceptions;
-using Lilara.Core.Adapters;
-using Lilara.Core.Adapters.Claude;
+using Lilara.Core.Protocol;
+using Lilara.Core.Protocol.Claude;
 using Lilara.Core.Providers;
 
 namespace Lilara.Core.Tests;

@@ -1,4 +1,4 @@
-using Lilara.Core.Adapters.OpenAi;
+using Lilara.Core.Protocol.OpenAi;
 using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Tests;

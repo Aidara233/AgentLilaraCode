@@ -1,6 +1,6 @@
 using Lilara.Core.Kernel;
-using Lilara.Core.Adapters;
-using Lilara.Core.Adapters.OpenAi;
+using Lilara.Core.Protocol;
+using Lilara.Core.Protocol.OpenAi;
 using Lilara.Core.Providers;
 
 namespace Lilara.Core.Tests;
@@ -16,7 +16,7 @@ public class OpenAiHttpTests
     [Fact]
     public void ClaudeAdapter_StillRejectsWrongProtocol()
     {
-        Assert.Throws<ArgumentException>(() => new Adapters.Claude.ClaudeAdapter(Def(Protocols.OpenAiChat)));
+        Assert.Throws<ArgumentException>(() => new Lilara.Core.Protocol.Claude.ClaudeAdapter(Def(Protocols.OpenAiChat)));
     }
 
     [Fact]

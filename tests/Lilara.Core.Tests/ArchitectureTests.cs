@@ -10,7 +10,7 @@ public class ArchitectureTests
 {
     // 底 → 顶。数值越大越靠上；一条 using 的目标层必须**严格低于**发出它的那一层。
     private static readonly string[] LayerOrder =
-        ["Kernel", "Persistence", "Providers", "Adapters", "Session", "Hosting", "Control", "Console"];
+        ["Kernel", "Storage", "Providers", "Protocol", "Session", "Hosting", "Control", "Console"];
 
     [Fact]
     public void Kernel_DoesNotDependOnAnyOtherLayer()
@@ -18,7 +18,7 @@ public class ArchitectureTests
         var files = Directory.GetFiles(LayerDir("Kernel"), "*.cs", SearchOption.AllDirectories);
 
         // 先钉「找得到东西」：glob 若空了，下面的空断言会**假绿**。
-        Assert.Equal(10, files.Length);
+        Assert.Equal(12, files.Length);
 
         var offenders = files
             .SelectMany(f => ExternalUsings(f).Select(u => $"{Path.GetFileName(f)}:{u.Line}  {u.Text}"))

@@ -1,5 +1,5 @@
 using Lilara.Core.Kernel;
-using Lilara.Core.Adapters;
+using Lilara.Core.Protocol;
 using Lilara.Core.Providers;
 
 namespace Lilara.Core.Tests;
@@ -13,9 +13,9 @@ public class AdapterFactoryTests
     };
 
     [Theory]
-    [InlineData("claude-messages", typeof(Adapters.Claude.ClaudeAdapter))]
-    [InlineData("openai-chat", typeof(Adapters.OpenAi.OpenAiChatAdapter))]
-    [InlineData("openai-responses", typeof(Adapters.OpenAi.OpenAiResponsesAdapter))]
+    [InlineData("claude-messages", typeof(Lilara.Core.Protocol.Claude.ClaudeAdapter))]
+    [InlineData("openai-chat", typeof(Lilara.Core.Protocol.OpenAi.OpenAiChatAdapter))]
+    [InlineData("openai-responses", typeof(Lilara.Core.Protocol.OpenAi.OpenAiResponsesAdapter))]
     public void Create_DispatchesTheOnDiskProtocolStrings(string onDiskValue, Type expected)
     {
         // 落盘的协议字符串必须按字面量守，常量在这里是被测对象。

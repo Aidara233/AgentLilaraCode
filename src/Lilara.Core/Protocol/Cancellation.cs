@@ -1,4 +1,4 @@
-namespace Lilara.Core.Adapters;
+namespace Lilara.Core.Protocol;
 
 // 取消不是失败：调用方的 token 被取消了就原样放行（Ctrl-C / session.interrupt），
 // 但 HttpClient 超时也以 TaskCanceledException 到达，那是一步真失败、必须包。

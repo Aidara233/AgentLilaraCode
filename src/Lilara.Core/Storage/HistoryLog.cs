@@ -3,7 +3,7 @@ using System.Text;
 using System.Text.Json;
 using Lilara.Core.Kernel;
 
-namespace Lilara.Core.Persistence;
+namespace Lilara.Core.Storage;
 
 // 每步追加的骨架记录——只追加，永不重写（「简化」是加载期解释，不是落盘时改写）。
 public static class HistoryLog

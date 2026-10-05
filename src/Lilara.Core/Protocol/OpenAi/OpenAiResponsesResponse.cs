@@ -1,7 +1,7 @@
 using System.Text.Json;
 using Lilara.Core.Kernel;
 
-namespace Lilara.Core.Adapters.OpenAi;
+namespace Lilara.Core.Protocol.OpenAi;
 
 // OpenAI Responses 响应 → canonical。纯函数：output 是异构数组，只取 type == "message" 的项，其余（reasoning 等）跳过。
 public static class OpenAiResponsesResponse

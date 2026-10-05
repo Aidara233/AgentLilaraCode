@@ -1,6 +1,6 @@
 using Lilara.Core.Kernel;
 
-namespace Lilara.Core.Persistence;
+namespace Lilara.Core.Storage;
 
 // 声明的落盘：<工作目录>/.lilara/claims.json——进工作目录不进数据根，
 // 因为声明是可分享的项目信息，会话状态才是私有的。没有文件 = 空列表，不是错误。

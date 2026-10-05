@@ -1,4 +1,4 @@
-using Lilara.Core.Hosting;
+using Lilara.Core.Storage;
 
 namespace Lilara.Core.Tests;
 

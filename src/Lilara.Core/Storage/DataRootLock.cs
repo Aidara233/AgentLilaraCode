@@ -1,4 +1,4 @@
-namespace Lilara.Core.Hosting;
+namespace Lilara.Core.Storage;
 
 /// <summary>数据根已被另一个核心持有。</summary>
 public sealed class DataRootHeldException(string message, Exception? inner = null)

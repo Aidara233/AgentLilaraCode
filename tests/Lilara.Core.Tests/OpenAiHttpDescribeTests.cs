@@ -1,5 +1,5 @@
 using System.Net;
-using Lilara.Core.Adapters.OpenAi;
+using Lilara.Core.Protocol.OpenAi;
 
 namespace Lilara.Core.Tests;
 

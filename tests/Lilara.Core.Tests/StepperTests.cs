@@ -1,6 +1,6 @@
-using Lilara.Core.Adapters;
+using Lilara.Core.Protocol;
 using Lilara.Core.Kernel;
-using Lilara.Core.Persistence;
+using Lilara.Core.Storage;
 using Lilara.Core.Session;
 using Lilara.Core.Tests.Fakes;
 

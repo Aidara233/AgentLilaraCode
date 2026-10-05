@@ -1,4 +1,4 @@
-using Lilara.Core.Adapters.Claude;
+using Lilara.Core.Protocol.Claude;
 using Anthropic.Models.Messages;
 using CanonicalBlock = Lilara.Core.Kernel.Block;
 

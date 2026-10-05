@@ -1,7 +1,7 @@
 using Lilara.Core.Kernel;
 using Lilara.Core.Providers;
 
-namespace Lilara.Core.Adapters.OpenAi;
+namespace Lilara.Core.Protocol.OpenAi;
 
 /// <summary>OpenAI Chat 适配器：构造 → 发 → 映射。</summary>
 public sealed class OpenAiChatAdapter : IModelAdapter

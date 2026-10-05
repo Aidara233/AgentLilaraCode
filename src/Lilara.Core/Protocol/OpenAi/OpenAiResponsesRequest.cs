@@ -1,7 +1,7 @@
 using System.Text.Json.Nodes;
 using Lilara.Core.Kernel;
 
-namespace Lilara.Core.Adapters.OpenAi;
+namespace Lilara.Core.Protocol.OpenAi;
 
 // canonical → OpenAI Responses 请求体。纯函数：同一 ModelRequest 必须构造出逐字节相同的 JSON；
 // 用 JsonObject 显式按序插入，绝不依赖字典枚举序。

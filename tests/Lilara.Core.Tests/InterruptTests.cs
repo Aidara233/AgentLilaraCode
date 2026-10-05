@@ -1,8 +1,8 @@
-using Lilara.Core.Adapters;
+using Lilara.Core.Protocol;
 using Lilara.Core.Kernel;
 using Lilara.Core.Control;
 using Lilara.Core.Hosting;
-using Lilara.Core.Persistence;
+using Lilara.Core.Storage;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
 

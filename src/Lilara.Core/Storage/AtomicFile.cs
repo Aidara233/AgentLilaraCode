@@ -1,6 +1,6 @@
 using System.Text;
 
-namespace Lilara.Core.Persistence;
+namespace Lilara.Core.Storage;
 
 // 原子重写：先写 .tmp，再替换——崩溃在两步之间只留一个孤儿 .tmp，目标文件永不半截。
 public static class AtomicFile

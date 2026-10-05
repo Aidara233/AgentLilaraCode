@@ -1,7 +1,7 @@
 using Anthropic.Models.Messages;
 using CanonicalBlock = Lilara.Core.Kernel.Block;
 
-namespace Lilara.Core.Adapters.Claude;
+namespace Lilara.Core.Protocol.Claude;
 
 // Claude Messages 响应 → canonical。纯函数：文本块与推理块都要取，保持原顺序（推理在前、文本在后）；
 // 推理块逐字回传（含签名）——丢掉它多轮 tool use 就断了。

@@ -1,9 +1,9 @@
-using Lilara.Core.Adapters.Claude;
-using Lilara.Core.Adapters.OpenAi;
+using Lilara.Core.Protocol.Claude;
+using Lilara.Core.Protocol.OpenAi;
 using Lilara.Core.Kernel;
 using Lilara.Core.Providers;
 
-namespace Lilara.Core.Adapters;
+namespace Lilara.Core.Protocol;
 
 // 协议 → 适配器：焊死的 switch，不做插件注册表。
 public static class AdapterFactory

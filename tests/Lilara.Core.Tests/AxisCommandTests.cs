@@ -1,4 +1,4 @@
-using Lilara.Core.Adapters;
+using Lilara.Core.Protocol;
 using Lilara.Core.Kernel;
 using Lilara.Core.Control;
 using Lilara.Core.Hosting;

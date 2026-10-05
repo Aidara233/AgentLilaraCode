@@ -1,6 +1,6 @@
 using Lilara.Core.Kernel;
-using Lilara.Core.Adapters;
-using Lilara.Core.Adapters.OpenAi;
+using Lilara.Core.Protocol;
+using Lilara.Core.Protocol.OpenAi;
 using Lilara.Core.Providers;
 
 namespace Lilara.Core.Tests;

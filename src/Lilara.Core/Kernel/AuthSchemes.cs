@@ -1,4 +1,4 @@
-namespace Lilara.Core.Providers;
+namespace Lilara.Core.Kernel;
 
 // 认证方式。官方 Anthropic 只认 x-api-key，本机网关只认 Authorization: Bearer——
 // 后端怪癖，归提供商配置，不写死在适配器里。

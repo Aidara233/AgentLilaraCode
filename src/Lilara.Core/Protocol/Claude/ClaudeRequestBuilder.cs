@@ -2,7 +2,7 @@ using Anthropic.Models.Messages;
 using Lilara.Core.Kernel;
 using CanonicalBlock = Lilara.Core.Kernel.Block;
 
-namespace Lilara.Core.Adapters.Claude;
+namespace Lilara.Core.Protocol.Claude;
 
 // canonical → Claude Messages 请求。纯函数：同一个 ModelRequest 必须构造出逐字节相同的请求（前缀稳定性）。
 public static class ClaudeRequestBuilder
