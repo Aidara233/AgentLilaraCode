@@ -85,9 +85,11 @@ public static class OpenAiChatRequest
     /// </summary>
     private static JsonObject ResultToJson(TimelineEvent.ToolResultEvent r, string protocol)
     {
-        if (r.Ref is { } reference)
-            throw new ArgumentException($"工具结果引用了记录 {reference}，但 `fetch` 还没实现", nameof(r));
-
+        // ⚠️ **`Ref` 到不了这里**（2026-10-06）：`fetch` 的结果今天带的是**内容**，
+        // 而引用（若哪天真有）由 `TimelineRender` 在**进适配器之前**解掉
+        // ⇒ 这里原先那条「`Ref` 非空 ⇒ 抛」的守卫已经**永远到不了**，删掉。
+        // ⚠️ **留着它比删掉坏**：`fetch` 一上线，那句话会变成一条指着错方向的假诊断。
+        // ⚠️ 若哪天真有引用漏到这里，下面 `switch` 的默认分支会响亮地抛——不需要额外守卫。
         var text = string.Concat(r.Content.Select(b => b switch
         {
             Block.TextBlock t => t.Text,

@@ -7,9 +7,8 @@ namespace Lilara.Core.Tests;
 /// <summary>
 /// **记录 → 这一刻的形态**（`TimelineRender`）。
 ///
-/// <para>⚠️ 这个类存在的理由是「只有一份」：`Stepper` 与 `SessionQueries.HistoryOf`
-/// 都走它。而它做的三件事（解库引用 / 换回收渲染 / 解 `Ref`）**各有各的失败方式**——
-/// 下面三条各钉一件。</para>
+/// <para>⚠️ <b>它现在做两件事</b>（曾经是三步，第三步「解 `Ref`」随那条机制一起删了）：
+/// 解库引用 · 换回收渲染。下面各钉一件。</para>
 /// </summary>
 public class TimelineRenderTests : IDisposable
 {
@@ -42,125 +41,92 @@ public class TimelineRenderTests : IDisposable
     private void Append(params TimelineEvent[] events) =>
         _store.AppendEvents(_handle.ProjectKey, _handle.SessionId, events);
 
-    private TimelineEvent.ToolResultEvent Result(string id, string callId, IReadOnlyList<Block> content) => new()
+    /// <summary>一条结果，内容**按写入侧的规则**落一遍（含进库）。</summary>
+    private TimelineEvent.ToolResultEvent Result(string id, string callId, params Block[] content) => new()
     {
-        Id = id, At = CoreClock.Now(), CallId = callId, Content = content,
+        Id = id, At = CoreClock.Now(), CallId = callId, Content = Reclaim.Materialize(content, _blobs),
     };
 
-    /// <summary>一条**过阈值**的结果 ⇒ 记录里降成一个库地址（大文件那条路）。</summary>
-    private TimelineEvent.ToolResultEvent StoreResult(string id, string callId, params Block[] content) =>
-        Result(id, callId, Reclaim.Materialize(content, _blobs));
-
-    /// <summary>一条**小**结果 ⇒ 记录里内联（小文件那条路）。</summary>
-    private TimelineEvent.ToolResultEvent InlineResult(string id, string callId, params Block[] content) =>
-        Result(id, callId, Reclaim.Materialize(content, _blobs));
-
     private IReadOnlyList<TimelineEvent> Render() => TimelineRender.Render(_store, _handle);
+
+    private static TimelineEvent.ToolResultEvent ResultAt(IReadOnlyList<TimelineEvent> rendered, int i) =>
+        (TimelineEvent.ToolResultEvent)rendered[i];
 
     /// <summary>
     /// ⚠️ **库对象要解成内容**（`01` §8.4：模型压根不该意识到库存在）。
     ///
     /// <para>这条曾经漏过，后果是一次**单向门**：写入方过阈值就进库、而读取方没做
     /// ⇒ 适配器遇到 `StoreBlock` 直接抛 ⇒ **那个会话从此永久发不出消息**。</para>
+    ///
+    /// <para>⚠️ **两条路必须分得开**：单文本块存的是**原始字节**，混排 / 多块存的是
+    /// **块数组 JSON**。混着读会让 `read` 的库对象吐出一段 JSON 来（而它本该是原文）。</para>
     /// </summary>
     [Fact]
     public void DereferencesStoreBlocks_AndRestoresBlockLists()
     {
-        // 一个正常的文本快照。
-        var text = InlineResult("r1", "c1", new Block.TextBlock("文件内容"));
-        // 一个**块数组**快照（混排 / 多块走的就是这条）。
-        var mixed = new Block[] { new Block.TextBlock("这是那张图"), new Block.ImageBlock(new string('i', 64), "image/png") };
-        var blocks = StoreResult("r2", "c2", mixed);
+        Append(
+            // 小的：内联进记录（原文就在那儿）。
+            Result("r1", "c1", new Block.TextBlock("小文件")),
+            // 大的：降成一个库地址（**原始字节**）。
+            Result("r2", "c2", new Block.TextBlock(new string('x', BlobStore.InlineThresholdBytes + 1))),
+            // 混排：也降成一个库地址（**块数组 JSON**）。
+            Result("r3", "c3",
+                new Block.TextBlock("这是那张图"),
+                new Block.ImageBlock(new string('i', 64), "image/png")));
 
-        Append(text, blocks);
         var rendered = Render();
 
-        // ⚠️ 单文本块存的是**原始字节** ⇒ 解出来就该是那段原文。
-        var r1 = (TimelineEvent.ToolResultEvent)rendered[0];
-        Assert.Equal("文件内容", Assert.IsType<Block.TextBlock>(Assert.Single(r1.Content)).Text);
+        Assert.Equal("小文件", Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(rendered, 0).Content)).Text);
 
-        // ⚠️ 块数组存的是 **JSON** ⇒ 必须还原成**那一串块**，不是「一个装着 JSON 的文本块」。
-        // 混着读的后果：模型会看到一串转义过的 JSON，而它当时看到的是一段图文。
-        var r2 = (TimelineEvent.ToolResultEvent)rendered[1];
-        Assert.Equal(2, r2.Content.Count);
-        Assert.Equal("这是那张图", Assert.IsType<Block.TextBlock>(r2.Content[0]).Text);
-        Assert.IsType<Block.ImageBlock>(r2.Content[1]);
+        var big = Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(rendered, 1).Content));
+        Assert.Equal(BlobStore.InlineThresholdBytes + 1, big.Text.Length);
+
+        // ⚠️ 块数组必须还原成**那一串块**，不是「一个装着 JSON 的文本块」。
+        var mixed = ResultAt(rendered, 2).Content;
+        Assert.Equal(2, mixed.Count);
+        Assert.Equal("这是那张图", Assert.IsType<Block.TextBlock>(mixed[0]).Text);
+        Assert.IsType<Block.ImageBlock>(mixed[1]);
     }
 
     /// <summary>
-    /// ⚠️ **`Ref` 要解成被引用那条的内容，而且是按<b>记录 id</b>找**（`01` §8.0.2 六 / 七）。
-    ///
-    /// <para>两个 id 在测试里刻意做成**不同**：用协议 `CallId` 找会找不到，
-    /// 于是回一句「找不到了」——而那是**静默地少一段**（`fetch` 看起来成功，内容却是句错误提示）。
-    /// ⇒ 这条测试是「用错 id」唯一能红的地方。</para>
+    /// ⚠️ **回收换的是渲染，不是记录**（`01` §8.0.2 一 / 八）：
+    /// 被收的那条渲染成注记，**没被收的原样**——而盘上两份都还是原来的字节。
     /// </summary>
     [Fact]
-    public void DereferencesRef_ByRecordId_NotByProtocolCallId()
+    public void ReclaimedResults_RenderAsTheNote_OthersUntouched()
     {
-        var original = InlineResult("r-original", "call-original", new Block.TextBlock("当时的内容"));
-
-        // fetch 的结果：内容为空、引用指向原行。
-        var fetched = new TimelineEvent.ToolResultEvent
-        {
-            Id = "r-fetch", At = CoreClock.Now(), CallId = "call-fetch",
-            Content = [], Ref = "r-original",
-        };
-
-        Append(original, fetched);
-        var rendered = (TimelineEvent.ToolResultEvent)Render()[1];
-
-        Assert.Equal("当时的内容", Assert.IsType<Block.TextBlock>(Assert.Single(rendered.Content)).Text);
-    }
-
-    /// <summary>引用的目标不在 ⇒ 给一句人话，**不是空内容**（空会让模型以为「那次调用没有输出」）。</summary>
-    [Fact]
-    public void DereferencesRef_ToAMissingRow_IsAReadableMessage()
-    {
-        Append(new TimelineEvent.ToolResultEvent
-        {
-            Id = "r-fetch", At = CoreClock.Now(), CallId = "call-fetch",
-            Content = [], Ref = "nope",
-        });
-
-        var rendered = (TimelineEvent.ToolResultEvent)Render()[0];
-        Assert.Contains("nope", Assert.IsType<Block.TextBlock>(Assert.Single(rendered.Content)).Text);
-    }
-
-    /// <summary>
-    /// ⚠️ **被引用的那条如果快照是 `StoreBlock`，也要解**——`fetch` 取回的是大文件时正是这个形状。
-    /// 少这一步，取回的内容会以一个 `StoreBlock` 的形态交给适配器（而它不认识）。
-    /// </summary>
-    [Fact]
-    public void DereferencesRef_WhoseTargetIsAStoreBlock()
-    {
-        var big = new string('x', BlobStore.InlineThresholdBytes + 1);
-        var target = StoreResult("r-original", "call-original", new Block.TextBlock(big));
-        Assert.IsType<Block.StoreBlock>(Assert.Single(target.Content));   // 确认它真的降成了地址
-
-        Append(target, new TimelineEvent.ToolResultEvent
-        {
-            Id = "r-fetch", At = CoreClock.Now(), CallId = "call-fetch",
-            Content = [], Ref = "r-original",
-        });
-
-        Assert.Equal(big, Assert.IsType<Block.TextBlock>(
-            Assert.Single(((TimelineEvent.ToolResultEvent)Render()[1]).Content)).Text);
-    }
-
-    /// <summary>
-    /// ⚠️ **回收与解引用互不干扰**：被回收的那条解出来的**不是**「一个装进库对象的块」，
-    /// 而是注记（用户/头看到的是那句注记，不是原文，也不是库地址）。
-    /// </summary>
-    [Fact]
-    public void ReclaimedResults_RenderAsTheNote_EvenWhenTheyAreStoreBlocks()
-    {
-        var big = new string('x', BlobStore.InlineThresholdBytes + 1);
-        var target = StoreResult("r1", "c1", new Block.TextBlock(big));
-        Append(target);
+        Append(
+            Result("r1", "c1", new Block.TextBlock("被收的")),
+            Result("r2", "c2", new Block.TextBlock("留着的")));
 
         _handle.SetReclaimed(new HashSet<string> { "r1" });
+        var rendered = Render();
 
-        var rendered = (TimelineEvent.ToolResultEvent)Render()[0];
-        Assert.Contains("[已回收]", Assert.IsType<Block.TextBlock>(Assert.Single(rendered.Content)).Text);
+        var note = Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(rendered, 0).Content)).Text;
+        Assert.Contains("[已回收]", note);
+        Assert.Contains("r1", note);        // 注记给的是**记录 id**
+        Assert.Contains("fetch(id=", note); // 而且是一条能直接抄走的调用
+
+        Assert.Equal("留着的", Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(rendered, 1).Content)).Text);
+
+        // ⚠️ **记录没动**：再读一遍盘，两条都还是原文（回收不写盘）。
+        var raw = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId);
+        Assert.Equal("被收的", Assert.IsType<Block.TextBlock>(Assert.Single(((TimelineEvent.ToolResultEvent)raw[0]).Content)).Text);
+    }
+
+    /// <summary>
+    /// ⚠️ **大文件（记录里是库地址）被回收时，渲染出的是注记而不是「一个丢了的库对象」**。
+    /// 次序错了（先回收后解引用）就会出现那个形状——因为地址是从**记录**算的，不是从渲染结果。
+    /// </summary>
+    [Fact]
+    public void ReclaimedResults_ThatWereStoreBlocks_RenderAsTheNote_NotAsAMissingObject()
+    {
+        Append(Result("r1", "c1", new Block.TextBlock(new string('x', BlobStore.InlineThresholdBytes + 1))));
+
+        _handle.SetReclaimed(new HashSet<string> { "r1" });
+        var text = Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(Render(), 0).Content)).Text;
+
+        Assert.Contains("[已回收]", text);
+        Assert.DoesNotContain("找不到了", text);   // 「库对象没了」那句**不许**出现
     }
 }

@@ -218,7 +218,6 @@ public class ToolExecutorTests : IDisposable
         var r = Assert.Single(results);
         Assert.Equal("a.txt", r.DependsOn);
         Assert.NotNull(r.Fingerprint);
-        Assert.Null(r.Ref);   // `Ref` 是 fetch 专用——普通工具不填
     }
 
     /// <summary>

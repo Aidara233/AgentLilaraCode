@@ -69,25 +69,6 @@ public sealed record ToolOutcome
     /// `00` §5 的不可重演类（执行命令 / 发邮件 / 取时间）**无指纹**，永不可优化。
     /// 别给一个「差不多」的值：假指纹比没有更坏，它会**声称**世界没动过。</summary>
     public string? Fingerprint { get; init; }
-
-    /// <summary>
-    /// **内容在别处**：指向另一条记录的稳定 id（`fetch` 专用），而不是复制一份字节。
-    ///
-    /// <para>⚠️ <b>它与 <see cref="Content"/> 恰好一个非空</b>——这是
-    /// <see cref="TimelineEvent.ToolResultEvent"/> 的契约，见那里的注释。</para>
-    ///
-    /// <para>⚠️ <b>别直接摆这个属性，用 <see cref="Reference"/></b>：两个都非空是「不该出现的形状」，
-    /// 而工厂方法把「内容为空」这件事在**结构上**一起办了（`00` §7 判据 4：结构上排除，而非规则禁止）。</para>
-    /// </summary>
-    public string? Ref { get; init; }
-
-    /// <summary>
-    /// 造一条**引用型**结果：内容在另一条记录里，本结果不复制字节。
-    ///
-    /// <para>⚠️ 会被取回的东西按定义**大**（它是被回收过的），复制回来正好抵消回收省下的东西
-    /// （`01` §8.0.2 六）。⇒ 记录里存引用、渲染时解引用，看到的就是原内容本身。</para>
-    /// </summary>
-    public static ToolOutcome Reference(string stableId) => new() { Content = [], Ref = stableId };
 }
 
 /// <summary>

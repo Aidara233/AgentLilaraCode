@@ -11,7 +11,7 @@ namespace Lilara.Core.Session;
 /// 各写一份的后果是本仓反复栽过的那个形状：**两处副本只改一处**，
 /// 于是模型看到的与用户看到的开始不一样，而且两边都「看起来是对的」。</para>
 ///
-/// <para>三步，次序是刻意的（<see cref="Render"/> 里有说明）：解库引用 → 换回收渲染 → 解 `Ref`。</para>
+/// <para>两步，次序是刻意的（<see cref="Render"/> 里有说明）：解库引用 → 换回收渲染。</para>
 /// </summary>
 public static class TimelineRender
 {
@@ -21,16 +21,13 @@ public static class TimelineRender
         var blobs = new BlobStore(store.DataRoot);
 
         // ⚠️ **次序：先解引用，再按记录的 id 回收。**
-        // 反过来的话，被回收的那条会先变成注记 ⇒ 紧接着的 `DereferenceRef` 会去解
-        // 「注记的字节」（毫无意义），而且 `fetch` 的语义也跟着糊掉。
+        // 反过来的话，被回收的那条会先变成注记 ⇒ 后面拿到的就不是内容了。
         // ⇒ 回收只动**已经解好的那次渲染**，记录一个字不动（`01` §8.0.2 一 / 八）。
-        var byId = raw.ToDictionary(e => e.Id, e => e, StringComparer.Ordinal);
-
-        return
-        [
-            .. Reclaim.Apply([.. raw.Select(e => Dereference(e, blobs))], handle.Reclaimed)
-                .Select(e => DereferenceRef(e, byId, blobs)),
-        ];
+        //
+        // ⚠️ 这里**曾经还有第三步「解 `Ref`」**（把 `fetch` 结果的引用换成被引用那条的内容）。
+        // 那一步连同 `Ref` 这个机制一起删了（2026-10-06，用户裁定，理由见
+        // `TimelineEvent.ToolResultEvent.Ref` 的注释）——`fetch` 的结果今天带的是**内容**。
+        return [.. Reclaim.Apply([.. raw.Select(e => Dereference(e, blobs))], handle.Reclaimed)];
     }
 
     /// <summary>
@@ -101,36 +98,4 @@ public static class TimelineRender
         TimelineEvent.ToolResultEvent r => r with { Content = [.. r.Content.SelectMany(b => Dereference(b, blobs))] },
         _ => evt,
     };
-
-    /// <summary>
-    /// 把一个工具结果里的 <see cref="TimelineEvent.ToolResultEvent.Ref"/> 解掉。
-    ///
-    /// <para>⚠️ <b>为什么解在这里、不在适配器里</b>：`fetch` 的结果是「另一条记录的内容」，
-    /// 而三个适配器**都不该认识这个引用**（它们是协议翻译器，不是记录读取器）。
-    /// 解开之后适配器只看见普通块——**零改动**。与 <see cref="Dereference(Block, BlobStore)"/>
-    /// 同一个位置、同一条理由。</para>
-    ///
-    /// <para>⚠️ <b>解到最底</b>（`01` §8.0.2 六）：`fetch` 一个 `fetch` 的结果时，
-    /// 它指向**原行**、不指向那条 fetch——否则会串成链。
-    /// ⚠️ 取不到时给一句人话，**不是空结果**：空结果会让模型以为「那次调用没有输出」。</para>
-    /// </summary>
-    private static TimelineEvent DereferenceRef(
-        TimelineEvent evt, IReadOnlyDictionary<string, TimelineEvent> byId, BlobStore blobs)
-    {
-        if (evt is not TimelineEvent.ToolResultEvent { Ref: { } id } r) return evt;
-
-        // ⚠️ **被引用的那条也要先过 `Dereference`**：它的快照可能是个库对象地址。
-        // 少了这一步，`fetch` 取回的内容会以一个 `StoreBlock` 的形态交给适配器（而它不认识）
-        // ——正是「读取方没做」那类单向门。
-        //
-        // ⚠️ **解到最底靠的是「取回来的内容本身不含 Ref」**：`fetch` 的结果记录里存的是
-        // 快照（`Content`），不是又一个引用 ⇒ 这里不会递归、也不会串成链。
-        IReadOnlyList<Block> referenced;
-        if (byId.TryGetValue(id, out var target) && target is TimelineEvent.ToolResultEvent t)
-            referenced = [.. t.Content.SelectMany(b => Dereference(b, blobs))];
-        else
-            referenced = [new Block.TextBlock($"（id 为 {id} 的那条结果找不到了）")];
-
-        return r with { Content = referenced };
-    }
 }

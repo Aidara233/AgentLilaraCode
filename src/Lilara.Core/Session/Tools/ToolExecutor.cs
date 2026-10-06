@@ -41,20 +41,13 @@ public sealed class ToolExecutor(IReadOnlyList<ITool> tools, Storage.BlobStore b
                 ? await tool.RunAsync(new ToolCall(call.CallId, call.Name, call.Arguments), context, ct)
                 : new ToolOutcome { Content = [new Block.TextBlock($"没有名为 '{call.Name}' 的工具。")] };
 
-            // ⚠️ **`Content` 与 `Ref` 恰好一个非空**（`01` §8.0.2 六）：
-            // 引用型不经过 `Materialize`——它的内容在别处，这里没有字节可进库。
-            var (content, reffed) = outcome.Ref is { } target
-                ? ((IReadOnlyList<Block>)[], (string?)target)
-                : (Reclaim.Materialize(outcome.Content, blobs), null);
-
             results.Add(new TimelineEvent.ToolResultEvent
             {
                 // ⚠️ 本记录的稳定 id（与协议 id `CallId` **不是一回事**）。见 `01` §8.0.2 第七节。
                 Id = Ids.New(),
                 At = CoreClock.Now(),
                 CallId = call.CallId,
-                Content = content,
-                Ref = reffed,
+                Content = Reclaim.Materialize(outcome.Content, blobs),
                 DependsOn = outcome.DependsOn,
                 Fingerprint = outcome.Fingerprint,
             });

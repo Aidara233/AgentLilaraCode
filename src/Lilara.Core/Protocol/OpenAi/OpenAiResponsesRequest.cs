@@ -84,9 +84,9 @@ public static class OpenAiResponsesRequest
     /// </summary>
     private static JsonObject ResultToItem(TimelineEvent.ToolResultEvent r)
     {
-        if (r.Ref is { } reference)
-            throw new ArgumentException($"工具结果引用了记录 {reference}，但 `fetch` 还没实现", nameof(r));
-
+        // ⚠️ **`Ref` 到不了这里**（2026-10-06）：理由与 Chat 那条链路**逐字相同**
+        // （见 `OpenAiChatRequest.ResultToJson`）。⚠️ 这三条链路必须**一起**看待：
+        // 只删一条会留下两条指着相反方向的假诊断，而它们分叉的那一刻没人会红。
         var text = string.Concat(r.Content.Select(b => b switch
         {
             Block.TextBlock t => t.Text,

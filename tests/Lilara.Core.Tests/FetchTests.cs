@@ -78,22 +78,22 @@ public class FetchTests : IDisposable
     }
 
     /// <summary>
-    /// ⚠️ **取回的结果里没有 `Ref`**（`01` §8.0.2 六「解到最底」）。
+    /// ⚠️ **取回的结果是「一串块」，不是一条引用**——那条引用机制已经作废
+    /// （2026-10-06，理由见 <see cref="TimelineEvent.ToolResultEvent.Ref"/> 的注释：
+    /// 零调用方，而它换来的三样全是负的）。
     ///
-    /// <para>这条钉的是一个**会静默出事**的形状：`TimelineRender` 解 `Ref` 时**不递归**
-    /// （只解一层）⇒ 若 `fetch` 哪天改成「返回一个指向原行的引用」，
-    /// 一条 `fetch(fetch(x) 的 id)` 就会解出一串**空内容**——静默地少一段，
-    /// 没有任何报错。⇒ 取回必须走**库地址**那条路，交回字节。</para>
+    /// <para>这条断言留着，钉的是**结果里真的有内容**——`fetch` 取的是当时的字节，
+    /// 而模型下一轮就要看见它。空着交出去等于「取回了一个什么都取不回」。</para>
     /// </summary>
     [Fact]
-    public async Task Fetch_ReturnsContent_NotAReference()
+    public async Task Fetch_ReturnsContent_NotAnEmptyShell()
     {
         var result = StoredResult("r1", "内容");
         var outcome = await _tool.RunAsync(
             new ToolCall("c1", "fetch", """{"id":"r1"}"""), ContextWith(result), default);
 
-        Assert.Null(outcome.Ref);
         Assert.NotEmpty(outcome.Content);
+        Assert.Equal("内容", Assert.IsType<Block.TextBlock>(Assert.Single(outcome.Content)).Text);
     }
 
     /// <summary>

@@ -7,9 +7,6 @@ namespace Lilara.Core.Kernel;
 //   内容：text（文本）· reasoning（推理）· image（图片，字节在库里）
 //   结构：toolUse（模型的调用）· store（引用库对象）
 //
-// ⚠️ **`fetch` 的结果不在这里**——它是 `TimelineEvent.ToolResultEvent.Ref` 那个**字段**
-//（引用是「结构」，不是「内容」）。见 `TimelineEvent.cs`。
-//
 // ⚠️ **工具结果不是块**——它是它自己的 `TimelineEvent` 派生类型。
 // 理由：Claude 的 tool_result 住在 **user 角色**的消息里，塞进共用的 `Block` 会
 // 在类型层面与用户文本不可分，而「用户消息是具体载荷」是硬约束（`01` §3.6）。

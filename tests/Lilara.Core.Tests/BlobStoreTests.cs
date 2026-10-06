@@ -172,14 +172,17 @@ public class TimelineEventShapeTests
         Assert.Contains("\"kind\":\"image\"", json);
     }
 
-    // ⚠️ **`Content` 与 `Ref` 恰好一个非空**：
-    //   · 空 Content 且无 Ref = 「这个工具什么都没返回」（合法，且最常见）
-    //   · Ref 非空       = `fetch` 的结果（引用，不是副本）
-    //   · 两个都非空     = 不该出现的形状
-    //
-    // 这条**不是**在禁止什么（类型层面管不住），而是把契约写下来 + 钉住序列化形状。
+    /// <summary>
+    /// 空的 `Content` 是**合法**形态：「这个工具什么都没返回」。
+    ///
+    /// <para>⚠️ **这条测试换过一次靶子**（2026-10-06）：它原先钉的是「`Ref` 非空时
+    /// 序列化形状」，而 <c>Ref</c> 那条机制**已经作废**（见
+    /// <see cref="TimelineEvent.ToolResultEvent.Ref"/> 的注释——它零调用方，
+    /// 而它换来的三样东西全是负的）。字段留着不动格式，但**没有产出方**，
+    /// 所以不值得再为它钉一条测试。</para>
+    /// </summary>
     [Fact]
-    public void ToolResultEvent_WithOnlyARef_OmitsContentKey()
+    public void ToolResultEvent_WithNoContent_KeepsAnEmptyContentList()
     {
         var evt = new TimelineEvent.ToolResultEvent
         {
@@ -187,14 +190,15 @@ public class TimelineEventShapeTests
             At = DateTimeOffset.UnixEpoch,
             CallId = "c9",
             Content = [],
-            Ref = "r7f3a",
         };
 
         var json = TimelineEvent.StableSerialize(evt);
 
         // ⚠️ `Content` 是 `required` 的**非可空**列表 ⇒ 它是 `[]`，**不会**被 WhenWritingNull 省掉。
+        // （省掉的话，读回来就是「缺一个必填字段」 = 一条坏行。）
         Assert.Contains("\"content\":[]", json);
-        Assert.Contains("\"ref\":\"r7f3a\"", json);
+        // ⚠️ 作废的字段**不出现**（`WhenWritingNull`）——这正是留字段不破格式的原因。
+        Assert.DoesNotContain("\"ref\"", json);
     }
 
     // ⚠️ 稳定 id 是**取回 / 改历史 / 头引用**三处共用的那个（01 §8.0.2 第七节）。
