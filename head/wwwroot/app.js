@@ -967,6 +967,20 @@ async function loadCoreFacts() {
   } catch {
     $("bar-core").innerHTML = '<b>控制面</b> <span class="bad">读不到 /info</span>';
   }
+
+  // ⚠️ **「我手上是哪一版」必须能查，否则每次「改了没效果」都要靠猜。**
+  // `app.js` 从来不换名字，而同一份改动**有三份副本**（`head/wwwroot/` 是源，
+  // `bin/Debug` 与 `bin/Release` 各复制一份）——跑哪个构建就看哪一份。
+  // ⇒ 这一格显示**提供本页面的那份** `app.js` 的大小与时间戳，与源码一比对答案立刻出来。
+  try {
+    const b = await (await fetch("/build.json")).json();
+    const s = document.createElement("span");
+    s.textContent = ` · 页面 ${b.appJsBytes}B @${(b.appJsWritten || "?").slice(11)}`;
+    s.title = b.servedFrom ?? "";
+    $("bar-version").append(s);
+  } catch {
+    // 老的核心/头没有这个端点 ⇒ 什么都不加（别让底栏出现一句看不懂的错）。
+  }
 }
 
 // 断开时去问一句「为什么」，而不是永远「已断开 · 3 秒后重连」。

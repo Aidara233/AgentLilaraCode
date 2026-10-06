@@ -15,7 +15,14 @@
     <!-- ⚠️ 前端是**零构建**的（用户裁定）：没有打包步骤，`wwwroot/` 就是最终产物。
          所以只需要一句话把它**抄到输出目录**——`WebApplicationOptions.WebRootPath`
          是相对 **content root**（= `AppContext.BaseDirectory`）解析的，
-         不抄过去就 404（实测踩过）。 -->
-    <Content Include="wwwroot/**" CopyToOutputDirectory="PreserveNewest" />
+         不抄过去就 404（实测踩过）。
+
+         ⚠️ **必须是 `Always`，不能是 `PreserveNewest`**（2026-10-06 改）：
+         这一格按**时间戳**判「要不要抄」，而时间戳会骗人——
+         切分支 / `git checkout` 会把源文件的 mtime 设成**比副本更早**的时刻，
+         于是「我今天改了 wwwroot，构建过了，而跑起来还是旧的」，**不报错**。
+         （本仓栽过三次「我改了、你说没效果」，其中两次就是这个形状。）
+         代价是每次构建多抄几十 KB，值。 -->
+    <Content Include="wwwroot/**" CopyToOutputDirectory="Always" />
   </ItemGroup>
 </Project>

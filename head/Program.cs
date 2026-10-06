@@ -28,10 +28,41 @@ builder.Logging.ClearProviders();
 
 var app = builder.Build();
 app.UseDefaultFiles();
-app.UseStaticFiles();
+
+// ⚠️ **静态文件不许被浏览器缓存**（2026-10-06 加，原因是同一类事故栽了三次）。
+//
+// 页面是 `index.html` + `app.js`，而 `app.js` 从来不换名字 ⇒ 浏览器完全有理由一直用旧的。
+// 更要命的是**同一次改动有多份副本**：`head/wwwroot/` 是源，`bin/Debug/.../wwwroot` 与
+// `bin/Release/.../wwwroot` 是**构建时复制**过去的，而**跑哪个构建就看哪一份**。
+// 于是「我改了、你却说没效果」可以有四种成因（跑了另一份构建 / 没重建 / 浏览器缓存 /
+// 改错了副本），而它们**在页面上长得一模一样**。
+//
+// ⇒ 两条一起上：① 浏览器不许留副本；② 页面把**它自己是哪一份**显示在底栏
+// （见下面的 `/build.json`）——「我手上是哪一版」从此不用猜。
+app.UseStaticFiles(new StaticFileOptions
+{
+    OnPrepareResponse = ctx => ctx.Context.Response.Headers.CacheControl = "no-store",
+});
 
 // /config.json 把核心地址递给页面——唯一需要从环境传进去的东西。头不做反向代理。
 app.MapGet("/config.json", () => Results.Json(new { core }));
+
+// **页面自述**：它是由哪个构建的 `wwwroot` 提供的、那份 `app.js` 有多大。
+// ⚠️ 这一条是为了终结「我改了、你说没效果」那类对话：底栏显示的那两个数就是
+// **你现在看的这一份**，与 `head/wwwroot/app.js` 的属性一比对，答案立刻出来。
+// ⚠️ 读的是 `AppContext.BaseDirectory`（= 静态文件的真实来源），不是源码目录。
+app.MapGet("/build.json", () =>
+{
+    var webRoot = Path.Combine(AppContext.BaseDirectory, "wwwroot");
+    var js = Path.Combine(webRoot, "app.js");
+    var stamp = File.Exists(js) ? File.GetLastWriteTime(js) : (DateTime?)null;
+    return Results.Json(new
+    {
+        servedFrom = webRoot,
+        appJsBytes = File.Exists(js) ? new FileInfo(js).Length : 0,
+        appJsWritten = stamp?.ToString("yyyy-MM-dd HH:mm:ss"),
+    });
+});
 
 // ⚠️ **绑定失败要说人话，不能砸栈**（2026-10-06 修）。
 // 原先这里是裸的 `await app.StartAsync()`：端口落在保留段时，
