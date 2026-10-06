@@ -58,5 +58,38 @@ catch (Exception ex) when (ex is System.Net.Sockets.SocketException or IOExcepti
 Console.WriteLine($"LILARA 头 — http://127.0.0.1:{port}");
 Console.WriteLine($"  页面 origin http://127.0.0.1:{port}（核心的 WS 白名单必须包含它）");
 Console.WriteLine($"  核心 {core}（页面直连它，头不代理）");
+
+// ⚠️ **启动时就把「连不上」说出来**（2026-10-06）。
+// 原先这里什么都不问：核心没起 / origin 对不上时，页面只会「已断开 · 3 秒后重连」，
+// 而**头这一侧本来就能当场发现**——它刚拿到核心的 `/info`，那份东西里就有白名单。
+// `05` §1 那条「核心越克制，头越要喧哗」在这里适用：核心对「谁被拒了」是**静默**的
+// （握手 403 时浏览器不把响应体交给页面 JS），所以这句话只能由头来说。
+await CheckCoreAsync(core);
 await app.WaitForShutdownAsync();
 return 0;
+
+static async Task CheckCoreAsync(string core)
+{
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+    string allowed;
+    try
+    {
+        var body = await http.GetStringAsync($"{core.TrimEnd('/')}/info");
+        using var doc = System.Text.Json.JsonDocument.Parse(body);
+        allowed = doc.RootElement.GetProperty("allowedOrigin").GetString() ?? "?";
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"  ⚠️ 核心没应答（{core}）：{ex.Message}");
+        Console.Error.WriteLine("     页面打开后会一直「已断开·重连中」。先把核心起起来。");
+        return;
+    }
+
+    // ⚠️ 判据与核心**逐字相同**：`AllowedOriginResolver` 解析出来的那个 origin。
+    // 头只知道**自己**的 origin（`127.0.0.1:{port}`），而用户可能用 `localhost` 打开——
+    // 那**不是**同一个 origin（浏览器这么判）⇒ 握手照样会被静默拒绝。
+    // ⇒ 这里只说头自己那个，并点名 localhost 那条路。
+    Console.WriteLine($"  ✓ 核心在，WS 白名单 = {allowed}");
+    Console.WriteLine("     ⚠️ 请用上面的 `127.0.0.1` 地址打开页面——用 `localhost` 打开时");
+    Console.WriteLine("        origin 会变成 http://localhost:…，与白名单**不是同一个**，握手会被静默拒绝。");
+}
