@@ -388,6 +388,24 @@ public sealed class ControlServer(
             }, ct));
         }
 
+        /// <summary>
+        /// **摘掉一条订阅**（2026-10-06 加）。
+        ///
+        /// <para>⚠️ **在此之前核心没有退订**，而 `subs` 是**按 topic** 建的 ⇒ 头切到别的会话时
+        /// 旧会话那条订阅**留着**，它的泵一直把那个会话的事件发过来，而头会丢弃它们
+        /// ⇒ <b>白占一条泵与整条连接，切得越多积得越多</b>。</para>
+        ///
+        /// <para>⚠️ **只 `Dispose`、不 `await`**：泵靠 `Reader.ReadAllAsync` 在订阅被释放后
+        /// 自然跑完（连接收尾那段的 `finally` 就是这么等的）。这里 await 会把收帧循环**卡住**。</para>
+        ///
+        /// <para>⚠️ 退订一个**没订过的** topic 是合法的 no-op——头可能重连过、或它的视图
+        /// 已经被别处清掉了。抛的话会回一句「帧形状不对」，而那是在说谎。</para>
+        /// </summary>
+        void Unsubscribe(string topic)
+        {
+            if (subs.Remove(topic, out var sub)) sub.Dispose();
+        }
+
         var buffer = new byte[64 * 1024];
         try
         {
@@ -396,7 +414,7 @@ public sealed class ControlServer(
                 var json = await ReceiveTextAsync(socket, buffer, ct);
                 if (json is null) break;
 
-                await HandleClientFrameAsync(json, Subscribe, SendAsync, ct);
+                await HandleClientFrameAsync(json, Subscribe, Unsubscribe, SendAsync, ct);
             }
         }
         catch (OperationCanceledException) { }   // 头断开了；核心不关心头在不在
@@ -429,7 +447,7 @@ public sealed class ControlServer(
     }
 
     private async Task HandleClientFrameAsync(
-        string json, Action<string, long?> subscribe, Func<WireFrame, Task> send, CancellationToken ct)
+        string json, Action<string, long?> subscribe, Action<string> unsubscribe, Func<WireFrame, Task> send, CancellationToken ct)
     {
         // 整帧解析都要在兜底里：头可以整个换掉，一个第三方头发错一帧不该让整条连接一起死掉。
         JsonElement root;
@@ -443,6 +461,10 @@ public sealed class ControlServer(
             {
                 case "subscribe":
                     subscribe(root.GetProperty("topic").GetString()!, OptSince(root));
+                    break;
+
+                case "unsubscribe":
+                    unsubscribe(root.GetProperty("topic").GetString()!);
                     break;
 
                 case "command":

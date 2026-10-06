@@ -166,9 +166,83 @@ public class ControlServerTests : IAsyncLifetime
                                      == "message.appended");
     }
 
-    // 命令不合法 ⇒ accepted: false + 理由；业务失败走 error 事件——两者混了头会把网络抖动当成「你命令写错了」。
+    /// <summary>
+    /// ⚠️ **退订之后，那条流真的不再发东西了**（2026-10-06 加）。
+    ///
+    /// <para>在加退订之前，核心**没有**这条路：`subs` 是**按 topic** 建的，头切到别的会话时
+    /// 旧会话那条订阅留着、泵一直发 ⇒ 白占一条泵与整条连接，切得越多积得越多
+    /// （而头会丢弃那些事件，所以**看不出来**）。</para>
+    ///
+    /// <para>⚠️ **判据是「不再收到」，不是「收到一个 ack」**——退订本身不回执
+    /// （它不是命令），所以只能靠「之后的发送的结果不再出现在这条连接上」来证。</para>
+    /// </summary>
     [Fact]
-    public async Task WebSocket_RejectsAMalformedCommandWithoutClosingTheSocket()
+    public async Task WebSocket_Unsubscribe_StopsTheStream()
+    {
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+
+        await SendAsync(ws, """{"kind":"command","id":"c1","payload":{"kind":"session.create"}}""");
+        var sid = (await ReceiveAsync(ws)).GetProperty("sessionId").GetString()!;
+
+        await SendAsync(ws, "{\"kind\":\"subscribe\",\"topic\":\"session:" + sid + "\"}");
+
+        // 先证「订上了」——不然下面那条「没收到」可能只是因为压根没订上（假绿）。
+        await SendAsync(ws,
+            "{\"kind\":\"command\",\"id\":\"c2\",\"payload\":{\"kind\":\"session.send\","
+            + "\"sessionId\":\"" + sid + "\",\"blocks\":[{\"kind\":\"text\",\"text\":\"你好\"}]}}");
+        var sawEvent = false;
+        for (var i = 0; i < 12 && !sawEvent; i++)
+            sawEvent = await TryReceiveAsync(ws, 5000) is { } f
+                       && f.GetProperty("kind").GetString() == "event"
+                       && f.GetProperty("topic").GetString() == "session:" + sid;
+        Assert.True(sawEvent, "订上了就该收到事件——收不到说明这条测试的前提不成立");
+
+        // 退订，然后再发一句。
+        await SendAsync(ws, "{\"kind\":\"unsubscribe\",\"topic\":\"session:" + sid + "\"}");
+        await SendAsync(ws,
+            "{\"kind\":\"command\",\"id\":\"c3\",\"payload\":{\"kind\":\"session.send\","
+            + "\"sessionId\":\"" + sid + "\",\"blocks\":[{\"kind\":\"text\",\"text\":\"再来\"}]}}");
+
+        // 收到 c3 的回执（**回执与订阅无关，一定会来**）⇒ 说明 c3 真的被处理了；
+        // 它之后**不该再有**这条 topic 的事件（退订前积压的帧有界，这里给足余量）。
+        var ackC3 = false;
+        for (var i = 0; i < 12 && !ackC3; i++)
+            ackC3 = await TryReceiveAsync(ws, 5000) is { } f
+                    && f.GetProperty("kind").GetString() == "ack"
+                    && f.GetProperty("id").GetString() == "c3";
+        Assert.True(ackC3, "c3 的回执必须到");
+
+        for (var i = 0; i < 5; i++)
+        {
+            var after = await TryReceiveAsync(ws, 500);
+            if (after is null) break;   // 静默 = 这就是要的结论
+            Assert.False(
+                after.Value.GetProperty("kind").GetString() == "event"
+                && after.Value.GetProperty("topic").GetString() == "session:" + sid,
+                "退订之后不该再收到那条流的事件");
+        }
+    }
+
+    // 退订一个**没订过的** topic 是合法 no-op：抛的话会回一句「帧形状不对」，那是在说谎。
+    [Fact]
+    public async Task WebSocket_UnsubscribeUnknownTopic_IsANoOp()
+    {
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+
+        await SendAsync(ws, """{"kind":"unsubscribe","topic":"session:nope"}""");
+
+        // 连接还活着、还能正常收帧（发一条命令拿回执）。
+        await SendAsync(ws, """{"kind":"command","id":"c1","payload":{"kind":"session.create"}}""");
+        var ack = await ReceiveAsync(ws);
+
+        Assert.Equal("ack", ack.GetProperty("kind").GetString());
+        Assert.True(ack.GetProperty("accepted").GetBoolean());
+    }
+
+    // 命令不合法 ⇒ accepted: false + 理由；业务失败走 error 事件——两者混了头会把网络抖动当成「你命令写错了」。
+    [Fact]    public async Task WebSocket_RejectsAMalformedCommandWithoutClosingTheSocket()
     {
         using var ws = new ClientWebSocket();
         await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
@@ -370,6 +444,36 @@ public class ControlServerTests : IAsyncLifetime
             await app.StopAsync(CancellationToken.None);
             await app.DisposeAsync();
         }
+    }
+
+    /// <summary>
+    /// 收一帧，**超时就返回 <c>null</c> 而不是抛**。
+    /// ⚠️ 存在的理由：有几条测试要证的正是「**它不再发了**」，而静默的表现就是超时——
+    /// 用会抛的 <see cref="ReceiveAsync"/> 只能把它写成「等 10 秒然后失败」（实测踩过：
+    /// 那条退订测试因此整条超时，而它其实**已经**证明了要证的东西）。
+    /// </summary>
+    private static async Task<JsonElement?> TryReceiveAsync(WebSocket ws, int milliseconds)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(milliseconds));
+        using var ms = new MemoryStream();
+        var buffer = new byte[64 * 1024];
+
+        try
+        {
+            while (true)
+            {
+                var result = await ws.ReceiveAsync(buffer, cts.Token);
+                if (result.MessageType != WebSocketMessageType.Text) return null;
+                ms.Write(buffer, 0, result.Count);
+                if (result.EndOfMessage) break;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return null;   // 这就是「静默」
+        }
+
+        return JsonDocument.Parse(Encoding.UTF8.GetString(ms.ToArray())).RootElement.Clone();
     }
 
     private static async Task SendAsync(WebSocket ws, string json) =>

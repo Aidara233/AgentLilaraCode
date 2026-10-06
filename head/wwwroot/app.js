@@ -247,6 +247,11 @@ async function openSession(id) {
   // 世代号让后一次调用作废前一次（同 id 双击时 current !== id 判不出来）。
   const gen = ++epoch;
 
+  // ⚠️ **先摘掉上一条会话流**（2026-10-06 加）：核心的订阅是**按 topic** 一条订阅 + 一条泵，
+  // 重复订同一个会换掉旧的，但**换到别的会话时不换** ⇒ 旧会话的泵一直活着、事件一直发过来，
+  // 而这头会丢弃它们 ⇒ 白占一条泵与整条连接，切得越多积得越多。
+  if (current && current !== id) unsubscribe(`session:${current}`);
+
   // subscribe() 在 !wsReady 时会静默返回 ⇒ 先等连接就绪，
   // 否则会话流可能根本没订上，而页面以为订过了。
   await connected();
@@ -270,6 +275,9 @@ async function openSession(id) {
     // 没东西可画 ⇒ 退回「没选会话」，别留一个空壳。
     clearCenter();
     renderMeta("✗ 会话读不出来（可能刚被删掉）：" + (e && e.message ? e.message : e), "error");
+    // ⚠️ 再打一行**给人看**的：上面那句在时间线里，而时间线此刻刚被 `clearCenter` 清空——
+    // 用户看到的可能只是「空白」。控制台这份是排查用的第二只眼睛。
+    console.error("[lilara] openSession 失败", id, e);
     return;
   }
 
@@ -289,7 +297,7 @@ async function openSession(id) {
   renderProjectPanel(state);
   setStatus(state.state.status, state.state.turn);
   renderSessions();
-  for (const turn of history.rendered) renderTurn(turn.from, turn.blocks);
+  for (const item of history.rendered) renderHistoryItem(item);
 
   await loadClaims();
 
@@ -306,6 +314,18 @@ function subscribe(topic, since) {
   ws.send(JSON.stringify({ kind: "subscribe", topic, since }));
 }
 
+/// **退订一个会话流**——`openSession` 切走时调。
+///
+/// <para>⚠️ <b>不退订会造成积压</b>（2026-10-06 查出来的）：核心的 `subs` 是**按 topic**
+/// 建的一条订阅 + 一条泵，**重复订阅同一个 topic 会换掉旧的**（那边注释写了为什么），
+/// 但**换到别的会话时不换**——旧会话的泵一直活着，把那个会话的事件继续发过来，
+/// 而头会丢弃它们（`p.sessionId !== current`）⇒ <b>白占一条泵与整条连接</b>，
+/// 切得越多积得越多。</para>
+function unsubscribe(topic) {
+  if (!wsReady) return;
+  ws.send(JSON.stringify({ kind: "unsubscribe", topic }));
+}
+
 // ---- 渲染：核心渲染，头只显示 ----
 
 // ⚠️ 抽文本这一步**不在**核心的读取点里（`SessionQueries` 只有 ModelBody / UserBody），
@@ -317,7 +337,16 @@ function textOf(blocks) {
 }
 
 function bodyOf(blocks) {
-  return textOf(blocks) || EMPTY_BODY;
+  // ⚠️ **模型消息里可能夹着工具调用块**（`kind:"toolUse"`）——它们不是正文，
+  // 但**不显示的话**，模型那一步看起来像「什么都没干」，而它其实调了工具。
+  // 这个缺口在 2026-10-06 的工具批里才出现（那之前不存在 `toolUse` 块）。
+  const parts = [];
+  for (const b of blocks || []) {
+    if (b.kind === "text") parts.push(b.text);
+    // `arguments` 是**原文 JSON 串**（核心逐字存、逐字发）⇒ 原样显示，不解析。
+    else if (b.kind === "toolUse") parts.push(`⚒ ${b.name} ${b.arguments}`);
+  }
+  return parts.join("\n") || EMPTY_BODY;
 }
 
 function renderTurn(from, blocks, cls) {
@@ -334,6 +363,31 @@ function renderTurn(from, blocks, cls) {
 
   el.append(who, body);
   appendTimeline(el);
+}
+
+/// <summary>
+/// `/history` 的每一项 → 一排。⚠️ **必须按 `kind` 分派**（2026-10-06 修）。
+///
+/// <para>原先这里写的是 `for (const t of history.rendered) renderTurn(t.from, t.blocks)`：
+/// 而核心给/工具结果那一项**没有 `from`**（它加了 `kind`/`callId`）⇒ 渲染成
+/// <c>class="turn undefined"</c> 与一个字面的「⏺」——**正是「刷新能看到、平时看不到」
+/// 那类错位**（刷新走这条路、实时走 `message.appended`，两条路画的东西不一样）。</para>
+/// </summary>
+function renderHistoryItem(t) {
+  if (t.kind === "toolResult") {
+    // ⚠️ 工具结果**不是「谁说的话」**（它是 user 角色里的载荷，`01` §3.6）⇒ 单独一类。
+    // ⚠️ 内容可能是**库地址**（`store` 块）而不是文本——那说明它太大、没内联进记录。
+    // 直接给个地址，不假装看到了内容（要真内容得另走 `GET /store/{sha256}`，还没做）。
+    const text = (t.blocks || []).map((b) =>
+      b.kind === "text" ? b.text
+        : b.kind === "store" ? `（内容在库里 ${(b.sha256 || "").slice(0, 8)}…）`
+          : b.kind === "image" ? `（图片 ${(b.sha256 || "").slice(0, 8)}…）`
+            : "").join("");
+    renderTurn("tool", [{ kind: "text", text }], "meta");
+    return;
+  }
+
+  renderTurn(t.from, t.blocks);
 }
 
 function renderMeta(text, cls) {
