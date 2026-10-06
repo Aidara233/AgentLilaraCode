@@ -41,6 +41,126 @@ public class SessionStoreTests : IDisposable
         Pending = [],
     };
 
+    /// <summary>
+    /// 项目键的顺序必须**确定**，而调用方会取 <c>[0]</c>（头在 `currentProject === null` 时
+    /// 拿它当默认订阅的项目流）。
+    ///
+    /// <para>⚠️ <b>如实说明这条守卫的成色：它在本项目唯一支持的平台上「不修也是绿的」。</b>
+    /// `Directory.GetDirectories` 的返回顺序由文件系统决定，而 Windows/NTFS <b>恰按文件名序</b>枚举，
+    /// 项目键又是规范化后的小写串 ⇒ 默认返回的**碰巧**就是序数序。
+    /// 所以它是一条**回归守卫**（防的是有人删掉 `OrderBy`、或换到别的文件系统），
+    /// <b>不是</b>「先红后绿」的那种。声称它证明了「不修就红」是假话。</para>
+    ///
+    /// <para>⚠️ <b>它仍然有区分力，但区分的是「哪个比较器」</b>：下面故意造了含大写与 `_` 的目录名，
+    /// 于是序数序与任何大小写不敏感的比较器会给出**不同的顺序**——
+    /// 序数是 <c>A</c>(0x41) &lt; <c>_</c>(0x5F) &lt; <c>b</c>(0x62) &lt; <c>z</c>(0x7A)，
+    /// 于是 <c>Alpha</c> 排在 <c>_under</c> **前面**；而忽略大小写时 <c>_</c> 会跑到最前。
+    /// 换成 `OrdinalIgnoreCase` 或文化敏感比较器 ⇒ 这条红。
+    /// <b>（期望值是跑出来核过的，不是手推的——我第一版就把它手推反了。）</b></para>
+    /// </summary>
+    [Fact]
+    public void ListProjects_IsOrdinalSorted_NotWhateverTheFileSystemReturns()
+    {
+        // 造目录而不是造会话：`ListProjects` 只枚举目录名，它不校验键的形状。
+        foreach (var pk in new[] { "zeta", "Alpha", "_under", "beta" })
+            Directory.CreateDirectory(Path.Combine(_store.ProjectsRoot, pk));
+
+        Assert.Equal(new[] { "Alpha", "_under", "beta", "zeta" }, _store.ListProjects());
+    }
+
+    // 没有项目目录时回空列表，不是抛。
+    [Fact]
+    public void ListProjects_WithNoProjectsRoot_ReturnsEmpty()
+    {
+        Assert.Empty(_store.ListProjects());
+    }
+
+    // ---- 格式版本闸 ----
+    //
+    // ⚠️ **这两条是「显式载入要响亮、扫盘要活下来」那对取舍的可执行形态。**
+    // 折成一个 null 会让用户看到「会话不存在」——而那会把人引向删掉重来，
+    // 正好是唯一一个会丢数据的做法。
+
+    private void WriteRawState(string json)
+    {
+        var dir = _store.SessionDirectory("p1", "s1");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "state.json"), json);
+    }
+
+    [Fact]
+    public void ReadState_WithANewerFormatVersion_IsRejectedWithTheReason()
+    {
+        WriteRawState("""{"version":99,"sessionId":"s1","status":"Idle","turn":0,"pending":[]}""");
+
+        var ex = Assert.Throws<FileFormatException>(() => _store.ReadState("p1", "s1"));
+
+        // 话里必须同时有：是哪一份、它多新、本程序认到哪、以及**别覆盖它**。
+        Assert.Contains("version=99", ex.Message);
+        Assert.Contains($"只认到 {Json.FormatVersion}", ex.Message);
+        Assert.Contains("别覆盖它", ex.Message);
+    }
+
+    // ⚠️ **缺 `version` 键 = 版本 0**（这个字段引入之前写的那些），**不是**「未知 ⇒ 拒绝」。
+    // 拒绝它们等于把用户在格式冻结期间攒下的全部会话作废——那比「静默当老格式读」坏得多。
+    [Fact]
+    public void ReadState_WithoutAVersionKey_IsTreatedAsTheOldestFormat()
+    {
+        WriteRawState("""{"sessionId":"s1","status":"Idle","turn":7,"pending":[]}""");
+
+        Assert.Equal(7, _store.ReadState("p1", "s1").Turn);
+    }
+
+    // 扫盘那一侧：版本太新的会话**不参与列表**，但也不该让整个列表打不开。
+    // 两种「读不出来」在返回值上仍然分不开（都是 null）——**区别只在 ReadSpec 那条路上**，
+    // 它才是用户点名要打开某一个会话时会走到的。
+    [Fact]
+    public void TryReadSpec_WithANewerFormatVersion_ReturnsNullInsteadOfThrowing()
+    {
+        var dir = _store.SessionDirectory("p1", "s1");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "spec.json"), """{"version":99,"sessionId":"s1"}""");
+
+        Assert.Null(_store.TryReadSpec("p1", "s1"));
+    }
+
+    [Fact]
+    public void ReadSpec_WithANewerFormatVersion_IsRejectedWithTheReason()
+    {
+        var dir = _store.SessionDirectory("p1", "s1");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "spec.json"), """{"version":99,"sessionId":"s1"}""");
+
+        Assert.Throws<FileFormatException>(() => _store.ReadSpec("p1", "s1"));
+    }
+
+    // ⚠️ **这条是手工 E2E 抓出来的**：`FindSession` 是按身份找（用户点了一个具体的会话），
+    // `ListSessions` 是枚举——**两者的容错要求不同**。一开始两者共用 `TryReadSpec`，
+    // 于是版本太新的会话在按身份找时也被吞成「不存在」，用户看到的理由是
+    // 「会话 'xxx' 不存在」——而那句话会把人引向删掉重来。
+    [Fact]
+    public void FindSession_WithANewerFormatVersion_IsLoudInsteadOfPretendingItIsAbsent()
+    {
+        var dir = _store.SessionDirectory("p1", "s1");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "spec.json"), """{"version":99,"sessionId":"s1"}""");
+
+        Assert.Throws<FileFormatException>(() => _store.FindSession("s1"));
+    }
+
+    // 反面：**损坏**的 spec.json 在按身份找时**照旧**被跳过（与 `TryReadSpec` 同一条路）。
+    // 少了这条，「但也不该把损坏也一起抛出去」这条就没人守——而损坏的处置方式完全不同：
+    // 重写一份就好，不该吓得用户以为数据是新版本写的。
+    [Fact]
+    public void FindSession_WithACorruptSpec_StillReportsAbsent()
+    {
+        var dir = _store.SessionDirectory("p1", "s1");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "spec.json"), "{ 这不是 JSON");
+
+        Assert.Null(_store.FindSession("s1"));
+    }
+
     private static TimelineEvent Msg(string text) => new TimelineEvent.MessageEvent
     {
         At = DateTimeOffset.UnixEpoch,

@@ -326,7 +326,7 @@ public sealed class CommandDispatcher(
             [
                 new TimelineEvent.MessageEvent
                 {
-                    At = DateTimeOffset.UtcNow,
+                    At = CoreClock.Now(),
                     From = Speaker.User,
                     Blocks = [new Block.TextBlock("ping")],
                 },
@@ -413,7 +413,8 @@ public sealed class CommandDispatcher(
             Note = handle.ProjectKey,
         });
 
-        // 空白 → null（`Title` 可空是磁盘格式不破的前提，别把 "" 存进去）。
+        // 空白 → null（`Title` 可空是**语义**：`null` =「没起名」，不是「格式兼容」的需要。
+        // 别把 "" 存进去——那会让「没起名」与「起了个空名字」变成两份数据）。
         static string? Trimmed(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
     }
 
@@ -434,7 +435,7 @@ public sealed class CommandDispatcher(
         // 追加与入队必须紧挨着——分开会产生「已落盘未入队」/「已入队未落盘」两种中间态，各自丢消息。
         // 这两步刻意不拿闸：合并是队列的副产品，而 no-op 的前提是后来的 send 先进得来。
         // 并发安全靠各自那层的锁：`HistoryLog.Append` 自带按路径的锁，`SessionHandle.Enqueue` 自带队列锁。
-        var at = DateTimeOffset.UtcNow;
+        var at = CoreClock.Now();
 
         _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
         {
@@ -494,7 +495,7 @@ public sealed class CommandDispatcher(
 
             // `step.begin` 是「在跑」的唯一信号源，不是 `session.state`——磁盘从不存 Running。
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                new WireEvent.StepBegin(handle.SessionId, handle.State.Turn + 1, DateTimeOffset.UtcNow));
+                new WireEvent.StepBegin(handle.SessionId, handle.State.Turn + 1, CoreClock.Now()));
 
             // 取空队列——合并是队列的副产品。
             var blocks = handle.DrainQueue();
@@ -503,7 +504,7 @@ public sealed class CommandDispatcher(
             // 模型消息由这里发（`Stepper` 不碰事件总线）；判据与它落盘时一致：拒答 / 空块不产生模型消息。
             if (!reply.Refused && reply.Blocks.Count > 0)
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                    new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, DateTimeOffset.UtcNow));
+                    new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, CoreClock.Now()));
 
             PublishStepEnd(handle, reply);
             return reply;
@@ -512,7 +513,7 @@ public sealed class CommandDispatcher(
         {
             // 中断不是失败：用户消息已落盘、Turn 不递增 ⇒ 发 `state` 回到 Idle，不发 `error`。
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                new WireEvent.StateChanged(handle.SessionId, "Idle", handle.State.Turn));
+                new WireEvent.StateChanged(handle.SessionId, SessionStatus.Idle, handle.State.Turn));
 
             if (throwOnFailure) throw new DispatchException("这一步被中断了。");
             return null;
@@ -611,12 +612,14 @@ public sealed class CommandDispatcher(
         // 丢 `Turn`，或把状态永久卡在 `Running`。
         // 换的是 `handle.State` 这个字段，不是 `handle` 本身——激活表存的是引用，
         // 换实例会让 dispatcher 与快照端点状态分叉。
-        // `persistedStatus: "Idle"`：本命令不拿会话闸，能在整个模型调用里发生，那时内存是 `Running`、磁盘从不存它。
+        // `diskStatus: SessionStatus.Idle`：本命令不拿会话闸，能在整个模型调用里发生，
+        // 那时内存是 `Running`、而磁盘从不存它。⚠️ 注意这个参数与 `change` **刻意不同**：
+        // 内存留 `Running`（这一步还在跑），磁盘钉 `Idle`。
         handle.UpdateStateAndPersist(_host.Store, s =>
         {
             var next = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal) { [x.Axis] = canonical };
             return s with { Axes = next };
-        }, persistedStatus: "Idle");
+        }, diskStatus: SessionStatus.Idle);
 
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
             new WireEvent.AxisChanged(handle.SessionId, x.Axis, canonical));
@@ -750,7 +753,7 @@ public sealed class CommandDispatcher(
         // `Archived` 三态：null=归档、false=取消。**不要**写成 `c.Archived == true`——
         // 那会把「没给」与「给定 false」混成同一个分支（本记录的注释里有完整理由）。
         var archive = c.Archived != false;
-        var wanted = archive ? DateTimeOffset.UtcNow : (DateTimeOffset?)null;
+        var wanted = archive ? CoreClock.Now() : (DateTimeOffset?)null;
 
         if (archive && spec.ArchivedAt is not null)
             return Reject(id, $"会话 '{c.SessionId}' 已经归档了。要取消：session archive {c.SessionId} --unarchive");
@@ -868,7 +871,7 @@ public sealed class CommandDispatcher(
     /// 三条销毁命令共用的「在跑就不许动」。**判据是 `Running` 而不是「在不在激活表」**——
     /// `session.create` 走 `Register()` 登记，用激活表判会让**刚建的会话删不掉**。
     ///
-    /// <para>为什么不是「原地掐断」：`Stepper` 的收尾会 `SaveState` 把 `state.json` 写回去，
+    /// <para>为什么不是「原地掐断」：`Stepper` 的收尾会 `UpdateStateAndPersist` 把 `state.json` 写回去，
     /// 目录就在那一刻被重新造出来——留下一个**有 state、没 spec** 的目录，
     /// 而 `ListSessions` **静默跳过**它（下次同 id 建会话时 `WriteSpec` 会翻出这个孤儿 state）。
     /// **半删状态比一句拒绝坏得多。**</para>
@@ -878,7 +881,7 @@ public sealed class CommandDispatcher(
     /// 所以这里不需要再去读盘。</para>
     /// </summary>
     private static bool IsRunning(SessionHandle? handle) =>
-        handle is not null && (handle.IsRunning || handle.State.Status == "Running");
+        handle is not null && (handle.IsRunning || handle.State.Status == SessionStatus.Running);
 
     private static string RunningRefusal(string sessionId) =>
         $"会话 '{sessionId}' 正在跑，不能归档 / 去激活 / 删除。先 `session interrupt {sessionId}`。";
@@ -929,7 +932,7 @@ public sealed class CommandDispatcher(
 
                 // 幂等：自己已经占着这条（含同一 scope 里重复写两次）就跳过
                 if (against.Any(x => x.SessionId == c.SessionId && x.Path == path)) continue;
-                additions.Add(new Claim(c.SessionId, handle.ProjectKey, path, DateTimeOffset.UtcNow));
+                additions.Add(new Claim(c.SessionId, handle.ProjectKey, path, CoreClock.Now()));
             }
 
             list.AddRange(additions);

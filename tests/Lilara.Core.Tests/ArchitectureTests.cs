@@ -18,7 +18,9 @@ public class ArchitectureTests
         var files = Directory.GetFiles(LayerDir("Kernel"), "*.cs", SearchOption.AllDirectories);
 
         // 先钉「找得到东西」：glob 若空了，下面的空断言会**假绿**。
-        Assert.Equal(12, files.Length);
+        // ⚠️ **这个数不是判据，是探针**——它抓的是「glob 悄悄少找了文件」（搬走一个 Kernel 文件、
+        // 或路径变了）。**加文件时按实测改，别按感觉改**：被机械改过一次的探针就等于没有。
+        Assert.Equal(13, files.Length);
 
         var offenders = files
             .SelectMany(f => ExternalUsings(f).Select(u => $"{Path.GetFileName(f)}:{u.Line}  {u.Text}"))
@@ -26,6 +28,48 @@ public class ArchitectureTests
 
         Assert.Empty(offenders);
     }
+
+    /// <summary>
+    /// 取时间只许走 <see cref="CoreClock"/>。
+    ///
+    /// <para>⚠️ <b>它挡的不是风格，是一条具体的坑。</b>散落的 <c>DateTimeOffset.UtcNow</c>
+    /// 让「新增字段的默认值是此刻」这种规则**无处可立**——反序列化不经过构造器，
+    /// 于是缺省到底取不取「现在」根本没有单一落点。先把入口收成一处，条款才谈得上。</para>
+    ///
+    /// <para>⚠️ <b>它只扫代码行，不扫注释</b>（每行 `//` 之后的部分先切掉）。
+    /// 不切的话，别的文件里一句「别用 <c>DateTimeOffset.UtcNow</c>」就会**误报**，
+    /// 而误报的守卫最后一定会被改成永远通过。</para>
+    ///
+    /// <para>⚠️ <b>它拦不住什么</b>：字符串拼出来的调用、<c>DateTime.Today</c>、
+    /// 以及 <c>new DateTime(...)</c> 这类构造。它管的是**最常见的那个形状**——
+    /// 与本仓其它守卫一样，这是有用的近似，不是证明。</para>
+    /// </summary>
+    [Fact]
+    public void Clock_IsOnlyReadThroughCoreClock()
+    {
+        var clockFile = Path.Combine("Kernel", "CoreClock.cs");
+        var root = Path.Combine(RepoRoot(), "src");
+
+        // 判据是**源码文本**，不是运行时——所以这里不碰任何被测物，不存在「探针≠被测物」的问题。
+        var forbidden = new[] { "DateTime.UtcNow", "DateTimeOffset.UtcNow", "DateTime.Now", "DateTimeOffset.Now" };
+
+        var offenders = Directory.GetFiles(root, "*.cs", SearchOption.AllDirectories)
+            .Where(f => !Path.GetRelativePath(root, f).EndsWith(clockFile, StringComparison.Ordinal))
+            .SelectMany(f => CodeLines(f)
+                .Where(l => forbidden.Any(t => l.Text.Contains(t, StringComparison.Ordinal)))
+                .Select(l => $"{Path.GetRelativePath(root, f)}:{l.Line}  {l.Text.Trim()}"))
+            .ToList();
+
+        Assert.Empty(offenders);
+    }
+
+    // 行号必须来自**原始文件**（切注释会吃掉 `//` 本身，但不改变行数，所以行号仍然对得上）。
+    private static IEnumerable<(int Line, string Text)> CodeLines(string file) =>
+        File.ReadLines(file).Select((raw, n) =>
+        {
+            var cut = raw.IndexOf("//", StringComparison.Ordinal);
+            return (Line: n + 1, Text: cut < 0 ? raw : raw[..cut]);
+        });
 
     [Fact]
     public void NoLayer_DependsOnALayerAboveIt()
@@ -70,9 +114,11 @@ public class ArchitectureTests
             .Where(x => x.Text != "using Lilara.Core.Kernel;")   // Kernel 是所有人的底，放行
             .Select(x => (x.Line, x.Text));
 
-    private static string LayerDir(string layer)
+    private static string LayerDir(string layer) => Path.Combine(RepoRoot(), "src", "Lilara.Core", layer);
+
+    // 从测试程序集往上找仓库根。
+    private static string RepoRoot()
     {
-        // 从测试程序集往上找仓库根。
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir is not null
                && !Directory.Exists(Path.Combine(dir.FullName, "src", "Lilara.Core", "Kernel")))
@@ -81,6 +127,6 @@ public class ArchitectureTests
         }
 
         Assert.NotNull(dir);   // 找不到仓库根 = 测试环境不对，响亮地失败，别静默跳过
-        return Path.Combine(dir!.FullName, "src", "Lilara.Core", layer);
+        return dir!.FullName;
     }
 }

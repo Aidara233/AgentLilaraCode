@@ -39,7 +39,11 @@ public sealed record SessionHandle
     /// ⚠️ **内存队列，不落盘**——这是**刻意的偏离**，别当成漏了。
     /// `01` §6.1 / §12.8 要求队列进 `state.json`，但 `SessionState.Pending` 是
     /// `IReadOnlyList&lt;string&gt;`，**装不下块**（`03` §9.1 的 `session.send` 带附件块）。
-    /// 改它的类型是一次**磁盘格式迁移**，而磁盘格式已冻结。
+    /// ⚠️ 改它的类型是一次**磁盘格式迁移**——而这件事**现在有路可走了**：格式带版本号
+    /// （`Kernel.Json.FormatVersion` + `Storage.FileFormat`），旧文件读得出来、缺的字段补默认值。
+    /// **所以不做它的理由不再是「格式冻结」，而是「还没到做待办持久化的时候」**
+    /// （`Pending` 恒为空列表、不是「有而没写」；今天丢了只会丢未开跑的待办）。
+    /// ⚠️ 那句话曾经写的是「磁盘格式已冻结」——本批之后它成了假话，别照抄。
     /// ⇒ 最小实现只在内存排队：崩溃会丢掉未开跑的待办，而磁盘上**看不出来**
     /// （`Pending` 恒为空列表，不是「有而没写」）。
     /// </summary>
@@ -111,15 +115,16 @@ public sealed record SessionHandle
             SessionId = Guid.NewGuid().ToString("N")[..12],
             ProjectKey = projectKey,
             WorkingDirectory = fullPath,
-            CreatedAt = DateTimeOffset.UtcNow,
+            CreatedAt = CoreClock.Now(),
             Model = model,
-            // 没给就是 null ⇒ `WhenWritingNull` 整个键不出现 ⇒ 老金样逐字节不变。
+            // 没给就是 null ⇒ `WhenWritingNull` 整个键不出现。可空是**语义**（「没起名」），
+            // 不再是「为了让老文件逐字节不变」——那件事现在由**格式版本**承担。
             Title = title,
         };
         var state = new SessionState
         {
             SessionId = spec.SessionId,
-            Status = "Idle",
+            Status = SessionStatus.Idle,
             Turn = 0,
             Pending = [],
 
@@ -261,19 +266,39 @@ public sealed record SessionHandle
     /// <summary>
     /// 原子换 `State` **并落盘**——两步在**同一个临界区**里。
     /// ⚠️ 少了这一步，「内存对了、盘上还是旧的」这条分叉就会落在两次写之间（终审 I2 的约束 1 / 2）。
+    ///
+    /// <para>⚠️ **它是「改内存 + 落盘」的唯一入口。** 曾经还有 <c>SaveState(SessionStore)</c>
+    /// 与 <c>SaveAxes(SessionStore)</c> 两个「只写」的方法——**两个在 <c>src/</c> 里零调用点**
+    /// （只有测试在调），生产路径早就全走这一条了。它们已经删掉，理由是它们**各自重抄了一遍
+    /// 「钉回磁盘语义」这条规则**：两份能分叉的判据，而其中一份根本不在跑的路径上。</para>
     /// </summary>
-    /// <param name="persistedStatus">
-    /// 落盘时把 `Status` 钉回的值（见下面 <see cref="SaveAxes"/> 的注释：`setAxis` 不拿闸，
-    /// 可能在**整个模型调用**的窗口里发生，那时内存里是 `Running`，而磁盘**从不存 Running**）。
-    /// 传 `null` = 原样落盘（`Stepper` 收尾时内存里本来就是 `Idle`）。
+    /// <param name="diskStatus">
+    /// **这一次该往磁盘上写哪个 <c>Status</c>。必填——没有默认值。**
+    ///
+    /// <para>⚠️ **它必须与 <paramref name="change"/> 分开看**，因为两者**刻意可以不同**：
+    /// 内存里留 `Running`（这一步还在跑），磁盘上钉 `Idle`（磁盘从不存 `Running`）。
+    /// 参数名叫 `diskStatus` 而不是 `persistedStatus`，就是为了让调用点这句话读得出来。</para>
+    ///
+    /// <para>⚠️ **为什么是必填、为什么没有「原样落盘」那个默认**：
+    /// 它曾经是 `string? persistedStatus = null`，而那个 `null` **同时表达了两件事**——
+    /// 「调用方没给」与「本来就是 `Idle`」，两者在这个签名下**无法区分**。
+    /// 那正是本仓反复吃亏的形状（一个值承担两种含义 ⇒ 判据必漂）。
+    /// 现在调用方必须**写出来**：`diskStatus: SessionStatus.Idle` 或
+    /// `diskStatus: handle.State.Status`——后者就是「原样落盘」，但它是一句**有人签过字**的话。</para>
+    ///
+    /// <para>⚠️ **判据是「磁盘上合法的是哪些取值」，不是「钉成 Idle」这个动作本身。**
+    /// 今天磁盘上合法的只有 <see cref="SessionStatus.Idle"/>；将来别的内存专有状态接上时，
+    /// **改的是调用点传进来的那个值**——而调用点只有一个
+    /// （`CommandDispatcher.HandleSessionSetAxis`），这是删掉 `SaveAxes` / `SaveState`
+    /// 那两个死方法换来的东西。</para>
     /// </param>
     public SessionState UpdateStateAndPersist(
-        SessionStore store, Func<SessionState, SessionState> change, string? persistedStatus = null)
+        SessionStore store, Func<SessionState, SessionState> change, string diskStatus)
     {
         lock (_gate)
         {
             State = change(State);
-            store.WriteState(ProjectKey, persistedStatus is null ? State : State with { Status = persistedStatus });
+            store.WriteState(ProjectKey, State with { Status = diskStatus });
             return State;
         }
     }
@@ -308,46 +333,5 @@ public sealed record SessionHandle
             store.WriteSpec(ProjectKey, Spec);
             return Spec;
         }
-    }
-
-    /// <summary>
-    /// 把**当前** `State` 落盘。
-    /// ⚠️ 它只做「写」，不做读-改-写 ⇒ **要改 `State` 请走 <see cref="UpdateStateAndPersist"/>**，
-    /// 别写成 `handle.State = …; handle.SaveState(store);`（那两句之间没有临界区）。
-    /// </summary>
-    public void SaveState(SessionStore store)
-    {
-        lock (_gate) store.WriteState(ProjectKey, State);
-    }
-
-    /// <summary>
-    /// 把轴写进 `state.json`（`session.setAxis` 的写回点，Task 3）。
-    ///
-    /// <para>⚠️ **轴与 `Turn` / `Status` 住同一份 `State`**（<see cref="SessionState.Axes"/>），
-    /// 所以这里写的是**整份** `State`——「改了轴却把 `Turn` 抹掉」这种分叉在结构上不可能发生。
-    /// 保留这个名字只是让调用点自己说清楚「我改的是轴」。</para>
-    ///
-    /// <para>⚠️ **但正因为写的是整份 `State`，`Status` 得先钉回磁盘语义。**
-    /// `session.setAxis` **不拿会话闸**，所以它能在**整个模型调用**的窗口里发生——
-    /// 而那时内存里的 `Status` 已经被 `Stepper` 置成了 `Running`（`Stepper.cs:51`，
-    /// 刻意**只写内存、不落盘**：这是被 `WireEvent` / `CommandDispatcher` / `CoreHost` /
-    /// `SessionQueries` 四处断言的「磁盘从不存 Running」）。不钉的话，一次 `setAxis`
-    /// 就把 `Running` 带上了磁盘 ⇒ 进程在步中被 kill 后 `Load` 读到它 ⇒ 快照如实回
-    /// `Running` ⇒ **会话永远显示在跑，而没有任何步在跑**，也永远等不到 `step.end`。</para>
-    ///
-    /// <para>⚠️ **钉成 `Idle` 的依据**：运行时给 `Status` 赋过的值只有两个——
-    /// `Idle`（`Create` 的播种、`Stepper` 的收尾，都上盘）与 `Running`（只上内存）。
-    /// ⇒ 今天 `Running` 是**唯一**的内存专有取值，钉成 `Idle` 是对的。
-    /// ⚠️ 将来若别的内存专有状态真的接上（`WaitingForInput` 等），这里要跟着改——
-    /// 判据是「磁盘上合法的是哪些取值」，不是「钉成 Idle」这个动作本身。</para>
-    ///
-    /// <para>⚠️ **改轴请走 <see cref="UpdateStateAndPersist"/>**——它把「改内存 + 落盘」放在
-    /// **同一个临界区**里，并顺带做这里的「钉回 `Idle`」。写成
-    /// `handle.State = handle.State with { Axes = … }` 再调这里，那两句之间没有临界区，
-    /// 正是终审 I2 点名的交错窗口（`Stepper` 的收尾读-改-写会在这里被整份盖掉）。</para>
-    /// </summary>
-    public void SaveAxes(SessionStore store)
-    {
-        lock (_gate) store.WriteState(ProjectKey, State with { Status = "Idle" });
     }
 }

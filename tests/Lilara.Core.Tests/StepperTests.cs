@@ -249,7 +249,7 @@ public class StepperTests : IDisposable
             {
                 [Axes.Temperature] = "0.3",
             },
-        });
+        }, diskStatus: SessionStatus.Idle);
 
         _adapter.Reply("ok");
         await _stepper.StepAsync(handle, "hi", CancellationToken.None);
@@ -271,7 +271,7 @@ public class StepperTests : IDisposable
             {
                 [Axes.Temperature] = "NaN",
             },
-        });
+        }, diskStatus: SessionStatus.Idle);
 
         _adapter.Reply("ok");
         await _stepper.StepAsync(handle, "hi", CancellationToken.None);

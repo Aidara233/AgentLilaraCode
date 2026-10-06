@@ -991,7 +991,8 @@ public class ControlServerTests : IAsyncLifetime
 
         Assert.Equal(
             ["ArchivedAt:Nullable`1", "CreatedAt:DateTimeOffset", "Model:ModelSelection",
-             "ProjectKey:String", "SessionId:String", "Title:String", "WorkingDirectory:String"],
+             "ProjectKey:String", "SessionId:String", "Title:String", "Version:Int32",
+             "WorkingDirectory:String"],
             Shape(typeof(SessionSpec)));
 
         // 嵌套那层也要钉——key 加在这里会序列化成 spec.model.apiKey，顶层看不见。

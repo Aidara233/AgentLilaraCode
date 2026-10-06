@@ -68,7 +68,7 @@ public class AtomicFileConcurrencyTests : IDisposable
         if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true);
     }
 
-    // 并发写同一路径是真实场景（SaveState 与 HTTP 快照端点同时碰 state.json）。
+    // 并发写同一路径是真实场景（`Stepper` 收尾写 state.json 与改轴那条路同时碰它）。
     [Fact]
     public async Task Write_ToleratesConcurrentWritersToTheSamePath()
     {

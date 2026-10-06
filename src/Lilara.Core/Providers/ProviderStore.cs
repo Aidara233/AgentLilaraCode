@@ -14,9 +14,13 @@ public sealed class ProviderStore(string dataRoot)
     public void Save(ProviderDefinition def) =>
         AtomicFile.Write(PathFor(def.Id), JsonSerializer.Serialize(def, Json.Options));
 
-    // 读不到返回 null，不抛。两种「读不到」都吞：文件不存在，和文件损坏——
-    // 只判 File.Exists 不够，损坏的文件会抛 JsonException 炸掉整个启动。
-    // 只吞 JsonException：权限/磁盘失败必须暴露，静默「消失」比崩溃更糟。
+    // 读不到返回 null，不抛。三种「读不到」都吞：文件不存在、文件损坏、**版本比本程序新**。
+    // 只吞 JsonException 与 FileFormatException：权限/磁盘失败必须暴露，静默「消失」比崩溃更糟。
+    //
+    // ⚠️ **为什么版本不符也吞**（与 `SessionStore.ReadSpec` 刻意不同）：provider 是**全局**的，
+    // 它坏掉/太新不该让**所有会话**都用不了。而 `Load` 的现有语义已经是「读不到 ⇒ null」，
+    // 调用方（`StepperResolver`）据此说「会话绑定的提供商已不存在」——那句话在版本不符时
+    // **方向是对的**（这个核心确实用不了它），只是原因不同。原因由 `provider list` 那条路说出来。
     public ProviderDefinition? Load(string id)
     {
         var path = PathFor(id);
@@ -24,9 +28,13 @@ public sealed class ProviderStore(string dataRoot)
 
         try
         {
-            return JsonSerializer.Deserialize<ProviderDefinition>(File.ReadAllText(path), Json.Options);
+            return JsonSerializer.Deserialize<ProviderDefinition>(FileFormat.ReadChecked(path), Json.Options);
         }
         catch (JsonException)
+        {
+            return null;
+        }
+        catch (FileFormatException)
         {
             return null;
         }
@@ -77,9 +85,13 @@ public sealed class ProviderStore(string dataRoot)
     {
         try
         {
-            return JsonSerializer.Deserialize<ProviderDefinition>(File.ReadAllText(path), Json.Options);
+            return JsonSerializer.Deserialize<ProviderDefinition>(FileFormat.ReadChecked(path), Json.Options);
         }
         catch (JsonException)
+        {
+            return null;
+        }
+        catch (FileFormatException)
         {
             return null;
         }

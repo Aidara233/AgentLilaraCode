@@ -64,7 +64,35 @@ if (existing.Count > 0)
 }
 else
 {
-    Console.WriteLine("  还没有会话。");
+    // ⚠️ **「还没有会话」是一句可能不成立的话**（手工 E2E 抓到的）。
+    // `ListSessions` 走 `TryReadSpec`，而它连**版本太新**也一起吞了（那是刻意的：
+    // 一个太新的会话不该让整张列表打不开）。于是这里若只说「还没有会话」，
+    // 用户会以为会话没了——而它其实在，只是这个核心读不了。
+    // ⇒ 分红字说清楚：这是同一类「静默」缺陷（横幅说一句假话，真话只在别处）。
+    // ⚠️ 原因分两类，**处置方式正相反**（损坏 ⇒ 重写就好；太新 ⇒ 重写会丢数据）
+    // ⇒ 分类走 `UnreadableReason`，别在这里自己猜（第一版就猜错过：把损坏也说成了「太新」）。
+    var sessionsDir = Path.Combine(host.Store.ProjectsRoot, projectKey, "sessions");
+    var unreadable = Directory.Exists(sessionsDir)
+        ? Directory.GetDirectories(sessionsDir)
+            .Select(Path.GetFileName).OfType<string>()
+            .Select(id => (Id: id, Reason: host.Store.UnreadableReason(projectKey, id)))
+            .Where(x => x.Reason is not null)
+            .ToList()
+        : [];
+
+    if (unreadable.Count == 0)
+    {
+        Console.WriteLine("  还没有会话。");
+    }
+    else
+    {
+        foreach (var (id, reason) in unreadable)
+            Console.WriteLine($"  ⚠️ 会话 {id} 读不出来：{reason}。");
+
+        // 只在**真的**可能是「太新」的时候才说那句「别删」——说给损坏的文件听是吓人。
+        if (unreadable.Any(x => x.Reason == "按更新的格式写的"))
+            Console.WriteLine("     这本机数据可能是更新的核心写的。用那个核心打开，**别删**：删了里面的记录就没了。");
+    }
 }
 
 // ⚠️ 适配器**不再在构造时定死**。`CoreHost.StepperFor` 按**该会话自己的** provider

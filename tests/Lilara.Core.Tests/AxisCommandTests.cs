@@ -231,7 +231,7 @@ public class AxisCommandTests : IDisposable
         Assert.Equal("max", reloaded.State.Axes![Axes.Effort]);
     }
 
-    // 步进行中改轴不许把内存专用的 Running 带上磁盘：SaveAxes 写整份 State，崩溃重启会读到 Running。
+    // 步进行中改轴不许把内存专用的 Running 带上磁盘：改轴那条路写整份 State，崩溃重启会读到 Running。
     // 断言用磁盘文本（不是 handle.State.Status），且必须在步进行中读——步正常收尾时 Stepper 会写回 Idle。
     [Fact]
     public async Task SetAxisDuringAStep_DoesNotWriteRunningToDisk()

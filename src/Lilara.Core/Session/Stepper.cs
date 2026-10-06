@@ -41,7 +41,7 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         SessionHandle handle, IReadOnlyList<Kernel.Block> blocks, CancellationToken ct)
     {
         // 「now 冻结在步开始」（00 §2.5）——同一步内重复渲染必须逐字节相同
-        var at = DateTimeOffset.UtcNow;
+        var at = CoreClock.Now();
 
         // ⚠️ 先记下落盘的那份，失败了原样放回去。
         // 调用方 catch 之后继续用**同一个把手**：不回滚的话，
@@ -50,7 +50,7 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         var persisted = handle.State;
         // ⚠️ 走 `UpdateState`（原子读-改-写）：它与 `setAxis` 的读-改-写共用**同一把锁**，
         // 两条交错时不会互相整份盖掉（终审 I2）。下同。
-        handle.UpdateState(s => s with { Status = "Running" });
+        handle.UpdateState(s => s with { Status = SessionStatus.Running });
 
         ModelReply reply;
         try
@@ -122,14 +122,17 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         // 只是没有内容可写。让它和「抛异常」一样不计数，
         // 会让 state.json 里「拒答过一次」与「从没跑过」无法区分。
         // ⚠️ **Turn 自增 + 落盘走 `UpdateStateAndPersist`（同一个临界区）**，不能拆成
-        // `handle.State = …` 与 `handle.SaveState(…)` 两句：`setAxis` 不拿会话闸，
+        // 「先换内存、再单独写盘」两句：`setAxis` 不拿会话闸，
         // 它的读-改-写能与这里交错，分开写会丢 `Turn` 或把状态卡在 `Running`（终审 I2）。
-        // ⚠️ `persistedStatus` 不传 = 原样落盘：换过之后内存里就是 `Idle`。
+        // ⚠️ `diskStatus` 必须是**字面量 `Idle`**，不能写 `handle.State.Status`——
+        // 实参是**调用前**求值的，而那一刻内存里还是上面刚置的 `Running` ⇒
+        // 那会把 `Running` 写进磁盘，正是整套机制要防的那件事（`SessionStatus` 的类型注释里有完整后果）。
+        // 一句话：**「原样落盘」不能用「读当前值」来表达**，因为调用点往往正好处在「内存已经领先」的时刻。
         handle.UpdateStateAndPersist(_store, s => s with
         {
-            Status = "Idle",
+            Status = SessionStatus.Idle,
             Turn = s.Turn + 1,
-        });
+        }, diskStatus: SessionStatus.Idle);
 
         return reply;
     }
@@ -151,7 +154,7 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         // ⚠️ 与 dispatcher 同一条次序：**先追加再入队**，然后取空。
         _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
         {
-            At = DateTimeOffset.UtcNow,
+            At = CoreClock.Now(),
             From = Speaker.User,
             Blocks = blocks,
         });

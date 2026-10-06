@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Lilara.Core.Kernel;
 using Lilara.Core.Storage;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
@@ -94,7 +95,7 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
         if (_activated.TryGetValue(sessionId, out var live)) return live.State.Status;
 
         var found = _store.FindSession(sessionId);
-        return found is null ? "Idle" : _store.ReadState(found.Value.ProjectKey, sessionId).Status;
+        return found is null ? SessionStatus.Idle : _store.ReadState(found.Value.ProjectKey, sessionId).Status;
     }
 
     /// <summary>丢掉**某一个**会话的 stepper 缓存（`session.deactivate` / `delete` 用）。</summary>

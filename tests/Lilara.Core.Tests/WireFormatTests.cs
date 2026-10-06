@@ -97,4 +97,55 @@ public class WireFormatTests
         Assert.Contains($"\"accepted\":{(accepted ? "true" : "false")}", json);
         Assert.Contains("\"id\":\"c1\"", json);
     }
+
+    /// <summary>
+    /// **每个上线的事件类型都有发射点。**
+    ///
+    /// <para>⚠️ **为什么值得一条守卫**：`03` §4 有一句「**判据是数 `WireEvent` 自己那张表**」——
+    /// 那就是说，**类型进了表、却没人 <c>Publish</c> 它**，是这张表最容易出的错。
+    /// 那个形状已经在别处出现过一次（`03` §4 记着 `session.created` 发两份、
+    /// 其中会话流那份**没有任何消费者**——「死投递」）。</para>
+    ///
+    /// <para>⚠️ **它只管「有没有发射点」，不管「发得对不对」**（发给哪个 topic、什么时候发、
+    /// 载荷对不对——那要靠真 WS 测试）。**这是有用的近似，不是证明。**</para>
+    /// </summary>
+    [Fact]
+    public void EveryWireEventType_HasAProducer()
+    {
+        // 从线上类型自己那张表派生（`WireEvent` 的嵌套类型），不手抄名单。
+        var declared = typeof(WireEvent).GetNestedTypes()
+            .Where(t => t.IsSubclassOf(typeof(WireEvent)))
+            .Select(t => t.Name)
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToArray();
+
+        // ⚠️ 探针：类型搬走 / 反射换了写法时，下面那个空断言会**假绿**。
+        // ⚠️ **加事件类型时按实测改这个数，别按感觉改**（被机械改过的探针等于没有）。
+        Assert.Equal(13, declared.Length);
+
+        var dispatcher = File.ReadAllText(Path.Combine(
+            RepoRoot(), "src", "Lilara.Core", "Hosting", "CommandDispatcher.cs"));
+
+        var silent = declared.Where(name => !dispatcher.Contains($"new WireEvent.{name}(", StringComparison.Ordinal)).ToList();
+
+        Assert.Empty(silent.Select(n => $"`{n}` 在 WireEvent 的表里，但 CommandDispatcher 里没有发射点（死投递）。"));
+    }
+
+    // 同族的探针守卫：`03` §4 的数条数那句的自动化版。
+    // ⚠️ 它钉的是「表本身」，不是「文档里写的那个数」——文档那个数靠这条测试红来维护。
+    [Fact]
+    public void WireEventTable_HasExactlyTheTypesWeThinkItDoes()
+    {
+        Assert.Equal(13, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+    }
+
+    private static string RepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null && !Directory.Exists(Path.Combine(dir.FullName, "src", "Lilara.Core", "Kernel")))
+            dir = dir.Parent;
+
+        Assert.NotNull(dir);
+        return dir!.FullName;
+    }
 }

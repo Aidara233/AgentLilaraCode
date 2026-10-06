@@ -26,6 +26,13 @@ public sealed record ModelSelection
 // ⚠️ 记录本身仍是 `init`-only：改的是「谁持有它」，不是「它能不能改」。
 public sealed record SessionSpec
 {
+    /// <summary>
+    /// 磁盘格式版本。写盘时恒等于 <see cref="Json.FormatVersion"/>（默认值即当前版本，
+    /// 与 `ReasoningBlock.Kind` 的做法同形）；读盘时由 `SessionStore` **显式校验**，
+    /// 比自己新 ⇒ 明确拒绝，不是静默重解释。
+    /// </summary>
+    public int Version { get; init; } = Json.FormatVersion;
+
     public required string SessionId { get; init; }
 
     // 会话**出生地**，会话一旦建出来就不会再变（不像 Model 那样可改）。
@@ -45,9 +52,9 @@ public sealed record SessionSpec
     /// 「点一下给个临时名」那种做法要丢掉：没有改名命令 ⇒ 名字是**永久**的，
     /// 工具不该替用户起名。</para>
     ///
-    /// <para>⚠️ **可空是刻意的，它是磁盘格式不破的唯一原因**：`Json.Options` 的
-    /// `WhenWritingNull` 让「没起名」的 `spec.json` **逐字节不变**，
-    /// 而 `DiskFormatGoldenTests` 钉的就是那几个字节。写成非空字符串会让那条金样红。</para>
+    /// <para>⚠️ **可空不是「磁盘格式不破」的要求**——那件事现在由**格式版本**承担
+    /// （见 `Storage.FileFormat`）：缺字段 = 一份老文件，读的一方当场就知道。
+    /// 可空在这里是**语义**：`null` 字面就是「没起名」，与「名叫空串」不是一回事。</para>
     /// </summary>
     public string? Title { get; init; }
 
@@ -61,7 +68,8 @@ public sealed record SessionSpec
     /// 而归档会话可能仍占着路径）⇒ 用户看到两份自相矛盾的真相。
     /// ⇒ **过滤挪到显示层**（头折叠、控制台不折叠——那是有意的两种视图）。</para>
     ///
-    /// <para>⚠️ 可空 ⇒ 老 `spec.json` 逐字节不变（同 <see cref="Title"/>）。</para>
+    /// <para>⚠️ 可空是**语义**（`null` = 没归档），不再是「为了让老文件逐字节不变」——
+    /// 那件事现在由**格式版本**承担。</para>
     /// </summary>
     public DateTimeOffset? ArchivedAt { get; init; }
 }

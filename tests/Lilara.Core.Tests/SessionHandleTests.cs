@@ -62,13 +62,31 @@ public class SessionHandleTests : IDisposable
     }
 
     [Fact]
-    public void SaveState_PersistsTurnCounter()
+    public void UpdateStateAndPersist_PersistsTheChange()
     {
         var handle = SessionHandle.Create(_store, @"C:\work", Model());
-        handle.State = handle.State with { Turn = 3 };
 
-        handle.SaveState(_store);
+        handle.UpdateStateAndPersist(_store, s => s with { Turn = 3 }, diskStatus: SessionStatus.Idle);
 
+        Assert.Equal(3, _store.ReadState(handle.ProjectKey, handle.SessionId).Turn);
+    }
+
+    // ⚠️ 这条是删掉 `SaveAxes` 时**补上**的：那条被判死的理由（「磁盘从不存 Running」）
+    // 一直只住在被删方法的注释里，而**参数本身在 tests/ 里零覆盖**
+    // （判据：`grep persistedStatus tests/` 空）。两个都删掉之后就没人守了。
+    [Fact]
+    public void UpdateStateAndPersist_WithADifferentDiskStatus_PinsItOnDiskOnly()
+    {
+        var handle = SessionHandle.Create(_store, @"C:\work", Model());
+
+        // 复刻「整个模型调用窗口里改轴」那一刻：内存是 Running。
+        handle.UpdateState(s => s with { Status = SessionStatus.Running });
+
+        handle.UpdateStateAndPersist(_store, s => s with { Turn = 3 }, diskStatus: SessionStatus.Idle);
+
+        // 内存留 Running（这一步还在跑），磁盘钉回 Idle——两边**刻意不同**。
+        Assert.Equal(SessionStatus.Running, handle.State.Status);
+        Assert.Equal(SessionStatus.Idle, _store.ReadState(handle.ProjectKey, handle.SessionId).Status);
         Assert.Equal(3, _store.ReadState(handle.ProjectKey, handle.SessionId).Turn);
     }
 
@@ -179,19 +197,18 @@ public class SessionHandleTests : IDisposable
     // 轴与 Turn 住同一份 State，别拆成两份（拆了 Turn 会被抹成 0 且无报错）。
     // 判据用 Turn 而不是 Status——磁盘上写过的状态只有 "Idle"，抹掉它这条测试也发现不了。
     [Fact]
-    public void SaveAxes_WritesTheAxisWithoutDisturbingTurn()
+    public void UpdateStateAndPersist_ChangingTheAxis_DoesNotDisturbTurn()
     {
         var handle = SessionHandle.Create(_store, @"C:\work", Model());
-        handle.State = handle.State with
+
+        handle.UpdateStateAndPersist(_store, s => s with
         {
             Turn = 3,
-            Axes = new Dictionary<string, string>(handle.State.Axes!, StringComparer.Ordinal)
+            Axes = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal)
             {
                 [Axes.Safety] = "prod",
             },
-        };
-
-        handle.SaveAxes(_store);
+        }, diskStatus: SessionStatus.Idle);
 
         var reread = _store.ReadState(handle.ProjectKey, handle.SessionId);
         Assert.Equal(3, reread.Turn);

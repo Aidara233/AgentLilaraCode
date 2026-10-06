@@ -1,16 +1,77 @@
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Lilara.Core.Kernel;
 using Lilara.Core.Storage;
 
 namespace Lilara.Core.Tests;
 
-// 磁盘格式已冻结：往返测试对形状变化（改字段名、换判别式、属性顺序）是瞎的，
+// 磁盘格式：**往返测试对形状变化（改字段名、换判别式、属性顺序）是瞎的**，
 // 故这里钉精确字节——期望字节是实测出来的，不是猜的。
+//
+// ⚠️ **这些断言真正在钉的是四件事，不是「每条记录各自的性质」**：
+//   ① `Json.Options` 的设置（`WhenWritingNull` / camelCase / 不转义非 ASCII / 枚举按名）
+//      ② 字段的**声明顺序**（序列化顺序 = 声明顺序）
+//   ③ 字段名与判别式串
+//   ④ 格式版本号
+// ⇒ 所以「加一个字段」不该来这里改期望串（除了版本号那一段），**改 `Json.Options` 才该让一大片一起红**。
+// 把它们分散写成「某条记录逐字节不变」会让人以为它们是四道独立防线，其实是一道说了几遍。
 public class DiskFormatGoldenTests
 {
     private static ModelSelection Sel() => new()
     {
         ProviderId = "p", ModelId = "m", Protocol = "claude-messages", Effort = "high", MaxTokens = 16000,
     };
+
+    // ---- ① 序列化器设置本身 ----
+    //
+    // ⚠️ 这一段是**那个真正的锚点**。下面所有的「某个键整个不出现」都是这一条设置的效果；
+    // 改它而不动这里，会让一大片金样同时变红，而红的原因不易看出来。
+    [Fact]
+    public void SerializerSettings_ArePinned()
+    {
+        Assert.Equal(JsonIgnoreCondition.WhenWritingNull, Json.Options.DefaultIgnoreCondition);
+        Assert.Equal(JsonNamingPolicy.CamelCase, Json.Options.PropertyNamingPolicy);
+        Assert.Equal(JavaScriptEncoder.UnsafeRelaxedJsonEscaping, Json.Options.Encoder);
+        Assert.False(Json.Options.WriteIndented);
+
+        // 枚举按名、且是小写 camelCase：换成整数会让成员重排**静默重解释**既有历史。
+        // ⚠️ 断言写成**行为**而不是 `converter.NamingPolicy`——那个属性不是公开成员。
+        // 顺带这也是更好的判据：它钉的是「落盘长什么样」，不是「转换器怎么配的」。
+        // `Speaker` 是磁盘模型里唯一的枚举（`ReasoningKind` 是字符串常量类，不是枚举）。
+        Assert.NotNull(Assert.Single(Json.Options.Converters.OfType<JsonStringEnumConverter>()));
+        Assert.Equal("\"user\"", JsonSerializer.Serialize(Speaker.User, Json.Options));
+        Assert.Equal("\"model\"", JsonSerializer.Serialize(Speaker.Model, Json.Options));
+    }
+
+    // ---- ④ 格式版本 ----
+    //
+    // ⚠️ 版本号进**磁盘**；它**也**会漏进 `/state` 的响应，因为那个端点**直接序列化磁盘记录**
+    //（`spec` / `state` 两个对象原样交出去），而不是逐字段手选。
+    // ⚠️ **这与 provider 那半刻意不同**：`/providers` 是逐字段手选的
+    //（key 就是那样被挡在外面的）⇒ 版本号到不了那里。
+    // ⚠️ 漏出去**不是缺陷**：多头一个键无害，而且「这个会话是被更新的核心写的」是头**该知道**的事。
+    // 但它是**线上表面的增长**，所以钉下来，别让它悄悄发生。
+    [Fact]
+    public void FormatVersion_IsWrittenToDisk_AndRidesAlongInTheStateSnapshot()
+    {
+        var spec = new SessionSpec
+        {
+            SessionId = "abc123",
+            ProjectKey = "pk1",
+            WorkingDirectory = @"C:\work",
+            CreatedAt = DateTimeOffset.UnixEpoch,
+            Model = Sel(),
+        };
+
+        var onDisk = JsonSerializer.Serialize(spec, Json.Options);
+        Assert.StartsWith("""{"version":1,""", onDisk);
+
+        // 线上那一份：同一批选项（`WireFormatTests` 钉着两份设置一致），端点又直接序列化这个类型
+        // ⇒ 版本号跟着走。**这就是它出现在头那边的原因**，不是谁忘了挡。
+        var onWire = JsonSerializer.Serialize(spec, Hosting.WireJson.Options);
+        Assert.StartsWith("""{"version":1,""", onWire);
+    }
 
     [Fact]
     public void SessionSpec_KeepsItsExactBytes()
@@ -25,11 +86,11 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
+            """{"version":1,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
-    // ⚠️ 上面那条是「不设 title / archivedAt 时逐字节不变」——**加字段不破格式的唯一证据**。
+    // ⚠️ 上面那条是「不设 title / archivedAt 时它们整个键不出现」——**加可空字段不破格式的证据**。
     // 这一条钉的是设上之后的字节（顺序 = 声明顺序，追加在 `model` 之后）。
     [Fact]
     public void SessionSpec_WithTitleAndArchive_KeepsItsExactBytes()
@@ -46,7 +107,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
+            """{"version":1,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -77,7 +138,7 @@ public class DiskFormatGoldenTests
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":1,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -141,14 +202,14 @@ public class DiskFormatGoldenTests
         Assert.Contains("\"kind\":\"text\"", typed);   // 嵌套块的判别式仍在
     }
 
-    // 老 state.json 没有 axes 键，必须仍然合法——WhenWritingNull 让没设轴的 state 逐字节不变。
+    // 老 state.json 没有 axes 键，必须仍然合法——WhenWritingNull 让没设轴的 state 不写出那个键。
     [Fact]
-    public void SessionState_WithoutAxes_IsByteIdenticalToBeforeTheAxisFeature()
+    public void SessionState_WithoutAxes_OmitsTheKeyEntirely()
     {
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":1,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -163,7 +224,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
+            """{"version":1,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 }
