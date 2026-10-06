@@ -243,7 +243,28 @@ function renderSessions() {
 
 // ---- 打开会话：先快照，再带高水位订阅 ----
 
+/// <summary>
+/// 打开一个会话——**它保证不抛**。
+///
+/// <para>⚠️ **这层壳是实测加的**（2026-10-06）：它从**五处**被调用
+/// （点会话行 · 引导 · 重连 · 视图切回 · `create` 之后），其中几处**没有 catch**
+/// ⇒ 里面任何一步抛出去都是一次**未观测的 promise 拒绝**，页面**一声不吭**
+/// （实测症状：点会话行之后时间线空着，除了浏览器控制台没有任何提示——
+/// 根因是 `renderAxes` 换掉了带 id 的节点，而它在**清空时间线之后、渲染历史之前**）。</para>
+///
+/// <para>⚠️ 所以这里不只是「接住」：**要把失败说到时间线上**。核心那条
+/// 「不许静默」的纪律在这里同样适用——用户看不到的错误等于没有报错。</para>
+/// </summary>
 async function openSession(id) {
+  try {
+    await openSessionInner(id);
+  } catch (e) {
+    console.error("[lilara] openSession 失败", id, e);
+    renderMeta("✗ 打开会话时出错：" + (e && e.message ? e.message : e), "error");
+  }
+}
+
+async function openSessionInner(id) {
   // 世代号让后一次调用作废前一次（同 id 双击时 current !== id 判不出来）。
   const gen = ++epoch;
 
@@ -985,21 +1006,19 @@ let ALERT_FROM   = "";
 // ⚠️ 轴名**不写字面量**，一律回去查核心给的表。
 const axisNamed = (n) => AXES.find((a) => a.name === n);
 
-// 渲染时会被**换掉**的控件要留住引用：安全轴那一格在 HTML 里是个 `<select>`，
-// 每渲染一次就 `replaceWith` 一个新控件 ⇒ 第二次必须用上一次换进去的那个，
-// 否则会往一个已脱离文档的节点上画（页面上什么都看不到，且不报错）。
-const caret = { axSecurity: null };
+// ⚠️ **别再给这里加「缓存节点引用」的兜底**（曾有一个 `caret` 对象，已删）。
+// 根因是**换进去的新控件丢了 id**：`$("ax-safety")` 从此永远是 null，
+// 而 `renderAxes` 开头那一句是**直接查 DOM** 的 ⇒ 第二次渲染必炸
+// （实测：`Cannot set properties of null (setting 'innerHTML')` at `renderAxes`）。
+// ⇒ 修法是**让新节点带上同一个 id**，`$()` 就一直拿得到——**一个机制，不是两个**。
 
 function renderAxes(values) {
   axes = values || {};
-  $("ax-safety").innerHTML = "";
+  // ⚠️ **先拿、再用**：这个节点每次渲染都会被换掉（见下面 `replaceWith`），
+  // 所以不能分开查两次，也不能假设它还是 HTML 里那一个。
+  const secSel = $("ax-safety");
+  secSel.innerHTML = "";
   $("axes").innerHTML = "";
-
-  // ⚠️ 安全轴那一格在 HTML 里是个 `<select>`，被 `replaceWith` 换掉之后**需要重新拿**。
-  // 第一次渲染时它是原始的；之后每次渲染它都是上一次换进去的那个控件。
-  // 不修回来的话，第二次 renderAxes 会往一个**已经脱离文档**的节点上画（页面上什么都没有）。
-  if (!caret.axSecurity) caret.axSecurity = $("ax-safety");
-  const secSel = caret.axSecurity;
 
   for (const a of AXES) {
     const row = document.createElement("div");
@@ -1050,8 +1069,12 @@ function renderAxes(values) {
     //    轴名归核心，头这里只能按核心给的数据认。
     if (a.values && a.values.includes(ALERT_SAFETY)) {
       $("ax-safety-label").textContent = a.label;
+      // ⚠️ **换进去的新控件必须带上同一个 id**：不带的话 `$("ax-safety")` 从此是 null
+      // （`replaceWith` 搬走的是**原来那个**节点），而本函数开头正是靠 `$()` 拿它的。
+      // 这就是「第二次打开会话时时间线空白」那个 bug——`renderAxes` 在 `openSession` 里
+      // 抛异常，而它在**清空时间线之后、渲染历史之前** ⇒ 历史永远渲染不出来。
+      ctl.id = "ax-safety";
       secSel.replaceWith(ctl);
-      caret.axSecurity = ctl;      // 换过了，下次要用新的那个
       continue;
     }
 
