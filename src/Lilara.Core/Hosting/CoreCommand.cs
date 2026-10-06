@@ -159,6 +159,23 @@ public abstract record CoreCommand
     /// </summary>
     public sealed record SessionDelete(string SessionId) : CoreCommand;
 
+    /// <summary>
+    /// **回收一次**（`01` §8.0.2 / §11）：重算这个会话里哪些工具结果该降级，然后换渲染。
+    ///
+    /// <para>⚠️ <b>它是触发源，不是回收本身</b>——回收的判定在 `Reclaim.Decide`，
+    /// 而今天**唯一的触发源就是这个手动命令**（用户裁定「现在暂且手动触发，后续再加自动」）。
+    /// 这与 `00` §0 的宪法同向：回收改的是前缀**中段** ⇒ 每触发一次破一次缓存
+    /// ⇒ 窗口本来就不该自动开。</para>
+    ///
+    /// <para>⚠️ <b>磁盘一字不动</b>（§8.0.2 一）：这个命令只换内存里那份回收集合，
+    /// 记录、库、`state.json` 全都不写。⇒ 「回收」这个词在这里的准确含义是
+    /// <b>「把字节换成指针」</b>，不是删除。</para>
+    ///
+    /// <para>⚠️ **全会话，没有范围参数**：§12.4 的 `release` 才是**作用域化**的那个
+    /// （按声明树），而它依赖声明系统。今天没有范围概念 ⇒ 全会话。</para>
+    /// </summary>
+    public sealed record SessionGc(string SessionId) : CoreCommand;
+
     /// <summary>占用一片区域。路径可以是相对的，按会话的工作目录解析。</summary>
     /// <param name="Scope">
     /// **名字与形状都照协议**：release 的形参写作 `scope: [...]` ⇒ 它是**列表**。

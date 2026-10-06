@@ -121,7 +121,8 @@ public class WireFormatTests
 
         // ⚠️ 探针：类型搬走 / 反射换了写法时，下面那个空断言会**假绿**。
         // ⚠️ **加事件类型时按实测改这个数，别按感觉改**（被机械改过的探针等于没有）。
-        Assert.Equal(13, declared.Length);
+        // 13 → 14：`session.reclaimed`（2026-10-06，回收批）。
+        Assert.Equal(14, declared.Length);
 
         var dispatcher = File.ReadAllText(Path.Combine(
             RepoRoot(), "src", "Lilara.Core", "Hosting", "CommandDispatcher.cs"));
@@ -133,10 +134,11 @@ public class WireFormatTests
 
     // 同族的探针守卫：`03` §4 的数条数那句的自动化版。
     // ⚠️ 它钉的是「表本身」，不是「文档里写的那个数」——文档那个数靠这条测试红来维护。
+    // 13 → 14：`session.reclaimed`（2026-10-06，回收批）。
     [Fact]
     public void WireEventTable_HasExactlyTheTypesWeThinkItDoes()
     {
-        Assert.Equal(13, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+        Assert.Equal(14, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
     }
 
     /// <summary>

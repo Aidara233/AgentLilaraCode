@@ -174,6 +174,10 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("session archive ", StringComparison.Ordinal))
             return ParseSessionArchive(trimmed);
 
+        // ---- 回收：与上面三条同一形状（只带一个会话 id，判词数就行）----
+        if (trimmed.StartsWith("session gc ", StringComparison.Ordinal))
+            return OneWord(trimmed, "session gc ", id => new CoreCommand.SessionGc(id));
+
         // 光一个 `axis` 不能落回「当成消息」——用户以为在设轴（`axis set` 已被上面截住）。
         if (string.Equals(trimmed, "axis", StringComparison.OrdinalIgnoreCase))
             return (null, "用法：axis set <会话 id> <轴> <值>");
@@ -200,7 +204,8 @@ public static class CoreCommandParser
                 + "\n      session list | session create [--cwd <目录>] [--title <名>]"
                 + " | session activate <id> | session interrupt <id>"
                 + "\n      session configure <id> [--provider <pid>] [--model <m>]"
-                + "\n      session deactivate <id> | session archive <id> [--unarchive] | session delete <id>");
+                + "\n      session deactivate <id> | session archive <id> [--unarchive] | session delete <id>"
+                + " | session gc <id>");
 
         // 光一个 `provider delete` 不能落回「当成消息」——用户以为删了，而 provider 还在盘上。
         if (string.Equals(trimmed, "provider delete", StringComparison.Ordinal))
@@ -223,6 +228,11 @@ public static class CoreCommandParser
 
         if (string.Equals(trimmed, "session archive", StringComparison.Ordinal))
             return (null, "用法：session archive <会话 id> [--unarchive]");
+
+        // ⚠️ 光杆的 `session gc` 同样不能落回「当成消息」——用户以为回收了，
+        // 而那句话被当成消息发给会话、**还烧了一次模型调用**。
+        if (string.Equals(trimmed, "session gc", StringComparison.Ordinal))
+            return (null, "用法：session gc <会话 id>");
 
         if (IsClaimList(trimmed)) return (null, null);
 

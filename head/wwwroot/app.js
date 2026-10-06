@@ -279,6 +279,7 @@ async function openSessionInner(id) {
   if (gen !== epoch) return;
   current = id;
   $("interrupt").disabled = false;   // 没选中会话时它是死的 —— 别让它看起来可点（点了也没事，只是会骗人）
+  $("gc").disabled = false;
   renderSessions();
   // ⚠️ 这里**不设 `#title`**——名字/ id 要等快照回来（`renderTitle`）。先设一个 id
   // 再被名字盖掉会闪一下，而且那是同一事实的两个显示点。
@@ -894,6 +895,7 @@ function clearCenter() {
   $("status").textContent = "未连接";
   $("status").className = "chip";
   $("interrupt").disabled = true;
+  $("gc").disabled = true;
   $("sess-detail").innerHTML = '<div class="note">未选会话。</div>';
   $("proj-detail").innerHTML = '<div class="note">未选会话。</div>';
   $("model-picker").innerHTML = "";
@@ -1382,6 +1384,13 @@ function handleEvent(p) {
       if (p.sessionId === current) openSession(current);
       break;
 
+    case "session.reclaimed":
+      // ⚠️ **回收不改盘**：核心只是换了一份渲染，而 `/history` 拿的就是那份
+      // ⇒ 不重拉的话，页面会一直显示回收**之前**的形态，而且完全看不出来。
+      // 判据是「该重拉了」，删什么、怎么显示由核心说了算（判定只有 `Reclaim.Decide` 一处）。
+      if (p.sessionId === current) openSession(current);
+      break;
+
     case "error":
       // 业务失败走这里（不是 rejected：命令本身没写错）。
       if (p.sessionId === current) renderMeta("✗ " + p.message, "error");
@@ -1491,6 +1500,13 @@ function renderNewProjectOptions() {
 
 $("interrupt").onclick = () => {
   if (current) command(crypto.randomUUID().slice(0, 8), { kind: "session.interrupt", sessionId: current });
+};
+
+// 回收（`01` §8.0.2，手动触发）。⚠️ 这里**不等回执、也不改本地状态**：
+// 判定与换渲染都在核心，头要做的一切就是「发命令」，然后等 `session.reclaimed` 回来重拉历史。
+// 在这里自己算一遍会造出**第二份判据**——而那样两边迟早会漂。
+$("gc").onclick = () => {
+  if (current) command(crypto.randomUUID().slice(0, 8), { kind: "session.gc", sessionId: current });
 };
 
 // GET /providers 是引导要用的：端点不存在时 bootstrap() 会在 fetch().json() 上抛，

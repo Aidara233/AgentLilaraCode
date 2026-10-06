@@ -18,6 +18,7 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(SessionDeactivated), "session.deactivated")]
 [JsonDerivedType(typeof(SessionArchived), "session.archived")]
 [JsonDerivedType(typeof(SessionDeleted), "session.deleted")]
+[JsonDerivedType(typeof(SessionReclaimed), "session.reclaimed")]
 [JsonDerivedType(typeof(Error), "error")]
 public abstract record WireEvent
 {
@@ -94,6 +95,23 @@ public abstract record WireEvent
     /// （`session.created` 那两份投递里「会话流那份」是既有的死投递，本批**不动**它。）
     /// </remarks>
     public sealed record SessionDeleted(string SessionId, string ProjectKey) : WireEvent;
+
+    /// <summary>
+    /// **回收算完了**（`session.gc`）：这个会话现在有 <paramref name="Reclaimed"/> 条工具结果被降级。
+    ///
+    /// <remarks>
+    /// ⚠️ <b>它必须在场，因为回收<b>不改盘</b></b>（`01` §8.0.2 一）：头看的
+    /// `/sessions/{id}/history` 是**核心渲染的形态**，而回收正好换的就是那个形态
+    /// ⇒ 不发这条事件，头会一直显示回收之前的（而且完全看不出来）。
+    /// ⇒ 头收到它就**重拉一次历史**。
+    ///
+    /// ⚠️ <b>载荷带 <paramref name="Reclaimed"/>（条数）而不是集合</b>：头要的是
+    /// 「该重拉了」这个信号，不是自己重算一遍回收（那是核心的判定，`Reclaim.Decide` 一处）。
+    ///
+    /// ⚠️ <b>投递范围与会话内的事件一视同仁</b>（会话流）：它讲的是「这个会话的形态变了」。
+    /// </remarks>
+    /// </summary>
+    public sealed record SessionReclaimed(string SessionId, int Reclaimed) : WireEvent;
 
     // 参数类型必须是 WireEvent（基类）：泛型版在静态类型推断成子类时会静默丢掉判别式。
     public static string StableSerialize(WireEvent value) =>

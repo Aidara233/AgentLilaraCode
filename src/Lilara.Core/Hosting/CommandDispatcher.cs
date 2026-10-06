@@ -86,6 +86,10 @@ public sealed class CommandDispatcher(
                 case CoreCommand.SessionDelete del:
                     return HandleSessionDelete(del, commandId);
 
+                // ---- 回收（触发源是手动；`01` §8.0.2）----
+                case CoreCommand.SessionGc g:
+                    return HandleSessionGc(g, commandId);
+
                 case CoreCommand.ClaimAcquire a: return HandleClaimAcquire(a, commandId);
                 case CoreCommand.ClaimRelease r: return HandleClaimRelease(r, commandId);
 
@@ -430,6 +434,48 @@ public sealed class CommandDispatcher(
         // 激活只是载入内存，不许写「控制台的当前会话」（那是 `Repl.Current` 自己的概念）——
         // 否则头点一下 B 就改掉控制台的当前会话，用户在控制台敲的下一句会跑到 B 去。
         return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = a.SessionId });
+    }
+
+    /// <summary>
+    /// **回收一次**（`01` §8.0.2）：重算集合 → 换渲染 → 发事件。磁盘一字不动。
+    ///
+    /// <para>⚠️ <b>它拿会话闸</b>（与退订 / 归档那三条同一个理由）：回收改的是
+    /// **要发给模型的字节**。若与在跑的步交错，那个步可能一半用旧形态、一半用新形态——
+    /// 而前缀的一致性正是整套经济学的地基（`00` §0）。⇒ 要么整个步在旧的形态下跑完，
+    /// 要么整个在旧的形态下跑完之后才换。</para>
+    ///
+    /// <para>⚠️ <b>它<b>不</b>搬动磁盘、也<b>不</b>碰库</b>：`Decide` 只读。这条命令的全部效果
+    /// 是「换一份内存里的渲染」——所以它**可逆、无副作用**，随时可以再触发一次。</para>
+    /// </summary>
+    private DispatchResult HandleSessionGc(CoreCommand.SessionGc g, string id)
+    {
+        if (!TryFind(g.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
+
+        var gate = _host.GateFor(handle.SessionId);
+        gate.Wait();
+
+        int count;
+        try
+        {
+            // ⚠️ 判定读的是**记录**（`_host.Store.ReadTimeline`），不是渲染后的形态。
+            var reclaimed = Reclaim.Decide(
+                _host.Store.ReadTimeline(handle.ProjectKey, handle.SessionId),
+                new Storage.BlobStore(_host.Store.DataRoot));
+
+            handle.SetReclaimed(reclaimed);
+            count = reclaimed.Count;
+        }
+        finally
+        {
+            gate.Release();
+        }
+
+        // ⚠️ **没有它头就看不见**：回收不改盘，头看的是核心渲染的那份形态 ⇒
+        // 不告诉它一声，它会一直显示回收之前的（而且完全看不出来）。
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.SessionReclaimed(handle.SessionId, count));
+
+        return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = g.SessionId });
     }
 
     private async Task<DispatchResult> HandleSessionSendAsync(

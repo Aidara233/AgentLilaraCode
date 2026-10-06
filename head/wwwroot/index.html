@@ -734,6 +734,9 @@ button:disabled:hover { border-color: var(--rule); }
     <span id="title" class="muted">未选会话</span>
     <span id="status" class="chip">未连接</span>
     <span class="spacer"></span>
+    <!-- ⚠️ 回收是**手动触发**的（`01` §8.0.2，用户裁定「先手动、后续再加自动」）⇒
+         没有这个按钮，那条命令在界面上就没有入口。它**不改盘、无副作用**，随时可以再点。 -->
+    <button id="gc" class="btn-ghost" disabled>回收</button>
     <button id="interrupt" class="btn-ghost" disabled>中断</button>
   </div>
 

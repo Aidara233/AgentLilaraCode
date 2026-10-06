@@ -287,4 +287,85 @@ public class StepperToolTests : IDisposable
         // （本仓栽过：`2009d9f` 删掉的正是这一类计数）。这里要钉的是**「发的是同一份表」**。
         Assert.Equal(BuiltInTools.All.Count, second.Tools.Count);
     }
+
+    // ---- 回收：整条链（`01` §8.0.2）----
+
+    /// <summary>
+    /// **回收 → 下一步的请求换成注记 → `fetch` 取回当时的字节**，全程走真推进器。
+    ///
+    /// <para>⚠️ 四种记录形状里**两种都要测**（内联的、留库地址的）——它们是两条不同的渲染路径。
+    /// 这里用**大的**（过 `InlineThresholdBytes` ⇒ 记录里是 `StoreBlock`）。</para>
+    ///
+    /// <para>⚠️ **最硬的一条断言是「盘面一字不动」**：回收不是删除，是换个渲染
+    /// （`01` §8.0.2 一 / 八）。它是可以直接测的，所以必须测。</para>
+    /// </summary>
+    [Fact]
+    public async Task Reclaim_ReplacesTheResultWithANote_AndFetchBringsBackTheBytes()
+    {
+        var file = Path.Combine(_work, "src", "big.cs");
+        var original = new string('x', BlobStore.InlineThresholdBytes + 1);
+        File.WriteAllText(file, original);
+
+        var handle = NewSession();
+        _adapter.ReplyWith(_ => Calls(("c1", "read", ReadArgs("src/big.cs"))));
+        await _stepper.StepAsync(handle, "读", default);
+
+        // ⚠️ 保护带会让「唯一的这条」落在窗口内 ⇒ 得先垫几条可回收的结果，回收才碰得到它。
+        // （这也是真实形态：保护带本来就是「最近 N 条不动」。）
+        for (var i = 0; i < Reclaim.ProtectedRecentResults; i++)
+        {
+            _adapter.ReplyWith(_ => Calls(($"f{i}", "read", ReadArgs("src/big.cs"))));
+            await _stepper.StepAsync(handle, [], default);
+        }
+
+        // ⚠️ **回收是内存账**：先记下盘面的字节数，回收之后再核一遍。
+        var history = Path.Combine(_store.SessionDirectory(handle.ProjectKey, handle.SessionId), "history.jsonl");
+        var before = File.ReadAllBytes(history);
+
+        // 触发的那一次（`session.gc` 走的就是这个判定）。
+        var reclaimed = Reclaim.Decide(
+            _store.ReadTimeline(handle.ProjectKey, handle.SessionId), new BlobStore(_store.DataRoot));
+        Assert.NotEmpty(reclaimed);
+        handle.SetReclaimed(reclaimed);
+
+        // ⚠️ 回收**只动注入、不动持久化**——盘面逐字节不变。
+        Assert.Equal(before, File.ReadAllBytes(history));
+
+        // 下一步的请求里：原文没了、注记在、`tool_use` 原样。
+        _adapter.Reply("好");
+        await _stepper.StepAsync(handle, [], default);
+        var sent = _adapter.Calls[^1].Timeline;
+
+        // `tool_use` 一个字不动（它是模型自己的输出，也是那个**锚**）。
+        Assert.Contains(sent, e =>
+            e is TimelineEvent.MessageEvent m && m.Blocks.OfType<Block.ToolUseBlock>()
+                .Any(b => b.Name == "read" && b.Arguments.Contains("big.cs")));
+
+        // ⚠️ **按 id 精确断言**：被收的那几条换成了注记，**没被收的原样**。
+        // （写成「整条时间线里没有原文」会把保护带里那些同内容的结果一起算进去——
+        // 而它们本来就该在。）
+        var byId = sent.OfType<TimelineEvent.ToolResultEvent>().ToDictionary(r => r.Id, r => r);
+        foreach (var rid in reclaimed)
+        {
+            var text = string.Concat(byId[rid].Content.OfType<Block.TextBlock>().Select(b => b.Text));
+            Assert.Contains("[已回收]", text, StringComparison.Ordinal);
+            Assert.Contains(rid, text, StringComparison.Ordinal);      // 注记给的是**记录 id**
+            Assert.DoesNotContain(original, text, StringComparison.Ordinal);
+        }
+
+        // 没被回收的（保护带里的那些）内容原样——这是「只降一部分」的另一半。
+        Assert.Contains(sent.OfType<TimelineEvent.ToolResultEvent>(),
+            r => !reclaimed.Contains(r.Id) && r.Content.OfType<Block.TextBlock>().Any(b => b.Text == original));
+
+        // 注记里给出的那个 id 真的取得回**当时那份字节**。
+        var noteId = Assert.Single(reclaimed).ToString();
+        var fetched = await new FetchTool().RunAsync(
+            new ToolCall("f1", "fetch",
+                System.Text.Json.JsonSerializer.Serialize(new { id = noteId })),
+            new SessionToolContext(_work, new BlobStore(_store.DataRoot),
+                _store.ReadTimeline(handle.ProjectKey, handle.SessionId)),
+            default);
+
+        Assert.Equal(original, Assert.IsType<Block.TextBlock>(Assert.Single(fetched.Content)).Text);
+    }
 }

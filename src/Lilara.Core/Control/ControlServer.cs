@@ -569,6 +569,9 @@ public sealed class ControlServer(
                 payload.GetProperty("sessionId").GetString()!, OptBool(payload, "archived")),
             "session.delete" => new CoreCommand.SessionDelete(
                 payload.GetProperty("sessionId").GetString()!),
+            // 同 session.setAxis：线上解析是第三条线。载荷只有一个会话 id（全会话、无范围）。
+            "session.gc" => new CoreCommand.SessionGc(
+                payload.GetProperty("sessionId").GetString()!),
             "provider.upsert" => new CoreCommand.ProviderUpsert(
                 payload.GetProperty("id").GetString()!,
                 // apiKey 必须走 Opt：GetProperty 在键缺失时抛 KeyNotFoundException，
