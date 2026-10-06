@@ -475,7 +475,18 @@ public sealed class CommandDispatcher(
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
             new WireEvent.SessionReclaimed(handle.SessionId, count));
 
-        return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = g.SessionId });
+        // ⚠️ **回执里必须说结果**，不能只回一个「收到了」：回收常常**一条都收不了**
+        // （都在保护带里 / 内容指向的对象不在库里）——那时渲染一字未变，
+        // 而用户看到的就是「**按了没反应**」，与「坏了」长得一模一样。
+        // `Note` 正是给「业务结果」用的（`provider.test` 就是这么用的），把条数说了就分得开。
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            SessionId = g.SessionId,
+            Note = count == 0
+                ? "没有可回收的结果（都在保护带里，或者内容已经不在库里）"
+                : $"回收了 {count} 条结果",
+        });
     }
 
     private async Task<DispatchResult> HandleSessionSendAsync(

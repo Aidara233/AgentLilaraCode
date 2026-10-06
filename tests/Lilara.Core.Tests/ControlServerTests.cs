@@ -1349,4 +1349,80 @@ public class ControlServerTests : IAsyncLifetime
         Assert.False(ack.GetProperty("accepted").GetBoolean());
         Assert.Contains("nope", ack.GetProperty("reason").GetString());
     }
+
+    // ---- 回收的线上那一线（回收批）----
+
+    /// <summary>
+    /// ⚠️ **`session.gc` 是同步跑完才回执的，而头在等回执的整个窗口里 `current` 还是旧会话。**
+    /// 连续点两次（或切完会话立刻点）时，第二条命令会带着**上一个会话的 id** 发出去。
+    ///
+    /// <para>这条钉的是**核心侧那一半**：它必须<b>当场、在这个会话上</b>把回收算完并发出事件
+    /// ——这样头「等回执 → 用它带回的 sessionId 去重拉」那条路才成立。</para>
+    ///
+    /// <para>⚠️ <b>为什么这条必须有</b>：`session.reclaimed` 的整个存在理由就是
+    /// 「回收不改盘，头不重拉就永远看不见」⇒ 事件没发出来 = 这个功能在线上是**静默失效**的
+    /// （核心那边一切正常、控制台也看得见，只有头什么都看不到）。</para>
+    /// </summary>
+    [Fact]
+    public async Task WebSocket_SessionGc_ReclaimsInThatSession_AndAnnouncesIt()
+    {
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+
+        await SendAsync(ws, """{"kind":"command","id":"c1","payload":{"kind":"session.create"}}""");
+        var sid = (await ReceiveAsync(ws)).GetProperty("sessionId").GetString()!;
+
+        await SendAsync(ws, "{\"kind\":\"subscribe\",\"topic\":\"session:" + sid + "\"}");
+
+        // 一条**过阈值**的工具结果 ⇒ 可回收（保护带之后才会被收，所以多造几条）。
+        var big = new string('x', BlobStore.InlineThresholdBytes + 1);
+        for (var i = 0; i < Session.Reclaim.ProtectedRecentResults + 1; i++)
+        {
+            _adapter.ReplyBlocks(new Block.ToolUseBlock($"k{i}", "read", """{"path":"a.txt"}"""));
+            _adapter.Reply("好");
+        }
+
+        // 让那个工作目录里有那个文件，`read` 才产得出快照。
+        Directory.CreateDirectory(_work);
+        File.WriteAllText(Path.Combine(_work, "a.txt"), big);
+
+        for (var i = 0; i <= Session.Reclaim.ProtectedRecentResults; i++)
+        {
+            await SendAsync(ws,
+                "{\"kind\":\"command\",\"id\":\"s" + i + "\",\"payload\":{\"kind\":\"session.send\","
+                + "\"sessionId\":\"" + sid + "\",\"blocks\":[{\"kind\":\"text\",\"text\":\"读一下\"}]}}");
+
+            // ⚠️ **收到这条的回执为止**——不要用「超时就当收完」那种排空：
+            // `ManagedWebSocket` 在**取消**挂起的接收时会**中止整个连接**
+            // （实测：下一次 `SendAsync` 直接抛 `WebSocketState.Aborted`）。
+            // 而每条命令**一定**有回执（成败都有）⇒ 按回执收是确定性的、不靠超时。
+            for (var k = 0; ; k++)
+            {
+                Assert.True(k < 200, "排空事件时收不到 s" + i + " 的回执");
+                if (await ReceiveAsync(ws) is { } f
+                    && f.GetProperty("kind").GetString() == "ack"
+                    && f.GetProperty("id").GetString() == "s" + i) break;
+            }
+        }
+
+        await SendAsync(ws,
+            "{\"kind\":\"command\",\"id\":\"g1\",\"payload\":{\"kind\":\"session.gc\",\"sessionId\":\"" + sid + "\"}}");
+
+        // ⚠️ 回执必须**当场**回来（同步算完），且在这条流上发了 `session.reclaimed`。
+        var sawGc = false;
+        var ackG1 = false;
+        for (var i = 0; i < 200 && !(sawGc && ackG1); i++)
+        {
+            var f = await ReceiveAsync(ws);
+            var kind = f.GetProperty("kind").GetString();
+            if (kind == "ack" && f.GetProperty("id").GetString() == "g1") ackG1 = true;
+            if (kind == "event"
+                && f.GetProperty("payload").GetProperty("kind").GetString() == "session.reclaimed")
+                sawGc = true;
+        }
+
+        Assert.True(ackG1, "session.gc 的回执必须到（它是同步算完才回的）");
+        Assert.True(sawGc,
+            "必须发 session.reclaimed——回收不改盘，头不重拉就永远看不见（这条不发 = 功能静默失效）");
+    }
 }

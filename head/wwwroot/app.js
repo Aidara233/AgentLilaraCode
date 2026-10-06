@@ -1502,11 +1502,35 @@ $("interrupt").onclick = () => {
   if (current) command(crypto.randomUUID().slice(0, 8), { kind: "session.interrupt", sessionId: current });
 };
 
-// 回收（`01` §8.0.2，手动触发）。⚠️ 这里**不等回执、也不改本地状态**：
-// 判定与换渲染都在核心，头要做的一切就是「发命令」，然后等 `session.reclaimed` 回来重拉历史。
-// 在这里自己算一遍会造出**第二份判据**——而那样两边迟早会漂。
+// 回收（`01` §8.0.2，手动触发）。
+//
+// ⚠️ **走 `commandNow`，用回执里带回来的 `sessionId` 去重拉 —— 不用 `current`**：
+// `session.gc` 是**同步**算完才回执的，而在这整个窗口里 `current` 还是**别的会话**。
+// 用 `current` 的话有两处错，而且都不报错：
+//   ① 用户在回执回来之前切了会话 ⇒ 重拉的是**新会话**，而**刚被回收的那个永远不刷新**；
+//   ② 连着点两下（或切完会话立刻点）⇒ 第二条命令带着**上一个会话的 id** 发出去。
+// 回执里的那条 sessionId 是**我们发出去的那一条**，不受切换影响。
+//
+// ⚠️ 头**不自己算**「哪些能回收」：判定只有核心一处（`Reclaim.Decide`），
+// 这里自己算一遍就是第二份判据——两边迟早会漂。
+// 回收（`01` §8.0.2，手动触发）。
+//
+// ⚠️ **重拉历史只有一条路：`session.reclaimed` 事件。** 这里**不**自己 `openSession`：
+// 两条路会让每次点击都多拉一次 `/state` + `/history`，而多出来那条**没有对应的机制**
+// （事件那条已经够了，而且它带着正确的 `current` 判据）。
+//
+// ⚠️ **这里只负责「把结果说出来」。** 回执用的是 `commandNow`：那条路径**先判且判完就 return**
+// （见 `onmessage` 里 `pendingAcks` 那一段），所以不会在时间线上出现两次。
 $("gc").onclick = () => {
-  if (current) command(crypto.randomUUID().slice(0, 8), { kind: "session.gc", sessionId: current });
+  if (!current) return;
+  commandNow(crypto.randomUUID().slice(0, 8), { kind: "session.gc", sessionId: current })
+    .then((r) => {
+      // ⚠️ **成败都要说**：回收**常常一条都收不了**（都在保护带里 / 内容已不在库里），
+      // 而那时渲染一字未变 ⇒ 不报的话用户看到的就是「按了没反应」，它与「坏了」分不开。
+      // （核心的 `Note` 就是这个用途，与 `provider.test` 那条一致。）
+      if (r.accepted) { if (r.note) renderMeta("ℹ " + r.note); }
+      else renderMeta("✗ " + r.reason, "error");
+    });
 };
 
 // GET /providers 是引导要用的：端点不存在时 bootstrap() 会在 fetch().json() 上抛，
