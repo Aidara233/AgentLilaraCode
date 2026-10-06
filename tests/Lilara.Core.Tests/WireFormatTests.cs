@@ -139,6 +139,48 @@ public class WireFormatTests
         Assert.Equal(13, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
     }
 
+    /// <summary>
+    /// **没有任何消费者用「强转成某一个 `TimelineEvent` 子类」来处理时间线。**
+    ///
+    /// <para>⚠️ <b>这条守卫是从三次真实事故里长出来的</b>（2026-10-06）：加了
+    /// <c>ToolResultEvent</c> 之后，有四处代码写着 <c>(TimelineEvent.MessageEvent)evt</c>：
+    /// 三个协议适配器（我修了）· <c>ControlServer</c> 的线上渲染（**漏了 ⇒ `/history` 对含工具的
+    /// 会话直接 HTTP 500**）· 控制台的 `history` 命令（**也漏了 ⇒ InvalidCastException**）。
+    /// ⇒ 形状是「**加一个封闭层级的新变体，得找出所有消费者**」，而人记住的总是前几个。</para>
+    ///
+    /// <para>⚠️ <b>判据是源码文本，不是运行时</b>——同 <c>Clock_IsOnlyReadThroughCoreClock</c>
+    /// 那条：它不碰被测物，所以不存在「探针 ≠ 被测物」的问题。但它是**有用的近似，不是证明**：
+    /// 拦不住「先转成 <c>object</c> 再转回来」这类绕法。它管的是**最常见的那个写法**。</para>
+    /// </summary>
+    [Fact]
+    public void NoConsumer_CastsTheTimelineToASingleEventSubtype()
+    {
+        var types = typeof(TimelineEvent).GetNestedTypes()
+            .Where(t => t.IsSubclassOf(typeof(TimelineEvent)))
+            .Select(t => t.Name)
+            .ToArray();
+
+        // 探针：反射若换写法、类型搬走，下面那个空断言会假绿。
+        Assert.Equal(2, types.Length);
+
+        var root = Path.Combine(RepoRoot(), "src");
+        var offenders = Directory.GetFiles(root, "*.cs", SearchOption.AllDirectories)
+            // ⚠️ **必须切掉 `//` 之后的部分**（同 `Clock_IsOnlyReadThroughCoreClock`）：
+            // 不切的话，**这条守卫自己的注释**（里面拿强转当反面例子）就会**误报**，
+            // 而误报的守卫最后一定会被改成永远通过。实测踩过。
+            .SelectMany(f => File.ReadLines(f).Select((raw, n) =>
+            {
+                var cut = raw.IndexOf("//", StringComparison.Ordinal);
+                return (f, Line: n + 1, Text: cut < 0 ? raw : raw[..cut]);
+            }))
+            .Where(x => types.Any(t => x.Text.Contains($"TimelineEvent.{t})", StringComparison.Ordinal)))
+            .Select(x => $"{Path.GetFileName(x.f)}:{x.Line}  {x.Text.Trim()}")
+            .ToList();
+
+        Assert.Empty(offenders.Select(o =>
+            $"{o}   ← 强转成单一事件类型：加一个新事件类型时这里会 InvalidCastException。改用 switch 分派。"));
+    }
+
     private static string RepoRoot()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);

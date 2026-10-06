@@ -13,6 +13,9 @@ public class StepAtomicityTests : IDisposable
     private readonly string _root = Path.Combine(Path.GetTempPath(), "lilara-batch-" + Guid.NewGuid().ToString("N"));
     private string HistoryPath => Path.Combine(_root, "history.jsonl");
 
+    // ⚠️ `File.WriteAllText` **不会建目录**（`AppendMany` 会）⇒ 手写历史行的测试必须先建。
+    private void EnsureDir() => Directory.CreateDirectory(_root);
+
     public void Dispose()
     {
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
@@ -39,6 +42,70 @@ public class StepAtomicityTests : IDisposable
         HistoryLog.AppendMany(HistoryPath, []);
 
         Assert.False(File.Exists(HistoryPath));
+    }
+
+    /// <summary>
+    /// ⚠️ **老行（缺 `id`）必须读得回来——这是实测事故的回归测试**（2026-10-06）。
+    ///
+    /// <para>`0b` 把 <c>TimelineEvent.Id</c> 设成 <c>required</c>，而 <see cref="HistoryLog.ReadAll"/>
+    /// 有一个「为断电容错」的 <c>catch (JsonException)</c> ⇒ **老行和断点半行走进了同一个 catch**，
+    /// 被一起静默跳过 ⇒ 所有 10-06 之前的会话历史读出来是空的（实测：盘上 3 行、API 交 <c>[]</c>）。</para>
+    ///
+    /// <para>⚠️ 而**类型层仍然要求 id**（`BlobStoreTests.Event_WithoutAnId_IsRejectedLoudly` 照旧成立）——
+    /// 兼容层住在 <b>reader</b> 里，与 `ReadSpec` / `TryReadSpec`「两种读不出来、处置相反」同形。</para>
+    /// </summary>
+    [Fact]
+    public void ReadAll_StillReadsLegacyLinesWithoutAnId()
+    {
+        // 手写一条 2026-10-06 之前的形状：没有 id。
+        EnsureDir();
+        File.WriteAllText(HistoryPath,
+            """{"kind":"message","from":"user","blocks":[{"kind":"text","text":"老消息"}],"at":"1970-01-01T00:00:00+00:00"}"""
+            + "\n");
+
+        var events = HistoryLog.ReadAll(HistoryPath);
+
+        var evt = Assert.Single(events);
+        Assert.NotEmpty(evt.Id);   // 补出来的 id 非空
+        Assert.Equal("老消息", ((Block.TextBlock)((TimelineEvent.MessageEvent)evt).Blocks[0]).Text);
+    }
+
+    // ⚠️ 补出来的 id 必须**可复现**：同一份文件读两次得到同一个 id。否则 `fetch` 的引用静默失效。
+    [Fact]
+    public void ReadAll_LegacyId_IsStableAcrossReads()
+    {
+        EnsureDir();
+        File.WriteAllText(HistoryPath,
+            """{"kind":"message","from":"user","blocks":[],"at":"1970-01-01T00:00:00+00:00"}""" + "\n");
+
+        Assert.Equal(HistoryLog.ReadAll(HistoryPath)[0].Id, HistoryLog.ReadAll(HistoryPath)[0].Id);
+    }
+
+    // 老行与新行**混在同一份文件里**（只追加 ⇒ 升级之后必然如此）：两边都要读出来。
+    [Fact]
+    public void ReadAll_MixedLegacyAndNewLines_ReadsBoth()
+    {
+        EnsureDir();
+        File.WriteAllText(HistoryPath,
+            """{"kind":"message","from":"user","blocks":[],"at":"1970-01-01T00:00:00+00:00"}""" + "\n"
+            + """{"kind":"message","from":"user","blocks":[],"id":"new1","at":"1970-01-01T00:00:00+00:00"}""" + "\n");
+
+        var events = HistoryLog.ReadAll(HistoryPath);
+
+        Assert.Equal(2, events.Count);
+        Assert.Equal("new1", events[1].Id);   // 新行的 id 原样保留，没被改
+    }
+
+    // 真坏行（半行）**照旧跳过**——这条补丁不许把断电容错弄丢。
+    [Fact]
+    public void ReadAll_StillSkipsGenuinelyCorruptLines()
+    {
+        EnsureDir();
+        File.WriteAllText(HistoryPath,
+            """{"kind":"message","from":"user","blocks":[],"id":"ok","at":"1970-01-01T00:00:00+00:00"}""" + "\n"
+            + """{"kind":"mess""" + "\n");   // 断电半行
+
+        Assert.Single(HistoryLog.ReadAll(HistoryPath));
     }
 
     /// <summary>

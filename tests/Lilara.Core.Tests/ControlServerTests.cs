@@ -899,7 +899,44 @@ public class ControlServerTests : IAsyncLifetime
 
         // `rendered` 的每一项来自 `ControlServer.Render`（核心渲染、头只显示）——
         // 在这里钉它的键集，加字段会红。（`blocks` 自己那层归 `BlockTests`，不重复守。）
-        AssertEachItemKeysOf(root.GetProperty("rendered"), "from", "at", "blocks");
+        // ⚠️ `kind` 是 2026-10-06 加的：加了工具结果之后，`rendered` 里**不止消息一种**了
+        // ⇒ 头得能分辨（它按 kind 过滤不认识的）。工具结果那一支另给 `callId`、**没有 `from`**。
+        AssertEachItemKeysOf(root.GetProperty("rendered"), "kind", "from", "at", "blocks");
+    }
+
+    /// <summary>
+    /// ⚠️ **含工具调用的会话，`/history` 必须照常 200**（2026-10-06 修）。
+    ///
+    /// <para>原先 `ControlServer.Render` 把每个事件**强转成 `MessageEvent`** ⇒ 遇到
+    /// `ToolResultEvent` 直接 `InvalidCastException` ⇒ **端点 HTTP 500**
+    /// ⇒ 头那边表现为「加载不出会话内容」（实测：盘上 17 行、端点 500）。</para>
+    /// </summary>
+    [Fact]
+    public async Task Snapshot_History_WithToolResults_StillReturns200()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        // 直接落一条工具结果进记录（本测试在 HTTP 层，不必真跑一次工具）。
+        // ⚠️ 走**生产路径**的 append（`SessionStore.AppendEvents`），不是手写文件——
+        // 手写会绕过格式校验，那样这条测试就测不到「记录里真有这种事件」。
+        _host.Store.AppendEvents(
+            Kernel.ProjectKey.FromPath(_work), sid,
+            [
+                new TimelineEvent.ToolResultEvent
+                {
+                    Id = "r1", At = DateTimeOffset.UnixEpoch, CallId = "c1",
+                    Content = [new Block.TextBlock("结果")],
+                },
+            ]);
+
+        var root = await GetJson($"/sessions/{sid}/history");
+
+        // 工具结果那一项：有 kind / callId，**没有 from**。
+        var tool = root.GetProperty("rendered").EnumerateArray()
+            .Single(i => i.GetProperty("kind").GetString() == "toolResult");
+        Assert.Equal("c1", tool.GetProperty("callId").GetString());
+        Assert.False(tool.TryGetProperty("from", out _));
     }
 
     [Fact]

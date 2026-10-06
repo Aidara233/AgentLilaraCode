@@ -273,16 +273,41 @@ public sealed class ControlServer(
     }
 
     // 一条事件的可渲染形态（核心渲染，头只显示）。
-    private static object Render(Kernel.TimelineEvent evt)
+    /// <summary>
+    /// 一条记录 → 线上那一份「可渲染的形态」。
+    ///
+    /// <para>⚠️ <b>必须按事件类型分派，不能强转成 <c>MessageEvent</c></b>（2026-10-06 修）：
+    /// 加了 <c>ToolResultEvent</c> 之后，那句强转会让**含工具调用的会话
+    /// `/history` 直接 HTTP 500**（实测：盘上 17 行、端点 500）。
+    /// 而它正是头的「加载不出会话内容」的原因。</para>
+    ///
+    /// <para>⚠️ <b>形状上的两处刻意</b>：工具结果**没有 `from`**（它是 user 角色的载荷，
+    /// 但那不是「谁说的话」），另给 <c>kind:"toolResult"</c> 与配对的 <c>callId</c>。
+    /// ⇒ 头那边不认识这个 kind 时**只是不显示它**，不会崩（`textOf` 按 kind 过滤）。</para>
+    /// </summary>
+    private static object Render(Kernel.TimelineEvent evt) => evt switch
     {
-        var m = (Kernel.TimelineEvent.MessageEvent)evt;
-        return new
+        Kernel.TimelineEvent.MessageEvent m => new
         {
+            Kind = "message",
             From = m.From == Kernel.Speaker.User ? "user" : "model",
             At = m.At,
             Blocks = m.Blocks,
-        };
-    }
+        },
+
+        Kernel.TimelineEvent.ToolResultEvent r => new
+        {
+            Kind = "toolResult",
+            // ⚠️ 配对 id 交出去：头要拿它跟前一条的 `toolUse` 块对起来。
+            CallId = r.CallId,
+            At = r.At,
+            // ⚠️ 交的是**库里那个地址**，不是内容——`StoreBlock` 的大小可能远超一屏，
+            // 而这个端点是给浏览器渲染的。要内容得另走（`03` §9.4 的 `GET /store/{sha256}`，还没做）。
+            Blocks = r.Content,
+        },
+
+        _ => throw new ArgumentException($"控制面不认识这个事件类型（{evt.GetType().Name}）", nameof(evt)),
+    };
 
     // ---- WS ----
 

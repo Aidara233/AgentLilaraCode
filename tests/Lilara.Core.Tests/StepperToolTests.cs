@@ -209,6 +209,62 @@ public class StepperToolTests : IDisposable
         Assert.NotNull(result.Fingerprint);
     }
 
+    /// <summary>
+    /// ⚠️ **库引用（`StoreBlock`）必须在请求里被解成真内容**——这是实测事故的回归测试（2026-10-06）。
+    ///
+    /// <para>写入方（`ToolExecutor`：快照过阈值就进库、记录里留地址）先上线，而**读取方没有**
+    /// ⇒ 适配器遇到 `StoreBlock` 直接抛「无法翻译的块」⇒ **那个会话从此永久发不出消息**
+    /// （记录只追加，改不掉）。</para>
+    ///
+    /// <para>⚠️ 这条测的是**下一步的请求**（`_adapter.Calls`），不是落盘——落盘那一半本来就是对的；
+    /// 缺的是「谁把地址读回来」。</para>
+    /// </summary>
+    [Fact]
+    public async Task SecondStep_DereferencesBlobAddresses_InsteadOfChokingOnThem()
+    {
+        var big = new string('x', BlobStore.InlineThresholdBytes + 100);
+        File.WriteAllText(Path.Combine(_work, "big.txt"), big);
+
+        var handle = NewSession();
+        _adapter.ReplyWith(_ => Calls(("c1", "read", ReadArgs("big.txt"))));
+        await _stepper.StepAsync(handle, "读", default);
+
+        // 确认前提：盘上那条结果**确实**是个地址（不然这条测试测的是别的东西）。
+        var stored = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>().Single();
+        Assert.IsType<Block.StoreBlock>(Assert.Single(stored.Content));
+
+        // 第二步：请求里的那条结果必须是**解引用之后的文本**。
+        _adapter.Reply("读到了");
+        await _stepper.StepAsync(handle, [], default);
+
+        var sent = Assert.Single(
+            _adapter.Calls[1].Timeline.OfType<TimelineEvent.ToolResultEvent>());
+        Assert.Equal(big, Assert.IsType<Block.TextBlock>(Assert.Single(sent.Content)).Text);
+    }
+
+    // 库对象**丢了**时给一段说得清的话，**不抛**——抛会让整个会话再也发不出消息。
+    [Fact]
+    public async Task SecondStep_WithAMissingBlob_SaysSo_InsteadOfThrowing()
+    {
+        var big = new string('x', BlobStore.InlineThresholdBytes + 100);
+        File.WriteAllText(Path.Combine(_work, "big.txt"), big);
+        var handle = NewSession();
+
+        _adapter.ReplyWith(_ => Calls(("c1", "read", ReadArgs("big.txt"))));
+        await _stepper.StepAsync(handle, "读", default);
+
+        // 把库里那个对象删掉，模拟「库没了 / 被清了」。
+        foreach (var f in Directory.GetFiles(new BlobStore(_store.DataRoot).Root)) File.Delete(f);
+
+        _adapter.Reply("接着说");
+        await _stepper.StepAsync(handle, [], default);   // 不抛
+
+        var sent = Assert.Single(
+            _adapter.Calls[1].Timeline.OfType<TimelineEvent.ToolResultEvent>());
+        Assert.Contains("找不到", Assert.IsType<Block.TextBlock>(Assert.Single(sent.Content)).Text);
+    }
+
     // 工具的调用在**请求**里也回传了（这一步的渲染看得见上一步的调用与结果）。
     [Fact]
     public async Task SecondStep_SeesThePreviousToolCallAndResult()

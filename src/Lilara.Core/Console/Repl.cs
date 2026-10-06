@@ -195,11 +195,45 @@ public sealed class Repl(
 
         foreach (var evt in timeline)
         {
-            var message = (TimelineEvent.MessageEvent)evt;
-            _out.WriteLine(message.From == Speaker.User
-                ? $"你  {SessionQueries.UserBody(message.Blocks)}"
-                : $"⏺  {SessionQueries.ModelBody(message.Blocks)}");
+            // ⚠️ **按事件类型分派，不强转**（2026-10-06 修）：加了 `ToolResultEvent` 之后，
+            // 原先那句 `(TimelineEvent.MessageEvent)evt` 会让 `history` 命令在**含工具调用的会话**上
+            // 直接抛 `InvalidCastException`（实测）。
+            switch (evt)
+            {
+                case TimelineEvent.MessageEvent message:
+                    _out.WriteLine(message.From == Speaker.User
+                        ? $"你  {SessionQueries.UserBody(message.Blocks)}"
+                        : $"⏺  {SessionQueries.ModelBody(message.Blocks)}");
+                    break;
+
+                // ⚠️ 工具结果单列一行、带前缀——`01` §3.6 说它**不是**「谁说的话」
+                // （它是 user 角色里的载荷），所以别混进上面那两个分支。
+                case TimelineEvent.ToolResultEvent result:
+                    _out.WriteLine($"⚒  {ToolResultLine(result)}");
+                    break;
+            }
         }
+    }
+
+    /// <summary>
+    /// 工具结果压成一行：先点名它是给哪个调用的，再给内容摘要。
+    /// ⚠️ `StoreBlock` 只印地址——**内容在库里**，把它整段打到终端会淹掉整屏。
+    /// </summary>
+    private static string ToolResultLine(TimelineEvent.ToolResultEvent result)
+    {
+        var text = string.Concat(result.Content.Select(b => b switch
+        {
+            Block.TextBlock t => t.Text,
+            Block.StoreBlock s => $"(库对象 {s.Sha256[..8]}…，{s.MediaType})",
+            Block.ImageBlock i => $"(图片 {i.Sha256[..8]}…，{i.MediaType})",
+            _ => $"(无法显示：{b.GetType().Name})",
+        }));
+
+        // 多行内容压成一行，免得一条结果把整个回放冲散。
+        var one = text.Replace('\n', ' ').Trim();
+        if (one.Length > 120) one = one[..120] + "…";
+
+        return $"[{result.CallId[..Math.Min(8, result.CallId.Length)]}] {one}";
     }
 
     private void PrintStatus()

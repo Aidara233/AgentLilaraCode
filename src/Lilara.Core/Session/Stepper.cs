@@ -40,6 +40,38 @@ public sealed class Stepper(
     public IModelAdapter Adapter => _adapter;
 
     /// <summary>
+    /// 把一个事件里指向库的块换成真内容。
+    ///
+    /// <para>⚠️ <b>库对象渲染成「内容本身」，模型不该知道库存在</b>（`01` §8.4）。
+    /// 而 <see cref="Kernel.Block.StoreBlock"/> 只带 `mediaType`，**它是不是文本、
+    /// 编码是什么，都只能看字节**——所以这里按 UTF-8 解成文本。</para>
+    ///
+    /// <para>⚠️ <b>读不出来时给一段说得清的话，不抛</b>：抛会让**整个会话再也发不出消息**
+    /// （记录只追加，那条坏引用永远在）。而「库对象没了」是**可以自愈的**——
+    /// 模型看到一句「这里本该有内容、但它丢了」，至少这一步还能走完。</para>
+    /// </summary>
+    private Kernel.Block Dereference(Kernel.Block block)
+    {
+        if (block is not Kernel.Block.StoreBlock store) return block;
+
+        var bytes = new BlobStore(_store.DataRoot).TryGet(store.Sha256);
+        if (bytes is null)
+            return new Kernel.Block.TextBlock($"（这里本该有一段内容，但库对象 {store.Sha256[..8]}… 找不到了）");
+
+        return new Kernel.Block.TextBlock(
+            new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false)
+                .GetString(bytes));
+    }
+
+    /// <summary>事件里的每个块都过一遍 <see cref="Dereference"/>；消息事件与工具结果**都要**。</summary>
+    private TimelineEvent Dereference(TimelineEvent evt) => evt switch
+    {
+        TimelineEvent.MessageEvent m => m with { Blocks = [.. m.Blocks.Select(Dereference)] },
+        TimelineEvent.ToolResultEvent r => r with { Content = [.. r.Content.Select(Dereference)] },
+        _ => evt,
+    };
+
+    /// <summary>
     /// 一步 = 渲染 → 调用 → 落盘（02 §2）。
     ///
     /// <para>⚠️ **它不再追加用户消息**（Task 4）。按 `01` §6.1 的次序，
@@ -95,12 +127,23 @@ public sealed class Stepper(
                 Effort = handle.State.Axes![Axes.Effort],
                 Temperature = Axes.NumberOrNull(Axes.Temperature, handle.State.Axes![Axes.Temperature]),
                 SystemBlocks = [], // 04 §1.3：核心自带零内容
+
                 // ⚠️ 工具表**从工具表投影**，不是从 spec 读的——spec 里没有它，
                 // 而「这一步有哪些工具」是**派生**的（04 §1.3：工具表不是独立实体）。
                 // ⚠️ 它的顺序必须**确定**（前缀指纹按它算）；`_tools` 是构造时定下的一个列表，
                 // 不经过任何容器枚举。
                 Tools = [.. _tools.Select(t => new ToolSpec(t.Name, t.Description, t.ParametersSchemaJson))],
-                Timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
+
+                // ⚠️ **去引用在这里做，不在适配器里**：记录里的快照可能是个
+                // `StoreBlock`（大对象进了库，`01` §8.4）⇒ 必须换成真内容再交给适配器。
+                // 三个适配器因此**都不需要认识库**——库是控制面概念（`01` §8.4：
+                // 「模型压根不该意识到库存在」），让适配器去查库等于把它泄漏到协议层。
+                //
+                // ⚠️ **这条曾经漏掉，后果是一次单向门**：写入方（`ToolExecutor` 过阈值就进库）
+                // 先上线了，而这里没解引用 ⇒ 适配器遇到 `StoreBlock` 直接抛
+                // ⇒ **那个会话从此永久发不出消息**（记录只追加，改不掉）。
+                // ⇒ 「只写不读」是这类改动最该先问的一句：**写下去的东西，谁读得回来？**
+                Timeline = [.. _store.ReadTimeline(handle.ProjectKey, handle.SessionId).Select(Dereference)],
             };
 
             // 调用（抛异常时直接传播——这一步没完成，Turn 不动）

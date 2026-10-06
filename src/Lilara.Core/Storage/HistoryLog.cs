@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Lilara.Core.Kernel;
@@ -85,9 +86,71 @@ public static class HistoryLog
             }
             catch (JsonException)
             {
-                // 断电留下的半行：跳过，保住前面的前缀
+                // ⚠️ **两种「读不出来」在这里合流，而它们的处置完全不同**（2026-10-06 补）：
+                //   ① **断电留下的半行** ⇒ 真该跳过（前缀才是值钱的部分）。
+                //   ② **缺 `id` 的老行**（2026-10-06 之前的记录没有这个字段）⇒ **绝不能跳过**。
+                // 原先只有 ①，而 `TimelineEvent.Id` 是 `required` ⇒ ② 也走进这个 catch
+                // ⇒ **所有 10-06 之前的会话历史读出来是空的**（实测：盘上 3 行、API 交 `[]`）。
+                // ⚠️ 当时注释写着「缺 id ⇒ 当场抛，抛是响亮失败」——**那句是错的**：
+                // 抛出发生在反序列化，而**这个 catch 的本职就是为断电容错**，于是它被吞了。
+                // ⇒ 补救：老行**按缺省值再读一次**（`id` 是唯一必填，别处都已有）——见 `ReadLegacy`。
+                if (ReadLegacy(line) is { } legacy) result.Add(legacy);
             }
         }
         return result;
+    }
+
+    /// <summary>
+    /// 读一条**没有 `id` 的老行**：补一个 id 再反序列化。
+    ///
+    /// <para>⚠️ <b>补的 id 必须<b>可复现</b>，不能是 `Ids.New()`（随机）或时钟</b>：
+    /// 那样同一个文件读两次得到两组 id，而 id 是 `fetch` / 改历史 / 头引用三处共用的指称
+    /// （`01` §8.0.2 第七节）⇒ 引用会**静默失效**。这恰恰是 `0b` 给 `Id` 设 `required`
+    /// 时想防的那件事——只是当时防错了地方（拦住了读，而不是拦住随手编一个）。
+    /// ⇒ 用**行内容**派生：同一行永远得到同一个 id，且不同行几乎不可能撞（12 位 hex）。</para>
+    ///
+    /// <para>⚠️ <b>不改盘</b>：只追加的文件里，补 id 只发生在**读的时候**。
+    /// 要改成盘的话得重写整份（那正是「截断」那条不可逆的路，不在这里）。</para>
+    /// </summary>
+    private static TimelineEvent? ReadLegacy(string line)
+    {
+        // 先确认它**确实**只是缺 id：带 id 的行进不来这里（上面已经读成功了）。
+        var patched = InsertMissingId(line);
+
+        try
+        {
+            return JsonSerializer.Deserialize<TimelineEvent>(patched, Json.Options);
+        }
+        catch (JsonException)
+        {
+            // 加了 id 还读不出来 ⇒ 它是真的坏行（半行 / 手改坏），按老规矩跳过。
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 给一行 JSON **对象**插一个（或换掉那个为 null 的）`id`。
+    /// ⚠️ 用 <see cref="System.Text.Json.Nodes.JsonNode"/> 而不是字符串拼接：
+    /// 拼接要自己处理转义与「插在哪一层」，而这里恰好有个现成的解析器。
+    /// </summary>
+    private static string InsertMissingId(string line)
+    {
+        try
+        {
+            if (System.Text.Json.Nodes.JsonNode.Parse(line) is not System.Text.Json.Nodes.JsonObject obj)
+                return line;
+
+            // 已经有非空 id ⇒ 什么都不做（这条其实不该走到这里）。
+            if (obj["id"] is System.Text.Json.Nodes.JsonValue existing
+                && existing.TryGetValue<string>(out var id) && !string.IsNullOrEmpty(id))
+                return line;
+
+            obj["id"] = Convert.ToHexStringLower(SHA256.HashData(Utf8NoBom.GetBytes(line)))[..12];
+            return obj.ToJsonString(Json.Options);
+        }
+        catch (JsonException)
+        {
+            return line;   // 连解析都做不到 ⇒ 交给上层按坏行跳过
+        }
     }
 }
