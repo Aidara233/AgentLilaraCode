@@ -82,6 +82,7 @@ public class StepperResolverTests : IDisposable
                     Effort = "high",
                     Temperature = null,
                     SystemBlocks = [],
+                    Tools = [],
                     Timeline = [],
                 },
                 CancellationToken.None));

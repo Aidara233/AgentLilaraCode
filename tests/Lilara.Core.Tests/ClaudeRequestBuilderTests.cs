@@ -26,6 +26,7 @@ public class ClaudeRequestBuilderTests
         Effort = "high",
         Temperature = null,
         SystemBlocks = [],
+        Tools = [],
         Timeline = timeline,
     };
 

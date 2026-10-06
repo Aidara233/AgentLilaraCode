@@ -1,21 +1,35 @@
 using Lilara.Core.Protocol;
 using Lilara.Core.Storage;
 using Lilara.Core.Kernel;
+using Lilara.Core.Session.Tools;
 
 namespace Lilara.Core.Session;
 
 /// <summary>
-/// 推进器：跑一步 = 渲染 → 调用 → 执行 → 落盘（02 §2）。
+/// 推进器：跑一步 = 渲染 → 调用 → **执行** → 落盘（02 §2）。
 ///
-/// ⚠️ 步是持久化的原子单位（01 §4）。这里的次序是刻意的：
+/// <para>⚠️ <b>一步 = <b>一次</b>模型调用 + 其工具执行</b>（`01` §4 的单数形式）。
+/// ⇒ 「模型又调了工具」不是在这里绕圈，而是**再一次入队 + 启动**（`01` §6.1 的队列机制）；
+/// 循环因此住在驱动层（`CommandDispatcher.RunStepAsync`），不在这里。
+/// 这条单射性质还是 <b>步原子性</b>的安全来源：至多一次模型调用 ⇒ 至多一组 `tool_use`。</para>
+///
+/// <para>⚠️ 步是持久化的原子单位（`01` §4）。这里的次序是刻意的：
 ///   1. 用户消息**先落盘**——它是事实，模型调用失败也抹不掉
-///   2. 模型输出在内存里合并完，**落盘只落一次**
-///   3. state.json 最后写——崩在 2 和 3 之间只会让 turn 计数偏小，历史不损坏
+///   2. 模型消息与它那批工具结果**一次落盘**（`01` §3.6 ④）
+///   3. state.json 最后写——崩在 2 和 3 之间只会让 turn 计数偏小，历史不损坏</para>
 /// </summary>
-public sealed class Stepper(SessionStore store, IModelAdapter adapter)
+public sealed class Stepper(
+    SessionStore store, IModelAdapter adapter, IReadOnlyList<ITool>? tools = null)
 {
     private readonly SessionStore _store = store;
     private readonly IModelAdapter _adapter = adapter;
+
+    /// <summary>
+    /// 工具表。⚠️ **默认空** = 纯 chat（`04` §1.3 推论 1：「没有任何插件」是完全合法的形态）。
+    /// ⚠️ 可空是给既有测试的：它们构造的是「没有工具」的推进器，而那条路上的行为
+    /// **逐字节不变**（工具相位整段跳过）。
+    /// </summary>
+    private readonly IReadOnlyList<ITool> _tools = tools ?? [];
 
     /// <summary>
     /// 构造时定下的适配器。⚠️ 这个只读访问器存在的唯一理由是**可测性**：
@@ -81,6 +95,11 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
                 Effort = handle.State.Axes![Axes.Effort],
                 Temperature = Axes.NumberOrNull(Axes.Temperature, handle.State.Axes![Axes.Temperature]),
                 SystemBlocks = [], // 04 §1.3：核心自带零内容
+                // ⚠️ 工具表**从工具表投影**，不是从 spec 读的——spec 里没有它，
+                // 而「这一步有哪些工具」是**派生**的（04 §1.3：工具表不是独立实体）。
+                // ⚠️ 它的顺序必须**确定**（前缀指纹按它算）；`_tools` 是构造时定下的一个列表，
+                // 不经过任何容器枚举。
+                Tools = [.. _tools.Select(t => new ToolSpec(t.Name, t.Description, t.ParametersSchemaJson))],
                 Timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
             };
 
@@ -107,10 +126,17 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
             throw;
         }
 
-        // 落盘：拒答不写空模型消息（Review Focus #2）
+        // ---- 执行相位（`01` §4：一步 = 一次模型调用 **+ 其工具执行**）----
+        //
+        // ⚠️ 它排在**落盘之前**，是为了把「模型消息 + 它那批结果」凑成**一次** append
+        // （`01` §3.6 ④ 的「步末按调用序一次落盘」）。分两次落就等于把步这个原子拆成两个崩溃窗口。
+        var toolCalls = reply.Blocks.OfType<Kernel.Block.ToolUseBlock>().ToList();
+        var events = new List<TimelineEvent>();
+
+        // 拒答不写空模型消息（Review Focus #2）
         if (!reply.Refused && reply.Blocks.Count > 0)
         {
-            _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
+            events.Add(new TimelineEvent.MessageEvent
             {
                 Id = Ids.New(),
                 At = at,
@@ -118,6 +144,22 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
                 Blocks = reply.Blocks,
             });
         }
+
+        // ⚠️ 工具调用是**模型消息的一部分** ⇒ 有调用就一定有那条模型消息（上面那个 if 通过）。
+        // `events.Count > 0` 不是多余的守卫，它挡的是「凭空落一堆悬空结果」——而悬空的
+        // `tool_result` 与悬空的 `tool_use` 一样会让下一步的请求非法（`01` §3.6）。
+        if (toolCalls.Count > 0 && events.Count > 0)
+        {
+            var blobs = new BlobStore(_store.DataRoot);
+            var executor = new ToolExecutor(_tools, blobs);
+            var context = new SessionToolContext(handle.Spec.WorkingDirectory, blobs);
+
+            events.AddRange(await executor.ExecuteAsync(toolCalls, context, ct));
+        }
+
+        // 一次落盘 = 一个原子。⚠️ 空批次**不写**（拒答且没有工具的那一步就是空的），
+        // 而 `AppendEvents` 对空批次是 no-op、不抛——见它的注释。
+        _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
 
         // ⚠️ Turn 递增**在拒答分支之外**：拒答是成功返回的、完成的一步，
         // 只是没有内容可写。让它和「抛异常」一样不计数，

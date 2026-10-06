@@ -9,6 +9,17 @@ public sealed class SessionStore(string dataRoot)
 {
     private readonly string _dataRoot = dataRoot;
 
+    /// <summary>
+    /// 数据根本身。⚠️ **提上来是为了让上层能按数据根构造别的东西**——
+    /// 具体是 `BlobStore`（工具的只读句柄要它）。
+    ///
+    /// <para>⚠️ **不用 `ProjectsRoot` 去反推**（`Path.GetDirectoryName` 那种写法）：
+    /// 反推出来的路径与这个字段**不保证逐字相同**（尾分隔符 / 规范化），
+    /// 而两个「同一个目录」的字符串在这类判据里就是两份能分叉的真相。
+    /// 与 `ListProjects` 那次「消灭私有拷贝」同一条纪律。</para>
+    /// </summary>
+    public string DataRoot => _dataRoot;
+
     public string SessionDirectory(string projectKey, string sessionId) =>
         Path.Combine(_dataRoot, "projects", projectKey, "sessions", sessionId);
 
@@ -126,6 +137,15 @@ public sealed class SessionStore(string dataRoot)
 
     public void AppendEvent(string projectKey, string sessionId, TimelineEvent evt) =>
         HistoryLog.Append(Path.Combine(SessionDirectory(projectKey, sessionId), "history.jsonl"), evt);
+
+    /// <summary>
+    /// **一步的多个事件，一次落盘**（步是持久化的原子单位，`01` §4）。
+    /// 有工具之后一步要落「模型消息（含 `tool_use`）+ N 条结果」，分 N 次追加
+    /// 等于把原子单位拆成 N 个崩溃窗口。原子性从<b>一把锁 + 一次 open/close</b> 来
+    /// ——见 <see cref="HistoryLog.AppendMany"/> 的注释（含它<b>没</b>解决什么）。
+    /// </summary>
+    public void AppendEvents(string projectKey, string sessionId, IReadOnlyList<TimelineEvent> events) =>
+        HistoryLog.AppendMany(Path.Combine(SessionDirectory(projectKey, sessionId), "history.jsonl"), events);
 
     public IReadOnlyList<TimelineEvent> ReadTimeline(string projectKey, string sessionId) =>
         HistoryLog.ReadAll(Path.Combine(SessionDirectory(projectKey, sessionId), "history.jsonl"));

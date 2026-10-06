@@ -28,6 +28,7 @@ public class ClaudeAdapterTests
         Effort = "high",
         Temperature = null,
         SystemBlocks = [],
+        Tools = [],
         Timeline = [],
     };
 

@@ -30,6 +30,17 @@ public sealed record ModelRequest
     /// <summary>系统块。核心不带提示词，最小闭环恒为空；「块数恒定」说的是最多各 1 块，不是非有不可。</summary>
     public required IReadOnlyList<Block> SystemBlocks { get; init; }
 
+    /// <summary>
+    /// 工具表。⚠️ **它在 Claude 协议下位于前缀的最前端** ⇒ 改它是最贵的操作
+    /// （`00` §7 判据 5：「只该在冷窗口做」）。所以这条**不是**给「这一步想给什么工具」用的旋钮，
+    /// 而是会话级的静态属性。
+    ///
+    /// <para>⚠️ **空表是合法形态**：没有插件就是纯 chat（`04` §1.3 推论 1）。
+    /// ⇒ 三个构造器都把「没有 tools 键」当作**不发这个字段**，与 <see cref="Temperature"/>
+    /// 的 `null` 同一个形状——没配工具的会话，请求**逐字节**与加这条之前相同。</para>
+    /// </summary>
+    public required IReadOnlyList<ToolSpec> Tools { get; init; }
+
     public required IReadOnlyList<TimelineEvent> Timeline { get; init; }
 }
 

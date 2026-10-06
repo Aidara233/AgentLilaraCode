@@ -322,6 +322,10 @@ public sealed class CommandDispatcher(
             // 带上它反而会让「自检失败」多一种可疑原因（某个模型不认某个温度）。
             Temperature = null,
             SystemBlocks = [],
+            // 自检**不发工具表**：探针要验的是「这个供应商通不通」。
+            // 带上工具会多一种可疑的失败原因（某个模型不认 tools、或工具 schema 有问题），
+            // 而那与「连通性」是两件事——同上面那句「自检不带温度」的判据。
+            Tools = [],
             Timeline =
             [
                 new TimelineEvent.MessageEvent

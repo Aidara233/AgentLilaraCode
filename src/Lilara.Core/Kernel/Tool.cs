@@ -1,6 +1,21 @@
 namespace Lilara.Core.Kernel;
 
 /// <summary>
+/// **发给 provider 的一份工具定义。** 它是 <see cref="ITool"/> 的投影——`Stepper` 从工具表
+/// 造出来交给 <c>ModelRequest</c>，**适配器只认这一层，不认识 <see cref="ITool"/>**。
+///
+/// <para>⚠️ **为什么要多这一层**：`ITool` 有 <see cref="ITool.RunAsync"/>（行为），
+/// 而请求里要的只有**声明**。把 `ITool` 直接放进 `ModelRequest` 会让「发出去的东西」
+/// 与「能执行的东西」绑死——而 MCP 工具是**远端**的（`04` §4：本地没有可执行的东西，
+/// 只有一个远端名字），它照样要进工具表。</para>
+/// </summary>
+/// <param name="Name">工具名。</param>
+/// <param name="Description">给模型的说明。</param>
+/// <param name="ParametersSchemaJson">参数 schema 的**原文**。⚠️ 逐字（同
+/// <see cref="Block.ToolUseBlock.Arguments"/> 那条纪律）。</param>
+public sealed record ToolSpec(string Name, string Description, string ParametersSchemaJson);
+
+/// <summary>
 /// 模型发出的**一次工具调用**。
 ///
 /// <para>⚠️ <b>它是一次调用的<b>全部</b>信息，而这里面没有「会话」「工作目录」</b>——

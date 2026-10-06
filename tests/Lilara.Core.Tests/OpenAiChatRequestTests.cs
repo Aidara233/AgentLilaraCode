@@ -19,6 +19,7 @@ public class OpenAiChatRequestTests
         Protocol = Protocols.OpenAiChat,
         ModelId = "deepseek-flash", MaxTokens = 16000, Effort = "high", Temperature = null,
         SystemBlocks = [], Timeline = tl,
+        Tools = [],
     };
 
     private static JsonElement Parse(string json) => JsonDocument.Parse(json).RootElement;
