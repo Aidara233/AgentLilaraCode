@@ -451,6 +451,11 @@ public sealed class CommandDispatcher(
         });
         handle.Enqueue(s.Blocks);
 
+        // ⚠️ **用户输入把链长度归零**：熔断算的是「自上次用户输入以来跑了多少步」
+        // （见 `SessionHandle.ConsecutiveToolSteps` 的注释——不归零的话，
+        // 一个用久了的会话会在用户**正常提问**时触发熔断）。
+        handle.ResetToolSteps();
+
         // 事件从 dispatcher 发，不从 `Stepper` 发——否则控制台敲的那句话在头上看不见
         // （控制台不订阅，但它的命令照样产生事件；缺了它头的视图会静默少一步）。
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
@@ -494,6 +499,10 @@ public sealed class CommandDispatcher(
         // 「我拿到了闸」必须是显式记录的，不能靠 `gate.CurrentCount == 0` 去猜——
         // 那判的是闸的当前状态，不是本方法的持有记录；用状态代理所有权本来就是错的。
         var acquired = false;
+
+        // ⚠️ 声明在 try **外面**：循环的续推发生在 finally 之后（那边得先 `ExitStep`），
+        // 所以结果要活过 try 这个作用域。
+        ModelReply? reply = null;
         try
         {
             await gate.WaitAsync(stepCts.Token);
@@ -505,7 +514,7 @@ public sealed class CommandDispatcher(
 
             // 取空队列——合并是队列的副产品。
             var blocks = handle.DrainQueue();
-            var reply = await _resolveStepper(handle).StepAsync(handle, blocks, stepCts.Token);
+            reply = await _resolveStepper(handle).StepAsync(handle, blocks, stepCts.Token);
 
             // 模型消息由这里发（`Stepper` 不碰事件总线）；判据与它落盘时一致：拒答 / 空块不产生模型消息。
             if (!reply.Refused && reply.Blocks.Count > 0)
@@ -513,7 +522,9 @@ public sealed class CommandDispatcher(
                     new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, CoreClock.Now()));
 
             PublishStepEnd(handle, reply);
-            return reply;
+
+            // ⚠️ **这里刻意不 `return`**：要让 `finally` 先跑（它 `ExitStep()` 放掉那把标志，
+            // 而下一步要重新拿它）。返回值在 finally 之后的续推那一步给出。
         }
         catch (OperationCanceledException) when (stepCts.IsCancellationRequested)
         {
@@ -542,7 +553,77 @@ public sealed class CommandDispatcher(
             handle.ExitStep();
             if (acquired) gate.Release();
         }
+
+        // ---- agent 循环：模型调了工具 ⇒ 再推进一步（`01` §4）----
+        //
+        // ⚠️ **这里是循环的落点，而它不是新机制**：`01` §4 定义「步 = 一次模型调用 + 其工具执行」
+        // ⇒「模型又调了工具」= 再一次入队 + 启动，走的就是 §6.1 已有的那条路。
+        // ⚠️ 而**形状上也只可能是这样**：`finally` 刚跑完、这把标志已经放掉，
+        // 下面这次重新 `TryEnterStep()` 是一条普通的新步——不需要「步内循环」那种
+        // 会打破状态机的东西。
+        if (reply is null) return null;   // 取消 / 失败那两条路（它们的 `error` 事件已经在上面发过）
+        return await ContinueIfToolCalledAsync(handle, reply, throwOnFailure);
     }
+
+    /// <summary>
+    /// 这一步的模型调了工具吗？调了就**接着推下一步**。
+    ///
+    /// <para>⚠️ <b>三个提前返回，每条都有理由</b>：</para>
+    /// <list type="number">
+    ///   <item><b>没调工具</b> ⇒ 循环正常结束（这是绝大多数情形）。</item>
+    ///   <item><b>没拿到那把标志</b> ⇒ 已经有别的推进在排队了。⚠️ **不重新入队**：
+    ///   队列里已经有东西（那条推进就是为此排的），再塞一次等于凭空多推一步。</item>
+    ///   <item><b>撞上熔断</b> ⇒ 见 <see cref="MaxConsecutiveToolSteps"/>。</item>
+    /// </list>
+    ///
+    /// <para>⚠️ <b>不重入队也要推</b>：`启动(s)` 的判据里「队列非空」是**必要条件**，
+    /// 而工具循环**没有新输入**（`01` §6.2 的「自主续跑」正是这个意思）⇒ 队列是空的。
+    /// ⇒ 直接调这一步的推进入口，不走「入队 + 启动」，免得为「触发一次推进」塞一条假待办
+    /// （那条假待办会被当成一条真的要发给用户的消息）。</para>
+    ///
+    /// <para>⚠️ <b>它会让 <c>turn</c> 一步一增</b>：一次 <c>send</c> 里模型调了两轮工具，
+    /// `turn` 就 +2、+3。这是**对的**——步是持久化的原子单位，每一次模型调用都是一步。
+    /// ⇒ 头看到的「会话推进了几步」与实际调用次数一致，而不是与用户按了几次回车一致。</para>
+    /// </summary>
+    private async Task<ModelReply?> ContinueIfToolCalledAsync(
+        SessionHandle handle, ModelReply reply, bool throwOnFailure)
+    {
+        if (!reply.Blocks.OfType<Kernel.Block.ToolUseBlock>().Any()) return reply;
+
+        // ⚠️ **熔断的阈值是占位的**（`01` §14 #14 明确写着阈值与触发后的行为**待定**）。
+        // 取一个保守值只为「不让它无限跑」——今天没有任何一档会自动续跑，
+        // 所以这条**在真实路径上还打不到**；它防的是将来接上「目标」档那天的失控。
+        if (handle.ConsecutiveToolSteps >= MaxConsecutiveToolSteps)
+        {
+            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                new WireEvent.Error(handle.SessionId,
+                    $"连续 {MaxConsecutiveToolSteps} 步都在调工具，已停下——这多半是循环打转（`01` §6.2 的熔断）。"));
+            return reply;
+        }
+
+        if (!handle.TryEnterStep()) return reply;
+
+        handle.BumpToolStep();
+
+        if (throwOnFailure)
+            return await RunStepAsync(handle, CancellationToken.None, throwOnFailure: true);
+
+        // 控制面那条路：**后台接着跑**（与 `HandleSessionSendAsync` 同一个形状）——
+        // 同步等会让 HTTP/WS 的调用方卡住整条工具链，而 `session.interrupt` 也失去落点。
+        _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
+            CancellationToken.None);
+
+        return reply;
+    }
+
+    /// <summary>
+    /// 「目标」档的**最大连续步数熔断**（`01` §6.2 规矩 1 / §14 #14）。
+    ///
+    /// <para>⚠️ <b>阈值是占位的</b>：§14 #14 把「阈值与触发后的行为」列为**未定项**。
+    /// 这里取一个保守值（够跑完一次正常的多轮工具使用，又不至于失控），
+    /// <b>并如实标注它是占位</b>——本仓栽过「把占位值当成定论写进文档」。</para>
+    /// </summary>
+    private const int MaxConsecutiveToolSteps = 24;
 
     /// <summary>
     /// `step.end` 必须在 `Turn` 自增之后（`Stepper` 已经加过了），且在拒答分支之外——

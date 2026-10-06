@@ -27,8 +27,8 @@ public static class StepperResolver
         {
             var any = providers.List().FirstOrDefault();
             return any is null
-                ? new Stepper(store, new UnconfiguredAdapter())
-                : new Stepper(store, AdapterFactory.Create(any));
+                ? new Stepper(store, new UnconfiguredAdapter(), Tools.BuiltInTools.All)
+                : new Stepper(store, AdapterFactory.Create(any), Tools.BuiltInTools.All);
         }
 
         var bound = providers.Load(preferredProviderId);
@@ -40,6 +40,6 @@ public static class StepperResolver
                 $"会话绑定的提供商 '{preferredProviderId}' 已不存在。用 `provider set` 重新配一个。"));
         }
 
-        return new Stepper(store, AdapterFactory.Create(bound));
+        return new Stepper(store, AdapterFactory.Create(bound), Tools.BuiltInTools.All);
     }
 }

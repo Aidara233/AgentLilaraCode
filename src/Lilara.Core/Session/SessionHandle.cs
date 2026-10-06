@@ -100,6 +100,25 @@ public sealed record SessionHandle
 
     public void ExitStep() => Volatile.Write(ref _step, 0);
 
+    /// <summary>
+    /// **本条消息链上已经跑了几步**——`01` §6.2 的「最大连续步数熔断」要它。
+    ///
+    /// <para>⚠️ <b>它是内存账，不落盘</b>：熔断防的是**这一次**失控，而重启之后
+    /// 「链」已经断了（没有任何东西还在续跑）。落盘反而会带来一个新问题——
+    /// 崩在链中间留下的计数会让重启后的第一次 `send` **继承**一个陈旧的高度。</para>
+    ///
+    /// <para>⚠️ <b>必须在用户消息到达时归零</b>（<see cref="ResetToolSteps"/>）：
+    /// 不归零的话，一个会话用久了之后，「用户按了回车」与「模型自己续跑」就再也分不开，
+    /// 熔断会在用户**正常提问**时触发。⇒ 计数的语义是「**自上次用户输入以来**」。</para>
+    /// </summary>
+    private int _toolSteps;
+
+    public int ConsecutiveToolSteps => Volatile.Read(ref _toolSteps);
+
+    public void BumpToolStep() => Interlocked.Increment(ref _toolSteps);
+
+    public void ResetToolSteps() => Volatile.Write(ref _toolSteps, 0);
+
     public static SessionHandle Create(
         SessionStore store, string workingDirectory, ModelSelection model, string? title = null)
     {
