@@ -21,11 +21,30 @@ public sealed class ControlServer(
     CoreHost host, CommandDispatcher dispatcher, EventBus bus, int port,
     string allowedOrigin = ControlServer.DefaultAllowedOrigin)
 {
-    public const int DefaultPort = 7788;
+    /// <summary>
+    /// 控制面默认端口。
+    ///
+    /// <para>⚠️ <b>选 17988 是**实测**的结果，不是审美</b>（2026-10-06）：原先的 <c>7788</c>
+    /// 落在了 Windows 的**保留端口段**里（本机实测的段有 7681-7780 / 7781-7880 / 7881-7980，
+    /// 通常由 Hyper-V / WSL / Docker 的 NAT 预留）⇒ 绑定时直接
+    /// <c>SocketException 10013</c>，<b>核心起不来</b>。</para>
+    ///
+    /// <para>⚠️ <b>而保留段会在重启后变</b>——所以换一个「今天不在里面」的值**不是永久解**，
+    /// 只是把一个开机就可能撞上的坑挪开。真正的处置是那条环境变量（<c>LILARA_PORT</c>）
+    /// 与那句人话报错，默认值只是让常见情况能用。</para>
+    /// </summary>
+    public const int DefaultPort = 17988;
 
-    // 默认只放行头自己的 origin（默认端口 7790）。localhost:7790 与 127.0.0.1:7790
-    // 不是同一个 origin（浏览器这么判），且 localhost 是任何本机程序都能抢占的名字（hosts / DNS）。
-    internal const string DefaultAllowedOrigin = "http://127.0.0.1:7790";
+    /// <summary>
+    /// 默认只放行头自己的 origin。
+    ///
+    /// <para>⚠️ <b>它必须与 <c>head/Program.cs</c> 的默认头端口是同一个数</b>——
+    /// 两份副本，而 `AllowedOriginResolver` 会在环境变量缺席时用这里兜底。
+    /// 头默认端口从 7790 改到 17990 时这里**跟着改**（7790 同样落在保留段里）。
+    /// ⚠️ <c>localhost:17990</c> 与 <c>127.0.0.1:17990</c> **不是同一个 origin**（浏览器这么判），
+    /// 且 <c>localhost</c> 是任何本机程序都能抢占的名字（hosts / DNS）⇒ 拒 localhost 是刻意的。</para>
+    /// </summary>
+    internal const string DefaultAllowedOrigin = "http://127.0.0.1:17990";
 
     // 只监听本机（核心是本设备唯一的，本机进程即可信）。
     public const string BindAddress = "127.0.0.1";
@@ -272,7 +291,7 @@ public sealed class ControlServer(
         // Origin 白名单是 apiKey 可选的硬前置：网页能改 endpoint 就能把流量（含 key）转到攻击者主机。
         // 放行「无 Origin」、拒绝别的 origin——浏览器握手必带 Origin，curl / 测试 / CLI 不带。
         // 这是防网页、不是鉴权（非浏览器客户端可伪造 Origin）。
-        // localhost:7790 与 127.0.0.1:7790 不是同一个 origin（浏览器这么判），拒 localhost 是刻意的。
+        // localhost 与 127.0.0.1 不是同一个 origin（浏览器这么判），拒 localhost 是刻意的。
         var origin = ctx.Request.Headers["Origin"].ToString();
         if (!string.IsNullOrEmpty(origin)
             && !string.Equals(origin, allowedOrigin, StringComparison.OrdinalIgnoreCase))

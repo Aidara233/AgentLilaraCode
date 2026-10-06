@@ -17,7 +17,9 @@
 
 const $ = (id) => document.getElementById(id);
 
-let core = "http://127.0.0.1:7788";
+// ⚠️ 这是**兜底值**——正常路径是启动时拉 `/config.json`（见下方 `core = ...core`）。
+// 它必须与 `head/Program.cs` 的默认核心地址一致（两份副本，改一个要跟着改另一个）。
+let core = "http://127.0.0.1:17988";
 let ws = null;
 let wsReady = false;                // 唯一的「可以发帧了吗」判据（见 connect()）
 let current = null;                 // 当前会话 id（视图，非真相）

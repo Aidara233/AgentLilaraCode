@@ -315,9 +315,9 @@ public class ControlServerTests : IAsyncLifetime
     // 浏览器发的握手永远带 Origin，而 curl / 测试驱动 / 未来的 CLI 头不带，要求它等于把它们全部误伤。
     [Theory]
     [InlineData(null)]                     // 无 Origin（curl / 测试驱动）⇒ 放行
-    [InlineData("http://127.0.0.1:7790")]  // 头自己的 origin ⇒ 放行
+    [InlineData("http://127.0.0.1:17990")]  // 头自己的 origin ⇒ 放行
     [InlineData("http://evil.example")]    // ⇒ 拒绝
-    [InlineData("http://localhost:7790")]  // ⚠️ 同机不同写法：**拒绝**——见下
+    [InlineData("http://localhost:17990")]  // ⚠️ 同机不同写法：**拒绝**——见下
     [InlineData("null")]                   // `file://` 页面与沙箱 iframe 的 Origin 字面量是 "null"
     public async Task WebSocket_OriginPolicy(string? origin)
     {
@@ -326,7 +326,7 @@ public class ControlServerTests : IAsyncLifetime
         if (origin is not null) socket.Options.SetRequestHeader("Origin", origin);
 
         var connect = socket.ConnectAsync(new Uri(Ws()), CancellationToken.None);
-        if (origin is null or "http://127.0.0.1:7790")
+        if (origin is null or "http://127.0.0.1:17990")
         {
             await connect;                                    // 放行 ⇒ 握上手
             Assert.Equal(WebSocketState.Open, socket.State);
@@ -334,7 +334,7 @@ public class ControlServerTests : IAsyncLifetime
         else
         {
             // 握手被拒时 ConnectAsync 抛 WebSocketException（服务端回了 403）。
-            // localhost:7790 在拒绝之列是刻意的：它与 127.0.0.1:7790 不是同一个 origin，
+            // localhost 在拒绝之列是刻意的：它与 127.0.0.1 不是同一个 origin，
             // 且放行 localhost 等于放行一个任何本机程序都能抢占的名字（hosts 文件 / DNS）。
             await Assert.ThrowsAnyAsync<WebSocketException>(() => connect);
         }
@@ -361,7 +361,7 @@ public class ControlServerTests : IAsyncLifetime
             }
             // 反向：默认值那个 origin 在这里必须被拒——否则说明参数没被用上
             using var bad = new ClientWebSocket();
-            bad.Options.SetRequestHeader("Origin", "http://127.0.0.1:7790");
+            bad.Options.SetRequestHeader("Origin", "http://127.0.0.1:17990");
             await Assert.ThrowsAnyAsync<WebSocketException>(
                 () => bad.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws"), CancellationToken.None));
         }

@@ -62,7 +62,7 @@ public class AllowedOriginResolverTests
     }
 
     // 非数字（头的 `int.TryParse` 也失败）⇒ 两边一起回落。若这里改成用垃圾串拼 origin，
-    // 头仍起在 7790 而核心放行一个不存在的 origin ⇒ 又变成静默拒绝。
+    // 头仍起在默认端口而核心放行一个不存在的 origin ⇒ 又变成静默拒绝。
     [Theory]
     [InlineData(null)]
     [InlineData("")]
@@ -82,13 +82,13 @@ public class AllowedOriginResolverTests
     {
         var resolved = AllowedOriginResolver.Resolve(_ => null);
 
-        Assert.Equal("http://127.0.0.1:7790", resolved.Origin);
+        Assert.Equal("http://127.0.0.1:17990", resolved.Origin);
         Assert.Equal(AllowedOriginSource.Default, resolved.Source);
     }
 
     // ---- 环境变量的名字是**跨程序集契约**（头读的是同一个）----
 
-    // ⚠️ 名字写错/改名的话，核心以为「没人设过头端口」而回落到 7790，
+    // ⚠️ 名字写错/改名的话，核心以为「没人设过头端口」而回落到默认值，
     // 头却起在用户设的那个端口上 ⇒ 静默拒绝。这条把名字钉死。
     // （同 `EndpointResolverTests.EnvVar_MatchesTheNameTheSdkReads` 的形状。）
     [Fact]
@@ -110,7 +110,7 @@ public class AllowedOriginResolverTests
     [Fact]
     public void Default_ComesFromControlServer_NotASecondLiteral()
     {
-        Assert.Equal("http://127.0.0.1:7790", ControlServer.DefaultAllowedOrigin);
+        Assert.Equal("http://127.0.0.1:17990", ControlServer.DefaultAllowedOrigin);
     }
 
     // ---- 同一个 origin、两种来源，调用方必须能分开 ----
@@ -118,7 +118,7 @@ public class AllowedOriginResolverTests
     [Fact]
     public void Resolve_SameOriginFromDifferentSourcesIsDistinguishable()
     {
-        var explicitSame = AllowedOriginResolver.Resolve(Env(AllowedOriginResolver.OriginEnvVar, "http://127.0.0.1:7790"));
+        var explicitSame = AllowedOriginResolver.Resolve(Env(AllowedOriginResolver.OriginEnvVar, "http://127.0.0.1:17990"));
         var byDefault = AllowedOriginResolver.Resolve(_ => null);
 
         Assert.Equal(explicitSame.Origin, byDefault.Origin);
