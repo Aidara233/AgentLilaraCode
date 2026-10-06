@@ -1,0 +1,66 @@
+using Lilara.Core.Kernel;
+using Lilara.Core.Storage;
+
+namespace Lilara.Core.Session.Tools;
+
+/// <summary>
+/// 工具能碰到的东西——<see cref="IToolContext"/> 的实现（`04` §5.1）。
+///
+/// <para>⚠️ <b>它是只读的，而且这件事由类型保证</b>：类上只有读取方法。
+/// 判据是「工具不该有写盘的手」，不是「工具作者应该自觉」。</para>
+/// </summary>
+/// <param name="workingDirectory">会话的工作目录。⚠️ **必须是绝对路径**——
+/// 相对路径会让 <see cref="ResolvePath"/> 的判据依赖进程的当前目录，而那是全局可变状态
+/// （`SessionHandle.Create` 已保证 spec 里存的是绝对路径）。</param>
+/// <param name="blobs">库。今天只用来读（`fetch` 落地时才用得上）；工具没有写库的手。</param>
+public sealed class SessionToolContext(string workingDirectory, BlobStore blobs) : IToolContext
+{
+    private readonly string _root = Path.GetFullPath(workingDirectory)
+        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+    public string WorkingDirectory => _root;
+
+    /// <summary>
+    /// ⚠️ <b>这个闸不是可选的</b>：模型给的路径是**不可信输入**，
+    /// 而 <c>../../../../etc/passwd</c> 一类会让工具读出工作目录之外的东西。
+    ///
+    /// <para>判据是「**解析出来的绝对路径仍在工作目录之下**」——**形状校验**，
+    /// 与 <c>BlobStore.IsSha256</c> / <c>CommandDispatcher.IsSafeProviderId</c> 同一条纪律。
+    /// 先 <see cref="Path.GetFullPath(string)"/> 把 <c>..</c> 与混合分隔符**解析掉再判**，
+    /// 而不是去数输入里有几个 <c>..</c>（那正是「像不像」的写法，绕得过去）。</para>
+    ///
+    /// <para>⚠️ <b>绝对路径由同一条判据挡掉，所以这里<b>没有</b>单独一句 `IsPathRooted`</b>
+    /// （2026-10-06 实测的结果，不是省了）：<c>Path.Combine(root, "C:\Windows")</c> 返回的是
+    /// **绝对的那个**，<c>GetFullPath</c> 之后包含判定照样失败 ⇒ 照样拒。
+    /// 这里原先有一句 <c>IsPathRooted</c>，而它的注释声称「放行它等于让判据在越界输入上做算术」——
+    /// **那句断言是假的**：摘掉它，<c>ToolTests</c> 882 条全绿。
+    /// ⇒ 两句谓词管同一件事就是「两层判据」的漂移温床（本仓栽过），删掉多的那句。</para>
+    ///
+    /// <para>⚠️ <b>大小写按不敏感判</b>（Windows 的语义）。⚠️ <b>它拦不住符号链接 / 目录联接</b>
+    /// ——见 <see cref="IToolContext.ResolvePath"/> 的注释，那是**已认下的洞**。</para>
+    /// </summary>
+    public string? ResolvePath(string relativePath)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath)) return null;
+
+        string full;
+        try
+        {
+            full = Path.GetFullPath(Path.Combine(_root, relativePath));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            // 形状坏到算不出来 ⇒ 与「越界」同一条处理（都是「不给」）。
+            return null;
+        }
+
+        // 判据：`full` 要么**就是**根，要么在「根 + 分隔符」之下。
+        // ⚠️ 后半句那个分隔符不能省：不加的话 `C:\work-evil` 会被判成在 `C:\work` 之下。
+        return full.Equals(_root, StringComparison.OrdinalIgnoreCase)
+               || full.StartsWith(_root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            ? full
+            : null;
+    }
+
+    public byte[]? ReadBlob(string sha256) => blobs.TryGet(sha256);
+}

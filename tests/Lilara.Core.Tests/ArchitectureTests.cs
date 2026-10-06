@@ -20,7 +20,8 @@ public class ArchitectureTests
         // 先钉「找得到东西」：glob 若空了，下面的空断言会**假绿**。
         // ⚠️ **这个数不是判据，是探针**——它抓的是「glob 悄悄少找了文件」（搬走一个 Kernel 文件、
         // 或路径变了）。**加文件时按实测改，别按感觉改**：被机械改过一次的探针就等于没有。
-        Assert.Equal(15, files.Length);
+        // 15 → 16（2026-10-06 最小工具批）：加了 `Tool.cs`（工具契约的词汇层）。
+        Assert.Equal(16, files.Length);
 
         var offenders = files
             .SelectMany(f => ExternalUsings(f).Select(u => $"{Path.GetFileName(f)}:{u.Line}  {u.Text}"))
