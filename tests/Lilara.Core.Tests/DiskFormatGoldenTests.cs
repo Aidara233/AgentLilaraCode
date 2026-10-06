@@ -65,12 +65,12 @@ public class DiskFormatGoldenTests
         };
 
         var onDisk = JsonSerializer.Serialize(spec, Json.Options);
-        Assert.StartsWith("""{"version":1,""", onDisk);
+        Assert.StartsWith("""{"version":2,""", onDisk);
 
         // 线上那一份：同一批选项（`WireFormatTests` 钉着两份设置一致），端点又直接序列化这个类型
         // ⇒ 版本号跟着走。**这就是它出现在头那边的原因**，不是谁忘了挡。
         var onWire = JsonSerializer.Serialize(spec, Hosting.WireJson.Options);
-        Assert.StartsWith("""{"version":1,""", onWire);
+        Assert.StartsWith("""{"version":2,""", onWire);
     }
 
     [Fact]
@@ -86,7 +86,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":1,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
+            """{"version":2,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -107,7 +107,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":1,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
+            """{"version":2,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -138,7 +138,7 @@ public class DiskFormatGoldenTests
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"version":1,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":2,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -148,13 +148,14 @@ public class DiskFormatGoldenTests
     {
         var evt = new TimelineEvent.MessageEvent
         {
+            Id = "r1",
             At = DateTimeOffset.UnixEpoch,
             From = Speaker.User,
             Blocks = [new Block.TextBlock("你好")],
         };
 
         Assert.Equal(
-            """{"kind":"message","from":"user","blocks":[{"kind":"text","text":"你好"}],"at":"1970-01-01T00:00:00+00:00"}""",
+            """{"kind":"message","from":"user","blocks":[{"kind":"text","text":"你好"}],"id":"r1","at":"1970-01-01T00:00:00+00:00"}""",
             TimelineEvent.StableSerialize(evt));
     }
 
@@ -162,6 +163,47 @@ public class DiskFormatGoldenTests
     public void TextBlock_KeepsItsExactBytes()
     {
         Assert.Equal("""{"kind":"text","text":"hi"}""", Json.StableSerialize(new Block.TextBlock("hi")));
+    }
+
+    // ⚠️ **看 `arguments` 那一格**：它原样嵌进来，**没有被再转义成字符串**。
+    // 这是「逐字回传」在**字节层面**的样子——`JsonRawConverter` 一被摘掉，这里立刻红。
+    [Fact]
+    public void ToolUseBlock_KeepsItsExactBytes_IncludingRawArguments()
+    {
+        var block = new Block.ToolUseBlock("c1", "read", """{ "path" : "a/b" }""");
+
+        Assert.Equal(
+            """{"kind":"toolUse","callId":"c1","name":"read","arguments":{ "path" : "a/b" }}""",
+            Json.StableSerialize(block));
+    }
+
+    // 图片的字节在库里，块里只有地址与媒体类型（01 §3.6）。
+    [Fact]
+    public void ImageBlock_KeepsItsExactBytes()
+    {
+        var block = new Block.ImageBlock("ab" + new string('0', 62), "image/png");
+
+        Assert.Equal(
+            $$"""{"kind":"image","sha256":"ab{{new string('0', 62)}}","mediaType":"image/png"}""",
+            Json.StableSerialize(block));
+    }
+
+    // 工具结果：判别式 + callId + content（一串块）+ 基类的 id/at。
+    // ⚠️ 顺序仍是「派生在前、基类在后」，与 MessageEvent 那条同一个规律。
+    [Fact]
+    public void ToolResultEvent_KeepsItsExactBytes()
+    {
+        var evt = new TimelineEvent.ToolResultEvent
+        {
+            Id = "r1",
+            At = DateTimeOffset.UnixEpoch,
+            CallId = "c1",
+            Content = [new Block.TextBlock("ok")],
+        };
+
+        Assert.Equal(
+            """{"kind":"toolResult","callId":"c1","content":[{"kind":"text","text":"ok"}],"id":"r1","at":"1970-01-01T00:00:00+00:00"}""",
+            TimelineEvent.StableSerialize(evt));
     }
 
     // 线上名是 reasoningKind 不是 kind：判别式已占 kind，撞名会让 STJ 对整个类型抛异常。
@@ -188,6 +230,7 @@ public class DiskFormatGoldenTests
     {
         var evt = new TimelineEvent.MessageEvent
         {
+            Id = "r1",
             At = DateTimeOffset.UnixEpoch,
             From = Speaker.Model,
             Blocks = [new Block.TextBlock("x")],
@@ -209,7 +252,7 @@ public class DiskFormatGoldenTests
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"version":1,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":2,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -224,7 +267,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":1,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
+            """{"version":2,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 }

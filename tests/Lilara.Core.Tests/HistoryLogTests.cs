@@ -17,6 +17,7 @@ public class HistoryLogTests : IDisposable
 
     private static TimelineEvent Evt(string text) => new TimelineEvent.MessageEvent
     {
+        Id = "r1",
         At = DateTimeOffset.UnixEpoch,
         From = Speaker.User,
         Blocks = [new Block.TextBlock(text)],

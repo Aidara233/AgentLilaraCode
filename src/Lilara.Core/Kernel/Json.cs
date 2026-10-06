@@ -32,7 +32,7 @@ public static class Json
     /// 那正是版本号要终结的那种不确定性（它今天恰好是无害的，明天可能不是：
     /// 如果那个新字段改变的是**已有字段的含义**，老程序会按旧含义解释新数据，且毫无察觉）。</para>
     /// </summary>
-    public const int FormatVersion = 1;
+    public const int FormatVersion = 2;
 
     public static readonly JsonSerializerOptions Options = new()
     {

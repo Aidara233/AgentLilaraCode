@@ -8,7 +8,9 @@ namespace Lilara.Core.Tests;
 public class OpenAiResponsesRequestTests
 {
     private static TimelineEvent Msg(Speaker from, params Block[] blocks) =>
-        new TimelineEvent.MessageEvent { At = DateTimeOffset.UnixEpoch, From = from, Blocks = blocks };
+        new TimelineEvent.MessageEvent
+        {
+            Id = "r1", At = DateTimeOffset.UnixEpoch, From = from, Blocks = blocks };
 
     private static ModelRequest Req(params TimelineEvent[] tl) => new()
     {

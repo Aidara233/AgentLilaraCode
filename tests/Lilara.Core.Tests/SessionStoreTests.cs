@@ -163,6 +163,7 @@ public class SessionStoreTests : IDisposable
 
     private static TimelineEvent Msg(string text) => new TimelineEvent.MessageEvent
     {
+        Id = "r1",
         At = DateTimeOffset.UnixEpoch,
         From = Speaker.User,
         Blocks = [new Block.TextBlock(text)],

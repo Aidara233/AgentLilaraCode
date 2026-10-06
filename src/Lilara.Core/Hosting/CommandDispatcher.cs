@@ -326,6 +326,7 @@ public sealed class CommandDispatcher(
             [
                 new TimelineEvent.MessageEvent
                 {
+                    Id = Ids.New(),
                     At = CoreClock.Now(),
                     From = Speaker.User,
                     Blocks = [new Block.TextBlock("ping")],
@@ -439,6 +440,7 @@ public sealed class CommandDispatcher(
 
         _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
         {
+            Id = Ids.New(),
             At = at,
             From = Speaker.User,
             Blocks = s.Blocks,

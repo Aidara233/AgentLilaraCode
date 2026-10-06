@@ -11,6 +11,7 @@ public class TimelineEventTests
         var at = new DateTimeOffset(2026, 9, 30, 12, 0, 0, TimeSpan.Zero);
         TimelineEvent original = new TimelineEvent.MessageEvent
         {
+            Id = "r1",
             At = at,
             From = Speaker.User,
             Blocks = [new Block.TextBlock("你好")],
@@ -31,6 +32,7 @@ public class TimelineEventTests
         // record 自动相等对集合成员用引用相等，故断言走字节相等。
         TimelineEvent original = new TimelineEvent.MessageEvent
         {
+            Id = "r1",
             At = DateTimeOffset.UnixEpoch,
             From = Speaker.Model,
             Blocks = [new Block.TextBlock("看看这个报错")],
@@ -47,6 +49,7 @@ public class TimelineEventTests
     {
         TimelineEvent original = new TimelineEvent.MessageEvent
         {
+            Id = "r1",
             At = DateTimeOffset.UnixEpoch,
             From = Speaker.Model,
             Blocks = [new Block.TextBlock("hi")],
@@ -64,6 +67,7 @@ public class TimelineEventTests
     {
         TimelineEvent original = new TimelineEvent.MessageEvent
         {
+            Id = "r1",
             At = DateTimeOffset.UnixEpoch,
             From = Speaker.User,
             Blocks = [],
@@ -79,6 +83,7 @@ public class TimelineEventTests
     {
         TimelineEvent original = new TimelineEvent.MessageEvent
         {
+            Id = "r1",
             At = DateTimeOffset.UnixEpoch,
             From = Speaker.Model,
             Blocks = [],
@@ -96,6 +101,7 @@ public class TimelineEventTests
     {
         TimelineEvent original = new TimelineEvent.MessageEvent
         {
+            Id = "r1",
             At = DateTimeOffset.UnixEpoch,
             From = Speaker.User,
             Blocks = [new Block.TextBlock("x")],

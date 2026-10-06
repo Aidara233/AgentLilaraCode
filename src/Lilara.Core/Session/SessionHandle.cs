@@ -112,7 +112,9 @@ public sealed record SessionHandle
         var projectKey = Kernel.ProjectKey.FromPath(fullPath);
         var spec = new SessionSpec
         {
-            SessionId = Guid.NewGuid().ToString("N")[..12],
+            // ⚠️ 走 `Ids.New()` 而不是就地 `Guid.NewGuid()...`：会话 id 与记录 id 是**同一个形状**，
+            // 两处各写一遍拼法就会漂（宽度 / 大小写 / 截断位置）。
+            SessionId = Ids.New(),
             ProjectKey = projectKey,
             WorkingDirectory = fullPath,
             CreatedAt = CoreClock.Now(),

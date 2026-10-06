@@ -10,6 +10,7 @@ public class OpenAiChatRequestTests
     private static TimelineEvent Msg(Speaker from, params Block[] blocks) =>
         new TimelineEvent.MessageEvent
         {
+            Id = "r1",
             At = DateTimeOffset.UnixEpoch, From = from, Blocks = blocks,
         };
 

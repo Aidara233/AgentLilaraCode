@@ -12,6 +12,7 @@ public class ClaudeRequestBuilderTests
 {
     private static TimelineEvent Msg(Speaker from, string text) => new TimelineEvent.MessageEvent
     {
+            Id = "r1",
         At = DateTimeOffset.UnixEpoch,
         From = from,
         Blocks = [new CanonicalBlock.TextBlock(text)],
@@ -113,6 +114,7 @@ public class ClaudeRequestBuilderTests
     {
         var modelTurn = new TimelineEvent.MessageEvent
         {
+            Id = "r1",
             At = DateTimeOffset.UnixEpoch,
             From = Speaker.Model,
             Blocks =
@@ -253,6 +255,7 @@ public class ClaudeRequestBuilderTests
         // Content = [] 会被 API 400 拒绝；Blocks 是普通 required 列表，没有非空不变量，能真走到这里。
         var empty = new TimelineEvent.MessageEvent
         {
+            Id = "r1",
             At = DateTimeOffset.UnixEpoch,
             From = Speaker.User,
             Blocks = [],

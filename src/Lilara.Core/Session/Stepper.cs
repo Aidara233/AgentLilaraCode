@@ -112,6 +112,7 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         {
             _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
             {
+                Id = Ids.New(),
                 At = at,
                 From = Speaker.Model,
                 Blocks = reply.Blocks,
@@ -154,6 +155,7 @@ public sealed class Stepper(SessionStore store, IModelAdapter adapter)
         // ⚠️ 与 dispatcher 同一条次序：**先追加再入队**，然后取空。
         _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
         {
+            Id = Ids.New(),
             At = CoreClock.Now(),
             From = Speaker.User,
             Blocks = blocks,
