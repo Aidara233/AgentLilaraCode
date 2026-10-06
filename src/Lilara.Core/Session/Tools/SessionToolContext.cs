@@ -12,8 +12,13 @@ namespace Lilara.Core.Session.Tools;
 /// <param name="workingDirectory">会话的工作目录。⚠️ **必须是绝对路径**——
 /// 相对路径会让 <see cref="ResolvePath"/> 的判据依赖进程的当前目录，而那是全局可变状态
 /// （`SessionHandle.Create` 已保证 spec 里存的是绝对路径）。</param>
-/// <param name="blobs">库。今天只用来读（`fetch` 落地时才用得上）；工具没有写库的手。</param>
-public sealed class SessionToolContext(string workingDirectory, BlobStore blobs) : IToolContext
+/// <param name="blobs">库。读用（`fetch` 靠它按地址取字节）；**工具没有写库的手**。</param>
+/// <param name="timeline">**记录**那一份时间线（不是渲染后的形态）。
+/// ⚠️ 取地址必须从**记录**取：回收只换渲染、记录不动（`01` §8.0.2 一 / 八）——
+/// 若拿渲染后的形态去算地址，被回收的那条算出来就是**那段注记**的哈希，`fetch` 当场永久取不回。</param>
+public sealed class SessionToolContext(
+    string workingDirectory, BlobStore blobs, IReadOnlyList<TimelineEvent>? timeline = null)
+    : IToolContext
 {
     private readonly string _root = Path.GetFullPath(workingDirectory)
         .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
@@ -63,4 +68,21 @@ public sealed class SessionToolContext(string workingDirectory, BlobStore blobs)
     }
 
     public byte[]? ReadBlob(string sha256) => blobs.TryGet(sha256);
+
+    /// <summary>
+    /// 按记录的稳定 id 取回**当时那串块**。
+    ///
+    /// <para>⚠️ <b>走的是 <see cref="TimelineRender.Dereference"/>（`internal`），
+    /// 不是这里另写一遍</b>：库对象有<b>两种</b>存法（原文 / 块数组 JSON），
+    /// 读的人必须分得开——另写一遍就会漂，而漂的后果是 `read` 的内容被当 JSON 交给模型。</para>
+    ///
+    /// <para>⚠️ <b>算地址用的是<b>记录</b>那一份</b>（那个理由写在构造参数的注释里）。</para>
+    /// </summary>
+    public IReadOnlyList<Block>? SnapshotOf(string stableId)
+    {
+        if (timeline?.OfType<TimelineEvent.ToolResultEvent>().FirstOrDefault(r => r.Id == stableId)
+            is not { } r) return null;
+
+        return TimelineRender.Dereference(r, blobs).Content;
+    }
 }

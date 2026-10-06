@@ -149,17 +149,26 @@ public class ClaudeToolTests
 
     // ⚠️ 认不出的形状**响亮地失败**，不静默给个空结果——空结果会让模型以为
     // 「那个工具什么都没返回」，而它其实是被丢弃了。
+    //
+    // ⚠️ **这条测试换过一次靶子**（2026-10-06）：它原先钉的是「带 `Ref` 的结果 ⇒ 抛」，
+    // 而那条守卫**已经删了**——`fetch` 的引用由 `TimelineRender` 在**进适配器之前**解掉
+    // （理由见那个类），所以 `Ref` 根本到不了这里。留着那条守卫会让 `fetch` 一上线
+    // 就抛出一句**指着错方向的假诊断**。
+    // ⇒ 现在钉的是**真的**还翻译不了的形状：一张图片（协议那条路今天没有读图的实现）。
     [Fact]
     public void UnrecognizedResultShape_Throws()
     {
-        var withRef = new TimelineEvent.ToolResultEvent
+        var withImage = new TimelineEvent.ToolResultEvent
         {
-            Id = "r1", At = DateTimeOffset.UnixEpoch, CallId = "c1", Content = [], Ref = "old-row",
+            Id = "r1",
+            At = DateTimeOffset.UnixEpoch,
+            CallId = "c1",
+            Content = [new Block.ImageBlock(new string('a', 64), "image/png")],
         };
 
         var call = new Block.ToolUseBlock("c1", "read", """{"path":"a.txt"}""");
         Assert.Throws<ArgumentException>(
-            () => ClaudeRequestBuilder.Build(Req([UserMsg("x"), ModelMsg(call), withRef])));
+            () => ClaudeRequestBuilder.Build(Req([UserMsg("x"), ModelMsg(call), withImage])));
     }
 
     // ---- 线 ④：收 tool_use（响应 → canonical） ----

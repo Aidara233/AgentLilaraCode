@@ -283,6 +283,8 @@ public class StepperToolTests : IDisposable
             e is TimelineEvent.MessageEvent m && m.Blocks.OfType<Block.ToolUseBlock>().Any());
         Assert.Contains(second.Timeline, e => e is TimelineEvent.ToolResultEvent);
         // 工具表也发了（不发的话模型下一轮就再也调不了工具）。
-        Assert.Equal(2, second.Tools.Count);
+        // ⚠️ **断言与工具表挂钩，不写死一个数**——那个数会随工具增加而腐
+        // （本仓栽过：`2009d9f` 删掉的正是这一类计数）。这里要钉的是**「发的是同一份表」**。
+        Assert.Equal(BuiltInTools.All.Count, second.Tools.Count);
     }
 }

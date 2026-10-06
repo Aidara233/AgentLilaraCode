@@ -21,11 +21,16 @@ public static class SessionQueries
         host.TryGetActivated(handle.SessionId, out var live) ? live.State : handle.State;
 
     /// <summary>
-    /// 时间线。未激活的会话从磁盘读；已激活的也读磁盘——
-    /// 因为 `history.jsonl` **只追加**，磁盘就是事实（不像 `State` 有「内存领先」的窗口）。
+    /// 时间线——**这一刻的形态**（库引用解开、被回收的换成注记、`fetch` 的引用解开）。
+    /// 未激活的会话从磁盘读；已激活的也读磁盘——因为 `history.jsonl` **只追加**，
+    /// 磁盘就是事实（不像 `State` 有「内存领先」的窗口）。
+    ///
+    /// <para>⚠️ <b>它必须与 `Stepper` 喂给模型的那份是同一个函数</b>（`TimelineRender.Render`）：
+    /// 各写一份的话，用户看到的与模型看到的会**悄悄分叉**——而两边各自都「看起来是对的」，
+    /// 这正是本仓栽过的形状（两处副本只改一处）。</para>
     /// </summary>
     public static IReadOnlyList<TimelineEvent> HistoryOf(CoreHost host, SessionHandle handle) =>
-        host.Store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+        Session.TimelineRender.Render(host.Store, handle);
 
     /// <summary>助手回合的可显示正文。</summary>
     /// <para>回复可能**只有推理块、没有正文**（推理块确实会落盘），于是正文是空串——

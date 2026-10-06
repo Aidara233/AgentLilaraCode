@@ -239,20 +239,36 @@ public class ToolExecutorTests : IDisposable
         Assert.Equal(big, System.Text.Encoding.UTF8.GetString(_blobs.TryGet(store.Sha256)!));
     }
 
-    // 小快照内联（不进库）——阈值以下散进两处只会让记录更难读。
+    /// <summary>
+    /// 小快照**仍然内联进记录**，但**库里也有一份**（2026-10-06 改）。
+    ///
+    /// <para>⚠️ <b>这条测试以前断言的是「内联 ⇒ 不写库」，而那条规则已经改了。</b>
+    /// 理由：回收的判据是「地址算得出来、且库里有」（`Reclaim`），
+    /// 内联而不进库 ⇒ 那条结果的字节**盘上只有一份、`fetch` 读不到**
+    /// ⇒ 它永远占着上下文，而回收器存在的意义正是收它。
+    /// ⇒ <b>内联与否只决定字节躺在哪，不决定进不进库</b>（`01` §8.4 ¶1）。</para>
+    ///
+    /// <para>⚠️ <b>键是 <c>Sha256Of(内容)</c>，不是别的</b>——判定侧算地址用的是同一个函数，
+    /// 两边各写一遍就会静默地一条也回收不了。</para>
+    /// </summary>
     [Fact]
-    public async Task Execute_SmallSnapshot_StaysInline()
+    public async Task Execute_SmallSnapshot_IsInlineAndAlsoInTheBlobStore()
     {
         File.WriteAllText(Path.Combine(_work, "a.txt"), "小");
 
         var results = await Subject().ExecuteAsync(
             [Use("c1", "read", """{"path":"a.txt"}""")], _ctx, default);
 
-        Assert.IsType<Block.TextBlock>(Assert.Single(Assert.Single(results).Content));
-        // ⚠️ 断言写成「目录不存在**或**为空」：内联时不写库 ⇒ 库目录压根不会被创建，
-        // 而 `Directory.GetFiles` 对不存在的目录**会抛**（不是返回空）。
-        // 直接 `Assert.Empty(Directory.GetFiles(...))` 会让这条测试在正确的行为上失败。
-        Assert.True(!Directory.Exists(_blobs.Root) || Directory.GetFiles(_blobs.Root).Length == 0);
+        var r = Assert.Single(results);
+
+        // 记录里仍然是原文（jsonl 好手查）。
+        var text = Assert.IsType<Block.TextBlock>(Assert.Single(r.Content));
+        Assert.Equal("小", text.Text);
+
+        // 而库里**也**有一份，名字就是内容的哈希 ⇒ 判定与 `fetch` 都找得到它。
+        var sha = BlobStore.Sha256Of(System.Text.Encoding.UTF8.GetBytes(text.Text));
+        Assert.True(_blobs.Has(sha));
+        Assert.Equal(text.Text, System.Text.Encoding.UTF8.GetString(_blobs.TryGet(sha)!));
     }
 
     /// <summary>

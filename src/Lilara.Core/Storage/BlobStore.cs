@@ -33,9 +33,16 @@ public sealed class BlobStore(string dataRoot)
     /// 图片几乎必然超线（几 KB 起），但一段超大的文本工具结果同样该进库。
     /// ⇒ 别把这条读成「图片进库、文本内联」。</para>
     ///
-    /// <para>⚠️ <b>今天没有写入方</b>（工具还不存在）⇒ 这个常量**只被测试用到**。
-    /// 定在这里而不是等第一个调用方，是为了让「阈值是多少」有一个**可查的唯一出处**，
-    /// 而不是让第一个写工具的人顺手内联一个自己的数。</para>
+    /// <para>⚠️ <b>今天它的作用是「字节躺在哪」，不是「进不进库」</b>（2026-10-06 更正——
+    /// 这一段原先写「今天没有写入方 ⇒ 只被测试用到」，那句话在最小工具批之后就过期了）：
+    /// `ToolExecutor.Materialize` **每次都 <see cref="Put"/> 一遍**工具结果的字节
+    /// （`01` §8.4 ¶1「凡是被记录引用的字节，都在库里」），过线才在记录里留
+    /// <see cref="Kernel.Block.StoreBlock"/>、没过线则**内联进记录而库里同样留一份**。</para>
+    ///
+    /// <para>⚠️ <b>它<b>不</b>决定「能不能回收」</b>：回收的判据是「库地址算得出来且库里有」
+    /// （见 `Reclaim`），与这个数无关。⇒ 别把这两件事再绑到一起：绑起来的后果是
+    /// **小文件永远占着上下文**——而回收器存在的意义正是收它。本条与 `01` §8.0.2 二
+    /// 那句「今天所有结果都是块、都可序列化 ⇒ 恰好恒真」说的是同一件事。</para>
     /// </summary>
     public const int InlineThresholdBytes = 8 * 1024;
 
@@ -43,18 +50,29 @@ public sealed class BlobStore(string dataRoot)
 
     public string Root => _root;
 
+    /// <summary>
+    /// 字节 → 库地址（小写 hex sha256）。
+    ///
+    /// <para>⚠️ <b>它是<b>唯一</b>一处算库地址的地方，<see cref="Put"/> 与判定侧都只走它。</b>
+    /// 各写一遍的后果是<b>静默的</b>：编码、BOM、大小写任何一处漂了，
+    /// 算出来的地址就<b>永远不在库里</b> ⇒ 回收判定一条也认不出来，而且一声不吭。
+    /// （本仓栽过的形状：两层判据必须共用一个谓词。）</para>
+    /// </summary>
+    public static string Sha256Of(byte[] content) =>
+        Convert.ToHexStringLower(SHA256.HashData(content));
+
     private string PathFor(string sha256) => Path.Combine(_root, sha256);
 
     /// <summary>
     /// 存字节，返回它的 sha256（小写 hex）。
     ///
     /// <para>⚠️ <b>先算哈希、再写文件</b>：文件名就是哈希 ⇒ 崩溃留下的只可能是
-    /// 一个孤儿 `.tmp`（<see cref="AtomicFile"/> 保证），**不可能出现一个「名字说它是 A、
+    /// 一个孤儿 <c>.tmp</c>（<see cref="AtomicFile"/> 保证），**不可能出现一个「名字说它是 A、
     /// 内容是 B」的坏对象**。</para>
     /// </summary>
     public string Put(byte[] content)
     {
-        var sha = Convert.ToHexStringLower(SHA256.HashData(content));
+        var sha = Sha256Of(content);
         var path = PathFor(sha);
 
         // 已经有一份逐字节相同的了 ⇒ 什么也不做（这就是去重，不是优化）。

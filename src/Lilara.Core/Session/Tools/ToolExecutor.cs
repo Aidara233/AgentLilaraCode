@@ -41,41 +41,25 @@ public sealed class ToolExecutor(IReadOnlyList<ITool> tools, Storage.BlobStore b
                 ? await tool.RunAsync(new ToolCall(call.CallId, call.Name, call.Arguments), context, ct)
                 : new ToolOutcome { Content = [new Block.TextBlock($"没有名为 '{call.Name}' 的工具。")] };
 
+            // ⚠️ **`Content` 与 `Ref` 恰好一个非空**（`01` §8.0.2 六）：
+            // 引用型不经过 `Materialize`——它的内容在别处，这里没有字节可进库。
+            var (content, reffed) = outcome.Ref is { } target
+                ? ((IReadOnlyList<Block>)[], (string?)target)
+                : (Reclaim.Materialize(outcome.Content, blobs), null);
+
             results.Add(new TimelineEvent.ToolResultEvent
             {
                 // ⚠️ 本记录的稳定 id（与协议 id `CallId` **不是一回事**）。见 `01` §8.0.2 第七节。
                 Id = Ids.New(),
                 At = CoreClock.Now(),
                 CallId = call.CallId,
-                Content = Materialize(outcome.Content),
+                Content = content,
+                Ref = reffed,
                 DependsOn = outcome.DependsOn,
                 Fingerprint = outcome.Fingerprint,
             });
         }
 
         return results;
-    }
-
-    /// <summary>
-    /// 决定快照落在记录里还是库里。
-    ///
-    /// <para>⚠️ <b>判据是「体积与身份」，不是「文本 vs 二进制」</b>
-    /// （`BlobStore.InlineThresholdBytes` 的注释写死了这一条）：一段超大的文本工具结果
-    /// 同样该进库。⇒ 别把这条读成「图片进库、文本内联」。</para>
-    ///
-    /// <para>⚠️ <b>只有「恰好一个文本块」才谈得上内联判断</b>：混排（图 + 文）与多块
-    /// **一律原样内联**。理由是判据本身——「这个结果够不够大」在混排下没有单一答案
-    /// （图早已是 <see cref="Block.ImageBlock"/> 引用、文本可能很小），
-    /// 而**猜一个**比不做更坏：它会让「同一份内容两次落盘得到两种形状」。</para>
-    /// </summary>
-    private IReadOnlyList<Block> Materialize(IReadOnlyList<Block> content)
-    {
-        if (content is not [Block.TextBlock text]) return content;
-
-        var bytes = System.Text.Encoding.UTF8.GetBytes(text.Text);
-        if (bytes.Length <= Storage.BlobStore.InlineThresholdBytes) return content;
-
-        var sha = blobs.Put(bytes);
-        return [new Block.StoreBlock(sha, "text/plain")];
     }
 }

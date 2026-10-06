@@ -40,38 +40,6 @@ public sealed class Stepper(
     public IModelAdapter Adapter => _adapter;
 
     /// <summary>
-    /// 把一个事件里指向库的块换成真内容。
-    ///
-    /// <para>⚠️ <b>库对象渲染成「内容本身」，模型不该知道库存在</b>（`01` §8.4）。
-    /// 而 <see cref="Kernel.Block.StoreBlock"/> 只带 `mediaType`，**它是不是文本、
-    /// 编码是什么，都只能看字节**——所以这里按 UTF-8 解成文本。</para>
-    ///
-    /// <para>⚠️ <b>读不出来时给一段说得清的话，不抛</b>：抛会让**整个会话再也发不出消息**
-    /// （记录只追加，那条坏引用永远在）。而「库对象没了」是**可以自愈的**——
-    /// 模型看到一句「这里本该有内容、但它丢了」，至少这一步还能走完。</para>
-    /// </summary>
-    private Kernel.Block Dereference(Kernel.Block block)
-    {
-        if (block is not Kernel.Block.StoreBlock store) return block;
-
-        var bytes = new BlobStore(_store.DataRoot).TryGet(store.Sha256);
-        if (bytes is null)
-            return new Kernel.Block.TextBlock($"（这里本该有一段内容，但库对象 {store.Sha256[..8]}… 找不到了）");
-
-        return new Kernel.Block.TextBlock(
-            new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false)
-                .GetString(bytes));
-    }
-
-    /// <summary>事件里的每个块都过一遍 <see cref="Dereference"/>；消息事件与工具结果**都要**。</summary>
-    private TimelineEvent Dereference(TimelineEvent evt) => evt switch
-    {
-        TimelineEvent.MessageEvent m => m with { Blocks = [.. m.Blocks.Select(Dereference)] },
-        TimelineEvent.ToolResultEvent r => r with { Content = [.. r.Content.Select(Dereference)] },
-        _ => evt,
-    };
-
-    /// <summary>
     /// 一步 = 渲染 → 调用 → 落盘（02 §2）。
     ///
     /// <para>⚠️ **它不再追加用户消息**（Task 4）。按 `01` §6.1 的次序，
@@ -143,7 +111,12 @@ public sealed class Stepper(
                 // 先上线了，而这里没解引用 ⇒ 适配器遇到 `StoreBlock` 直接抛
                 // ⇒ **那个会话从此永久发不出消息**（记录只追加，改不掉）。
                 // ⇒ 「只写不读」是这类改动最该先问的一句：**写下去的东西，谁读得回来？**
-                Timeline = [.. _store.ReadTimeline(handle.ProjectKey, handle.SessionId).Select(Dereference)],
+                //
+                // ⚠️ 同一条线上现在还有两件事（都在 `TimelineRender` 里）：按记录 id **回收**（换渲染）、
+                // 以及把 `fetch` 的 `Ref` 解开。三件事都得在这里做完——**适配器只看见普通块**。
+                // ⚠️ 那份渲染**与头 / 控制台读的是同一个函数**（`SessionQueries.HistoryOf` 也走它）：
+                // 各写一份就会出现「模型看到的」与「用户看到的」悄悄分叉。
+                Timeline = TimelineRender.Render(_store, handle),
             };
 
             // 调用（抛异常时直接传播——这一步没完成，Turn 不动）
@@ -176,6 +149,10 @@ public sealed class Stepper(
         var toolCalls = reply.Blocks.OfType<Kernel.Block.ToolUseBlock>().ToList();
         var events = new List<TimelineEvent>();
 
+        // ⚠️ **记录那一份**（未经回收、未经解引用）——`fetch` 取地址必须从它算，
+        // 理由见 `SessionToolContext` 的构造参数注释。
+        var recorded = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+
         // 拒答不写空模型消息（Review Focus #2）
         if (!reply.Refused && reply.Blocks.Count > 0)
         {
@@ -195,7 +172,7 @@ public sealed class Stepper(
         {
             var blobs = new BlobStore(_store.DataRoot);
             var executor = new ToolExecutor(_tools, blobs);
-            var context = new SessionToolContext(handle.Spec.WorkingDirectory, blobs);
+            var context = new SessionToolContext(handle.Spec.WorkingDirectory, blobs, recorded);
 
             events.AddRange(await executor.ExecuteAsync(toolCalls, context, ct));
         }

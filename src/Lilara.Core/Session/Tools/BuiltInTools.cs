@@ -8,8 +8,12 @@ namespace Lilara.Core.Session.Tools;
 /// <para>⚠️ <b>这与「核心自带零个工具」矛盾吗？不矛盾，但需要说清楚</b>
 /// （`04` §1.3 那句话要拆成两半读）：那一句说的是<b>核心不提供「内容」</b>
 /// ——`read` / `write` / `bash` 这类**干活的能力**全部来自插件。
-/// 而这里有两条工具属于**机制**：它们是「模型能看见自己历史」的唯一入口，
-/// 而那条路径是核心的加载/渲染机制本身。</para>
+/// 而这里的三个属于**机制**：`ls` / `read` 是「模型能看见自己的工作目录」的入口，
+/// `fetch` 是「模型能看见**自己历史**」的入口——两条路径都是核心的加载 / 渲染机制本身。</para>
+///
+/// <para>⚠️ <b>三个挤在同一份列表里，而这不是偶然</b>：`fetch` 的取回能力来自
+/// **句柄里的数据根**（`04` §5.1），与别的工具走同一条路——它<b>不是核心特权</b>
+/// （`01` §8.0.2 六，用户裁定）。所以它照样住在这里，而不是被捧进核心。</para>
 ///
 /// <para>⚠️ <b>「内建」是一条<b>属性</b>（不可卸载），不是第三种来源</b>
 /// ——三种来源只有：内建 / 插件 / MCP。判据同 `04` §1.2 给协议适配器的那条：
@@ -25,5 +29,5 @@ namespace Lilara.Core.Session.Tools;
 /// </summary>
 public static class BuiltInTools
 {
-    public static IReadOnlyList<ITool> All { get; } = [new ListTool(), new ReadTool()];
+    public static IReadOnlyList<ITool> All { get; } = [new ListTool(), new ReadTool(), new FetchTool()];
 }

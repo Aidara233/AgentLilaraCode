@@ -109,13 +109,14 @@ public static class ClaudeRequestBuilder
     /// </summary>
     private static List<ContentBlockParam> ToResultBlocks(TimelineEvent.ToolResultEvent result, TimelineEvent evt)
     {
-        // ⚠️ `Ref` 与 `Content` **恰好一个非空**——Ref 非空意味着「这条结果是取回来的」
-        // （`fetch` 专用）。而 `fetch` 今天还不存在（它要等回收那块），所以走到这里
-        // 只能是 `Content`。⚠️ **不静默跳过**：认不出的形状要响亮地失败，
-        // 否则模型会收到一条**空结果**并以为「那个工具什么都没返回」。
-        if (result.Ref is { } r)
-            throw new ArgumentException($"工具结果引用了记录 {r}，但 `fetch` 还没实现", nameof(evt));
-
+        // ⚠️ **`Ref` 到不了这里**（2026-10-06）：`fetch` 的结果带引用，而引用由
+        // `TimelineRender` **在进适配器之前**就解掉了（那里解、不在适配器里解，
+        // 理由见那个类）。⇒ 这里原先有一条「`Ref` 非空 ⇒ 抛」的守卫，它已经**永远到不了**，
+        // 删掉它。⚠️ 而**留着它更坏**：`fetch` 一上线，那句话会变成一条指着错方向的假诊断。
+        //
+        // ⚠️ 若哪天真有引用漏到这里，下面那个 `switch` 的默认分支会响亮地抛
+        // （「工具结果里有无法翻译的块」）——**不需要额外的守卫**，那正是这一行的职责。
+        //
         // ⚠️ **直接拼文本，不走 `content` 那个联合列表再 OfType 回来**。
         // 那个写法看着更「统一」，但它错得**静默**：`new TextBlockParam{…}` 是**隐式**转成
         // `ContentBlockParam` 才进列表的，所以 `content.OfType<TextBlockParam>()` **永远是空**

@@ -93,3 +93,30 @@ public abstract record Block
     /// </summary>
     public sealed record StoreBlock(string Sha256, string MediaType) : Block;
 }
+
+/// <summary>
+/// 一串块的**规范序列化**——写入侧（`ToolExecutor` 把混排结果进库）与判定侧
+/// （`Reclaim` 算它的地址）**共用这一个**。
+///
+/// <para>⚠️ <b>为什么必须是共用的一个函数</b>：判定算地址、写入算地址，各写一遍的后果是
+/// <b>静默的</b>——键序、转义、忽略 null 任何一处漂了，算出来的地址就永远不在库里
+/// ⇒ <b>一条都回收不了且不报错</b>（本仓栽过的「两层判据必须共用一个谓词」）。</para>
+///
+/// <para>⚠️ <b>参数类型必须是 <see cref="Block"/> 的集合，不能是泛型</b>——同
+/// <see cref="Json.StableSerialize"/> 的陷阱：推断成具体子类会丢掉判别式 <c>kind</c>，
+/// 于是同一串块写出两种字节、进而两个地址。</para>
+/// </summary>
+public static class BlockList
+{
+    /// <summary>
+    /// 库对象的媒体类型：内容是**一串块**（<see cref="ToJson"/> 的字节），不是原始文本。
+    ///
+    /// <para>⚠️ <b>它与 <c>text/plain</c> 是两条不同的路，读取方必须分得开</b>：
+    /// 单文本块的快照存的是**文件原文**，混排 / 多块的存的是**块数组 JSON**。
+    /// 混着读会让 `read` 的库对象吐出一段 JSON 来（而它本该是原文）。</para>
+    /// </summary>
+    public const string MediaType = "application/vnd.lilara.blocks+json";
+
+    public static string ToJson(IReadOnlyList<Block> blocks) =>
+        System.Text.Json.JsonSerializer.Serialize(blocks, Json.Options);
+}
