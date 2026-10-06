@@ -19,7 +19,8 @@ public static class OpenAiResponsesRequest
 
         var input = new JsonArray();
         foreach (var evt in request.Timeline)
-            input.Add(ToItem(evt, request.Protocol));
+            foreach (var item in ToItems(evt, request.Protocol))
+                input.Add(item);
 
         var body = new JsonObject
         {
@@ -41,36 +42,118 @@ public static class OpenAiResponsesRequest
 
         body["input"] = input;
 
+        // ⚠️ **空工具表 ⇒ 不写这个键**（与 Chat / temperature 同一条判据）。
+        // Responses 的工具是**扁平**的（Chat 多一层 `function`）——两条 OpenAI 协议**形状不同**，
+        // 别互相抄（本文件开头那句「两条协议的 content 形状不可互换」同一个教训）。
+        if (request.Tools.Count > 0)
+        {
+            body["tools"] = new JsonArray(request.Tools.Select(t => (JsonNode)new JsonObject
+            {
+                ["type"] = "function",
+                ["name"] = t.Name,
+                ["description"] = t.Description,
+                ["parameters"] = JsonNode.Parse(t.ParametersSchemaJson),
+            }).ToArray());
+        }
+
         return body.ToJsonString(Json.Options);
     }
 
-    // 一条 canonical 消息 → 协议 input 项。Responses 不暴露推理（返回体无推理字段）→ 丢且不伪造；
-    // protocol 参数在这里对输出无可观测影响（过滤结果只被 OfType<TextBlock>() 消费）。
-    private static JsonObject ToItem(TimelineEvent evt, string protocol)
+    /// <summary>
+    /// 一个 canonical 事件 → **若干**协议 input 项。
+    ///
+    /// <para>⚠️ <b>为什么是「若干」而不是「一个」</b>：Responses 把模型的工具调用做成
+    /// <b>与消息并列的项</b>（<c>type:"function_call"</c>），而不是挂在消息上的字段
+    /// ——所以「模型说了句话 + 调了两个工具」是**三项**，不是一项。
+    /// ⚠️ 这是三条链路里唯一需要「一变多」的地方（Chat 挂在 <c>tool_calls</c>、
+    /// Claude 是同一个 content 数组里的块）。</para>
+    /// </summary>
+    private static List<JsonObject> ToItems(TimelineEvent evt, string protocol) => evt switch
     {
-        var message = (TimelineEvent.MessageEvent)evt;
+        TimelineEvent.MessageEvent m => MessageToItems(m, protocol),
+        TimelineEvent.ToolResultEvent r => [ResultToItem(r)],
+        _ => throw new ArgumentException($"时间线里有无法翻译的事件（{evt.GetType().Name}）", nameof(evt)),
+    };
+
+    /// <summary>
+    /// 工具结果 → `{"type":"function_call_output","call_id":…,"output":…}`。
+    ///
+    /// <para>⚠️ 字段名是 <c>call_id</c> 与 <c>output</c>——**不是** Chat 的
+    /// <c>tool_call_id</c> / <c>content</c>。两条 OpenAI 协议的这两个名字都不一样，
+    /// 而写错了的表现是上游 400，不是静默降级。</para>
+    /// </summary>
+    private static JsonObject ResultToItem(TimelineEvent.ToolResultEvent r)
+    {
+        if (r.Ref is { } reference)
+            throw new ArgumentException($"工具结果引用了记录 {reference}，但 `fetch` 还没实现", nameof(r));
+
+        var text = string.Concat(r.Content.Select(b => b switch
+        {
+            Block.TextBlock t => t.Text,
+            _ => throw new ArgumentException(
+                $"工具结果里有无法翻译的块（{b.GetType().Name}）", nameof(r)),
+        }));
+
+        // 空输出给出占位串：与另两条链路同一种行为（换个 provider 不该改变模型看到的东西）。
+        if (text.Length == 0) text = "(无输出)";
+
+        return new JsonObject
+        {
+            ["type"] = "function_call_output",
+            ["call_id"] = r.CallId,
+            ["output"] = text,
+        };
+    }
+
+    // 一条 canonical 消息 → 协议 input 项（有工具调用时是多项，见 ToItems）。
+    // Responses 不暴露推理（返回体无推理字段）→ 丢且不伪造。
+    private static List<JsonObject> MessageToItems(TimelineEvent.MessageEvent message, string protocol)
+    {
         var role = message.From == Speaker.User ? "user" : "assistant";
 
         // 先按协议能力过滤推理块——Responses 不承载，丢且不伪造。
         var blocks = ReasoningPolicy.FilterFor(message.Blocks, protocol);
         var texts = blocks.OfType<Block.TextBlock>().Select(b => b.Text).ToList();
 
+        // ⚠️ 与 Chat 同一条判据：一个只调工具、不说话的 assistant 消息 content 是空的，
+        // 而那是常态 ⇒ 判据要连调用一起看。
+        var calls = blocks.OfType<Block.ToolUseBlock>().ToList();
+
         // 过滤掉推理块后可能一条不剩（推理模型只思考不落笔），必须早失败。
-        if (texts.Count == 0)
+        if (texts.Count == 0 && calls.Count == 0)
             throw new ArgumentException(
-                $"时间线里有空消息（speaker={message.From}），无法构造请求", nameof(evt));
+                $"时间线里有空消息（speaker={message.From}），无法构造请求", nameof(message));
 
-        // 用户用 input_text、助手用 output_text（上游两者都收）。
-        // 始终发 part 数组（单块也是）：数组对单块/多块是同一条路径，少一处无覆盖的代码。
-        var blockType = message.From == Speaker.User ? "input_text" : "output_text";
-        var content = new JsonArray(
-            texts.Select(t => (JsonNode)new JsonObject { ["type"] = blockType, ["text"] = t }).ToArray());
+        var items = new List<JsonObject>();
 
-        return new JsonObject
+        // ⚠️ **没有正文时不发那条 message 项**（`content: []` 是另一回事，而且多半非法）。
+        // 一条「只调工具」的 assistant 消息在 Responses 下**就是**若干 function_call 项，没有消息项。
+        if (texts.Count > 0)
         {
-            ["type"] = "message",   // 必须——少了它上游报 upstream_error
-            ["role"] = role,
-            ["content"] = content,
-        };
+            // 用户用 input_text、助手用 output_text（上游两者都收）。
+            // 始终发 part 数组（单块也是）：数组对单块/多块是同一条路径，少一处无覆盖的代码。
+            var blockType = message.From == Speaker.User ? "input_text" : "output_text";
+            items.Add(new JsonObject
+            {
+                ["type"] = "message",   // 必须——少了它上游报 upstream_error
+                ["role"] = role,
+                ["content"] = new JsonArray(
+                    texts.Select(t => (JsonNode)new JsonObject { ["type"] = blockType, ["text"] = t })
+                        .ToArray()),
+            });
+        }
+
+        // 模型的调用在 Responses 里是**并列的项**（这是它与 Chat 最不一样的地方）。
+        foreach (var c in calls)
+            items.Add(new JsonObject
+            {
+                ["type"] = "function_call",
+                ["call_id"] = c.CallId,
+                ["name"] = c.Name,
+                // ⚠️ 与 Chat 同：`arguments` 是**字符串**，逐字塞原文。
+                ["arguments"] = c.Arguments,
+            });
+
+        return items;
     }
 }
