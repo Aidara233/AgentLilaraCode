@@ -31,8 +31,15 @@ public static class Json
     /// <para>纯加字段**也 +1**——因为加了之后老程序读新文件就是「静默忽略一个它不认识的键」，
     /// 那正是版本号要终结的那种不确定性（它今天恰好是无害的，明天可能不是：
     /// 如果那个新字段改变的是**已有字段的含义**，老程序会按旧含义解释新数据，且毫无察觉）。</para>
+    ///
+    /// <para>⚠️ <b>3（2026-10-06，最小工具批）</b>：<c>ToolResultEvent</c> 加了
+    /// <c>dependsOn</c> 与 <c>fingerprint</c>（`00` §5 的三件里除快照外的两件）。
+    /// ⚠️ 顺带说明一个**已知且刻意**的边界：<b><c>history.jsonl</c> 的行上没有版本号</b>
+    /// （那份是只追加的，行与行可以来自不同版本，见 <see cref="VersionKey"/> 的注释）
+    /// ⇒ 老核心读新行会**静默忽略**这两个键。代价是「三态判定退化成总是『不一致』」——
+    /// 失败方向是**多一次重读**，不是错读。这是接受这个代价的前提，写下来免得将来被当成漏洞。</para>
     /// </summary>
-    public const int FormatVersion = 2;
+    public const int FormatVersion = 3;
 
     public static readonly JsonSerializerOptions Options = new()
     {

@@ -65,12 +65,12 @@ public class DiskFormatGoldenTests
         };
 
         var onDisk = JsonSerializer.Serialize(spec, Json.Options);
-        Assert.StartsWith("""{"version":2,""", onDisk);
+        Assert.StartsWith("""{"version":3,""", onDisk);
 
         // 线上那一份：同一批选项（`WireFormatTests` 钉着两份设置一致），端点又直接序列化这个类型
         // ⇒ 版本号跟着走。**这就是它出现在头那边的原因**，不是谁忘了挡。
         var onWire = JsonSerializer.Serialize(spec, Hosting.WireJson.Options);
-        Assert.StartsWith("""{"version":2,""", onWire);
+        Assert.StartsWith("""{"version":3,""", onWire);
     }
 
     [Fact]
@@ -86,7 +86,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":2,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
+            """{"version":3,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -107,7 +107,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":2,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
+            """{"version":3,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -138,7 +138,7 @@ public class DiskFormatGoldenTests
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"version":2,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":3,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -190,6 +190,9 @@ public class DiskFormatGoldenTests
 
     // 工具结果：判别式 + callId + content（一串块）+ 基类的 id/at。
     // ⚠️ 顺序仍是「派生在前、基类在后」，与 MessageEvent 那条同一个规律。
+    //
+    // ⚠️ **这条同时是「加字段不破格式」的证据**：`Ref` / `DependsOn` / `Fingerprint`
+    // 三个都没给 ⇒ 按 WhenWritingNull **整个键不出现**，期望串与本批之前逐字节相同。
     [Fact]
     public void ToolResultEvent_KeepsItsExactBytes()
     {
@@ -204,6 +207,51 @@ public class DiskFormatGoldenTests
         Assert.Equal(
             """{"kind":"toolResult","callId":"c1","content":[{"kind":"text","text":"ok"}],"id":"r1","at":"1970-01-01T00:00:00+00:00"}""",
             TimelineEvent.StableSerialize(evt));
+    }
+
+    // ⚠️ **这三件是三个不同的东西，这条钉的是它们各自的键名与顺序**（`00` §5 / `01` §3.6）：
+    //   `content`    = 快照在哪（这一条是内联的小快照）
+    //   `ref`        = 指向**另一条记录**（`fetch` 专用）—— 这条刻意不设
+    //   `dependsOn`  = 依赖什么（重新解析回同一个东西的指称）
+    //   `fingerprint`= 当时的指纹（三态判定要比的就是它）
+    // 顺序 = 声明顺序；`ref` 不给 ⇒ 它那一段不出现，正好把「两件」与「三件」分开摆着。
+    [Fact]
+    public void ToolResultEvent_WithDependencyAndFingerprint_KeepsItsExactBytes()
+    {
+        var evt = new TimelineEvent.ToolResultEvent
+        {
+            Id = "r1",
+            At = DateTimeOffset.UnixEpoch,
+            CallId = "c1",
+            Content = [new Block.TextBlock("ok")],
+            DependsOn = "src/auth.cs",
+            Fingerprint = "1f2e3d",
+        };
+
+        Assert.Equal(
+            """{"kind":"toolResult","callId":"c1","content":[{"kind":"text","text":"ok"}],"dependsOn":"src/auth.cs","fingerprint":"1f2e3d","id":"r1","at":"1970-01-01T00:00:00+00:00"}""",
+            TimelineEvent.StableSerialize(evt));
+    }
+
+    // ⚠️ **指纹为 null 不是「没填」，是「这个结果没有指纹」**——`00` §5 的不可重演类
+    // （执行命令 / 发邮件 / 取时间）**永不可优化**，因为它们**无指纹**。
+    // 这条钉住：`null` 与 `""` 在盘上**必须长得不一样**（前者键不出现、后者是空串），
+    // 否则「没有指纹」与「指纹是空串」就分不开了。
+    [Fact]
+    public void ToolResultEvent_WithNullFingerprint_OmitsTheKey_UnlikeAnEmptyString()
+    {
+        static string Ser(string? fp) => TimelineEvent.StableSerialize(new TimelineEvent.ToolResultEvent
+        {
+            Id = "r1",
+            At = DateTimeOffset.UnixEpoch,
+            CallId = "c1",
+            Content = [],
+            DependsOn = "x",
+            Fingerprint = fp,
+        });
+
+        Assert.DoesNotContain("\"fingerprint\"", Ser(null));
+        Assert.Contains("\"fingerprint\":\"\"", Ser(""));
     }
 
     // 线上名是 reasoningKind 不是 kind：判别式已占 kind，撞名会让 STJ 对整个类型抛异常。
@@ -252,7 +300,7 @@ public class DiskFormatGoldenTests
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"version":2,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":3,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -267,7 +315,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":2,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
+            """{"version":3,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 }
