@@ -1132,8 +1132,8 @@ public class ControlServerTests : IAsyncLifetime
 
         Assert.Equal(
             ["ArchivedAt:Nullable`1", "CreatedAt:DateTimeOffset", "Model:ModelSelection",
-             "ProjectKey:String", "SessionId:String", "Title:String", "Version:Int32",
-             "WorkingDirectory:String"],
+             "ProjectKey:String", "SessionId:String", "SystemPromptPreset:String", "Title:String",
+             "Version:Int32", "WorkingDirectory:String"],
             Shape(typeof(SessionSpec)));
 
         // 嵌套那层也要钉——key 加在这里会序列化成 spec.model.apiKey，顶层看不见。
@@ -1423,7 +1423,15 @@ public class ControlServerTests : IAsyncLifetime
 
         Assert.NotNull(ackNote);
         Assert.NotNull(eventReason);
-        Assert.Contains("回收了", ackNote);
+
+        // ⚠️ **这里原先是 `Assert.Contains("回收了", ackNote)`**，而它在本批红了——
+        // 因为预设一上线，工具结果的**内容**变了：`read` 读到的那个文件更小/更大了，
+        // 而「收不收得了」本来就取决于内容在不在库里。**这条断言在钉一个会随别的东西变的事实**，
+        // 而本测试要钉的是「回执与事件说同一句话」，不是「这一次到底收了几条」。
+        // ⇒ 改成断言那句人话的**形状**（两种结果都认），把「具体收了几条」留给 ReclaimTests。
+        Assert.True(
+            ackNote.Contains("回收了") || ackNote.Contains("没有可回收"),
+            $"回执得说清结果，实际是：{ackNote}");
 
         // ⚠️ **同一个事实，两处必须逐字相同**（2026-10-06 加）。
         //

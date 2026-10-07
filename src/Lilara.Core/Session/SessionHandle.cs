@@ -145,7 +145,8 @@ public sealed record SessionHandle
     public void SetReclaimed(IReadOnlySet<string> ids) => Volatile.Write(ref _reclaimed, ids);
 
     public static SessionHandle Create(
-        SessionStore store, string workingDirectory, ModelSelection model, string? title = null)
+        SessionStore store, string workingDirectory, ModelSelection model, string? title = null,
+        string? systemPromptPreset = null)
     {
         // ⚠️ **一次取绝对路径，三处共用同一个值**：算 key、写 spec、定目录。
         // 改之前是**两次独立的** `GetFullPath`（`ProjectKey.FromPath` 内部一次、
@@ -166,6 +167,9 @@ public sealed record SessionHandle
             // 没给就是 null ⇒ `WhenWritingNull` 整个键不出现。可空是**语义**（「没起名」），
             // 不再是「为了让老文件逐字节不变」——那件事现在由**格式版本**承担。
             Title = title,
+            // 同上：`null` = 没指定 ⇒ 渲染时跟随全局默认（`CorePrompts.DefaultPreset`）。
+            // ⚠️ **这里不校验那个预设文件存不存在**（理由见 `SessionCreate.Preset` 的注释）。
+            SystemPromptPreset = systemPromptPreset,
         };
         var state = new SessionState
         {

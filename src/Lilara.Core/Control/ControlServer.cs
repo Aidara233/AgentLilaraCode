@@ -153,10 +153,18 @@ public sealed class ControlServer(
                     Spec = handle.Spec,
 
                     // 三个槽（系统 / 首要 / 浮动）：渲染归核心、显示归头。
-                    // 核心还没有装配器，所以恒为空——但如实交出空数组、不省略字段（空的也要显示）。
+                    // ⚠️ **系统那格今天是真的了**（2026-10-07，预设批）：它读的就是发请求时用的那一份
+                    // （`SystemBlock.Render`），所以头显示什么、模型收到什么**同一个来源**。
+                    // ⚠️ 首要与浮动仍然恒空——装配器只做了系统块这一半，如实交空数组、不省略字段。
+                    //
+                    // ⚠️ **读的时刻与「步」无关**：这里没有步的概念（这是个 HTTP 快照端点），
+                    // 所以它拿的是**此刻**的文件内容。而发请求那一侧是**步开始冻结**的
+                    // （见 `SystemBlock.Render` 的注释）⇒ 用户在步中途改文件时，
+                    // 这一格会**先**变、而请求里要等下一步才变。那不是缺陷，是两条不同的时间轴：
+                    // 快照端点回答「现在是什么」，请求回答「这一步是什么」。
                     Slots = new
                     {
-                        System = Array.Empty<object>(),
+                        System = SystemBlock.Render(new PresetStore(host.DataRoot), handle.Spec.SystemPromptPreset),
                         Premier = Array.Empty<object>(),
                         Floating = Array.Empty<object>(),
                     },
@@ -590,6 +598,16 @@ public sealed class ControlServer(
             // 连通性自检。与 provider.delete 同形（只带 id）。
             "provider.test" => new CoreCommand.ProviderTest(
                 payload.GetProperty("id").GetString()!),
+            // 预设：系统的系统提示词从哪来。三条同 `provider.*` 一族（id 闸也在 dispatcher）。
+            // ⚠️ `content` 走 GetProperty（**必给**）——`preset.set` 没有别的字段，
+            // 所以「没给 content」只可能是发命令的程序写错了；而「给了空串」是**合法值**（纯 chat）。
+            // 用 `Opt` 的话两者会被并成同一个 null ⇒ 把「我要纯聊天」变成一条含义不明的命令。
+            "preset.set" => new CoreCommand.PresetSet(
+                payload.GetProperty("id").GetString()!,
+                payload.GetProperty("content").GetString()!),
+            "preset.delete" => new CoreCommand.PresetDelete(
+                payload.GetProperty("id").GetString()!),
+            "preset.list" => new CoreCommand.PresetList(),
             _ => throw new ArgumentException($"认不出的命令 '{kind}'"),
         };
 

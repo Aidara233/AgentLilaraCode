@@ -194,18 +194,26 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("provider test ", StringComparison.Ordinal))
             return ParseProviderTest(trimmed);
 
+        // 预设：系统提示词的存放（`01` §3.1）。三条**都走命令通道**——
+        // 连 `list` 也走，因为头要拿它做下拉，而头只有「命令 + 快照」两层的入口。
+        // ⚠️ 动词判据在**归一化后**的行上（词是单个词，折空白无妨），
+        // 而**内容**取自**原始行**——见 `ParsePreset` 里那段。
+        if (StartsWithToken(trimmed, "preset")) return ParsePreset(line);
+
         // 三条本地查询（provider / session / claim）+ 光杆动词，都不能落回「当成消息」
         // （用户以为在列东西，实际烧了一次模型调用）。
         if (IsProviderList(trimmed)) return (null, null);
         if (IsSessionList(trimmed)) return (null, null);
         if (string.Equals(trimmed, "provider", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(trimmed, "session", StringComparison.OrdinalIgnoreCase))
+            || string.Equals(trimmed, "session", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, "preset", StringComparison.OrdinalIgnoreCase))
             return (null, "用法：provider list | provider set <id> … | provider delete <id> | provider test <id>"
-                + "\n      session list | session create [--cwd <目录>] [--title <名>]"
+                + "\n      session list | session create [--cwd <目录>] [--title <名>] [--preset <id>]"
                 + " | session activate <id> | session interrupt <id>"
                 + "\n      session configure <id> [--provider <pid>] [--model <m>]"
                 + "\n      session deactivate <id> | session archive <id> [--unarchive] | session delete <id>"
-                + " | session gc <id>");
+                + " | session gc <id>"
+                + "\n      preset list | preset set <id> <内容> | preset delete <id>");
 
         // 光一个 `provider delete` 不能落回「当成消息」——用户以为删了，而 provider 还在盘上。
         if (string.Equals(trimmed, "provider delete", StringComparison.Ordinal))
@@ -318,7 +326,7 @@ public static class CoreCommandParser
         return (new CoreCommand.SessionSetAxis(parts[2], parts[3], parts[4]), null);
     }
 
-    // `session create [--cwd <目录>] [--title <名>]`
+    // `session create [--cwd <目录>] [--title <名>] [--preset <id>]`
     //
     // ⚠️ **光杆的 `session create` 必须继续成立**（今天控制台的默认手感），
     // 所以这个解析器**不用通用的标志循环**：词数为 2 就是「什么都不给」，直接返回。
@@ -333,7 +341,7 @@ public static class CoreCommandParser
         var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length == 2) return (new CoreCommand.SessionCreate(), null);
 
-        string? cwd = null, title = null;
+        string? cwd = null, title = null, preset = null;
 
         for (var i = 2; i < parts.Length; i += 2)
         {
@@ -348,6 +356,7 @@ public static class CoreCommandParser
             {
                 case "--cwd": cwd = value; break;
                 case "--title": title = value; break;
+                case "--preset": preset = value; break;
 
                 // 未知标志必须拒绝：拼错的 --cwd 会被静默吞掉、照常建出一个会话，
                 // 而它**落在了核心的工作目录**而不是用户想要的地方。
@@ -355,7 +364,66 @@ public static class CoreCommandParser
             }
         }
 
-        return (new CoreCommand.SessionCreate { Cwd = cwd, Title = title }, null);
+        return (new CoreCommand.SessionCreate { Cwd = cwd, Title = title, Preset = preset }, null);
+    }
+
+    // `preset set <id> <内容>` / `preset delete <id>` / `preset list`
+    //
+    // ⚠️ **内容按原始行原样截，不走归一化那一步**——这是本函数唯一不能用 `Normalize` 的地方，
+    // 也是它为什么收的是原始 `line` 而不是 `trimmed`。理由：预设的正文**就是要发给模型的那段
+    // 提示词**，换行 / Tab / 连续空格都是它的意思。折叠一次就等于改写用户写的提示词，
+    // 而且**没有任何地方会报告这件事**（它只是安静地少了几格缩进）。
+    // 归一化只用来**定位**（认出动词、找到 id 的边界），内容按原样截。
+    //
+    // ⚠️ 代价如实写下：内容**开头的空白**表达不出来（分隔用的那一格总是被跳过）。
+    // 想要前导空行，用别的方式绕（或者将来换成 `preset set <id> --file <路径>`）。
+    private static (CoreCommand?, string?) ParsePreset(string line)
+    {
+        var parts = Normalize(line).Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (parts.Length < 2)
+            return (null, "用法：preset list | preset set <id> <内容> | preset delete <id>");
+
+        var verb = parts[1];
+
+        if (string.Equals(verb, "list", StringComparison.OrdinalIgnoreCase))
+            return parts.Length == 2
+                ? (new CoreCommand.PresetList(), null)
+                : (null, "用法：preset list");
+
+        if (string.Equals(verb, "delete", StringComparison.OrdinalIgnoreCase))
+            return parts.Length == 3
+                ? (new CoreCommand.PresetDelete(parts[2]), null)
+                : (null, "用法：preset delete <id>");
+
+        if (string.Equals(verb, "set", StringComparison.OrdinalIgnoreCase))
+        {
+            if (parts.Length < 3) return (null, "用法：preset set <id> <内容>");
+
+            // parts[2] 是 id（它没有空白 ⇒ 归一化不影响它本身）。
+            // 内容从**原始行**里 id 之后开始截 —— 跳过那段分隔空白，其余一字不动。
+            var start = AfterNthToken(line, 2);
+            var content = start >= line.Length ? "" : line[start..];
+
+            return (new CoreCommand.PresetSet(parts[2], content), null);
+        }
+
+        return (null, $"未知 preset 动词 '{verb}'。用法：preset list | preset set <id> <内容> | preset delete <id>");
+    }
+
+    // 「第 n 个（0 起）空白分隔词之后、跳过那段分隔空白」在**原始行**上的索引。
+    // ⚠️ 它只**定位**，不折叠也不改写它扫过的任何字符（内容由调用方按原样截）。
+    private static int AfterNthToken(string line, int n)
+    {
+        var i = 0;
+        for (var token = 0; token <= n; token++)
+        {
+            while (i < line.Length && char.IsWhiteSpace(line[i])) i++;
+            while (i < line.Length && !char.IsWhiteSpace(line[i])) i++;
+        }
+
+        while (i < line.Length && char.IsWhiteSpace(line[i])) i++;
+        return i;
     }
 
     // `provider set <id> [--key <k>] [--model <m>] [--protocol <p>] [--endpoint <u>] [--auth <a>] [--models a,b,c]`

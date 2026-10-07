@@ -72,4 +72,22 @@ public sealed record SessionSpec
     /// 那件事现在由**格式版本**承担。</para>
     /// </summary>
     public DateTimeOffset? ArchivedAt { get; init; }
+
+    /// <summary>
+    /// 这个会话用哪份系统提示词（`presets/&lt;id&gt;.md`）。`null` = **没指定，跟随全局默认**
+    /// （<see cref="CorePrompts.DefaultPreset"/>）。
+    ///
+    /// <para>⚠️ <b>这里存的是「引用」，不是内容</b>——与 <c>Model</c> 存「解析结果的快照 + 指向定义的引用」
+    /// 那条（`01` §7.2）**刻意不同**，而对「系统提示词」这个对象是**有意选的**（用户 2026-10-07 裁定）：
+    /// 改那个文件**立刻**对下一次请求生效。<b>代价如实认下</b>：那些会话的前缀全废——
+    /// 而那正是刚写进 `01` §3.1 的「**外力失效窗口**」（用户改配置 / 插件变 / 核心升级同族）。</para>
+    ///
+    /// <para>⚠️ <b>实时的是「跨步」，不是「渲染时现读」</b>：内容在**步开始**取一次并冻住
+    /// （照抄 `now` 的先例，`01` §3.2）。见 <see cref="Session.SystemBlock"/> 的注释——
+    /// 那里写了为什么「随手现读」会变成「每步破前缀」。</para>
+    ///
+    /// <para>⚠️ 可空是**语义**（`null` = 没指定），不是「为了让老文件逐字节不变」——
+    /// 那件事由**格式版本**承担。</para>
+    /// </summary>
+    public string? SystemPromptPreset { get; init; }
 }

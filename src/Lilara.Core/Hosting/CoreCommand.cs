@@ -51,6 +51,39 @@ public abstract record CoreCommand
     public sealed record ProviderTest(string Id) : CoreCommand;
 
     /// <summary>
+    /// 写一份预设（`&lt;数据根&gt;/presets/&lt;id&gt;.md`）。<b>内容就是那段系统提示词</b>。
+    ///
+    /// <para>⚠️ <b>空 <paramref name="Content"/> 是合法且有意义的值</b>（= 纯聊天），
+    /// 别把它当「没给」——它与「没提到这个字段」完全不同，而这条命令**没有别的字段**，
+    /// 所以不存在 <see cref="ProviderUpsert"/> 那种「null = 保留旧值」的语义。</para>
+    ///
+    /// <para>⚠️ <b>它不碰任何会话</b>：改完立刻对下一次请求生效的是「会话引用它」那条路
+    /// （`SessionSpec.SystemPromptPreset` 存的是引用），本条命令**只是改那个被引用的东西**。
+    /// ⇒ 不需要通知任何会话、也没有会话级事件可发。</para>
+    /// </summary>
+    public sealed record PresetSet(string Id, string Content) : CoreCommand;
+
+    /// <summary>
+    /// 删掉一份预设。判据同 <see cref="ProviderDelete"/>（同一个 id 闸、同样
+    /// **不存在 ⇒ 拒绝，不是幂等成功**）。
+    ///
+    /// <para>⚠️ 删掉之后引用它的会话<b>不报错</b>——渲染回落到内置模板
+    /// （`SystemBlock` 的第三条路：「没配过」）。这是刻意的：预设是**引用**，
+    /// 而引用的目标可以消失；拒绝删除会逼用户先去改每个会话，那是把「删一个文件」
+    /// 变成一次跨会话事务。</para>
+    /// </summary>
+    public sealed record PresetDelete(string Id) : CoreCommand;
+
+    /// <summary>
+    /// 列出有哪些预设。⚠️ **它走线**（不像 `provider list` 是控制台本地查询）：
+    /// 头要做下拉，而头**只有一个入口**（命令 + 快照两层），没有第二套本地查询通道。
+    ///
+    /// <para>结果走 <c>Ack.Accepted.Note</c>——与 `provider.test` 同一条用法
+    /// （「业务结果」放 Note，头不该依赖它，但控制台与头都看得见）。</para>
+    /// </summary>
+    public sealed record PresetList : CoreCommand;
+
+    /// <summary>
     /// 建一个会话。**显式动作**——核心不替你决定该有个会话（`01` §8.1）。
     ///
     /// <para>名字 `Cwd` 取自设计（`03` §3 的 `session.create(projectKey?, preset?, cwd?)`）：
@@ -66,9 +99,12 @@ public abstract record CoreCommand
     /// 其余时候报一句用户无从补救的错。头那边本来就有路径（从会话 spec 推的），
     /// 直接交路径，两边都简单。</para>
     ///
-    /// <para>⚠️ <b><see cref="Title"/> 只能在这里设一次，此后没有任何命令能改它</b>
-    /// （所以没有 `session.renamed` 事件）。⇒ 别做成「点一下给个临时名」：
-    /// 名字是**永久**的，工具不该替用户起名。</para>
+    /// <para>⚠️ **没有「按项目键建」那一半**，理由见 <see cref="SessionCreate.Cwd"/> 的注释。</para>
+    ///
+    /// <para>⚠️ <b><see cref="Preset"/> 是「出生时施加一次」</b>（`01` §7.1）：它只在建会话这一刻
+    /// 决定用哪份系统提示词，此后那个值住在 <c>spec.json</c> 里，要改走
+    /// <see cref="SessionConfigure"/>。<b>预设不是第二个能改会话的地方</b>——
+    /// 两个变更入口迟早会漂，这是本仓栽熟的形状。</para>
     /// </summary>
     public sealed record SessionCreate : CoreCommand
     {
@@ -80,6 +116,17 @@ public abstract record CoreCommand
 
         /// <summary>会话名，可选（可人为空 ⇒ 存 null，整个键不落盘）。</summary>
         public string? Title { get; init; }
+
+        /// <summary>
+        /// 用哪份系统提示词（`presets/&lt;id&gt;.md`）。**可选**：不给 ⇒ 会话存 `null`，
+        /// 渲染时跟随全局默认（`CorePrompts.DefaultPreset`）。
+        ///
+        /// <para>⚠️ <b>这里不校验「那个预设文件存不存在」</b>——与 <see cref="PresetSet"/> 刻意不同。
+        /// 文件不在不是错误：渲染会回落到内置模板（`SystemBlock` 那三条路的第二条是「没配过」）。
+        /// 若在这里拒绝，「先建会话、以后再写预设」这条完全正常的路会被堵死，
+        /// 而它恰恰是最常见的那条（用户还没写呢）。</para>
+        /// </summary>
+        public string? Preset { get; init; }
     }
 
     public sealed record SessionActivate(string SessionId) : CoreCommand;

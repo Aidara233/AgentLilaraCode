@@ -29,6 +29,11 @@ public sealed class CommandDispatcher(
     private readonly Func<ProviderDefinition, IModelAdapter> _createAdapter =
         createAdapter ?? AdapterFactory.Create;
 
+    // 预设的读写点。**从数据根现造**（与 `Reclaim` 那处 `new BlobStore(DataRoot)` 同形）：
+    // 它无状态、只包一个路径前缀，做成字段就得给 `CoreHost` 再开一个属性，
+    // 而那个属性没有任何别的地方要用。
+    private readonly PresetStore _presets = new(host.DataRoot);
+
     /// <summary>
     /// 分派一条命令。
     /// <paramref name="awaitCompletion"/>：控制台传 true——它没有视图，唯一的输出就是这次的返回值，
@@ -54,6 +59,11 @@ public sealed class CommandDispatcher(
 
                 case CoreCommand.ProviderTest t:
                     return await HandleProviderTestAsync(t, commandId, ct);
+
+                // ---- 预设：系统块从哪来（`01` §3.1；`14` 未决项 6）----
+                case CoreCommand.PresetSet ps: return HandlePresetSet(ps, commandId);
+                case CoreCommand.PresetDelete pd: return HandlePresetDelete(pd, commandId);
+                case CoreCommand.PresetList: return HandlePresetList(commandId);
 
                 case CoreCommand.SessionCreate c:
                     return HandleSessionCreate(c, commandId);
@@ -276,6 +286,84 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
+    /// 写一份预设（`&lt;数据根&gt;/presets/&lt;id&gt;.md`）。
+    ///
+    /// <para>⚠️ <b>它不碰任何会话、也不失效任何东西</b>：会话存的是**引用**
+    /// （`SessionSpec.SystemPromptPreset`），而这次改的是被引用的那个文件 ⇒
+    /// 引用方的 `spec` 一个字没变，下一次渲染自己去读就会拿到新内容。
+    /// ⇒ 没有会话级事件可发，也没有缓存要失效（`Stepper` 里那次读是**每步**发生的，
+    /// 见 `SystemBlock.Render` 的注释）。</para>
+    /// </summary>
+    private DispatchResult HandlePresetSet(CoreCommand.PresetSet p, string id)
+    {
+        if (!IsSafeProviderId(p.Id))
+            return Reject(id, UnsafeProviderIdReason(p.Id));
+
+        // ⚠️ **空内容是合法的**（= 纯聊天），所以这里**不判** `IsNullOrEmpty`。
+        // 判了的话「我要纯聊天」会变成一条被拒的命令，而它是最该好走的那条路。
+        _presets.Save(p.Id, p.Content);
+
+        // 回执说清「写进去了什么长度」，因为空内容与有内容的成功**长得一样**——
+        // 而用户敲完 `preset set default ""` 之后最想确认的就是「我真的存了个空的吗」。
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Note = p.Content.Length == 0
+                ? $"'{p.Id}' 已写成空预设——用它的会话不带系统提示词（纯 chat）。"
+                : $"'{p.Id}' 已写入（{p.Content.Length} 字符）。",
+        });
+    }
+
+    /// <summary>删一份预设。判据与 <see cref="HandleProviderDelete"/> 同源（同一个 id 闸、同样不幂等）。</summary>
+    private DispatchResult HandlePresetDelete(CoreCommand.PresetDelete d, string id)
+    {
+        if (!IsSafeProviderId(d.Id))
+            return Reject(id, UnsafeProviderIdReason(d.Id));
+
+        bool deleted;
+        try
+        {
+            deleted = _presets.Delete(d.Id);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return Reject(id, $"无法删除预设 '{d.Id}'：文件正被占用（可能有并发读）。稍后再试。");
+        }
+
+        if (!deleted)
+            return Reject(id, $"没有预设 '{d.Id}'，无从删除。");
+
+        // ⚠️ 引用它的会话**不报错**（`PresetDelete` 的注释说了为什么）——它们下一次渲染
+        // 会发现文件不在，回落到内置模板。回执里点一句，免得用户以为删了个没人用的东西。
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Note = $"'{d.Id}' 已删除。引用它的会话不受影响，会回落到内置系统提示词。",
+        });
+    }
+
+    /// <summary>
+    /// 列出有哪些预设。
+    ///
+    /// <para>⚠️ <b>走线，不像 `provider list` 那样做本地查询</b>：头只有一个入口
+    /// （命令 + 快照两层），没有第二套本地查询通道；而头要用它做下拉。
+    /// ⇒ 结果走 `Note`（同 `provider.test` 的用法）。空表也是一条**成功**的回执——
+    /// 「一个都没有」不是错误，是初始状态。</para>
+    /// </summary>
+    private DispatchResult HandlePresetList(string id)
+    {
+        var ids = _presets.List();
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Note = ids.Count == 0
+                ? "还没有预设。`preset set <id> <内容>` 建一个；不建的话会话用核心内置的那份。"
+                : string.Join(" / ", ids),
+        });
+    }
+
+    /// <summary>
     /// 连通性自检：用该提供商的配置发一次最小请求，把结果翻成一句人话。
     ///
     /// ⚠️ **失败不走 `Rejected`**：按 `03` §3，`rejected` 只用于**命令本身不合法**
@@ -398,7 +486,8 @@ public sealed class CommandDispatcher(
         }
 
         var model = _host.Providers.ToSelection(provider, null, "high", 16000);
-        var handle = SessionHandle.Create(_host.Store, workingDirectory, model, Trimmed(c.Title));
+        var handle = SessionHandle.Create(
+            _host.Store, workingDirectory, model, Trimmed(c.Title), Trimmed(c.Preset));
 
         // 登记进激活表——快照端点据此避免读到盘上过期的 Idle。
         _host.Register(handle);
@@ -850,7 +939,7 @@ public sealed class CommandDispatcher(
         if (next.ProviderId != before.ProviderId) _host.InvalidateSteppers();
 
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-            new WireEvent.SpecChanged(handle.SessionId, next));
+            new WireEvent.SpecChanged(handle.SessionId, next, handle.Spec.SystemPromptPreset));
 
         return new DispatchResult(new Ack.Accepted { CommandId = id, Note = $"{next.ProviderId} / {next.ModelId}" });
     }

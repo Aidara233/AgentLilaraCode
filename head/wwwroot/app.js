@@ -457,6 +457,10 @@ function appendTimeline(el) {
 
 function renderSlots(slots) {
   // 空的也要显示：区分「核心没配提示词」与「头坏了」。
+  // ⚠️ **系统那一格从 2026-10-07 起是**真的**了**（预设批）：核心以前恒交空数组，
+  // 现在它交的是 `presets/<id>.md` 的内容。这里**一个字都不用改**——
+  // 渲染一直就是「有块就显示、没块显示（空）」，缺的只是核心侧那份数据。
+  // ⇒ 显示「（空）」现在意味着「这个会话选了空预设 / 纯 chat」，不再意味着「没实现」。
   const fmt = (b) => (b && b.length ? b.map(textOf).join("") : "（空）");
   const put = (el, v) => {
     el.textContent = v;
@@ -464,7 +468,7 @@ function renderSlots(slots) {
   };
   put($("slot-system"), slots ? fmt(slots.system) : "（空）");
   put($("slot-premier"), slots ? fmt(slots.premier) : "（空）");
-  // 浮动槽正文由核心给；核心尚无装配器 ⇒ 恒空，如实显示「尚未实现」。
+  // ⚠️ 浮动槽**仍然**是「尚未实现」——本批只做了系统块那一半，如实写，别跟着上面那句一起改。
   $("floating-body").textContent = slots && slots.floating && slots.floating.length
     ? slots.floating.map(textOf).join("")
     : "（核心侧装配器尚未实现）";

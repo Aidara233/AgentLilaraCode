@@ -181,15 +181,20 @@ public class StepperTests : IDisposable
     }
 
     [Fact]
-    public async Task Step_KeepsSystemBlocksEmpty()
+    public async Task Step_SendsTheBuiltInSystemPrompt_WhenNoPresetConfigured()
     {
-        // 裸核心没有系统提示词。
+        // ⚠️ **这条 2026-10-07 反过来了**：它原先叫 `Step_KeepsSystemBlocksEmpty`，
+        // 钉的是「核心自带零内容」——那时系统块确实是空的（`SystemBlocks = []` 是硬编码的）。
+        // 预设批之后它**不再空**：没有预设文件时回落 `CorePrompts.SystemFallback`，
+        // 而那句话正是「回收是正常会发生的」——修模型自证的唯一一样东西。
+        // ⇒ 保留这条的**位置与形状**（步的产物里确实带着系统块），但期望值反过来。
         var handle = NewSession();
         _adapter.Reply("ok");
 
         await _stepper.StepAsync(handle, "hi", CancellationToken.None);
 
-        Assert.Empty(_adapter.Calls[0].SystemBlocks);
+        var text = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[0].SystemBlocks));
+        Assert.Equal(CorePrompts.SystemFallback, text.Text);
     }
 
     [Fact]

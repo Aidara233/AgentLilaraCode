@@ -38,8 +38,14 @@ public static class Json
     /// （那份是只追加的，行与行可以来自不同版本，见 <see cref="VersionKey"/> 的注释）
     /// ⇒ 老核心读新行会**静默忽略**这两个键。代价是「三态判定退化成总是『不一致』」——
     /// 失败方向是**多一次重读**，不是错读。这是接受这个代价的前提，写下来免得将来被当成漏洞。</para>
+    ///
+    /// <para>⚠️ <b>4（2026-10-07，预设批）</b>：<c>SessionSpec</c> 加了 <c>systemPromptPreset</c>。
+    /// ⚠️ 它**不是**「加个字段所以顺手 +1」——那条规则见上面那段。这里要 +1 是因为
+    /// <b>它改变了一个已有位置的解释</b>：这个会话的**前缀最前面那块**（`system`）从此不是常量，
+    /// 而老程序会把「缺这个键」读成「这套格式里根本没有系统提示词这回事」。
+    /// ⇒ 两份程序对同一个会话发出的请求**逐字节不同**，而它们都以为自己在读同一份 spec。</para>
     /// </summary>
-    public const int FormatVersion = 3;
+    public const int FormatVersion = 4;
 
     public static readonly JsonSerializerOptions Options = new()
     {

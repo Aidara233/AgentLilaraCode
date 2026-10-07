@@ -28,6 +28,13 @@ public class CommandSurfaceTests
         (typeof(CoreCommand.ProviderDelete),   "provider.delete",   "provider delete p"),
         (typeof(CoreCommand.ProviderTest),     "provider.test",     "provider test p"),
 
+        // 预设：系统提示词的存放（预设批）。三条**都有线上形态**——
+        // 连 `preset list` 也有（它走线，不像 `provider list` 是控制台本地查询：
+        // 头只有一个入口，而它要用这个做下拉）。
+        (typeof(CoreCommand.PresetSet),        "preset.set",        "preset set default 你是助手"),
+        (typeof(CoreCommand.PresetDelete),     "preset.delete",     "preset delete default"),
+        (typeof(CoreCommand.PresetList),       "preset.list",       "preset list"),
+
         (typeof(CoreCommand.SessionCreate),    "session.create",    "session create"),
         (typeof(CoreCommand.SessionActivate),  "session.activate",  "session activate s1"),
         (typeof(CoreCommand.SessionSend),      "session.send",      null),
@@ -87,6 +94,11 @@ public class CommandSurfaceTests
         "claim.release" => """{"kind":"claim.release","sessionId":"s1","scope":["src/foo"]}""",
         "session.setAxis" => """{"kind":"session.setAxis","sessionId":"s1","axis":"safety","value":"prod"}""",
         "session.configure" => """{"kind":"session.configure","sessionId":"s1","model":"m"}""",
+        // ⚠️ 预设这几条**不能走那个兜底载荷**：它会塞一个 `sessionId`，而这三条
+        // 各自要的是 `id`（预设名）与 `content`。用兜底的话会漏测「真的读到了那两个键没有」。
+        "preset.set" => """{"kind":"preset.set","id":"default","content":"你是助手"}""",
+        "preset.delete" => """{"kind":"preset.delete","id":"default"}""",
+        "preset.list" => """{"kind":"preset.list"}""",
         _ => $$"""{"kind":"{{kind}}","id":"x","sessionId":"s1"}""",
     };
 

@@ -16,6 +16,11 @@ namespace Lilara.Core.Tests;
 //   ④ 格式版本号
 // ⇒ 所以「加一个字段」不该来这里改期望串（除了版本号那一段），**改 `Json.Options` 才该让一大片一起红**。
 // 把它们分散写成「某条记录逐字节不变」会让人以为它们是四道独立防线，其实是一道说了几遍。
+//
+// ⚠️ **版本号 3 → 4（2026-10-07，预设批）**：`SessionSpec` 加了 `systemPromptPreset`。
+// ⚠️ 注意下面那几条 `SessionSpec` 金样**没有**出现这个键——那是对的，不是漏了：
+// 这些用例都不给预设（`null`），而 `WhenWritingNull` 会整个省掉它 ⇒ **老文件的形状逐字节不变**。
+// 要钉「给了预设时长什么样」，见 `SessionSpec_WithPreset_...`。
 public class DiskFormatGoldenTests
 {
     private static ModelSelection Sel() => new()
@@ -65,12 +70,12 @@ public class DiskFormatGoldenTests
         };
 
         var onDisk = JsonSerializer.Serialize(spec, Json.Options);
-        Assert.StartsWith("""{"version":3,""", onDisk);
+        Assert.StartsWith("""{"version":4,""", onDisk);
 
         // 线上那一份：同一批选项（`WireFormatTests` 钉着两份设置一致），端点又直接序列化这个类型
         // ⇒ 版本号跟着走。**这就是它出现在头那边的原因**，不是谁忘了挡。
         var onWire = JsonSerializer.Serialize(spec, Hosting.WireJson.Options);
-        Assert.StartsWith("""{"version":3,""", onWire);
+        Assert.StartsWith("""{"version":4,""", onWire);
     }
 
     [Fact]
@@ -86,7 +91,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":3,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
+            """{"version":4,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -107,7 +112,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":3,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
+            """{"version":4,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -132,13 +137,34 @@ public class DiskFormatGoldenTests
         Assert.EndsWith("\"archivedAt\":\"1970-01-01T00:00:00+00:00\"}", json);
     }
 
+    // ⚠️ 与上面那条 `SessionSpec_KeepsItsExactBytes` 是**两个不同的断言**，别合并：
+    // 那条钉「不给预设 ⇒ 那个键整个不出现」（老文件的形状不变），
+    // 这条钉「给了预设 ⇒ 它出现在 `title` 之后」（声明顺序 = 序列化顺序）。
+    [Fact]
+    public void SessionSpec_WithPreset_PutsTheKeyAfterTitle()
+    {
+        var spec = new SessionSpec
+        {
+            SessionId = "abc123",
+            ProjectKey = "pk1",
+            WorkingDirectory = @"C:\work",
+            CreatedAt = DateTimeOffset.UnixEpoch,
+            Model = Sel(),
+            SystemPromptPreset = "task",
+        };
+
+        Assert.Equal(
+            """{"version":4,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"systemPromptPreset":"task"}""",
+            JsonSerializer.Serialize(spec, Json.Options));
+    }
+
     [Fact]
     public void SessionState_KeepsItsExactBytes()
     {
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"version":3,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":4,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -300,7 +326,7 @@ public class DiskFormatGoldenTests
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"version":3,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":4,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -315,7 +341,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":3,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
+            """{"version":4,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 }

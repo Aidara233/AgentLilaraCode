@@ -40,12 +40,23 @@ public abstract record WireEvent
     // 只在真的迁移时发：重复设同一个值是 no-op，不发事件。头据此更新显示。
     public sealed record AxisChanged(string SessionId, string Axis, string Value) : WireEvent;
 
-    // `session.configure` 改了模型选择（换绑供应商 / 换模型）。
-    // ⚠️ **载荷只带 `Model`，不带整个 `SessionSpec`**：spec 里能变的**只有这一块**
-    //（SessionId / ProjectKey / WorkingDirectory / CreatedAt 出生即定）。
-    // 带整份会让头以为「别的那几项也可能变」，去写它根本不该有的更新逻辑。
-    // ⚠️ 与 `axis.changed` 同一条约定：**只在真的变了才发**（同样值不发）。
-    public sealed record SpecChanged(string SessionId, ModelSelection Model) : WireEvent;
+    /// <summary>
+    /// `session.configure` 改了会话配置（换绑供应商 / 换模型）。
+    ///
+    /// <para>⚠️ <b>载荷只带**会变的那两块**，不带整个 `SessionSpec`</b>——带整份会让头以为
+    /// 「别的那几项也可能变」，去写它根本不该有的更新逻辑。
+    /// `SessionId` / `ProjectKey` / `WorkingDirectory` / `CreatedAt` 出生即定，永远不变。</para>
+    ///
+    /// <para>⚠️ <b>这里原先只带 `Model`，注释写着「spec 里能变的只有这一块」</b>——
+    /// 那句在 <see cref="SessionSpec.SystemPromptPreset"/> 加进来之后**不再成立**
+    /// （2026-10-07）。⚠️ 但今天**没有任何命令能改预设**（它只在 `session.create` 那一刻定），
+    /// 所以第二个字段此刻恒等于原值；带上它是为了让**形状与事实一致**，
+    /// 而不是等那条命令出现时再来改这个事件（那时改就晚了——头的分派已经按旧形状写好了）。</para>
+    ///
+    /// <para>⚠️ 与 `axis.changed` 同一条约定：**只在真的变了才发**（同样值不发）。</para>
+    /// </summary>
+    public sealed record SpecChanged(
+        string SessionId, ModelSelection Model, string? SystemPromptPreset) : WireEvent;
 
     // 发到项目流：谁在动哪些文件，跨会话才有意义。
     public sealed record ClaimAcquired(string SessionId, string Path) : WireEvent;

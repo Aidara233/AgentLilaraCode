@@ -148,6 +148,19 @@ public sealed class Repl(
                     _out.WriteLine(accepted.Note ?? $"提供商 '{test.Id}' 已测试。");
                     break;
 
+                // 预设三条：结果**全在 Note 里**（`Reply` 是 null）。
+                // ⚠️ **不接这三条就是一声不吭**——与 `provider.delete` 那条注释里写的是同一个坑
+                //（「不加这条 case 会落进 default 一声不吭」）。本批实测踩到了：
+                // `preset set default 你是助手` 敲下去，控制台上**一个字都没有**，
+                // 而盘上文件已经写了 ⇒ 用户以为没生效。
+                // ⚠️ 尤其 `preset set` 的空内容**必须说得出来**：它与「没写」在屏幕上长得一样，
+                // 而 Note 正是核心用来区分它们的那句话。
+                case CoreCommand.PresetSet:
+                case CoreCommand.PresetDelete:
+                case CoreCommand.PresetList:
+                    _out.WriteLine(accepted.Note ?? "✓");
+                    break;
+
                 default:
                     PrintReply(result.Reply);
                     break;
