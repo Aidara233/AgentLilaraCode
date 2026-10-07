@@ -97,7 +97,8 @@ public abstract record WireEvent
     public sealed record SessionDeleted(string SessionId, string ProjectKey) : WireEvent;
 
     /// <summary>
-    /// **回收算完了**（`session.gc`）：这个会话现在有 <paramref name="Reclaimed"/> 条工具结果被降级。
+    /// **回收算完了**（`session.gc`）：<paramref name="Reason"/> 就是**那条命令的回执里那句话**
+    /// （「回收了 N 条结果」/「没有可回收的结果…」）。
     ///
     /// <remarks>
     /// ⚠️ <b>它必须在场，因为回收<b>不改盘</b></b>（`01` §8.0.2 一）：头看的
@@ -105,13 +106,22 @@ public abstract record WireEvent
     /// ⇒ 不发这条事件，头会一直显示回收之前的（而且完全看不出来）。
     /// ⇒ 头收到它就**重拉一次历史**。
     ///
-    /// ⚠️ <b>载荷带 <paramref name="Reclaimed"/>（条数）而不是集合</b>：头要的是
-    /// 「该重拉了」这个信号，不是自己重算一遍回收（那是核心的判定，`Reclaim.Decide` 一处）。
+    /// <para>⚠️ <b>为什么载荷是「那句话」而不是条数</b>（2026-10-06 改，原先是 <c>int Reclaimed</c>）：<b>条数
+    /// 到不了用户眼前</b>。回执先到、事件后到，而头处理事件时要 <c>openSession</c> 重拉历史，
+    /// 那一步会 <c>timeline.innerHTML = ""</c> —— 把回执刚画上的那行<b>一起抹掉</b>。
+    /// 页面于是<b>一个字都不说</b>，与「坏了」分不开。（实测：三次免费帧，三次都是这个序。）</para>
     ///
-    /// ⚠️ <b>投递范围与会话内的事件一视同仁</b>（会话流）：它讲的是「这个会话的形态变了」。
+    /// <para>⇒ 头把这句话交给重拉之后的渲染，<b>在同一处、同一时刻</b>画出来——同一件事只有一个出处，
+    /// 不为它单开一条显示路径。⇒ 那句话的<b>唯一出处仍是核心</b>（<see cref="Ack.Accepted.Note"/> 的既定用途，
+    /// `provider.test` 就是这么用的），头只是换了个落点。</para>
+    ///
+    /// <para>⚠️ <b>它不是「重算的请求」</b>：头收到的只是「该重拉了」这个信号，判定仍在核心
+    /// （<c>Reclaim.Decide</c> 一处）。</para>
+    ///
+    /// <para>⚠️ <b>投递范围与会话内的事件一视同仁</b>（会话流）：它讲的是「这个会话的形态变了」。</para>
     /// </remarks>
     /// </summary>
-    public sealed record SessionReclaimed(string SessionId, int Reclaimed) : WireEvent;
+    public sealed record SessionReclaimed(string SessionId, string Reason) : WireEvent;
 
     // 参数类型必须是 WireEvent（基类）：泛型版在静态类型推断成子类时会静默丢掉判别式。
     public static string StableSerialize(WireEvent value) =>

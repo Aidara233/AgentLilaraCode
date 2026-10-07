@@ -1409,20 +1409,33 @@ public class ControlServerTests : IAsyncLifetime
             "{\"kind\":\"command\",\"id\":\"g1\",\"payload\":{\"kind\":\"session.gc\",\"sessionId\":\"" + sid + "\"}}");
 
         // ⚠️ 回执必须**当场**回来（同步算完），且在这条流上发了 `session.reclaimed`。
-        var sawGc = false;
-        var ackG1 = false;
-        for (var i = 0; i < 200 && !(sawGc && ackG1); i++)
+        string? ackNote = null, eventReason = null;
+        for (var i = 0; i < 200 && (ackNote is null || eventReason is null); i++)
         {
             var f = await ReceiveAsync(ws);
             var kind = f.GetProperty("kind").GetString();
-            if (kind == "ack" && f.GetProperty("id").GetString() == "g1") ackG1 = true;
+            if (kind == "ack" && f.GetProperty("id").GetString() == "g1")
+                ackNote = f.GetProperty("note").GetString();
             if (kind == "event"
                 && f.GetProperty("payload").GetProperty("kind").GetString() == "session.reclaimed")
-                sawGc = true;
+                eventReason = f.GetProperty("payload").GetProperty("reason").GetString();
         }
 
-        Assert.True(ackG1, "session.gc 的回执必须到（它是同步算完才回的）");
-        Assert.True(sawGc,
-            "必须发 session.reclaimed——回收不改盘，头不重拉就永远看不见（这条不发 = 功能静默失效）");
+        Assert.NotNull(ackNote);
+        Assert.NotNull(eventReason);
+        Assert.Contains("回收了", ackNote);
+
+        // ⚠️ **同一个事实，两处必须逐字相同**（2026-10-06 加）。
+        //
+        // 这句话的两个去处是**不同用途**、不是冗余：回执给「发命令的那个客户端」
+        // （控制台 / 脚本），事件给「盯着这条流的每个头」。但**它只有一个出处**（核心这里）——
+        // 各写一份的话，改了一句忘了另一句，两个客户端就会对同一件事说不同的话。
+        //
+        // ⚠️ **为什么单靠「事件到了」不够**（这条断言就是那次事故留下的）：
+        // 原先事件只带**条数**，而条数**到不了用户眼前**——回执先到、事件后到，
+        // 头处理事件时要重拉历史，那一步清空时间线，把回执刚画上的那行一起抹掉。
+        // 于是核心侧全绿、控制台也看得见，**只有头一个字都不说**。
+        // ⇒ 现在头把这句话画在**重拉之后**，前提正是它随事件一起来。
+        Assert.Equal(ackNote, eventReason);
     }
 }

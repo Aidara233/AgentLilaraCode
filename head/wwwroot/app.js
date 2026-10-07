@@ -268,6 +268,10 @@ async function openSessionInner(id) {
   // 世代号让后一次调用作废前一次（同 id 双击时 current !== id 判不出来）。
   const gen = ++epoch;
 
+  // ⚠️ **记下「来的时候开的是哪一个」**：下面决定要不要先清空中栏要用它
+  //（`current` 马上就会被改成 `id`，那时「是不是换了会话」就再也判不出来了）。
+  const leaving = current;
+
   // ⚠️ **先摘掉上一条会话流**（2026-10-06 加）：核心的订阅是**按 topic** 一条订阅 + 一条泵，
   // 重复订同一个会换掉旧的，但**换到别的会话时不换** ⇒ 旧会话的泵一直活着、事件一直发过来，
   // 而这头会丢弃它们 ⇒ 白占一条泵与整条连接，切得越多积得越多。
@@ -283,7 +287,19 @@ async function openSessionInner(id) {
   renderSessions();
   // ⚠️ 这里**不设 `#title`**——名字/ id 要等快照回来（`renderTitle`）。先设一个 id
   // 再被名字盖掉会闪一下，而且那是同一事实的两个显示点。
-  $("timeline").innerHTML = "";
+
+  // ⚠️ **只有「换了会话」才清空中栏**（2026-10-06 改，原来是无条件清）。
+  //
+  // 这个函数有**两个**入口：切会话（用户点的），以及**重拉当前会话**
+  //（`session.reclaimed` / `spec.changed` 那两个回声走的就是这条）。
+  // 无条件清空时，第二条路会把**别处刚画上去的行一起抹掉**——回收那条正是这么消失的：
+  // 回执先到、往时间线上画一行「回收了 N 条结果」，`session.reclaimed` 后到、
+  // 重拉、清空 ⇒ **用户一个字都看不到**，与「坏了」分不开。
+  //
+  // 两条路的要求其实是相反的：换会话时那一屏**必须**清（停在别人的时间线上是本页
+  // 能犯的最大的谎）；重拉当前会话时**不能**清——`replaceChildren` 会在快照回来后
+  // 整体换掉，中间那一瞬留着旧内容，比留一片空白更诚实（也不闪）。
+  if (leaving !== id) $("timeline").innerHTML = "";
 
   // ⚠️ 两条 fetch 必须**各自**带 catch：`session.delete` 会让它们 404，
   // 而 404 的 `.json()` 会**抛**。不接的话这个 async 函数变成一次未观测拒绝 ⇒
@@ -319,6 +335,12 @@ async function openSessionInner(id) {
   renderProjectPanel(state);
   setStatus(state.state.status, state.state.turn);
   renderSessions();
+  // ⚠️ **整体换掉，不是逐条追加**（2026-10-06 改）。这个函数是**重拉**（「把现在这份画出来」），
+  // 而重拉期间时间线上可能已经有东西了——`session.reclaimed` 的处理器刚把「回收了 N 条结果」
+  // 画上去，回收条数那个回声就是这么丢的（见 openSession 里那段）。逐条追加会把旧内容
+  // **留在上面、叠成两遍**。
+  // ⚠️ 用 `replaceChildren`（不是 `innerHTML = ""` 再逐条）：一条语句换完，中间不留空白帧。
+  $("timeline").replaceChildren();
   for (const item of history.rendered) renderHistoryItem(item);
 
   await loadClaims();
@@ -879,9 +901,12 @@ async function deleteSession(id, spec) {
 
   const r = await commandNow(crypto.randomUUID().slice(0, 8), { kind: "session.delete", sessionId: id });
   if (!r.accepted) { renderMeta("✗ " + r.reason, "error"); return; }
-  if (r.note) renderMeta("ℹ " + r.note);
   // 会话已不在 ⇒ 事件会让左栏重画（`session.deleted`）；万一它正开着，也要清中栏。
+  // ⚠️ **顺序不能反**（2026-10-06 修）：`clearCenter` 会清空时间线，先画回执那句话
+  // 会被它一起抹掉。这是「回收」那处完全相同的形状——凡是「回执里要说一句话」+
+  // 「这一步还要换掉中栏」的命令，都得先换、后说。
   if (current === id) clearCenter();
+  if (r.note) renderMeta("ℹ " + r.note);
 }
 
 // 中栏回到「没选会话」。⚠️ **必须真的清空**：停在一条已经被删掉的时间线上是最糟的谎言
@@ -1402,7 +1427,14 @@ function handleEvent(p) {
       // ⚠️ **回收不改盘**：核心只是换了一份渲染，而 `/history` 拿的就是那份
       // ⇒ 不重拉的话，页面会一直显示回收**之前**的形态，而且完全看不出来。
       // 判据是「该重拉了」，删什么、怎么显示由核心说了算（判定只有 `Reclaim.Decide` 一处）。
-      if (p.sessionId === current) openSession(current);
+      //
+      // ⚠️ **成果那句话画在重拉之后**（2026-10-06 修）：回执**先到**（它是同步返回的），
+      // 而这条事件后到。原先只靠回执画那行 ⇒ 这条事件触发重拉时会把刚画的那行**抹掉**
+      // ⇒ 用户看到的就是「按了没反应」。现在话随事件来、画在重拉之后，位置就不再重要。
+      // ⚠️ 判据是 `p.sessionId === current`：换了会话之后这个回声不该落在新会话上。
+      if (p.sessionId === current) {
+        openSession(current).then(() => { if (p.reason) renderMeta("ℹ " + p.reason); });
+      }
       break;
 
     case "error":
@@ -1527,24 +1559,19 @@ $("interrupt").onclick = () => {
 //
 // ⚠️ 头**不自己算**「哪些能回收」：判定只有核心一处（`Reclaim.Decide`），
 // 这里自己算一遍就是第二份判据——两边迟早会漂。
-// 回收（`01` §8.0.2，手动触发）。
+// ⚠️ **成果那句话不在这里画**（2026-10-06 修）：它随 `session.reclaimed` 来、画在**重拉之后**
+// （见 `handleEvent` 那一段）。这里再画一遍的话有两种错：位置不对（紧接着就被重拉抹掉），
+// 以及万一事件先到，用户会看到**两遍**同一句话。
 //
-// ⚠️ **重拉历史只有一条路：`session.reclaimed` 事件。** 这里**不**自己 `openSession`：
-// 两条路会让每次点击都多拉一次 `/state` + `/history`，而多出来那条**没有对应的机制**
-// （事件那条已经够了，而且它带着正确的 `current` 判据）。
+// ⚠️ **这里只负责「被拒」**：`rejected` 那条路**不发事件**（命令本身没写错，没什么可重拉的），
+// 所以那句话没有别的去处，只能在这儿说。
 //
-// ⚠️ **这里只负责「把结果说出来」。** 回执用的是 `commandNow`：那条路径**先判且判完就 return**
-// （见 `onmessage` 里 `pendingAcks` 那一段），所以不会在时间线上出现两次。
+// ⚠️ 头**不自己算**「哪些能回收」：判定只有核心一处（`Reclaim.Decide`），
+// 这里自己算一遍就是第二份判据——两边迟早会漂。
 $("gc").onclick = () => {
   if (!current) return;
   commandNow(crypto.randomUUID().slice(0, 8), { kind: "session.gc", sessionId: current })
-    .then((r) => {
-      // ⚠️ **成败都要说**：回收**常常一条都收不了**（都在保护带里 / 内容已不在库里），
-      // 而那时渲染一字未变 ⇒ 不报的话用户看到的就是「按了没反应」，它与「坏了」分不开。
-      // （核心的 `Note` 就是这个用途，与 `provider.test` 那条一致。）
-      if (r.accepted) { if (r.note) renderMeta("ℹ " + r.note); }
-      else renderMeta("✗ " + r.reason, "error");
-    });
+    .then((r) => { if (!r.accepted) renderMeta("✗ " + r.reason, "error"); });
 };
 
 // GET /providers 是引导要用的：端点不存在时 bootstrap() 会在 fetch().json() 上抛，

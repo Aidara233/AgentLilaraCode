@@ -444,6 +444,13 @@ public sealed class CommandDispatcher(
     /// 而前缀的一致性正是整套经济学的地基（`00` §0）。⇒ 要么整个步在旧的形态下跑完，
     /// 要么整个在旧的形态下跑完之后才换。</para>
     ///
+    /// <para>⚠️ <b>成果那句话只说一次</b>（2026-10-06 改）：它<b>既进回执的 <c>Note</c>、
+    /// 又随 <see cref="WireEvent.SessionReclaimed"/> 发出去</b>。两个去处不是冗余——
+    /// 回执给「发命令的那个客户端」（控制台、脚本），事件给「盯着这条流的每个头」。
+    /// 原先事件只带条数，而<b>条数到不了用户眼前</b>：回执先到、事件后到，
+    /// 头处理事件时要重拉历史，那一步会清空时间线，把回执刚画上的那行一起抹掉
+    /// ⇒ 页面一个字都不说。⇒ 现在头把这句话画在<b>重拉之后</b>，位置就不重要了。</para>
+    ///
     /// <para>⚠️ <b>它<b>不</b>搬动磁盘、也<b>不</b>碰库</b>：`Decide` 只读。这条命令的全部效果
     /// 是「换一份内存里的渲染」——所以它**可逆、无副作用**，随时可以再触发一次。</para>
     /// </summary>
@@ -470,22 +477,25 @@ public sealed class CommandDispatcher(
             gate.Release();
         }
 
-        // ⚠️ **没有它头就看不见**：回收不改盘，头看的是核心渲染的那份形态 ⇒
-        // 不告诉它一声，它会一直显示回收之前的（而且完全看不出来）。
-        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-            new WireEvent.SessionReclaimed(handle.SessionId, count));
-
         // ⚠️ **回执里必须说结果**，不能只回一个「收到了」：回收常常**一条都收不了**
         // （都在保护带里 / 内容指向的对象不在库里）——那时渲染一字未变，
         // 而用户看到的就是「**按了没反应**」，与「坏了」长得一模一样。
         // `Note` 正是给「业务结果」用的（`provider.test` 就是这么用的），把条数说了就分得开。
+        var reason = count == 0
+            ? "没有可回收的结果（都在保护带里，或者内容已经不在库里）"
+            : $"回收了 {count} 条结果";
+
+        // ⚠️ **没有它头就看不见**：回收不改盘，头看的是核心渲染的那份形态 ⇒
+        // 不告诉它一声，它会一直显示回收之前的（而且完全看不出来）。
+        // ⚠️ 只是**换个落点**，话还是上面那一句——不在这里另写一份（同一件事只说一次）。
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.SessionReclaimed(handle.SessionId, reason));
+
         return new DispatchResult(new Ack.Accepted
         {
             CommandId = id,
             SessionId = g.SessionId,
-            Note = count == 0
-                ? "没有可回收的结果（都在保护带里，或者内容已经不在库里）"
-                : $"回收了 {count} 条结果",
+            Note = reason,
         });
     }
 
