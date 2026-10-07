@@ -17,22 +17,60 @@ namespace Lilara.Core.Hosting;
 /// 存在的理由与 <paramref name="resolveStepper"/> 一样：`provider.test` 要真发一次请求，
 /// 不给测试留注入口就只能靠打真网络——那不是单元测试。
 /// </param>
-public sealed class CommandDispatcher(
-    CoreHost host,
-    EventBus bus,
-    Func<SessionHandle, Stepper> resolveStepper,
-    Func<ProviderDefinition, IModelAdapter>? createAdapter = null)
+/// <remarks>
+/// ⚠️ **构造完就把回收器的自动触发源接上**（<see cref="CoreHost.OnActivated"/>，见构造器末尾）。
+/// 接线放在<b>类内部</b>是刻意的：让「造一个 dispatcher」与「激活会触发回收」成为
+/// <b>同一件事</b>。做成 `Program.cs` 里额外的一行赋值 ⇒ 漏掉它的后果是<b>静默的</b>
+/// ——自动回收永远不发生，而没有任何东西会红（本仓栽过同形：`Repl` 少一个 `case`
+/// ⇒ 控制台一声不吭，而盘上文件已经写了）。
+/// </remarks>
+public sealed class CommandDispatcher
 {
-    private readonly CoreHost _host = host;
-    private readonly EventBus _bus = bus;
-    private readonly Func<SessionHandle, Stepper> _resolveStepper = resolveStepper;
-    private readonly Func<ProviderDefinition, IModelAdapter> _createAdapter =
-        createAdapter ?? AdapterFactory.Create;
+    private readonly CoreHost _host;
+    private readonly EventBus _bus;
+    private readonly Func<SessionHandle, Stepper> _resolveStepper;
+    private readonly Func<ProviderDefinition, IModelAdapter> _createAdapter;
 
     // 预设的读写点。**从数据根现造**（与 `Reclaim` 那处 `new BlobStore(DataRoot)` 同形）：
     // 它无状态、只包一个路径前缀，做成字段就得给 `CoreHost` 再开一个属性，
     // 而那个属性没有任何别的地方要用。
-    private readonly PresetStore _presets = new(host.DataRoot);
+    private readonly PresetStore _presets;
+
+    /// <summary>
+    /// ⚠️ <b>构造器里额外做一件事：把回收器的自动触发源接上</b>（`01` §11.7）。
+    ///
+    /// <para>接线放在<b>类内部</b>，不是 `Program.cs` 里的一行赋值：漏掉的后果是**静默的**
+    /// ——自动回收永远不发生，而没有任何东西会红。放在这里，
+    /// 「造一个 dispatcher」与「激活会触发回收」就是<b>同一件事</b>。</para>
+    ///
+    /// <para>⚠️ <b>它只用两个东西</b>：`Reclaim.Decide`（纯函数）与 `_host`。
+    /// 不碰 `_bus`、不发事件——理由见 <see cref="CoreHost.OnActivated"/>。</para>
+    ///
+    /// <para>⚠️ <b>触发源只负责「开门」，回收只有一处</b>（`01` §11.7 的口径）：
+    /// 这条路与 `HandleSessionGc` 走的是**同一个** `Reclaim.Decide`。
+    /// 两条路唯一的区别是**要不要吭声**——这里不吭声（激活路径上事件没有去处），
+    /// 手动那条要（用户按了按钮，得知道结果）。</para>
+    /// </summary>
+    public CommandDispatcher(
+        CoreHost host,
+        EventBus bus,
+        Func<SessionHandle, Stepper> resolveStepper,
+        Func<ProviderDefinition, IModelAdapter>? createAdapter = null)
+    {
+        _host = host;
+        _bus = bus;
+        _resolveStepper = resolveStepper;
+        _createAdapter = createAdapter ?? AdapterFactory.Create;
+        _presets = new PresetStore(host.DataRoot);
+
+        _host.OnActivated = h =>
+        {
+            var reclaimed = Reclaim.Decide(
+                _host.Store.ReadTimeline(h.ProjectKey, h.SessionId),
+                new BlobStore(_host.Store.DataRoot));
+            h.SetReclaimed(reclaimed);
+        };
+    }
 
     /// <summary>
     /// 分派一条命令。

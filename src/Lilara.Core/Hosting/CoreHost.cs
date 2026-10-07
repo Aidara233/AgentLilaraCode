@@ -42,9 +42,43 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
     /// <summary>
     /// 载入一个会话并登记；已激活则返回**同一个实例**。
     /// 幂等是硬要求：两个实例会让 `State` 分叉，而 `State` 是可变属性。
+    ///
+    /// <para>⚠️ <b>会话<b>真的</b>进了内存的那一刻，就是「激活」这个事件本身</b>
+    /// （`01` §8.3 / §11.7：`00` §4 把「激活」列为 GC 触发源，理由正是
+    /// 「恢复即事件」——「重启即重新决定」）。所以 <see cref="OnActivated"/> 挂在这里，
+    /// 而不是挂在 `session.activate` 命令上：**命令只是路径之一**——
+    /// 头条会话时根本不发那条命令（它走 <c>TryFind</c> 的 miss 回落），
+    /// 挂在命令上会让主路径一次都碰不到。</para>
+    ///
+    /// <para>⚠️ <b>它<b>只</b>在「新建了 handle」时触发，不是「每次调用」</b>。
+    /// 命令层已经先查过激活表（miss 时才走到这里）⇒ 绝大多数调用都恰好是新建；
+    /// 但 <c>GetOrAdd</c> 在并发下<b>可能白造一个再丢掉</b>（返回值才是真相）
+    /// ⇒ 用 <see cref="object.ReferenceEquals"/> 判「到底存进去的是不是这一个」。</para>
     /// </summary>
-    public SessionHandle Activate(string projectKey, string sessionId) =>
-        _activated.GetOrAdd(sessionId, _ => SessionHandle.Load(_store, projectKey, sessionId));
+    public SessionHandle Activate(string projectKey, string sessionId)
+    {
+        var fresh = SessionHandle.Load(_store, projectKey, sessionId);
+        var handle = _activated.GetOrAdd(sessionId, fresh);
+
+        // 输了竞争的调用方：它造的那个被丢掉 ⇒ 对**胜者**什么都不做，免得同一次激活跑两遍。
+        if (ReferenceEquals(handle, fresh)) OnActivated?.Invoke(handle);
+
+        return handle;
+    }
+
+    /// <summary>
+    /// 「一个会话刚被激活」——**挂在这里的是回收器的自动触发源**（`01` §11.7）。
+    ///
+    /// <para>⚠️ <b>它由 <see cref="Activate"/> 在读盘之后、返回之前同步调用</b>，
+    /// 所以回调里做的事**必须短**。今天它只做一件事：`Reclaim.Decide`（一次记录扫描 + 库探测）。
+    /// 它<b>不发事件</b>——激活路径上事件没有去处（调用方是个 HTTP 快照端点或一次 `TryFind`，
+    /// 两者都不订阅），而 <c>GetOrAdd</c> 会**把这句「激活了」当工厂调两次**，
+    /// 订阅者可能观察到两次。⇒ 那个「说得出口」的动作归**命令层**：谁触发谁负责报。</para>
+    ///
+    /// <para>⚠️ <b>空 = 没有回收器</b>。`CoreHost` 是纯数据 + 闸（见类注释），
+    /// 不认识 `Reclaim`、也不认识事件总线；把线接上的是 `CommandDispatcher`（它两样都有）。</para>
+    /// </summary>
+    public Action<SessionHandle>? OnActivated { get; set; }
 
     /// <summary>
     /// 登记一个**已经建好**的 handle（`session.create` 用的）。
