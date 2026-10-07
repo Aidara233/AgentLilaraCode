@@ -376,8 +376,32 @@ function unsubscribe(topic) {
 //    所以这里是**手抄的第二副本**（见 `实现现状.md` §四）。改核心的措辞要同时改这里。
 const EMPTY_BODY = "（这一步没有正文输出）";
 
+/// **一串块** → 一段文本（只取 `text` 块，其余丢掉）。
+///
+/// <para>⚠️ <b>它的入参必须是一串块。</b>本仓栽过两次同一形状的错——都是「把不是一串块的东西
+/// 喂进来」，而两次<b>都不报错</b>：</para>
+/// <list type="bullet">
+///   <item><b>喂一个（块）对象</b> ⇒ <c>b.filter is not a function</c> ⇒ 打开会话时整段渲染中断，
+///   中栏连**历史都画不出来**（用户报的那句 `(blocks || []).filter is not a function`）。</item>
+///   <item><b>喂那个槽信封</b>（<c>{system, premier, floating}</c>）或一个字符串 ⇒
+///   `filter` 直接跳过全部 ⇒ 空串 ⇒ 每个槽都显示「（空）」，<b>静默</b>。</item>
+/// </list>
+/// <para>⇒ 拿不准就先问「我手上到底是一串块吗」，别直接喂。见 <c>HeadScriptTests</c> 的三条守卫。</para>
 function textOf(blocks) {
   return (blocks || []).filter((b) => b.kind === "text").map((b) => b.text).join("");
+}
+
+/// **一个槽**（`/slots` 的 `system` / `premier` / `floating`）→ 显示什么。
+///
+/// <para>⚠️ <b>抽文本走 <see cref="textOf"/>，本函数只负责「空」那一格</b>——
+/// 块级逻辑只有一份实现（两处各写一遍的话，改一处忘一处是静默的：显示成「（空）」）。</para>
+///
+/// <para>⚠️ <b>入参必须是一串<b>块</b>，不是槽对象本身</b>：
+/// `renderSlots` 传的是 `slots.system` 这些数组。传错一层的话 `b.kind` 全是 `undefined`
+/// ⇒ 拼出来是空串 ⇒ 每个槽都显示「（空）」，而<b>不报错</b>。</para>
+function slotText(blocks) {
+  if (!blocks || !blocks.length) return "（空）";
+  return textOf(blocks);
 }
 
 function bodyOf(blocks) {
@@ -458,19 +482,21 @@ function appendTimeline(el) {
 function renderSlots(slots) {
   // 空的也要显示：区分「核心没配提示词」与「头坏了」。
   // ⚠️ **系统那一格从 2026-10-07 起是**真的**了**（预设批）：核心以前恒交空数组，
-  // 现在它交的是 `presets/<id>.md` 的内容。这里**一个字都不用改**——
-  // 渲染一直就是「有块就显示、没块显示（空）」，缺的只是核心侧那份数据。
+  // 现在它交的是 `presets/<id>.md` 的内容。缺的只是核心侧那份数据。
   // ⇒ 显示「（空）」现在意味着「这个会话选了空预设 / 纯 chat」，不再意味着「没实现」。
-  const fmt = (b) => (b && b.length ? b.map(textOf).join("") : "（空）");
-  const put = (el, v) => {
+
+  // ⚠️ 抽文本走 `slotText`，**不用 `textOf`**：后者的契约是「一串块」，
+  // 而这里手上是「一个槽的块列表」（不是块、也不是槽信封）。
+  const put = (el, x) => {
+    const v = slots ? slotText(x) : "（空）";
     el.textContent = v;
     el.classList.toggle("empty", v === "（空）");
   };
-  put($("slot-system"), slots ? fmt(slots.system) : "（空）");
-  put($("slot-premier"), slots ? fmt(slots.premier) : "（空）");
+  put($("slot-system"), slots && slots.system);
+  put($("slot-premier"), slots && slots.premier);
   // ⚠️ 浮动槽**仍然**是「尚未实现」——本批只做了系统块那一半，如实写，别跟着上面那句一起改。
   $("floating-body").textContent = slots && slots.floating && slots.floating.length
-    ? slots.floating.map(textOf).join("")
+    ? slotText(slots.floating)
     : "（核心侧装配器尚未实现）";
 }
 
