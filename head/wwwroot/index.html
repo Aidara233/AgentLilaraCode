@@ -315,6 +315,19 @@ button:disabled:hover { border-color: var(--rule); }
 .srow.active { background: var(--accent-wash); }
 .srow.active .sid { color: var(--accent-ink); }
 
+/* 「这个会话在等我」的徽标（`01` §3.8）。
+   ⚠️ 用 accent 而不是红：等回答不是**错误**，是一个需要动作的状态。
+   红会让人以为出事了，而这个仓库里红是留给 `error` 的。 */
+.srow.waiting { background: var(--accent-wash); }
+.askbadge {
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  white-space: nowrap;
+}
+
 .gauge { position: relative; align-self: stretch; width: 9px; }
 .gauge::before {           /* 槽：整条淡色的底，标示「量程」 */
   content: "";

@@ -1278,6 +1278,89 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Equal("[]", (await r.Content.ReadAsStringAsync()).Trim());
     }
 
+    // ---- 全量会话状态（`01` §3.8）：一次拿全，供头顶「哪个会话在等我」----
+
+    /// <summary>
+    /// ⚠️ <b>这条钉的是「读不能有副作用」</b>——而这个端点最容易写错的地方正是它：
+    /// `/sessions/{id}/state` 在激活表 miss 时会**载入并登记**那个会话，
+    /// 照着它写 ⇒ **打开一次列表 = 全库载入**（`01` §11.7 那次事故的形状）。
+    /// ⇒ 判据：**读完之后那个会话仍然不在激活表里**。
+    /// </summary>
+    [Fact]
+    public async Task SessionsList_DoesNotActivateTheSessionsItLists()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        // 先摘掉（`session.create` 会登记）——这样「它没被重新载入」才是可观测的。
+        _host.Deactivate(sid);
+
+        using var doc = JsonDocument.Parse(await Client.GetStringAsync(Http("/sessions")));
+        Assert.Contains(doc.RootElement.EnumerateArray(),
+            e => e.GetProperty("sessionId").GetString() == sid);
+
+        Assert.False(_host.TryGetActivated(sid, out _));
+    }
+
+    /// <summary>
+    /// ⚠️ <b>四种状态里有两种是内存事实</b>（`Running` 只写内存；「不活跃」= 不在激活表里），
+    /// 而盘上只存 `Idle` / `WaitingForInput` ⇒ 这个端点必须两个来源都看。
+    /// </summary>
+    [Fact]
+    public async Task SessionsList_ReportsInactiveAndDiskStatus()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        _host.Deactivate(sid);
+
+        using var doc = JsonDocument.Parse(await Client.GetStringAsync(Http("/sessions")));
+        var row = doc.RootElement.EnumerateArray().Single(e => e.GetProperty("sessionId").GetString() == sid);
+
+        Assert.False(row.GetProperty("active").GetBoolean());
+        Assert.Equal("Idle", row.GetProperty("status").GetString());
+
+        // ⚠️ **「没在等」是 `{}`**——键在，而里面什么都没有（`WhenWritingNull` 把可空字段
+        // 也省掉了）。⇒ 判据必须是 `askId` **为空**，**不能**拿 `ask` 本身当判据
+        // （`{}` 在 JS 里是 truthy ⇒ 头会以为在等）。见 `ControlServer` 那段注释。
+        var ask = row.GetProperty("ask");
+        Assert.False(ask.TryGetProperty("askId", out _));
+    }
+
+    /// <summary>
+    /// **待在等待里的会话，列表上看得见**——这是头标出「哪个会话在等我」的唯一来源
+    /// （重启之后 `approval.requested` 那条事件**没有生产者**：那次挂起发生在进程死之前）。
+    /// </summary>
+    [Fact]
+    public async Task SessionsList_ShowsAPendingAsk()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        // 直接写盘 + 摘内存：模拟「进程重启后读回来的那次挂起」——
+        // 那正是这条路径的真实来源（内存里那份 `AwaitingInput` 已经不存在了）。
+        var projectKey = _host.Store.FindSession(sid)!.Value.ProjectKey;
+        var handle = _host.Activate(projectKey, sid);
+        handle.UpdateStateAndPersist(_host.Store, s => s with
+        {
+            Status = SessionStatus.WaitingForInput,
+            Ask = new PausedAsk("ask-1", AskKind.Permission, "call-1", "bash", "hash", null),
+        }, diskStatus: SessionStatus.WaitingForInput);
+        _host.Deactivate(sid);
+
+        using var doc = JsonDocument.Parse(await Client.GetStringAsync(Http("/sessions")));
+        var row = doc.RootElement.EnumerateArray().Single(e => e.GetProperty("sessionId").GetString() == sid);
+
+        Assert.Equal("WaitingForInput", row.GetProperty("status").GetString());
+        var ask = row.GetProperty("ask");
+        Assert.Equal("ask-1", ask.GetProperty("askId").GetString());
+        Assert.Equal("Permission", ask.GetProperty("kind").GetString());
+        Assert.Equal("bash", ask.GetProperty("toolName").GetString());
+
+        // ⚠️ 内部配对用的那两格**不进线上 schema**（交出去等于把实现细节写进协议）。
+        Assert.False(ask.TryGetProperty("argsHash", out _));
+        Assert.False(ask.TryGetProperty("callId", out _));
+    }
+
     // 走真 WS，不是直接调 dispatcher——后者在接线缺失时会照样绿，它绕过的正是本条要钉的那一层。
     [Fact]
     public async Task WebSocket_ClaimRelease_ReachesTheDispatcher()

@@ -103,28 +103,34 @@ function hideOnboarding() {
 // 全局会话列表 = 对 GET /projects 的每个 pk 取 sessions 的并集；分组名从 spec.workingDirectory 反推。
 
 async function loadSessions() {
-  const pks = await (await fetch(core + "/projects")).json();
+  // ⚠️ **一个端点拿全**（`GET /sessions`，2026-08 询问批加的）：它一次给出每条的
+  // 运行状态与待办询问。旧写法是 `/projects` + 每个 pk 的 `/projects/{pk}/sessions`
+  // + **每个会话一次** `/sessions/{id}/state`——N+1 次往返，而这个列表是**每次
+  // 事件都要重画**的。⚠️ 旧写法里那个 `/state` 还**有副作用**（核心会 Activate），
+  // 新端点刻意不载入（见核心里那段注释）。
+  const rows = await (await fetch(core + "/sessions")).json();
   sessions.clear();
   projects.clear();
-  for (const pk of pks) {
-    if (currentProject === null) currentProject = pk;
-    const ids = await (await fetch(`${core}/projects/${pk}/sessions`)).json();
-    projects.set(pk, { count: ids.length });
-    for (const id of ids) sessions.set(id, { projectKey: pk });
-  }
+  for (const r of rows) {
+    if (currentProject === null) currentProject = r.projectKey;
+    sessions.set(r.sessionId, { projectKey: r.projectKey, ...r });
 
-  // 项目名 = 该会话的工作目录。只对「还没知道」的会话各拉一次。
-  for (const id of sessions.keys()) {
-    if (info.has(id) && info.get(id).spec) continue;
-    try {
-      const st = await (await fetch(`${core}/sessions/${id}/state`)).json();
-      info.set(id, {
-        spec: st.spec,
-        turn: st.state.turn,
-        status: st.state.status,
-      });      const p = projects.get(st.spec.projectKey);
-      if (p && !p.dir) p.dir = st.spec.workingDirectory;
-    } catch { /* 单个会话读不出来不该拖垮整张列表 */ }
+    const p = projects.get(r.projectKey) || { count: 0, dir: null, asks: 0 };
+    p.count += 1;
+    // ⚠️ 判据是 `ask?.askId`，**不是** `ask`：没在等时核心交的是 `{}`，
+    // 而 `{}` 在 JS 里是 truthy（见核心那段的注释）。
+    if (r.ask?.askId) p.asks += 1;
+    projects.set(r.projectKey, p);
+
+    // ⚠️ **`spec` 的形状不能改**：`renderSessions` 读 `spec.title` / `spec.archivedAt`，
+    // 而这两件事在这个端点里是**顶级字段**。在这里补一次映射，
+    // 比让两个渲染点各判一次「这份数据是从哪来的」要好（两处判据必漂）。
+    info.set(r.sessionId, {
+      spec: { title: r.title, archivedAt: null, projectKey: r.projectKey },
+      turn: r.turn,
+      status: r.status,
+      ask: r.ask,
+    });
   }
 
   renderSessions();
@@ -132,6 +138,9 @@ async function loadSessions() {
   // 在这里补订项目流。重复订阅是安全的：核心对同 topic 换掉旧的，
   // 且 since: null 只要从现在起的事件 ⇒ 任一顺序下恰剩一条有效订阅。
   if (currentProject) subscribe(`project:${currentProject}`, null);
+  // ⚠️ **审批流**（`03` §5 那条「头最需要的」）：一次订阅看见**所有**会话的待审批。
+  // 不订它的话，别的会话在等人，而当前页面**完全看不出来**。
+  subscribe("approvals", null);
 }
 
 // 目录名当项目名（完整路径放在 title 里 —— 本机绝对路径不该占一整行）。
@@ -234,6 +243,18 @@ function renderSessions() {
       turn.textContent = v.turn === undefined ? "·" : `#${v.turn}`;
 
       row.append(gauge, sid, turn);
+
+      // ⚠️ **「这个会话在等我」必须看得见**（`01` §3.8）：一条只有点进去才知道的
+      // 待审批，等于没有。判据是 `ask?.askId`——没在等时核心交 `{}`，而 `{}` 是 truthy。
+      if (v.ask?.askId) {
+        const badge = document.createElement("span");
+        badge.className = "askbadge";
+        badge.textContent = v.ask.kind === "Permission" ? "？授权" : "？提问";
+        badge.title = "这个会话在等你回答" + (v.ask.deadlineAt ? `（${shortTime(v.ask.deadlineAt)} 之前）` : "");
+        row.appendChild(badge);
+        row.classList.add("waiting");
+      }
+
       row.onclick = () => openSession(id);
       g.appendChild(row);
     }
@@ -1467,8 +1488,33 @@ function handleEvent(p) {
       }
       break;
 
-    case "error":
-      // 业务失败走这里（不是 rejected：命令本身没写错）。
+    // ⚠️ **询问**（`01` §3.8）。它同时投 `approvals` 与会话流 ⇒ 这里收到的是**一条**
+    // （两次投递落在**两个不同的 topic** 上，而 `subscribe` 是每 topic 一条连接）。
+    //
+    // ⚠️ **本轮只做到「看得见」**：列表上标出来、时间线上画一行。
+    // **回答的 UI 还没做**（那要一颗卡片：多问 + 混合类型 + 改写参数 + remember 两档），
+    // 而它今天**不该被半个实现顶替**——一个只能填第一个问题的表单比没有更坏。
+    // ⇒ 现在的回答途径是控制台：`approval allow <会话> <askId>`（`askId` 印在这一行里）。
+    case "approval.requested":
+      {
+        const v = info.get(p.sessionId);
+        if (v) { v.ask = { askId: p.askId, kind: p.askKindName, deadlineAt: p.deadlineAt }; renderSessions(); }
+        if (p.sessionId === current) {
+          setStatus("WaitingForInput", undefined);
+          renderMeta(`❓ 在等你回答（askId ${p.askId}）—— 用控制台 approval allow/deny/answer 回它`);
+        }
+      }
+      break;
+
+    case "approval.resolved":
+      {
+        const v = info.get(p.sessionId);
+        if (v) { v.ask = null; renderSessions(); }
+        if (p.sessionId === current) renderMeta(`（那次询问已结束：${p.outcome}）`);
+      }
+      break;
+
+    case "error":      // 业务失败走这里（不是 rejected：命令本身没写错）。
       if (p.sessionId === current) renderMeta("✗ " + p.message, "error");
       break;
   }
@@ -1620,3 +1666,13 @@ $("gc").onclick = () => {
     renderMeta("✗ 核心没连上（" + (e && e.message ? e.message : e) + "）——连上后会自动重试", "error");
   }
 })();
+
+// ---- 待审批（`01` §3.8） ----
+//
+// ⚠️ **本轮只做「看得见」**：会话列表上标出哪个会话在等人、时间线上画一行提示。
+// **回答的 UI 还没做**——它要一张卡片（多问 + 混合类型 + 改写参数 + remember 两档），
+// 而一个只能填第一个问题的表单**比没有更坏**（用户以为答完整了）。
+// ⇒ 回答走控制台：`approval allow|deny|cancel|answer <会话> <askId> …`。
+//
+// ⚠️ 判据一律是 `ask?.askId`：核心在「没在等」时交的是 `{}`，
+// 而 `{}` 在 JS 里是 **truthy**（见 `ControlServer` 里那段注释）。

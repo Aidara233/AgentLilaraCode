@@ -127,6 +127,90 @@ public sealed class ControlServer(
         app.MapGet("/projects/{pk}/sessions", (string pk) =>
             Results.Json(host.Store.ListSessions(pk), WireJson.Options));
 
+        // 全部会话的**运行状态**，一次拿全（`01` §3.8）。
+        //
+        // ⚠️ **它绝不 `Activate`** —— 这是这个端点唯一真的容易写错的地方：
+        // `/sessions/{id}/state` 那条路在激活表 miss 时会**载入并登记**那个会话，
+        // 而那是**有副作用的读**。照着它写这个端点 ⇒ **打开一次列表 = 全库载入**，
+        // 而载入会触发回收（`01` §11.7 那次事故：把「顺手捡」做成了「花钱买」）。
+        // ⇒ 判据：**激活表里有就拿内存那份（它才有 `Running`），没有就直接读盘**。
+        //
+        // ⚠️ **四种状态里有两种是内存事实**：`Running` 只写内存、`不活跃` 是「不在激活表里」。
+        // 盘上只存 `Idle` / `WaitingForInput` ⇒ 这个端点必须两个来源都看。
+        app.MapGet("/sessions", () =>
+        {
+            var activated = host.Activated.ToDictionary(h => h.SessionId, StringComparer.Ordinal);
+            var rows = new List<object>();
+
+            // 项目序 + 项目内序都由各自的既有实现定（`ListProjects` / `ListSessions` 都是有序列举）
+            // ⇒ 本端点不引入第二个排序判据。
+            foreach (var pk in ProjectKeys())
+            {
+                foreach (var sid in host.Store.ListSessions(pk))
+                {
+                    var spec = host.Store.TryReadSpec(pk, sid);
+                    if (spec is null) continue;     // 坏 spec 的会话列不出来（同 `ListSessions` 的取舍）
+
+                    if (activated.TryGetValue(sid, out var live))
+                    {
+                        rows.Add(Row(sid, pk, active: true, live.State, spec.Title));
+                        continue;
+                    }
+
+                    // ⚠️ 读不出来就**跳过**，不抛：一个坏 `state.json` 不该让整个列表 500
+                    // （同 `/claims` 那条「坏文件不让它打死核心」）。
+                    SessionState? disk = null;
+                    try { disk = host.Store.ReadState(pk, sid); }
+                    catch (Exception ex) when (ex is IOException or FileNotFoundException
+                                                  or UnauthorizedAccessException)
+                    {
+                        // 跳过。
+                    }
+
+                    if (disk is not null) rows.Add(Row(sid, pk, active: false, disk, spec.Title));
+                }
+            }
+
+            return Results.Json(rows, WireJson.Options);
+
+            static object Row(string sid, string pk, bool active, SessionState state, string? title) => new
+            {
+                SessionId = sid,
+                ProjectKey = pk,
+                // ⚠️ 「不活跃」是**内存事实**（盘上没有它的痕迹）。头要它，因为
+                // 「没在内存里」与「没在跑」不是一回事（后者还要看 `status`）。
+                Active = active,
+                state.Status,
+                state.Turn,
+                Title = title,
+                // ⚠️ **待办的那次询问**：头据此在列表上标出「哪个会话在等我」，
+                // 不必再去逐个 `GET /approvals`。
+                //
+                // ⚠️ **「没在等」是 `{}`，不是 `null`、也不是省略**。三个都试过：
+                //   · `null` ⇒ `WhenWritingNull` 把**整个键**省掉 ⇒ 头的 `row.ask` 是
+                //     `undefined`（同 `/claims` 的 `stale` 那条教训）
+                //   · 内层可空字段 ⇒ 同一个开关把内层也写成 `{}`
+                // ⇒ **契约是：头判 `row.ask?.askId`**（`{}` 本身是 truthy，不能拿它当判据）。
+                // 这条**必须写在这里**，因为 `{}` 看着像「有个对象」，而它是「什么都没有」。
+                //
+                // ⚠️ 只交出**外部要看的三格**——`ArgsHash` / `CallId` 是内部配对用的，
+                // 交出去等于把实现细节写进线上 schema。
+                Ask = state.Ask is { } a
+                    ? new
+                    {
+                        // ⚠️ 显式 `(string?)` 不是多余的：两个分支的匿名类型**必须逐字段同名同型**
+                        // 才会被编译器合并成同一个类型——否则这里是一个 CS8619（可空性不匹配），
+                        // 而解法不是 `!`（那会撒谎），是让两支**真的是同一个形状**。
+                        AskId = (string?)a.AskId,
+                        ToolName = (string?)a.ToolName,
+                        Kind = (string?)a.Kind.ToString(),
+                        a.DeadlineAt,
+                    }
+                    : new { AskId = (string?)null, ToolName = (string?)null, Kind = (string?)null,
+                            DeadlineAt = (DateTimeOffset?)null },
+            };
+        });
+
         app.MapGet("/sessions/{id}/state", (string id) =>
         {
             if (!TryFind(id, out var handle)) return Results.NotFound();

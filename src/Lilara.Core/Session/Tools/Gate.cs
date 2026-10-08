@@ -35,26 +35,26 @@ public enum Verdict
 public static class Gate
 {
     /// <summary>
-    /// 档位 → 它**放行**哪些类别。⚠️ <b>顺序就是 `01` §3.5 表里的行序</b>，
-    /// 而且它是**单调阶梯**（每升一档，只移动一个边界）——`GateTests` 钉着这条。
+    /// 档位 → 它**自动放行**哪些类别（`01` §3.5 那张表）。
+    ///
+    /// <para>⚠️ <b>顺序就是表里的行序</b>，而且它是**单调阶梯**（每升一档，只移动一个边界）
+    /// ——`GateTests` 钉着这条。</para>
     ///
     /// <para>⚠️ <b>它是一张<b>显式</b>集合的表，不是"枚举数值 ≤ 某个数"</b>：
     /// 后者依赖<b>枚举成员的相邻性</b>，往 `PermissionClass` 中间插一档（或重排）
     /// 会让整张表**静默错位**——而那正是 `Axes.cs` 里给权限轴写的那条警告的同一个形状。</para>
     ///
-    /// <para>⚠️ <b>两处「问」在表里是 `Ask`，这里实现成 <c>Deny</c></b>：
-    /// `standard` 的写入格、`authorized` 的高危格。理由见 <see cref="Verdict.Ask"/>。
-    /// ⚠️ <b>这个偏离必须写进 `01` §3.5</b>——否则就是「文档说一套、代码做一套」，
-    /// 而那正是本仓反复栽的那个形状。</para>
+    /// <para>⚠️ <b>⚠️ 只写「自动放行」的那半，这一格是本文件最容易读错的地方</b>——
+    /// 表里还有一列（<see cref="Asks"/>），而**「问」与「拒」是不同的档**：
+    /// 低档的边界是**拒绝线**（硬），高档的边界是**询问线**（软），档位 = 那条线在哪。
+    /// 本方法返回 <see cref="Verdict.Ask"/> 的那些格**不在**这张表里。</para>
     /// </summary>
     private static readonly Dictionary<string, PermissionClass[]> Allowed = new(StringComparer.Ordinal)
     {
         ["off"] = [],
         ["readonly"] = [PermissionClass.ReadOnly],
         ["investigate"] = [PermissionClass.ReadOnly, PermissionClass.Consuming],
-        // ⚠️ 表里写作「问」，本批降级为拒 ⇒ 只到 Consuming 为止。
         ["standard"] = [PermissionClass.ReadOnly, PermissionClass.Consuming],
-        // ⚠️ 同上：表里高危是「问」⇒ 只到 Writing 为止。
         ["authorized"] = [PermissionClass.ReadOnly, PermissionClass.Consuming, PermissionClass.Writing],
         ["trusted"] =
         [
@@ -64,14 +64,47 @@ public static class Gate
     };
 
     /// <summary>
+    /// 档位 → 它**要问用户**哪些类别（`01` §3.5 的「询问线」那一列）。
+    ///
+    /// <para>⚠️ <b>这条线是 2026-10-08（询问批）才接上的</b>：在那之前这两格**实现成 `Deny`**
+    /// ——因为「问」要转 `WaitingForInput`，而那个状态当时**没有任何生产者**。
+    /// ⇒ 那是一次**看得见的降级**（如实写在 `01` §3.5 与 `实现现状` 里），
+    /// 而它的代价当时就写明了：默认档是 `standard`，降级之后**默认档写不了任何东西**。
+    /// 本批把降级掀掉，那个代价随之消失。</para>
+    ///
+    /// <para>⚠️ <b>结构与 <see cref="Allowed"/> 完全同形</b>（显式集合、不依赖枚举相邻性），
+    /// 理由也同一条。两张表**合起来**才是 `01` §3.5 那张 6×4 表的第一列：
+    /// 每一格要么在 `Allowed` 里、要么在 `Asks` 里、要么两者都不在（= 拒）。</para>
+    /// </summary>
+    private static readonly Dictionary<string, PermissionClass[]> Asks = new(StringComparer.Ordinal)
+    {
+        // 3 标准：写入是**询问线**（表里那一格写着「问」）。
+        ["standard"] = [PermissionClass.Writing],
+        // 4 授权：高危是**询问线**。
+        ["authorized"] = [PermissionClass.Destructive],
+    };
+
+    /// <summary>
     /// 判定。⚠️ <b>未知档位一律当作最严的那一档</b>——与 `Axes.InContext` 那条
     /// 「不知道的一律当作不进上下文」同一条判据：**宁可漏放，不可错放**。
     ///
     /// <para>⚠️ 别指望"上游一定拦住了"：盘上的 `state.json` 是**用户可手改的**
     /// （`SessionStore.TryReadSpec` 那条已知边界），而闸门是**安全**那一侧。</para>
+    ///
+    /// <para>⚠️ <b>「先放行、再问」的次序不是随机的</b>：一格同时出现在两张表里时
+    /// 以放行为准——两张表都写成显式集合，那个重叠是**配置错误**，
+    /// 而两个判据冲突时取更宽松的那个是**唯一说得通**的默认（另一个方向会让
+    /// 一次「本来能跑」的调用变成一次没必要的打扰）。</para>
     /// </summary>
-    public static Verdict Decide(PermissionClass cls, string? level) =>
-        Allowed.TryGetValue(level ?? "", out var allowed) && allowed.Contains(cls) ? Verdict.Allow : Verdict.Deny;
+    public static Verdict Decide(PermissionClass cls, string? level)
+    {
+        var key = level ?? "";
+
+        if (Allowed.TryGetValue(key, out var allowed) && allowed.Contains(cls)) return Verdict.Allow;
+        if (Asks.TryGetValue(key, out var asked) && asked.Contains(cls)) return Verdict.Ask;
+
+        return Verdict.Deny;
+    }
 
     /// <summary>
     /// 拒绝理由。⚠️ <b>它在<b>执行那一刻</b>就落进结果、此后冻结</b>

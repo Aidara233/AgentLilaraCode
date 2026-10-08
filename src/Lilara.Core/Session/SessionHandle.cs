@@ -175,9 +175,14 @@ public sealed record SessionHandle
     /// <summary>换掉整份回收集合。⚠️ 调用方（`session.gc`）必须先算完再进来——这里不判、不算。</summary>
     public void SetReclaimed(IReadOnlySet<string> ids) => Volatile.Write(ref _reclaimed, ids);
 
+    /// <param name="sessionId">
+    /// ⚠️ <b>可空，而且正常路径**必须**不传</b>：给它的唯一用途是**可测性**
+    /// ——一个会问用户的工具需要观察「等回答」那条路，而会话 id 随机生成时
+    /// 断言写不出来。生产调用点一个都不该传（那等于让一个外部值决定盘上的身份）。
+    /// </param>
     public static SessionHandle Create(
         SessionStore store, string workingDirectory, ModelSelection model, string? title = null,
-        string? systemPromptPreset = null)
+        string? systemPromptPreset = null, string? sessionId = null)
     {
         // ⚠️ **一次取绝对路径，三处共用同一个值**：算 key、写 spec、定目录。
         // 改之前是**两次独立的** `GetFullPath`（`ProjectKey.FromPath` 内部一次、
@@ -190,7 +195,7 @@ public sealed record SessionHandle
         {
             // ⚠️ 走 `Ids.New()` 而不是就地 `Guid.NewGuid()...`：会话 id 与记录 id 是**同一个形状**，
             // 两处各写一遍拼法就会漂（宽度 / 大小写 / 截断位置）。
-            SessionId = Ids.New(),
+            SessionId = sessionId ?? Ids.New(),
             ProjectKey = projectKey,
             WorkingDirectory = fullPath,
             CreatedAt = CoreClock.Now(),

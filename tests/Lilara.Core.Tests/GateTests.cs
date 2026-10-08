@@ -34,10 +34,10 @@ public class GateTests
     /// <summary>
     /// ⚠️ **照抄 `01` §3.5 那张表**，逐格钉住。表是**唯一来源**，`Gate` 里不许自己推。
     ///
-    /// <para>⚠️ <b>一处刻意的偏离</b>：`standard(3)` 的 **Writing 格在表里是「问」**，
-    /// 而本批实现成 <b>拒</b>——因为「问」要转 <c>WaitingForInput</c>，
-    /// 而那个状态**从来没有生产者**（用户裁定：审批单独一批）。
-    /// ⇒ 这里按**实现**钉（拒），而偏离本身写进了 `01` §3.5。</para>
+    /// <para>⚠️ <b>那两格「问」在 2026-10-08（询问批）落地了</b>——在那之前它们被
+    /// **刻意降级成 `Deny`**（「问」要转 `WaitingForInput`，而那个状态当时没有生产者）。
+    /// ⇒ 本表现在钉的是**真值**（`Ask`），而降级那段历史写在 `Gate` 的 `Asks` 字段注释里。
+    /// ⚠️ 那条降级的代价当时就写明了：默认档是 `standard`，降级之后**默认档写不了任何东西**。</para>
     /// </summary>
     [Theory]
     // 0 禁用 ⇒ 四类全拒
@@ -55,16 +55,16 @@ public class GateTests
     [InlineData("investigate", PermissionClass.Consuming, Verdict.Allow)]
     [InlineData("investigate", PermissionClass.Writing, Verdict.Deny)]
     [InlineData("investigate", PermissionClass.Destructive, Verdict.Deny)]
-    // 3 标准 ⇒ 前三（Writing 表里是"问"，本批**降级为拒**）
+    // 3 标准 ⇒ 前两通，写入是**询问线**（表里的「问」）
     [InlineData("standard", PermissionClass.ReadOnly, Verdict.Allow)]
     [InlineData("standard", PermissionClass.Consuming, Verdict.Allow)]
-    [InlineData("standard", PermissionClass.Writing, Verdict.Deny)]
+    [InlineData("standard", PermissionClass.Writing, Verdict.Ask)]
     [InlineData("standard", PermissionClass.Destructive, Verdict.Deny)]
-    // 4 授权 ⇒ Destructive 是唯一被拦的（表里是"问"，同上降级为拒）
+    // 4 授权 ⇒ 前三通，高危是**询问线**（表里的「问」）
     [InlineData("authorized", PermissionClass.ReadOnly, Verdict.Allow)]
     [InlineData("authorized", PermissionClass.Consuming, Verdict.Allow)]
     [InlineData("authorized", PermissionClass.Writing, Verdict.Allow)]
-    [InlineData("authorized", PermissionClass.Destructive, Verdict.Deny)]
+    [InlineData("authorized", PermissionClass.Destructive, Verdict.Ask)]
     // 5 信任 ⇒ 四类全通
     [InlineData("trusted", PermissionClass.ReadOnly, Verdict.Allow)]
     [InlineData("trusted", PermissionClass.Consuming, Verdict.Allow)]
@@ -96,6 +96,12 @@ public class GateTests
             var firstAllow = verdicts.IndexOf(Verdict.Allow);
             if (firstAllow < 0) continue;
             Assert.DoesNotContain(Verdict.Deny, verdicts.Skip(firstAllow));
+
+            // ⚠️ **而「问」也只在放行之前**：`01` §3.5 的结构是「低档是**拒绝线**（硬）、
+            // 高档是**询问线**（软）」⇒ 序必须是 拒 → 问 → 通，**不许**出现「通 → 问」
+            // （那等于升了档反而多一次打扰）。⚠️ 这条是 2026-10-08 询问批补的：
+            // 在那之前 `Decide` 根本不返回 `Ask`，所以这条形状**测不出来**。
+            Assert.DoesNotContain(Verdict.Ask, verdicts.Skip(firstAllow));
         }
     }
 
