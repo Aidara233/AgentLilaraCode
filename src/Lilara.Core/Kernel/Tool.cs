@@ -146,6 +146,23 @@ public sealed record ToolOutcome
     /// 不给 ⇒ 盘上键不出现 ⇒ 老文件逐字节不变。</para>
     /// </summary>
     public ToolFraming? Framing { get; init; }
+
+    /// <summary>
+    /// **这次执行其实是「问用户」**（`01` §3.8）。非 null ⇒ 本次**没有跑任何东西**，
+    /// 核心应当把这一步**中止**、落盘、转 `WaitingForInput`。
+    ///
+    /// <para>⚠️ <b>只有声明了 <see cref="ITool.AsksBeforeRunning"/> 的工具该填它</b>
+    /// ——否则「先判全、再执行」那条不变量破（走在前面的调用可能已经落了副作用）。</para>
+    ///
+    /// <para>⚠️ <b>它是一个<b>结果</b>，不是一个异常</b>：与 <see cref="Content"/> 那条
+    /// 「失败也是内容」同源。而这个结果**不会被落盘**——它转成一次暂停。
+    /// 用户答完之后，核心**重新问一次工具**要那批问题（工具因此必须是纯的，
+    /// 见 `SessionState.PausedAsk` 的注释）。</para>
+    ///
+    /// <para>⚠️ <c>null</c> 是默认 —— 老工具、以及所有不声明询问的工具，
+    /// 行为**逐字节不变**。</para>
+    /// </summary>
+    public AskRequest? Ask { get; init; }
 }
 
 /// <summary>
@@ -247,6 +264,26 @@ public interface ITool
     /// 绝不进系统提示词）——所以要写清**边界**（能读什么、读不了什么），而不是写清「这是个好东西」。
     /// </summary>
     string Description { get; }
+
+    /// <summary>
+    /// **这个工具会不会问用户**（`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>它存在的唯一理由是「先判全、再执行任何人都任何东西」</b>：
+    /// 闸门的 <c>Ask</c> 是**静态可知**的（查表），而工具自己发现的问
+    /// （`ask` 工具）只有跑起来才知道——那时副作用**已经发生了**。
+    /// ⇒ 与 <see cref="PermissionClass"/> 同形：让**声明**先于**执行**。</para>
+    ///
+    /// <para>⚠️ <b>它是<b>静态声明</b>，不是「这一次会不会问」</b>：
+    /// 声明 <c>true</c> 的工具**永远**不执行、只产出那一批问题（它本来就没有副作用，
+    /// 否则它就不该声明这个）；声明 <c>false</c> 的工具**永远不问**。
+    /// ⇒ 判据是「**它在执行前就知道要问什么吗**」，不是「它想不想问」。</para>
+    ///
+    /// <para>⚠️ <b>有默认值 <c>false</c>，而这是刻意与本仓「不给沉默的默认」那条相反的例外</b>：
+    /// 绝大多数的工具**不问**，而「不问」在这里是**安全**的那一侧——
+    /// 一个忘了声明的询问工具，后果是它照常执行（= 今天的行为），不是静默漏掉一次授权。
+    /// 对比 <see cref="PermissionClass"/> 那个<b>不给默认值</b>的：那里两个方向都危险。</para>
+    /// </summary>
+    bool AsksBeforeRunning => false;
 
     /// <summary>
     /// 参数的 JSON Schema，**原文**。⚠️ 与 <see cref="Block.ToolUseBlock.Arguments"/> 同一条纪律

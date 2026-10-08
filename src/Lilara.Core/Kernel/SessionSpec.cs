@@ -90,4 +90,22 @@ public sealed record SessionSpec
     /// 那件事由**格式版本**承担。</para>
     /// </summary>
     public string? SystemPromptPreset { get; init; }
+
+    /// <summary>
+    /// 一次询问**最多等多久**（`01` §3.8）。`null` = **不超时**（默认）。
+    ///
+    /// <para>⚠️ <b>超时的后果按 Kind 分</b>：<see cref="AskKind.Permission"/> 超时 =
+    /// **拒绝**（「等待超时，没人回答」）；<see cref="AskKind.Question"/> 超时 =
+    /// 一条「没有人回答」。⚠️ <b>默认不超时是刻意的</b>——一个可能不可逆的操作
+    /// 不该因为「头不在」而被自动放行，也不该被自动拒掉。</para>
+    ///
+    /// <para>⚠️ <b>可空是<b>两件事</b>的合一，而它们不必分开</b>：`null` = 「没设过」，
+    /// 而「没设过」的后果就是「不超时」。这与 <see cref="ArchivedAt"/> 那种
+    /// 「可空 = 一件事实的有无」形状相同 —— <b>而 `TimeSpan.Zero` 是<b>非法</b>的</b>
+    /// （「等 0 分钟」读不出意思），校验时必须拒掉，别让它悄悄等于「立刻超时」。</para>
+    ///
+    /// <para>⚠️ 可空**不破老字节**（`WhenWritingNull` 已开，`Ref` / <see cref="Title"/> 是先例）——
+    /// 但语义变了照样 **+1 格式版本**：理由不在兼容（本来就兼容），在**标记这是一份按新格式写的文件**。</para>
+    /// </summary>
+    public TimeSpan? AskTimeout { get; init; }
 }

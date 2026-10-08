@@ -29,6 +29,21 @@ public static class SessionStatus
     /// 正在跑。**只写内存、从不落盘**——见类型注释。
     /// </summary>
     public const string Running = "Running";
+
+    /// <summary>
+    /// **等用户回答**（`01` §5 / §3.8）。
+    ///
+    /// <para>⚠️ <b>它是**磁盘合法**取值，而且这一点是刻意的</b>——类型注释里那条判据在这里
+    /// 得到的答案是「算」：一个挂在等待里的会话，它的 `state.json` 里那行状态
+    /// **本来就该是它**。反过来（写 `Idle`）会让进程在等待中被 kill 之后，
+    /// 重启读到 `Idle` ⇒ 快照如实回一个「没有任何步在跑」⇒ 而它**真的还在等**
+    /// （那次调用一条结果都没落，那个 `tool_use` 悬着）。</para>
+    ///
+    /// <para>⚠️ **注意它与 <see cref="Running"/> 的形状相反**：`Running` 只写内存、
+    /// 从不落盘（因为「这一刻有一步在跑」是**进程事实**，重启后它必然为假）；
+    /// 而「有一个问题等着被回答」是**盘面事实**，重启后照样成立。</para>
+    /// </summary>
+    public const string WaitingForInput = "WaitingForInput";
 }
 
 // 每步原子重写。
@@ -64,4 +79,49 @@ public sealed record SessionState
     // 那条守卫会红（这正是它存在的意义）。那是一次**线上 schema 变更**，
     // 与磁盘那半是两件事 ⇒ 别在这里顺手做半截。
     public IReadOnlyDictionary<string, string>? Axes { get; init; }
+
+    /// <summary>
+    /// **等待中的那次询问**（`01` §3.8）。⚠️ 非 null ⟺ <see cref="Status"/> 是
+    /// <see cref="SessionStatus.WaitingForInput"/>——两份事实、一处判断（见 <see cref="PausedAsk"/> 注释）。
+    ///
+    /// <para>⚠️ <b>可空 = 「没在等」</b>，与 <see cref="Axes"/> 那条「可空是历史遗留」不同：
+    /// 这里可空是**语义**。老文件缺这个键 ⇒ `WhenWritingNull` 让盘上键不出现 ⇒ **逐字节不变**。</para>
+    /// </summary>
+    public PausedAsk? Ask { get; init; }
 }
+
+/// <summary>
+/// **一次挂起的询问**（`01` §3.8）。
+///
+/// <para>⚠️ <b>它<b>不</b>落盘「问题原文」</b>——刻意如此。提问是一次**渲染产物**
+/// （同 `01` §3.7 的框架），而挂起状态只需要知道「在等哪一次调用、等多久」。
+/// 代价要认：**进程重启后问题原文丢了**（它住在内存里）。⇒ 恢复时伪造一个
+/// <see cref="Question"/> 是那句固定的「会话在等待时重启过，原来的问题没能保留」，
+/// 用户答一次即可继续。⚠️ 而**状态是诚实的**（`Status` 落盘）——这正是落盘买到的。</para>
+///
+/// <para>⚠️ <b>另一条边界</b>：用户答完之后，我们会**重新问一次**工具要它那批问题
+/// （见 `SessionHandle.PendingAsk` 的注释）。那要求工具是**纯的**——`00` §5 铁律 1 早就
+/// 要求了（「同一个 `ToolCall` 配上同一个上下文，跑几次都一样」）⇒ 对一个守规矩的工具，
+/// 重问得到的是**同一批问题**。不守规矩的工具会得到一张**对不上号的卡**，
+/// 而那不会静默：答案按 id 归位，对不上就是一句「这一项没有被回答」。</para>
+/// </summary>
+/// <param name="AskId">稳定 id。⚠️ 它与下面那个 <paramref name="CallId"/> **不是一回事**（见 `01` 的 id 分工）。</param>
+/// <param name="Kind">授权 / 问意见。</param>
+/// <param name="CallId">被挂起的那个调用的**协议 id**（`tool_use.callId`）。回答时要靠它配对。</param>
+/// <param name="ToolName">哪个工具的调用。</param>
+/// <param name="ArgsHash">
+/// 参数原文的哈希（`ApprovalStore.HashArgs`）。⚠️ **两个用途**：① 记忆的键；
+/// ② 用户**改写**过参数之后，用它和原来那个比，就知道要不要标 `ArgumentsAmended`。
+/// </param>
+/// <param name="DeadlineAt">
+/// 超时时刻（绝对）。⚠️ <b><c>null</c> = 不超时</b>（`spec.askTimeout` 也是 null）。
+/// 看它的人**只有一个**：任何一次试图恢复这个会话的动作（`approval.respond` / `session.send`）。
+/// ⇒ <b>超时不是定时器，是盘面自证</b>——见 `01` §3.8。
+/// </param>
+public sealed record PausedAsk(
+    string AskId,
+    AskKind Kind,
+    string CallId,
+    string ToolName,
+    string ArgsHash,
+    DateTimeOffset? DeadlineAt);

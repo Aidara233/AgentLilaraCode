@@ -99,4 +99,48 @@ public static class Gate
         return $"这次调用被拒绝了：它是**{name}**类工具，而当前权限档位（{current}）不允许这一类。"
              + "要让它能跑，请让用户提高权限档位（session.setAxis permission）。";
     }
+
+    /// <summary>
+    /// **把一次 `Ask` 变成一张卡**（`01` §3.8）：「准不准跑这一次？」
+    ///
+    /// <para>⚠️ <b>它是「统一处理」那个要求落在闸门这一侧的样子</b>：闸门不自己弹窗、
+    /// 不自己落盘、不碰状态机——它只**描述问题**，然后由 `ToolExecutor` 交出去。
+    /// `ask` 工具走的是**同一条**恢复路径，只是 <see cref="AskKind"/> 不同。</para>
+    ///
+    /// <para>⚠️ <b>卡上必须能看出「本该问」还是「档位不够」</b>（`01` §3.5 记的那处
+    /// 本批的已知不精确：两者今天都印"档位不允许"）。这里把措辞分开：
+    /// 这一条说的是「**这需要你点头**」，而 <see cref="DenyReason"/> 说的是
+    /// 「**这一档不许**」。</para>
+    ///
+    /// <para>⚠️ <b>它是只读的、无副作用的</b>——`ToolExecutor` 会在「先判全」那一趟
+    /// **每条被问的调用调它一次**，而那时一条工具都还没跑。</para>
+    /// </summary>
+    /// <param name="call">被问的那个调用。⚠️ 它的**参数原文**进卡（改写后批准要用）。</param>
+    public static AskRequest AskFor(ITool tool, Block.ToolUseBlock call, string? level)
+    {
+        var cls = tool.PermissionClass;
+        var current = level is null ? "未知" : Axes.LabelOf(Axes.Permission) + "＝" + level;
+
+        var what = cls switch
+        {
+            PermissionClass.Writing => "会改动东西",
+            PermissionClass.Destructive => "不可逆（高危）",
+            _ => "需要授权",
+        };
+
+        return new AskRequest
+        {
+            Id = Ids.New(),
+            Kind = AskKind.Permission,
+            Items =
+            [
+                AskItem.Verbatim(
+                    "arguments",
+                    $"要跑 `{tool.Name}`（{what}），当前档位（{current}）要求先问你。可以改参数再批准。",
+                    call.Arguments),
+            ],
+            // ⚠️ 两档都给，**粗的那档由卡片负责写明**（见 `AskMemory`）。
+            Remember = [AskMemory.Args, AskMemory.Tool],
+        };
+    }
 }

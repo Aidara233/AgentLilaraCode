@@ -45,7 +45,7 @@ public static class Json
     /// 而老程序会把「缺这个键」读成「这套格式里根本没有系统提示词这回事」。
     /// ⇒ 两份程序对同一个会话发出的请求**逐字节不同**，而它们都以为自己在读同一份 spec。</para>
     /// </summary>
-    public const int FormatVersion = 4;
+    public const int FormatVersion = 5;
 
     public static readonly JsonSerializerOptions Options = new()
     {

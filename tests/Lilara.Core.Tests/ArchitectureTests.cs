@@ -22,7 +22,8 @@ public class ArchitectureTests
         // 或路径变了）。**加文件时按实测改，别按感觉改**：被机械改过一次的探针就等于没有。
         // 15 → 16（2026-10-06 最小工具批）：加了 `Tool.cs`（工具契约的词汇层）。
         // 16 → 17（2026-10-07 预设批）：加了 `CorePrompts.cs`（核心自带的那份系统提示词模板）。
-        Assert.Equal(17, files.Length);
+        // 17 → 18（2026-10-08 询问批）：加了 `Ask.cs`（问用户的词汇层：Kind/Shape/AskRequest）。
+        Assert.Equal(18, files.Length);
 
         var offenders = files
             .SelectMany(f => ExternalUsings(f).Select(u => $"{Path.GetFileName(f)}:{u.Line}  {u.Text}"))

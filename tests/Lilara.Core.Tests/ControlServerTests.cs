@@ -1131,8 +1131,9 @@ public class ControlServerTests : IAsyncLifetime
                 .ToArray();
 
         Assert.Equal(
-            ["ArchivedAt:Nullable`1", "CreatedAt:DateTimeOffset", "Model:ModelSelection",
-             "ProjectKey:String", "SessionId:String", "SystemPromptPreset:String", "Title:String",
+            ["ArchivedAt:Nullable`1", "AskTimeout:Nullable`1", "CreatedAt:DateTimeOffset",
+             "Model:ModelSelection", "ProjectKey:String", "SessionId:String",
+             "SystemPromptPreset:String", "Title:String",
              "Version:Int32", "WorkingDirectory:String"],
             Shape(typeof(SessionSpec)));
 

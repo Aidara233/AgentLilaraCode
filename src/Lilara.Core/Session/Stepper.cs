@@ -172,6 +172,11 @@ public sealed class Stepper(
             });
         }
 
+        // ⚠️ **工具一次都还没跑，所以这一趟的落盘完全不同**（`01` §3.8）。
+        // 有问 ⇒ 事件列表**空**（模型消息也不落——见下），状态转 `WaitingForInput`，
+        // 那次暂停冻进 handle，等用户答完由 `CommandDispatcher` 续跑。
+        AskRequest? pending = null;
+
         // ⚠️ 工具调用是**模型消息的一部分** ⇒ 有调用就一定有那条模型消息（上面那个 if 通过）。
         // `events.Count > 0` 不是多余的守卫，它挡的是「凭空落一堆悬空结果」——而悬空的
         // `tool_result` 与悬空的 `tool_use` 一样会让下一步的请求非法（`01` §3.6）。
@@ -181,10 +186,41 @@ public sealed class Stepper(
             // ⚠️ **权限档位在这里读一次，冻进这一趟**（与上面那个 `now` 同一个道理）：
             // 它是**浮动字段**（`01` §9.2：改它零前缀代价），而一步之内的判定必须一致——
             // 否则同一步里两条调用会按两个档位判，而记录里看不出为什么。
-            var executor = new ToolExecutor(_tools, blobs, handle.State.Axes![Axes.Permission]);
+            var executor = new ToolExecutor(
+                _tools, blobs, handle.State.Axes![Axes.Permission],
+                new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId));
             var context = new SessionToolContext(handle.Spec.WorkingDirectory, blobs, recorded);
 
-            events.AddRange(await executor.ExecuteAsync(toolCalls, context, ct));
+            var batch = await executor.ExecuteAsync(toolCalls, context, ct);
+            pending = batch.Pending;
+            events.AddRange(batch.Results);
+        }
+
+        // ⚠️ **有问 ⇒ 中止这一步，一条结果都不落**（`01` §3.8）。
+        // ⚠️ **连那条模型消息也不落**——它与工具结果同属「这一步的产物」，
+        // 落它而不落结果，就会在下一步的请求里留下**悬空的 `tool_use`** ⇒ 上游 400。
+        // ⇒ 这一步**整个**没发生：模型那段话会被重放（前缀没变，模型吐同样的东西）。
+        // 代价如实认下：一次需要授权的调用 = **多花一次模型调用**。
+        // ⚠️ 判据在这条与「先判全、再执行」那条之间是**同一条**：宁可让一步整个不算，
+        // 也不许留下半个状态（`01` §3.6 ②「一对不能拆」的结构性后果）。
+        if (pending is not null)
+        {
+            handle.AwaitingInput = new SessionHandle.PendingAsk(pending, toolCalls);
+            handle.UpdateStateAndPersist(_store, s => s with
+            {
+                Status = SessionStatus.WaitingForInput,
+                Ask = new PausedAsk(
+                    pending.Id, pending.Kind,
+                    // ⚠️ 一条询问今天只可能属于**一个** Kind，而 `CallId` 那一格只装得下一个。
+                    // 取第一条；真正的配对靠 `PendingAsk.Calls`（它是列表）。
+                    toolCalls[0].CallId,
+                    toolCalls[0].Name,
+                    ApprovalStore.HashArgs(toolCalls[0].Arguments),
+                    DeadlineOf(handle.Spec.AskTimeout)),
+                Turn = s.Turn + 1,
+            }, diskStatus: SessionStatus.WaitingForInput);
+
+            return reply;
         }
 
         // 一次落盘 = 一个原子。⚠️ 空批次**不写**（拒答且没有工具的那一步就是空的），
@@ -209,6 +245,17 @@ public sealed class Stepper(
 
         return reply;
     }
+
+    /// <summary>
+    /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。
+    ///
+    /// <para>⚠️ <b>它在暂停那一刻算一次、冻进盘</b>，而不是每读一次算一次：
+    /// 「等多久」是用户设的**时长**，而「什么时候到点」必须在**盘上**（重启之后
+    /// 那段计时还得接着走）。现算的话，重启会把时限**重新起算** ⇒ 一个设了 5 分钟的
+    /// 询问，重启几次就能无限等下去。</para>
+    /// </summary>
+    private static DateTimeOffset? DeadlineOf(TimeSpan? timeout) =>
+        timeout is { } t ? CoreClock.Now() + t : null;
 
     /// <summary>
     /// 一步：**追加 + 入队 + 推进**——`01` §6.1 那条复合动作的完整形态。

@@ -120,6 +120,37 @@ public sealed record SessionHandle
     public void ResetToolSteps() => Volatile.Write(ref _toolSteps, 0);
 
     /// <summary>
+    /// **挂起的那次询问**（`01` §3.8）。非 null ⟺ <see cref="SessionState.Ask"/> 非 null。
+    /// ⚠️ 名字与那个**盘上**的类型（<see cref="Kernel.PausedAsk"/>）分开，是刻意的：
+    /// 它们是这件事的两半，一半在盘上、一半在内存（见下面那个嵌套类型的注释）。
+    ///
+    /// <para>⚠️ <b>挂起状态有<b>两份</b>，而这是刻意的、也是唯一安全的形状</b>：
+    /// 一组是**盘面事实**（等哪一次调用、等多久——<see cref="Kernel.PausedAsk"/> 落进
+    /// `state.json`），另一组是**内存事实**（那批问题原文——只有它才知道卡片上画什么）。
+    /// ⚠️ <b>问题原文<b>不</b>落盘</b>，因为提问是一次**渲染产物**（同 `01` §3.7 的框架），
+    /// 而它由工具的**纯函数**重新算得出来（`00` §5 铁律 1）。
+    /// ⇒ 重启之后盘面还在、问题没了：状态**诚实**，问题**不诚实**——
+    /// 恢复时用一句「会话在等待时重启过，原来的问题没能保留」顶上，用户答一次即可继续。</para>
+    ///
+    /// <para>⚠️ <b>于是「重新问一次工具」是恢复路径的一部分</b>，而它要求工具是纯的
+    /// （同一个调用 + 同一个上下文 ⇒ 同一批问题）。不纯的工具会得到一张**对不上号**的卡，
+    /// 而那个失败**不静默**：答案按 id 归位，对不上就是一句「这一项没有被回答」。
+    /// </para>
+    /// </summary>
+    public PendingAsk? AwaitingInput { get; set; }
+
+    /// <summary>
+    /// 一次挂起询问的**内存那一半**（`01` §3.8）。见 <see cref="PendingAsk"/> 的注释。
+    /// </summary>
+    /// <param name="Ask">那批问题（用户答完要靠它把答案归位）。</param>
+    /// <param name="Calls">
+    /// **被挂住的那些调用**——⚠️ 它们还没配对，答完要按 <c>CallId</c> 给每条补一个结果。
+    /// 一条询问可以盖住**多个**调用（同一批 `tool_use` 里两条都要问）。
+    /// ⇒ 它是**列表**，不是一个（当年按「一问一调用」写会在这里炸）。
+    /// </param>
+    public sealed record PendingAsk(AskRequest Ask, IReadOnlyList<Block.ToolUseBlock> Calls);
+
+    /// <summary>
     /// **这一份会话里被回收的结果**（记录 id 的集合）。⚠️ <b>内存账，不落盘</b>
     /// （`01` §8.0.2 八：「持久化永远存原文；注入与否只取决于 GC 状态，而 GC 状态不落盘」）。
     ///

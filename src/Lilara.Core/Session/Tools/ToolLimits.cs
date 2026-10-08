@@ -40,4 +40,14 @@ internal static class ToolLimits
     /// ⚠️ 一个 5 万条目的目录**不需要任何大文件**就能把上下文撑爆——`ls` 与 `read` 是**同一个病**。</para>
     /// </summary>
     public const int MaxDirectoryEntries = 1000;
+
+    /// <summary>
+    /// `ask` 一次**最多问几个问题**（`01` §3.8）。
+    ///
+    /// <para>⚠️ **占位值**。多问是**一次询问一个信封**，所以没有协议层的上限兜着——
+    /// 一个模型可以在一张卡上塞 500 个问题，而那是**用户**要挨个填的。
+    /// ⇒ 这里必须有个数，理由同 <see cref="MaxDirectoryEntries"/>：
+    /// 撑爆的是**人的耐心**，不是上下文。</para>
+    /// </summary>
+    public const int MaxAskItems = 8;
 }

@@ -205,7 +205,7 @@ public class ToolExecutorTests : IDisposable
             Use("c2", "read", """{"path":"a.txt"}"""),
         };
 
-        var results = await Subject().ExecuteAsync(calls, _ctx, default);
+        var results = (await Subject().ExecuteAsync(calls, _ctx, default)).Results;
 
         Assert.Equal(["c1", "c2"], results.Select(r => r.CallId));
         Assert.Equal("B", ((Block.TextBlock)results[0].Content[0]).Text);
@@ -218,8 +218,8 @@ public class ToolExecutorTests : IDisposable
     {
         File.WriteAllText(Path.Combine(_work, "a.txt"), "x");
 
-        var results = await Subject().ExecuteAsync(
-            [Use("c1", "read", """{"path":"a.txt"}""")], _ctx, default);
+        var results = (await Subject().ExecuteAsync(
+            [Use("c1", "read", """{"path":"a.txt"}""")], _ctx, default)).Results;
 
         var r = Assert.Single(results);
         Assert.Equal("a.txt", r.DependsOn);
@@ -236,8 +236,8 @@ public class ToolExecutorTests : IDisposable
         var big = new string('x', BlobStore.InlineThresholdBytes + 1);
         File.WriteAllText(Path.Combine(_work, "big.txt"), big);
 
-        var results = await Subject().ExecuteAsync(
-            [Use("c1", "read", """{"path":"big.txt"}""")], _ctx, default);
+        var results = (await Subject().ExecuteAsync(
+            [Use("c1", "read", """{"path":"big.txt"}""")], _ctx, default)).Results;
 
         var store = Assert.IsType<Block.StoreBlock>(Assert.Single(Assert.Single(results).Content));
         Assert.Equal("text/plain", store.MediaType);
@@ -261,8 +261,8 @@ public class ToolExecutorTests : IDisposable
     {
         File.WriteAllText(Path.Combine(_work, "a.txt"), "小");
 
-        var results = await Subject().ExecuteAsync(
-            [Use("c1", "read", """{"path":"a.txt"}""")], _ctx, default);
+        var results = (await Subject().ExecuteAsync(
+            [Use("c1", "read", """{"path":"a.txt"}""")], _ctx, default)).Results;
 
         var r = Assert.Single(results);
 
@@ -283,8 +283,8 @@ public class ToolExecutorTests : IDisposable
     [Fact]
     public async Task Execute_UnknownToolName_IsAResult()
     {
-        var results = await Subject().ExecuteAsync(
-            [Use("c1", "nonexistent", "{}")], _ctx, default);
+        var results = (await Subject().ExecuteAsync(
+            [Use("c1", "nonexistent", "{}")], _ctx, default)).Results;
 
         var r = Assert.Single(results);
         Assert.Equal("c1", r.CallId);
@@ -297,11 +297,11 @@ public class ToolExecutorTests : IDisposable
     {
         File.WriteAllText(Path.Combine(_work, "ok.txt"), "fine");
 
-        var results = await Subject().ExecuteAsync(
+        var results = (await Subject().ExecuteAsync(
         [
             Use("c1", "read", """{"path":"../../escape"}"""),   // 被拒（一条结果）
             Use("c2", "read", """{"path":"ok.txt"}"""),         // 正常
-        ], _ctx, default);
+        ], _ctx, default)).Results;
 
         Assert.Equal(2, results.Count);
         Assert.Equal("fine", ((Block.TextBlock)results[1].Content[0]).Text);
