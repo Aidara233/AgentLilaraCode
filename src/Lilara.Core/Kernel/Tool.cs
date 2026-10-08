@@ -1,6 +1,45 @@
 namespace Lilara.Core.Kernel;
 
 /// <summary>
+/// **框架**——工具对自己**那次调用**的结构化描述（`01` §3.7）。
+///
+/// <para>⚠️ <b>它是「那次调用返回了什么」，是事实 ⇒ 跟着记录落盘</b>。
+/// 与**核心那一半**（「这条已回收」）**不是一个东西**：那一半说的是
+/// 「你现在还能看到多少」，随回收状态变 ⇒ 渲染期算、不落盘。
+/// ⇒ 一条判据管两半、方向相反：**「那次调用发生的事」→ 工具，落盘；
+/// 「这一刻的可见性」→ 核心，渲染期算。**</para>
+///
+/// <para>⚠️ <b>为什么它是<b>结构化</b>的、不是一段拼好的字符串</b>：
+/// 核心要能<b>取用</b>其中的事实（比如判「这条结果被截断过」），
+/// 而不是去 <c>StartsWith("[read")</c> 解析自己刚拼出来的那句话。
+/// 拼法只有一处（<see cref="Render"/>）——两处各拼一遍，那句「定长、位置固定」
+/// 就会漂，而**漂了不会报错**。</para>
+/// </summary>
+/// <param name="Tool">工具名。⚠️ 就是模型回传的那个串（<see cref="ITool.Name"/>）——**别改**。</param>
+/// <param name="Fields">
+/// 字段。⚠️ <b>顺序由工具定</b>（它知道哪个字段重要），渲染器**不排序**——
+/// 排序会漂，而漂了就是「同一步内渲染两次结果不同」（`00` §5 铁律 1）。
+/// </param>
+public sealed record ToolFraming(string Tool, IReadOnlyList<ToolFramingField> Fields)
+{
+    /// <summary>
+    /// 渲染成**一句定长、位置固定**的文本——它是给模型的**形状**，不是一段散文。
+    ///
+    /// <para>⚠️ <b>模型认位置与形状，不认语义</b>（`00` §7 判据 5：
+    /// 「能进机械层的，绝不靠嘴说」）。⇒ 把它写成一句读得懂的话是在**求**模型配合，
+    /// 而下面这个方括号形状是在**给**它一个可辨认的边界。</para>
+    ///
+    /// <para>⚠️ <b>不转义、不折行</b>：字段值由工具保证（路径 / 数字 / 短词），
+    /// 而替换任何字符都会让两个不同的框架渲染成同一句——那是**静默的假信息**。</para>
+    /// </summary>
+    public string Render() =>
+        "[" + Tool + (Fields.Count == 0 ? "" : " " + string.Join(" · ", Fields.Select(f => $"{f.Key} {f.Value}"))) + "]";
+}
+
+/// <summary>框架里的一个字段。⚠️ <c>(键, 值)</c> 就够——核心不该懂任何一条工具的字段语义。</summary>
+public sealed record ToolFramingField(string Key, string Value);
+
+/// <summary>
 /// **发给 provider 的一份工具定义。** 它是 <see cref="ITool"/> 的投影——`Stepper` 从工具表
 /// 造出来交给 <c>ModelRequest</c>，**适配器只认这一层，不认识 <see cref="ITool"/>**。
 ///
@@ -69,6 +108,19 @@ public sealed record ToolOutcome
     /// `00` §5 的不可重演类（执行命令 / 发邮件 / 取时间）**无指纹**，永不可优化。
     /// 别给一个「差不多」的值：假指纹比没有更坏，它会**声称**世界没动过。</summary>
     public string? Fingerprint { get; init; }
+
+    /// <summary>
+    /// **框架**——这一次调用返回了什么（`01` §3.7）。⚠️ 它是**事实** ⇒ 跟着记录落盘。
+    ///
+    /// <para>⚠️ <b>它<b>不是</b> <see cref="Content"/> 的一部分</b>：回收换的是整个
+    /// <c>Content</c>，框架若混在里面会被**一起吃掉**。分成两块之后，
+    /// 回收只换内容、框架原样——而模型靠「这是**独立的块**」区分二者，
+    /// **不靠读一段散文**。</para>
+    ///
+    /// <para>⚠️ <c>null</c> 是合法的（老记录、和不需要框架的工具都是）。
+    /// 不给 ⇒ 盘上键不出现 ⇒ 老文件逐字节不变。</para>
+    /// </summary>
+    public ToolFraming? Framing { get; init; }
 }
 
 /// <summary>

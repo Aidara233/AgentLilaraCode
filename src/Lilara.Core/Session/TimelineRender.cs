@@ -11,7 +11,7 @@ namespace Lilara.Core.Session;
 /// 各写一份的后果是本仓反复栽过的那个形状：**两处副本只改一处**，
 /// 于是模型看到的与用户看到的开始不一样，而且两边都「看起来是对的」。</para>
 ///
-/// <para>两步，次序是刻意的（<see cref="Render"/> 里有说明）：解库引用 → 换回收渲染。</para>
+/// <para>三步，次序是刻意的（<see cref="Render"/> 里有说明）：解库引用 → 换回收渲染 → **加框架**。</para>
 /// </summary>
 public static class TimelineRender
 {
@@ -20,15 +20,37 @@ public static class TimelineRender
         var raw = store.ReadTimeline(handle.ProjectKey, handle.SessionId);
         var blobs = new BlobStore(store.DataRoot);
 
-        // ⚠️ **次序：先解引用，再按记录的 id 回收。**
+        // ⚠️ **次序：先解引用，再按记录的 id 回收，最后加框架。**
         // 反过来的话，被回收的那条会先变成注记 ⇒ 后面拿到的就不是内容了。
         // ⇒ 回收只动**已经解好的那次渲染**，记录一个字不动（`01` §8.0.2 一 / 八）。
         //
-        // ⚠️ 这里**曾经还有第三步「解 `Ref`」**（把 `fetch` 结果的引用换成被引用那条的内容）。
+        // ⚠️ **框架排在回收之后，这是它独立成格的<b>全部理由</b>**（`01` §3.7）：
+        // 回收换的是整个 `Content`。若框架先拼进 `Content`，这一步就会**连它一起吃掉**。
+        // 排在这里 ⇒ 回收只换内容、框架一个字不动。
+        //
+        // ⚠️ 这里**曾经还有一步「解 `Ref`」**（把 `fetch` 结果的引用换成被引用那条的内容）。
         // 那一步连同 `Ref` 这个机制一起删了（2026-10-06，用户裁定，理由见
         // `TimelineEvent.ToolResultEvent.Ref` 的注释）——`fetch` 的结果今天带的是**内容**。
-        return [.. Reclaim.Apply([.. raw.Select(e => Dereference(e, blobs))], handle.Reclaimed)];
+        var dereferenced = raw.Select(e => Dereference(e, blobs));
+        var reclaimed = Reclaim.Apply([.. dereferenced], handle.Reclaimed);
+        return [.. reclaimed.Select(WithFraming)];
     }
+
+    /// <summary>
+    /// 把框架渲染成**一个独立的文本块**，恒定在<span>内容之前</span>（`01` §3.7）。
+    ///
+    /// <para>⚠️ <b>「独立的块」是这条机制的全部要害，不是排版偏好</b>：模型只能靠
+    /// 「这是一个<b>块</b>」来区分框架与内容。合并进同一个块（或拼成一段文本）之后，
+    /// **一个首行恰好长得像框架的内容**就能冒充框架，而模型**没有任何办法分辨**
+    /// ——那正是 §3.6 ①之二警告的「最坏的失败不是少了信息，是**多了一条假信息**」。</para>
+    ///
+    /// <para>⚠️ <b>没有 <c>Framing</c> 的记录原样返回</b>（老记录、以及不需要框架的工具）
+    /// ⇒ 逐字节与今天相同。</para>
+    /// </summary>
+    private static TimelineEvent WithFraming(TimelineEvent evt) =>
+        evt is TimelineEvent.ToolResultEvent { Framing: { } framing } r
+            ? r with { Content = [new Block.TextBlock(framing.Render()), .. r.Content] }
+            : evt;
 
     /// <summary>
     /// 把一个工具结果里的库对象换成真内容——**给 `fetch` 取回时用**。

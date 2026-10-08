@@ -129,4 +129,82 @@ public class TimelineRenderTests : IDisposable
         Assert.Contains("[已回收]", text);
         Assert.DoesNotContain("找不到了", text);   // 「库对象没了」那句**不许**出现
     }
+
+    // ---- 框架（`01` §3.7）------------------------------------------------------
+
+    /// <summary>一条**带框架**的结果。框架是「那次调用返回了什么」= 事实。</summary>
+    private TimelineEvent.ToolResultEvent Framed(string id, string callId, string tool, params Block[] content) => new()
+    {
+        Id = id, At = CoreClock.Now(), CallId = callId,
+        Content = Reclaim.Materialize(content, _blobs),
+        Framing = new ToolFraming(tool, [new ToolFramingField("路径", "a.log")]),
+    };
+
+    /// <summary>
+    /// ⚠️ **框架渲染成它自己的一个块，恒定在内容之前**（`01` §3.7）。
+    ///
+    /// <para>「独立的块」是这条机制的全部要害，不是排版偏好——模型只能靠
+    /// 「这是一个**块**」区分框架与内容。合并进同一个块之后，一个首行恰好长得像框架的
+    /// **内容**就能冒充框架，而模型**没有任何办法分辨**。</para>
+    /// </summary>
+    [Fact]
+    public void Frame_IsItsOwnBlock_BeforeTheContent()
+    {
+        Append(Framed("r1", "c1", "read", new Block.TextBlock("正文")));
+
+        var content = ResultAt(Render(), 0).Content;
+
+        Assert.Equal(2, content.Count);
+        Assert.Equal("[read 路径 a.log]", Assert.IsType<Block.TextBlock>(content[0]).Text);
+        Assert.Equal("正文", Assert.IsType<Block.TextBlock>(content[1]).Text);
+    }
+
+    /// <summary>
+    /// ⚠️ **本批存在的理由**：回收换的是整个 `Content`——框架若混在里面会被**一起吃掉**。
+    /// 分成两块之后，回收**只换内容**、框架**一个字不动**。
+    ///
+    /// <para>⚠️ 变异：让 `Reclaim.Apply` 连 `Framing` 一起换掉（或把框架拼进 `Content`）
+    /// ⇒ 这条必须红。</para>
+    /// </summary>
+    [Fact]
+    public void Reclaim_ReplacesTheContent_ButNotTheFrame()
+    {
+        Append(Framed("r1", "c1", "read", new Block.TextBlock("正文")));
+
+        _handle.SetReclaimed(new HashSet<string> { "r1" });
+        var content = ResultAt(Render(), 0).Content;
+
+        // 框架仍在，而且**还是那一句**（回收状态不影响它——它是事实）。
+        Assert.Equal("[read 路径 a.log]", Assert.IsType<Block.TextBlock>(content[0]).Text);
+        // 内容换成了注记。
+        Assert.Contains("[已回收]", Assert.IsType<Block.TextBlock>(content[1]).Text);
+    }
+
+    /// <summary>
+    /// ⚠️ **没有框架的记录原样返回**（老记录、以及不需要框架的工具）——
+    /// 这条钉的是「加字段不改老字节」那个结论在**渲染**这一侧也成立（本仓的 G20）。
+    /// </summary>
+    [Fact]
+    public void AResultWithoutAFrame_RendersUnchanged()
+    {
+        Append(Result("r1", "c1", new Block.TextBlock("正文")));
+
+        Assert.Equal("正文", Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(Render(), 0).Content)).Text);
+    }
+
+    /// <summary>
+    /// ⚠️ <b>框架的渲染是**纯函数**</b>：同一条记录渲染两次必须**逐字节相同**。
+    /// 一旦它带上时间/序号之类的东西，就成了「每步破一次前缀」——而那是**静默**的
+    /// （`00` §5 铁律 1）。
+    /// </summary>
+    [Fact]
+    public void Frame_RendersTheSameBytesEveryTime()
+    {
+        Append(Framed("r1", "c1", "read", new Block.TextBlock("正文")));
+
+        var a = Assert.IsType<Block.TextBlock>(ResultAt(Render(), 0).Content[0]).Text;
+        var b = Assert.IsType<Block.TextBlock>(ResultAt(Render(), 0).Content[0]).Text;
+
+        Assert.Equal(a, b);
+    }
 }

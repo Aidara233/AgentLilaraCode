@@ -48,6 +48,10 @@ public sealed class ToolExecutor(IReadOnlyList<ITool> tools, Storage.BlobStore b
                 At = CoreClock.Now(),
                 CallId = call.CallId,
                 Content = Reclaim.Materialize(outcome.Content, blobs),
+                // ⚠️ 框架**不进 `Materialize`**：它是**事实**（薄薄几个字段），
+                // 不是"内容"——把它塞进库会为几十个字节开一个对象，而
+                // `Materialize` 的判据（`InlineThresholdBytes`）管的是**字节量**。
+                Framing = outcome.Framing,
                 DependsOn = outcome.DependsOn,
                 Fingerprint = outcome.Fingerprint,
             });

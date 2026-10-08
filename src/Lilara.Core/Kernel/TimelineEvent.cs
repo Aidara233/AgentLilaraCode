@@ -56,6 +56,25 @@ public abstract record TimelineEvent
         public required string CallId { get; init; }
 
         /// <summary>
+        /// **框架**——工具对自己**那次调用**的结构化描述（`01` §3.7）。
+        ///
+        /// <para>⚠️ <b>它说的是「那次调用<b>返回了什么</b>」，而那是<b>事实</b> ⇒ 落盘。</b>
+        /// 与<b>核心那一半</b>（「这条<b>已回收</b>」）分得开：那一半说的是
+        /// 「你**现在还能看到多少**」，随回收状态变 ⇒ **渲染期算、不落盘**（与注记同类）。</para>
+        ///
+        /// <para>⚠️ <b>为什么要单独一格、而不是拼进 <see cref="Content"/></b>：
+        /// 回收今天换的是<b>整个 <c>Content</c></b>。框架若与内容混在同一个块里，
+        /// 那一步就会<b>连框架一起吃掉</b>——而它今天没出事，只是因为结果是<b>一对一</b>。
+        /// 分成两块之后，<c>Reclaim.Apply</c> 只换 <c>Content</c>，框架一个字不动。</para>
+        ///
+        /// <para>⚠️ <b>可空 + 不设值 ⇒ 盘上键整个不出现</b>（<c>Json.Options</c> 开了
+        /// <c>WhenWritingNull</c>）⇒ <b>老文件逐字节不变、金样不用改</b>。
+        /// 这条是「加字段要不要动 <c>FormatVersion</c>」的答案（本仓的 G20），
+        /// 与已作废的 <see cref="Ref"/> 用的是同一个手法。</para>
+        /// </summary>
+        public ToolFraming? Framing { get; init; }
+
+        /// <summary>
         /// 结果的内容。⚠️ **取回时它是空的**（见 <see cref="Ref"/>）——
         /// 「空内容」在**没有 `Ref`** 时才是「这个工具确实什么都没返回」。
         /// </summary>
