@@ -87,6 +87,10 @@ public sealed class ListTool : ITool
 {
     public string Name => "ls";
 
+    /// <summary>只读：列目录不改任何东西（`01` §3.5）。</summary>
+    public PermissionClass PermissionClass => PermissionClass.ReadOnly;
+
+
     public string Description =>
         "列出一个目录里的条目。路径相对于工作目录；不写就是工作目录本身。"
         + "目录名带尾随斜杠。想看某个文件的内容，用 read。";
@@ -220,6 +224,10 @@ public sealed class ListTool : ITool
 public sealed class ReadTool : ITool
 {
     public string Name => "read";
+
+    /// <summary>只读：读文件不改任何东西（`01` §3.5）。</summary>
+    public PermissionClass PermissionClass => PermissionClass.ReadOnly;
+
 
     public string Description =>
         "读一个文本文件。路径相对于工作目录。"

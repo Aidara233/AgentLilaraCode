@@ -179,7 +179,13 @@ public class ToolExecutorTests : IDisposable
 
     private static Block.ToolUseBlock Use(string callId, string name, string args) => new(callId, name, args);
 
-    private ToolExecutor Subject() => new(_tools, _blobs);
+    /// <summary>
+    /// ⚠️ **档位必须显式给**（`ToolExecutor` 那个参数没有默认值）。
+    /// 这一组测的是**执行相位本身**（顺序 / 落库 / 失败不断链），不是闸门
+    /// ⇒ 给最高档，让闸门**不介入**，测的才是它们各自要测的東西。
+    /// ⚠️ 闸门自己由 `GateTests` 单独钉（那里有写类替身）。
+    /// </summary>
+    private ToolExecutor Subject() => new(_tools, _blobs, "trusted");
 
     /// <summary>
     /// ⚠️ **顺序 = 调用序，不是完成序**（`01` §4 的明文规定）。

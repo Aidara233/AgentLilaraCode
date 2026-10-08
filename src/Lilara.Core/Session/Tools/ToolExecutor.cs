@@ -18,7 +18,15 @@ namespace Lilara.Core.Session.Tools;
 /// 名字查不到时走「这个工具不存在」，那条**也是内容**（与「工具在、但被拒」要分开显示，
 /// 但今天那条线还没做，见下）。</param>
 /// <param name="blobs">库。⚠️ **今天只读**：写入方是下面的 <see cref="Materialize"/>。</param>
-public sealed class ToolExecutor(IReadOnlyList<ITool> tools, Storage.BlobStore blobs)
+/// <param name="permissionLevel">
+/// 当前权限档位（`01` §3.5 的 `permission` 轴值）。
+/// ⚠️ <b>它没有默认值，而这是刻意的</b>：给一个默认（哪怕是 `null`）就等于让
+/// 「用哪个档位」变成**沉默的选择**——而那正是 `04` §5 警告过的那种默认
+/// （未声明的东西会被静静地用掉）。⇒ 每个调用点**必须写出来**。
+/// ⚠️ <b>`null` 是合法的，且表示"未知档位"</b>，而 <see cref="Gate.Decide"/> 把未知
+/// 当作**最严的那一档**（宁可漏放不可错放）。
+/// </param>
+public sealed class ToolExecutor(IReadOnlyList<ITool> tools, Storage.BlobStore blobs, string? permissionLevel)
 {
     /// <summary>
     /// 全部执行完，返回与入参**一一对应、同序**的结果。
@@ -37,8 +45,14 @@ public sealed class ToolExecutor(IReadOnlyList<ITool> tools, Storage.BlobStore b
 
         foreach (var call in calls)
         {
+            // ⚠️ **三路，次序是刻意的**：不存在的工具 → 闸门 → 执行。
+            // ⚠️ **被拒的调用绝不 `RunAsync`**——否则就是「拒了，但还是删了库」。
+            // ⚠️ 闸门在这里（**执行期**）而不是工具表里（请求期）：那是 `01` §9.2 的分工，
+            // 改闸门**零前缀代价**，而改工具表破最前端。
             var outcome = byName.TryGetValue(call.Name, out var tool)
-                ? await tool.RunAsync(new ToolCall(call.CallId, call.Name, call.Arguments), context, ct)
+                ? Gate.Decide(tool.PermissionClass, permissionLevel) is Verdict.Allow
+                    ? await tool.RunAsync(new ToolCall(call.CallId, call.Name, call.Arguments), context, ct)
+                    : ToolText.Of(Gate.DenyReason(tool.PermissionClass, permissionLevel))
                 : new ToolOutcome { Content = [new Block.TextBlock($"没有名为 '{call.Name}' 的工具。")] };
 
             results.Add(new TimelineEvent.ToolResultEvent

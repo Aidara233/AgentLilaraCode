@@ -178,7 +178,10 @@ public sealed class Stepper(
         if (toolCalls.Count > 0 && events.Count > 0)
         {
             var blobs = new BlobStore(_store.DataRoot);
-            var executor = new ToolExecutor(_tools, blobs);
+            // ⚠️ **权限档位在这里读一次，冻进这一趟**（与上面那个 `now` 同一个道理）：
+            // 它是**浮动字段**（`01` §9.2：改它零前缀代价），而一步之内的判定必须一致——
+            // 否则同一步里两条调用会按两个档位判，而记录里看不出为什么。
+            var executor = new ToolExecutor(_tools, blobs, handle.State.Axes![Axes.Permission]);
             var context = new SessionToolContext(handle.Spec.WorkingDirectory, blobs, recorded);
 
             events.AddRange(await executor.ExecuteAsync(toolCalls, context, ct));

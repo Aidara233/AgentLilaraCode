@@ -30,6 +30,10 @@ public sealed class FetchTool : ITool
 {
     public string Name => "fetch";
 
+    /// <summary>只读：取回旧结果是读存档（`01` §8.0.2 六——它<b>不跑任何工具代码</b>）。</summary>
+    public PermissionClass PermissionClass => PermissionClass.ReadOnly;
+
+
     public string Description =>
         "取回一条**旧工具结果**当时的内容（被回收之后你只看到一条 [已回收] 注记，"
         + "注记里有它的 id）。给的是**当时那份字节**，不是现在的值——"
