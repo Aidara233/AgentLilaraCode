@@ -34,6 +34,37 @@ internal static class ToolArgs
             return null;
         }
     }
+
+    /// <summary>
+    /// 取一个**整数**字段。缺失 / 不是整数 / 整段不是 JSON ⇒ <c>null</c>。
+    ///
+    /// <para>⚠️ <b>「不宽容」是判据，不是洁癖</b>：<c>"42"</c>（字符串）与 <c>1.5</c>（小数）
+    /// 都给 <c>null</c>——偏移不是那种量。替模型「帮忙解析」会让一个写错的参数变成
+    /// 一次**看着正常、实际错位**的读取，而**它不会报错**。
+    /// 宽严同 <see cref="String"/>：只认它说的话，不猜。</para>
+    ///
+    /// <para>⚠️ 走 <c>TryGetInt64</c> 而**不是** <c>GetDouble</c> 再截断：
+    /// 后者会把 <c>1.5</c> 变成 <c>1</c>（静默），而 64 位整数也不都表示得成 <c>double</c>。</para>
+    ///
+    /// <para>⚠️ <b>这里<b>不</b>判「负数算不算合法」</b>——那是调用方的事（它知道语义：
+    /// 偏移取负与非负是两种不同的处理）。本方法只负责「读出它写的那个数」。</para>
+    /// </summary>
+    public static long? Number(string argumentsJson, string key)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(argumentsJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return null;
+            return doc.RootElement.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number
+                   && v.TryGetInt64(out var n)
+                ? n
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
 }
 
 /// <summary>
