@@ -972,6 +972,29 @@ public class ControlServerTests : IAsyncLifetime
         AssertEachItemIsString(await GetJson($"/projects/{ProjectKey.FromPath(_work)}/sessions"));
     }
 
+    /// <summary>
+    /// ⚠️ **`/sessions` 的键集守卫**（`01` §3.8）——与「`/projects/{pk}/sessions` 是字符串数组」
+    /// 那条**刻意并存**：两个端点的形状**不一样**，而它们只差一个路径段。
+    /// 不钉这条的话，「顺手把它也改成数组」是一次静默的线上 schema 变更。
+    /// </summary>
+    [Fact]
+    public async Task Snapshot_Sessions_CarriesExactlyTheseKeys()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        var rows = await GetJson("/sessions");
+        var row = rows.EnumerateArray().Single(e => e.GetProperty("sessionId").GetString() == sid);
+
+        // ⚠️ **实测是六格，不是七格**：`title` 可空，而 `WhenWritingNull` 会把
+        // 它**整个省掉** ⇒ 没起名的会话那一行**根本没有** `title` 这个键。
+        // 这条不是我推出来的，是这条守卫头一次跑就抓出来的（我原先按七个字段写）。
+        // ⇒ 头的判据必须是 `r.title` 而不是「`title` 一定在」。
+        Assert.Equal(
+            ["active", "ask", "projectKey", "sessionId", "status", "turn"],
+            row.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray());
+    }
+
     [Fact]
     public async Task Snapshot_State_CarriesExactlyTheseKeys()
     {
