@@ -29,5 +29,6 @@ namespace Lilara.Core.Session.Tools;
 /// </summary>
 public static class BuiltInTools
 {
-    public static IReadOnlyList<ITool> All { get; } = [new ListTool(), new ReadTool(), new FetchTool()];
+    public static IReadOnlyList<ITool> All { get; } =
+        [new ListTool(), new ReadTool(), new FetchTool(), new AskTool()];
 }

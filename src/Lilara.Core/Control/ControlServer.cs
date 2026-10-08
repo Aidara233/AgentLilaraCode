@@ -608,8 +608,36 @@ public sealed class ControlServer(
             "preset.delete" => new CoreCommand.PresetDelete(
                 payload.GetProperty("id").GetString()!),
             "preset.list" => new CoreCommand.PresetList(),
+            // 询问：挂起的唯一解除入口（`01` §3.8）。
+            // ⚠️ `outcome` / `askId` 走 GetProperty（**必给**）：这条命令没有别的用途，
+            // 缺了它俩只可能是发命令的程序写错了。而 `answers` 与 `remember` 走 Opt 形状——
+            // 前者可以整个不给（cancel 就是「不答」），后者不给 = **只这一次**。
+            "approval.respond" => new CoreCommand.ApprovalRespond(
+                payload.GetProperty("sessionId").GetString()!,
+                payload.GetProperty("askId").GetString()!,
+                payload.GetProperty("outcome").GetString()!,
+                OptStringMap(payload, "answers"),
+                Opt(payload, "remember")),
             _ => throw new ArgumentException($"认不出的命令 '{kind}'"),
         };
+
+        // 字符串→字符串的映射版。⚠️ 与 `Opt` 一样「只认形状对的」：
+        // 键缺失 / 不是对象 / 值不是字符串 ⇒ 空字典（对 `answers` 就是「什么都没答」）。
+        // ⚠️ **值不是字符串的那一项被丢掉、其余照收**——这与 `OptStringList` 的取舍一致
+        // （那里也是「有一个坏的整条算没给」……不，那里是整条 null）。这里取**逐项**：
+        // 用户答的是一组独立的问题，一个坏值不该让其余答案全丢。
+        static IReadOnlyDictionary<string, string> OptStringMap(JsonElement e, string name)
+        {
+            var map = new Dictionary<string, string>(StringComparer.Ordinal);
+            if (!e.TryGetProperty(name, out var v) || v.ValueKind != JsonValueKind.Object) return map;
+
+            foreach (var p in v.EnumerateObject())
+            {
+                if (p.Value.ValueKind == JsonValueKind.String) map[p.Name] = p.Value.GetString()!;
+            }
+
+            return map;
+        }
 
         static string? Opt(JsonElement e, string name) =>
             e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;

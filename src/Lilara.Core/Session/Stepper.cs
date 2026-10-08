@@ -51,7 +51,7 @@ public sealed class Stepper(
     /// <para>⚠️ 次序仍是刻意的（`01` §4）：模型输出在内存合并完只落一次盘；
     /// `state.json` 最后写——崩在中间只让 turn 偏小，历史不损坏。</para>
     /// </summary>
-    public async Task<ModelReply> StepAsync(
+    public async Task<StepOutcome> StepAsync(
         SessionHandle handle, IReadOnlyList<Kernel.Block> blocks, CancellationToken ct)
     {
         // 「now 冻结在步开始」（00 §2.5）——同一步内重复渲染必须逐字节相同
@@ -196,15 +196,23 @@ public sealed class Stepper(
             events.AddRange(batch.Results);
         }
 
-        // ⚠️ **有问 ⇒ 中止这一步，一条结果都不落**（`01` §3.8）。
-        // ⚠️ **连那条模型消息也不落**——它与工具结果同属「这一步的产物」，
-        // 落它而不落结果，就会在下一步的请求里留下**悬空的 `tool_use`** ⇒ 上游 400。
-        // ⇒ 这一步**整个**没发生：模型那段话会被重放（前缀没变，模型吐同样的东西）。
-        // 代价如实认下：一次需要授权的调用 = **多花一次模型调用**。
-        // ⚠️ 判据在这条与「先判全、再执行」那条之间是**同一条**：宁可让一步整个不算，
-        // 也不许留下半个状态（`01` §3.6 ②「一对不能拆」的结构性后果）。
+        // ⚠️ **有问 ⇒ 中止这一步的「执行」，但那条模型消息照样落盘**（`01` §3.8）。
+        //
+        // ⚠️ **这一格我第一版写反了**，记在这里：初稿写的是「这一步整个没发生」，
+        // 理由是「落模型消息而不落结果会留下悬空的 `tool_use`」。
+        // **恰好相反**——不落模型消息，才是**悬空**：
+        // 用户答完之后我们补一条 `tool_result`，而它配对的 `tool_use`
+        // **从来没有落过盘** ⇒ 那条结果**悬空** ⇒ 下一步的请求非法。**两个方向都试过了，只有这一个成立。**
+        //
+        // ⇒ 落到盘上的是：`[……, 用户消息, 模型消息(含 tool_use)]`——**配对缺一半，而那一半正在路上**。
+        // ⚠️ 这个「缺一半」的窗口**不会漏给模型**：请求只在 `StepAsync` 里构造，
+        // 而它只在**解除暂停之后**才会再跑一次（`CommandDispatcher` 的续跑）。
+        // ⚠️ 而它**正是**重启后要靠 `state.json` 里那份 `PausedAsk` 去补的那一对
+        // （见 `PausedAsk` 的注释）。
         if (pending is not null)
         {
+            _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
+
             handle.AwaitingInput = new SessionHandle.PendingAsk(pending, toolCalls);
             handle.UpdateStateAndPersist(_store, s => s with
             {
@@ -220,9 +228,8 @@ public sealed class Stepper(
                 Turn = s.Turn + 1,
             }, diskStatus: SessionStatus.WaitingForInput);
 
-            return reply;
+            return new StepOutcome(reply, pending, handle.State.Ask?.DeadlineAt);
         }
-
         // 一次落盘 = 一个原子。⚠️ 空批次**不写**（拒答且没有工具的那一步就是空的），
         // 而 `AppendEvents` 对空批次是 no-op、不抛——见它的注释。
         _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
@@ -243,8 +250,24 @@ public sealed class Stepper(
             Turn = s.Turn + 1,
         }, diskStatus: SessionStatus.Idle);
 
-        return reply;
+        return new StepOutcome(reply);
     }
+
+    /// <para>⚠️ <b><see cref="Refused"/> 是新增的</b>：`Stepper` 刻意**不碰事件总线**
+    /// （模型消息与 `step.end` 都由 `CommandDispatcher` 发，这样控制台敲的那句话
+    /// 在头上也看得见）。挂起那条路**本来没打算发事件**，但 `WireFormatTests` 有一条
+    /// 「每个事件类型都要有发射点」的守卫——而那正是**该有的**：
+    /// 一条头永远收不到的问题，等于把会话静默挂起。⇒ 与那条分工和解的做法是
+    /// <b>把它作为<b>返回值的一部分</b>交出去</b>，由 `CommandDispatcher` 发。</para>
+    /// </summary>
+    /// <param name="Reply">原样返回给调用方（控制台要它）。</param>
+    /// <param name="Refused">
+    /// 这次挂起的**那件事**（要问什么、等多久）。<c>null</c> = 没挂起。
+    /// ⚠️ 答案要从 <c>SessionHandle.AwaitingInput</c> 里取那批问题——它在这儿**已经算过一遍了**，
+    /// 不重算的理由是「工具是纯的」这条契约不该在核心内部被当成可有可无
+    /// （重算一遍会得到同一个答案，但那是**假设**，而不是这里能证明的事）。
+    /// </param>
+    public sealed record StepOutcome(ModelReply Reply, AskRequest? Refused = null, DateTimeOffset? DeadlineAt = null);
 
     /// <summary>
     /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。
@@ -258,6 +281,40 @@ public sealed class Stepper(
         timeout is { } t ? CoreClock.Now() + t : null;
 
     /// <summary>
+    /// **把一次询问的答复落成一条结果**（`01` §3.8）——用户答完 / 超时之后走这条路。
+    ///
+    /// <para>⚠️ <b>它只落<b>一条</b> <c>ToolResultEvent</c>，哪怕那次询问盖住了好几个调用</b>。
+    /// 记法是「一条 <c>tool_use</c> ↔ 一条 <c>tool_result</c>」，而多问**不改记法**
+    /// （见 `AskItem` 的注释：多问是一个信封）。⚠️ 那么另外那些 `tool_use` 呢？
+    /// ⇒ **它们会一直悬着**，而悬空的 `tool_use` 会让下一步的请求非法（`01` §3.6）。
+    /// 今天的答案：**这条询问的答复落到 <see cref="SessionState.PausedAsk.CallId"/>
+    /// 指的那一条上**，其余的被 `Answer` 里那句「同一批里还有 N 条调用被这次询问挡下了，
+    /// 请重新发起」交代掉——由**模型**去重发。
+    /// ⚠️ 这是本批**认下的代价**，不是设计目标：多条 `tool_use` 共用一个信封是罕见的
+    /// （模型极少一步里连发两个要授权的写操作），而修它要动记法。**别当成已解决。**</para>
+    ///
+    /// <para>⚠️ <b>落的是<b>那一刻</b>算好的最终正文</b>——它此后冻结（`DenyReason` 那条
+    /// 「理由不能渲染时重算」的判据在这里同样成立）。</para>
+    /// </summary>
+    /// <param name="paused">盘上那份（等哪一次调用、等多久）。</param>
+    /// <param name="text">最终正文。⚠️ 由调用方算好后交进来，本方法**不判断**它是批准还是拒绝。</param>
+    /// <param name="amended">
+    /// 用户改写过的参数（没有就是 <c>null</c>）。⚠️ 它**不改这里落的任何一格**——
+    /// 它进结果是为了让**下一步**拿去执行（见 `TimelineEvent.ToolResultEvent.ArgumentsAmended`）。
+    /// </param>
+    public static TimelineEvent.ToolResultEvent Answer(
+        PausedAsk paused, string text, string? amended = null) => new()
+    {
+        // ⚠️ 稳定 id 现取：这条结果**不是**那一步的产物（那一步整个被撤销了），
+        // 它是**用户答复**的产物。用同一个 `CallId` 配对就够了。
+        Id = Ids.New(),
+        At = CoreClock.Now(),
+        CallId = paused.CallId,
+        Content = [new Block.TextBlock(text)],
+        ArgumentsAmended = amended,
+    };
+
+    /// <summary>
     /// 一步：**追加 + 入队 + 推进**——`01` §6.1 那条复合动作的完整形态。
     ///
     /// <para>⚠️ 它保留下来是为了**让既有测试的语义不被稀释**：
@@ -267,7 +324,7 @@ public sealed class Stepper(
     /// ⇒ 生产者路径（dispatcher）走「追加 + 入队 + 取空队列」，
     /// 这个壳子给「我就想跑一步」的调用方用。</para>
     /// </summary>
-    public Task<ModelReply> StepAsync(SessionHandle handle, string userText, CancellationToken ct)
+    public Task<StepOutcome> StepAsync(SessionHandle handle, string userText, CancellationToken ct)
     {
         var blocks = new List<Kernel.Block> { new Kernel.Block.TextBlock(userText) };
 

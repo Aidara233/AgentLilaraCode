@@ -202,4 +202,15 @@ public sealed class EventBus(
     public static string ProjectTopic(string projectKey) => $"project:{projectKey}";
 
     public const string CoreTopic = "core";
+
+    /// <summary>
+    /// **所有待审批**（`01` §3.8 · `03` §5）。⚠️ <b>它是那条「头最需要」的流</b>——
+    /// 审批单独一条流，是为了不混在会话事件里淹掉。
+    ///
+    /// <para>⚠️ <b>它长期零生产者</b>（没有审批子系统），本批起**有了**：
+    /// `Stepper` 挂起时发 `approval.requested`，`CommandDispatcher` 答复时发
+    /// `approval.resolved`。⚠️ 两条都是**双投**（这条流 + 会话流）——理由见
+    /// `WireEvent.ApprovalRequested` 的注释。</para>
+    /// </summary>
+    public const string ApprovalsTopic = "approvals";
 }

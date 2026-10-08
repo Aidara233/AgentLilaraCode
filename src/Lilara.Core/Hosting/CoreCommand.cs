@@ -233,6 +233,37 @@ public abstract record CoreCommand
     /// <summary>释放。**这是「模型失控时的逃生口」**——所以它**不检查**占用者是不是自己。</summary>
     /// <param name="Scope">同 <see cref="ClaimAcquire"/>：列表、名字照协议。</param>
     public sealed record ClaimRelease(string SessionId, IReadOnlyList<string> Scope) : CoreCommand;
+
+    /// <summary>
+    /// **回答一次询问**（`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>它是挂起会话的<b>唯一</b>解除入口</b>——`session.send` 撞上
+    /// <see cref="Kernel.SessionStatus.WaitingForInput"/> 时**拒绝**（理由：两条路都能解除
+    /// ⇒ 判据漂）。「用户直接打字说别的」那条（`Superseded`）走的是**另一条**路：
+    /// 它**先**把那次询问合成成一条结果，**再**当普通消息处理。</para>
+    /// </summary>
+    /// <param name="AskId">
+    /// 哪一次询问（`AskRequest.Id`）。⚠️ <b>不是 `CallId`</b>——那是协议 id，
+    /// 而这一个是核心的稳定 id（`01` §8.0.2 第七节的 id 分工）。
+    /// </param>
+    /// <param name="Outcome">
+    /// `"submit"` = 作答 · `"cancel"` = 作废这次询问 · `"modify"` = 改了参数但**先不批**、
+    /// 重新问一次。⚠️ 线上只认这三个字面量（同 `session.archive` 那条 `OptBool` 的取舍）。
+    /// </param>
+    /// <param name="Answers">
+    /// 按问题 id 的答案。⚠️ `submit` 时**允许缺项**（用户可以不答某个问题）——
+    /// 缺的那些会被如实写成「未回答」，而不是编一个空值（那是撒谎）。
+    /// </param>
+    /// <param name="Remember">
+    /// 记忆档位（`AskMemory` 的名字）。<c>null</c> = **只这一次**。⚠️ 只对
+    /// <see cref="Kernel.AskKind.Permission"/> 有意义——`Question` 的问**没有**记忆。
+    /// </param>
+    public sealed record ApprovalRespond(
+        string SessionId,
+        string AskId,
+        string Outcome,
+        IReadOnlyDictionary<string, string> Answers,
+        string? Remember = null) : CoreCommand;
 }
 
 /// <summary>

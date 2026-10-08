@@ -50,6 +50,11 @@ public class CommandSurfaceTests
 
         (typeof(CoreCommand.ClaimAcquire),     null,                "claim src/foo"),
         (typeof(CoreCommand.ClaimRelease),     "claim.release",     "claim release src/foo"),
+
+        // 询问：挂起的唯一解除入口（`01` §3.8）。四条线都在——
+        // ⚠️ 控制台那条尤其不能缺：`approval …` 落回「当成消息」会**静默烧一次模型调用**
+        // 而会话还挂在等待里。
+        (typeof(CoreCommand.ApprovalRespond),  "approval.respond",  "approval allow s1 ask1"),
     ];
 
     // ---- ① 那张表必须覆盖全部类型 ----
@@ -99,6 +104,7 @@ public class CommandSurfaceTests
         "preset.set" => """{"kind":"preset.set","id":"default","content":"你是助手"}""",
         "preset.delete" => """{"kind":"preset.delete","id":"default"}""",
         "preset.list" => """{"kind":"preset.list"}""",
+        "approval.respond" => """{"kind":"approval.respond","sessionId":"s1","askId":"a1","outcome":"submit"}""",
         _ => $$"""{"kind":"{{kind}}","id":"x","sessionId":"s1"}""",
     };
 

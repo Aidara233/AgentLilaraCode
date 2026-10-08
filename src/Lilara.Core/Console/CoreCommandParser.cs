@@ -244,6 +244,16 @@ public static class CoreCommandParser
 
         if (IsClaimList(trimmed)) return (null, null);
 
+        // 询问：挂起的唯一解除入口（`01` §3.8）。
+        // ⚠️ **它必须在这里、而且光杆也要给用法**——`approval` 若落回「当成消息」，
+        // 用户以为在回答，而那句话被发给模型、**会话还挂在等待里**。
+        if (StartsWithToken(trimmed, "approval")) return ParseApproval(trimmed);
+
+        if (string.Equals(trimmed, "approval", StringComparison.OrdinalIgnoreCase))
+            return (null, "用法：approval allow|deny <会话 id> <askId> [--remember args|tool]"
+                + "\n      approval cancel <会话 id> <askId>"
+                + "\n      approval answer <会话 id> <askId> <问题id>=<值> …");
+
         // 入口判据与 IsClaimList 共用 IsClaimVerb（宽口径边界也由它统一管）：
         // 这里只查位置不查前缀时，任何首词恰好 5 个字符的普通消息都会被静默变成 claim.acquire。
         if (IsClaimVerb(trimmed))
@@ -324,6 +334,87 @@ public static class CoreCommandParser
                 + "；取值见 `status`）");
 
         return (new CoreCommand.SessionSetAxis(parts[2], parts[3], parts[4]), null);
+    }
+
+    /// <summary>
+    /// `approval allow &lt;askId&gt; [--remember args|tool]` · `approval deny &lt;askId&gt; [理由…]` ·
+    /// `approval cancel &lt;askId&gt;` · `approval answer &lt;askId&gt; &lt;id&gt;=&lt;值&gt; [&lt;id&gt;=&lt;值&gt;…]`
+    ///
+    /// <para>⚠️ <b>会话 id 只有一个来源</b>：那条正在等人的会话隐含在 <paramref name="askId"/> 里
+    /// ——但 `approval.respond` 要它，而控制台**没有**「哪条会话在等」的地方可查。
+    /// ⇒ 用 <c>--session</c> 显式给（与别的命令同形），缺了就说清怎么给。</para>
+    ///
+    /// <para>⚠️ **`&lt;id&gt;=&lt;值&gt;` 这个形状是被字典类型逼出来的**：`answers` 是
+    /// <c>IReadOnlyDictionary&lt;string,string&gt;</c>（问题 id → 答案），
+    /// 而控制台的行是扁平词。用一个显式的分隔符比「按位置配对」好：后者在
+    /// 用户少给一个答案时会**把答案错位到另一个问题上**，那是静默的。</para>
+    /// </summary>
+    private static (CoreCommand?, string?) ParseApproval(string line)
+    {
+        var parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        const string usage =
+            "用法：approval allow|deny <会话 id> <askId> [--remember args|tool] [理由…]"
+            + "\n      approval cancel <会话 id> <askId>"
+            + "\n      approval answer <会话 id> <askId> <问题id>=<值> …";
+
+        if (parts.Length < 4) return (null, usage);
+
+        var verb = parts[1];
+        var session = parts[2];
+        var askId = parts[3];
+
+        var outcome = verb.ToLowerInvariant() switch
+        {
+            "allow" => "submit",
+            "deny" => "submit",
+            "cancel" => "cancel",
+            "answer" => "submit",
+            _ => null,
+        };
+
+        if (outcome is null) return (null, usage);
+
+        var answers = new Dictionary<string, string>(StringComparer.Ordinal);
+        string? remember = null;
+
+        if (string.Equals(verb, "allow", StringComparison.OrdinalIgnoreCase)) answers["decision"] = "allow";
+        if (string.Equals(verb, "deny", StringComparison.OrdinalIgnoreCase)) answers["decision"] = "deny";
+
+        // 余下的词：`--remember X` 是有形状的标志，`a=b` 是答案，其余归理由。
+        var reason = new List<string>();
+        for (var i = 4; i < parts.Length; i++)
+        {
+            if (string.Equals(parts[i], "--remember", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= parts.Length) return (null, "--remember 后面要给 args 或 tool。");
+
+                remember = parts[++i].ToLowerInvariant() switch
+                {
+                    "args" => nameof(AskMemory.Args),
+                    "tool" => nameof(AskMemory.Tool),
+                    _ => null,
+                };
+
+                if (remember is null) return (null, "--remember 只认 args 或 tool。");
+                continue;
+            }
+
+            // ⚠️ **只在第一个 `=` 处切**：值里可以有 `=`（用户答复本身就可能含它）。
+            var eq = parts[i].IndexOf('=');
+            if (eq > 0 && !string.Equals(verb, "deny", StringComparison.OrdinalIgnoreCase))
+            {
+                answers[parts[i][..eq]] = parts[i][(eq + 1)..];
+                continue;
+            }
+
+            reason.Add(parts[i]);
+        }
+
+        // 拒绝时余下的词是**理由**（`01` §3.8：拒绝理由比「档位不允许」有用得多）。
+        if (reason.Count > 0 && answers.ContainsKey("decision"))
+            answers["reason"] = string.Join(" ", reason);
+
+        return (new CoreCommand.ApprovalRespond(session, askId, outcome, answers, remember), null);
     }
 
     // `session create [--cwd <目录>] [--title <名>] [--preset <id>]`

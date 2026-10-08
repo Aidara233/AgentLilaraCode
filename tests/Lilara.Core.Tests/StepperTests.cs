@@ -90,7 +90,7 @@ public class StepperTests : IDisposable
 
         var reply = await _stepper.StepAsync(handle, "hi", CancellationToken.None);
 
-        Assert.True(reply.Refused);
+        Assert.True(reply.Reply.Refused);
         var timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
         Assert.Single(timeline); // 只有用户那条
         Assert.Equal(Speaker.User, ((TimelineEvent.MessageEvent)timeline[0]).From);

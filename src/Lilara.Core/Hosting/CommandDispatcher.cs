@@ -103,6 +103,8 @@ public sealed class CommandDispatcher(
                 case CoreCommand.ClaimAcquire a: return HandleClaimAcquire(a, commandId);
                 case CoreCommand.ClaimRelease r: return HandleClaimRelease(r, commandId);
 
+                case CoreCommand.ApprovalRespond a: return HandleApprovalRespond(a, commandId);
+
                 default:
                     return Reject(commandId, $"认不出的命令：{command.GetType().Name}");
             }
@@ -670,7 +672,22 @@ public sealed class CommandDispatcher(
 
             // 取空队列——合并是队列的副产品。
             var blocks = handle.DrainQueue();
-            reply = await _resolveStepper(handle).StepAsync(handle, blocks, stepCts.Token);
+            var step = await _resolveStepper(handle).StepAsync(handle, blocks, stepCts.Token);
+            reply = step.Reply;
+
+            // ⚠️ **挂起也要发事件**（`01` §3.8）：一条头收不到的问题 = 会话被**静默挂起**。
+            // ⚠️ 它同时投**两条流**（`approvals` 与这条会话流），理由见
+            // `WireEvent.ApprovalRequested` 的注释。⚠️ 在 `StepEnd` **之前**发——
+            // 头的顺序应当是「这一步结束了，而它停在等一个回答上」。
+            if (step.Refused is { } asked)
+            {
+                var requested = new WireEvent.ApprovalRequested(
+                    handle.SessionId, asked.Id, asked.Kind.ToString(), asked.Items,
+                    asked.Remember, step.DeadlineAt);
+
+                _bus.Publish(EventBus.ApprovalsTopic, requested);
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId), requested);
+            }
 
             // 模型消息由这里发（`Stepper` 不碰事件总线）；判据与它落盘时一致：拒答 / 空块不产生模型消息。
             if (!reply.Refused && reply.Blocks.Count > 0)
@@ -1218,6 +1235,175 @@ public sealed class CommandDispatcher(
 
         return new DispatchResult(new Ack.Accepted { CommandId = id });
     }
+
+    /// <summary>
+    /// **回答一次询问**（`01` §3.8）。挂起的会话从这里、也只有从这里解除。
+    ///
+    /// <para>⚠️ <b>它<b>不</b>同步跑下一步</b>：合成结果 + 落盘 + 释放那把标志之后，
+    /// 走的是**与 `session.send` 同一条**的异步推进（`Task.Run` + `RunStepAsync`）。
+    /// 理由也同它：同步等会让 WS/HTTP 的调用方卡住一整条工具链，
+    /// 而 `session.interrupt` 失去落点（那时步在命令里已经跑完了）。</para>
+    ///
+    /// <para>⚠️ <b>次序：先落结果、再释放标志、最后才续跑</b>。反过来（提前续跑）
+    /// 那一次推进拿不到闸（旧标志还在）⇒ `TryEnterStep` 返回 false ⇒ 这条答复**被静默丢掉**。</para>
+    /// </summary>
+    private DispatchResult HandleApprovalRespond(CoreCommand.ApprovalRespond c, string id)
+    {
+        if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
+
+        // 没在等 ⇒ rejected（**不是**幂等成功）：用户对着一条已经答过的卡再点一次，
+        // 回一句「已受理」会让他以为那次答复生效了。
+        if (handle.State.Ask is not { } paused || handle.State.Status != SessionStatus.WaitingForInput)
+            return Reject(id, $"会话 '{c.SessionId}' 现在没有在等回答。");
+
+        // 那批问题原文住在内存里。⚠️ **重启之后它没了**（`01` §3.8 认下的代价）——
+        // 那时代码算不出该问什么，只能合成一句「原问题没能保留」让用户重启这一步。
+        var awaiting = handle.AwaitingInput;
+
+        // ⚠️ askId 对不上 = 时代的眼泪（用户对着**上一张**卡点的）。拒绝，
+        // 而不是「当作最新的那张」——后者会把一次陈旧的批准**安到另一个调用上**。
+        if (!string.Equals(paused.AskId, c.AskId, StringComparison.Ordinal))
+            return Reject(id, $"这次答复对应的询问（{c.AskId}）不是当前等在会话上的那一次（{paused.AskId}）。");
+
+        // ---- 超时（`01` §3.8）：**盘面自证，不是定时器** ----
+        // ⚠️ 看它的人只有这里（以及将来 `session.send` 那条 Superseded 路）。
+        // 过期 ⇒ **用户的答案不采用**（它来晚了），按超时合成。
+        var expired = paused.DeadlineAt is { } dl && CoreClock.Now() >= dl;
+
+        var (text, amended) = expired
+            ? (TimeoutText(paused.Kind, handle.Spec.AskTimeout), null)
+            : Reply(c, paused, handle, awaiting);
+
+        _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId,
+            Stepper.Answer(paused, text, amended));
+
+        // 挂起态清干净（内存 + 盘）——⚠️ **与「拿到闸」无关**：这一步不跑推进。
+        handle.AwaitingInput = null;
+        handle.UpdateStateAndPersist(_host.Store, s => s with
+        {
+            Status = SessionStatus.Idle,
+            Ask = null,
+        }, diskStatus: SessionStatus.Idle);
+
+        _bus.Publish(EventBus.SessionTopic(c.SessionId), new WireEvent.ApprovalResolved(c.SessionId, c.AskId, c.Outcome));
+        _bus.Publish(EventBus.ApprovalsTopic, new WireEvent.ApprovalResolved(c.SessionId, c.AskId, c.Outcome));
+
+        // ⚠️ **中断也走这里**：答复落完了，但**不续跑**——用户说了「别跑了」。
+        if (string.Equals(c.Outcome, "cancel", StringComparison.Ordinal))
+            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = "已作废这次询问。" });
+
+        // ⚠️ `TryEnterStep` 在这里：拿不到就**不续跑**（已经有一次推进在飞）。
+        // 与 `ContinueIfToolCalledAsync` 那条同样处理——不需要重新入队，因为
+        // 那条在飞的推进本来就会读到刚落的那条结果。
+        if (!handle.TryEnterStep())
+            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = "已记录答复。" });
+
+        _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
+            CancellationToken.None);
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Note = expired ? "已经超时了，按超时处理。" : null,
+        });
+    }
+
+    /// <summary>
+    /// 超时时那条结果（`01` §3.8）。⚠️ <b>两种 Kind 的后果不同</b>（用户裁定）：
+    /// 授权默认**拒绝**；问意见返回一句「没有人回答」。
+    /// </summary>
+    private static string TimeoutText(AskKind kind, TimeSpan? timeout)
+    {
+        var waited = timeout is { } t ? t.TotalMinutes.ToString("0.#") + " 分钟" : "一段时间";
+
+        return kind == AskKind.Permission
+            ? $"这次调用被拒绝了：等你回答了 {waited}，没有人回答。"
+            : $"没有人回答（等了 {waited}）。";
+    }
+
+    /// <summary>
+    /// 把一次答复算成最终正文（`01` §3.8）。⚠️ <b>它<b>不</b>执行那个工具</b>。
+    ///
+    /// <para>⚠️ <b>「批准」的后果是「下一步带着批准去执行」</b>——而那个「下一步」是
+    /// **模型**走的：它看到这条结果，重新发起调用，而那时闸门因为记忆/档位放行。
+    /// ⇒ 本方法只落一条**说得清的答复**，不去替模型跑那个工具。
+    /// 这样「谁执行工具」只有一个答案（`ToolExecutor`），而这里不会长成第二个执行点。</para>
+    ///
+    /// <para>⚠️ 判据是「这一步的产物是**答复**，不是**执行**」。把执行塞进来会让
+    /// 「一条结果可能对应一次真的副作用」变成隐式的，而 `01` §3.6 那套配对纪律
+    /// 是围绕「结果的产出者是 `ToolExecutor`」写的。</para>
+    /// </summary>
+    private (string Text, string? Amended) Reply(
+        CoreCommand.ApprovalRespond c, PausedAsk paused, SessionHandle handle, SessionHandle.PendingAsk? awaiting)
+    {
+        var kind = string.Equals(c.Outcome, "modify", StringComparison.Ordinal) ? "modify" : c.Outcome;
+
+        if (kind == "modify")
+            return ("你把参数改了但还没有批准。请用改好的参数重新发起这一次调用。", null);
+
+        // ---- 授权 ----
+        if (paused.Kind == AskKind.Permission)
+        {
+            var approved = c.Answers.TryGetValue("decision", out var d)
+                        && (d == "allow" || d == "approve" || d == "yes");
+
+            if (!approved)
+                return ("用户拒绝了这次调用。" + Reason(c), null);
+
+            // 记忆（`01` §3.8）：用户说了「记住」才写。
+            if (c.Remember is { Length: > 0 } rm)
+            {
+                var store = new ApprovalStore(_host.Store.DataRoot, handle.ProjectKey, handle.SessionId);
+                store.Add(new Approval(paused.ToolName, paused.ArgsHash,
+                    ToolWide: string.Equals(rm, nameof(AskMemory.Tool), StringComparison.Ordinal),
+                    At: CoreClock.Now()));
+            }
+
+            // ⚠️ 改写过的参数：**逐字比较**，不是「解析后比对象」——
+            // 那段原文是逐字保真的（`01` §9），而规范化一次就会把「改了空格」
+            // 这种真实差异吃掉。见 `ApprovalStore.HashArgs` 那条同源的理由。
+            var amended = c.Answers.TryGetValue("arguments", out var a) ? a : null;
+            var changed = amended is not null
+                       && !string.Equals(ApprovalStore.HashArgs(amended), paused.ArgsHash, StringComparison.Ordinal);
+
+            return (changed
+                ? $"用户批准了这次调用，**但改了参数**。请用改后的参数重新发起它。"
+                : "用户批准了这次调用。请重新发起它，这次会放行。",
+                changed ? amended : null);
+        }
+
+        // ---- 问意见：答案就是内容 ----
+        if (awaiting is null)
+        {
+            // ⚠️ 重启之后问题原文没了（`01` §3.8 认下的代价）。**如实说**，不编答案。
+            return ("用户回答了，但会话在等待期间重启过，原来那批问题没能保留 ⇒ 这次答复取不回来。"
+                  + "请重新问一次。", null);
+        }
+
+        var lines = new List<string>();
+        foreach (var item in awaiting.Ask.Items)
+        {
+            // ⚠️ **缺项如实写「未回答」**，不编一个空值——那是「多了一条假信息」（`01` §3.6 ①之二）。
+            lines.Add(c.Answers.TryGetValue(item.Id, out var v) ? $"{item.Id}: {v}" : $"{item.Id}: （未回答）");
+        }
+
+        // ⚠️ **同一批里还有别的调用被这次询问挡下了**：多问是一个信封，而记法要求
+        // 一条 `tool_use` 一条 `tool_result`（`01` §3.8）。⇒ 只能配一条，其余的
+        // 由这句话交代给模型，它自己去重发。**本批认下的代价，不是设计目标。**
+        if (awaiting.Calls.Count > 1)
+        {
+            lines.Add($"（同一批里还有 {awaiting.Calls.Count - 1} 次调用被这次询问一起挡下了，"
+                    + "它们没有执行——请重新发起。）");
+        }
+
+        return (string.Join("\n", lines), null);
+    }
+
+    /// <summary>拒绝时带上用户给的理由（`01` §3.8：拒绝理由比「档位不允许」有用得多）。</summary>
+    private static string Reason(CoreCommand.ApprovalRespond c) =>
+        c.Answers.TryGetValue("reason", out var r) && !string.IsNullOrWhiteSpace(r)
+            ? $"理由：{r}"
+            : "";
 
     /// <summary>
     /// 找会话：先看激活表，miss 才扫项目目录回落到磁盘载入。

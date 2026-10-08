@@ -74,6 +74,18 @@ public abstract record TimelineEvent
         /// </summary>
         public ToolFraming? Framing { get; init; }
 
+    /// <summary>
+    /// **用户改写过的参数**（`01` §3.8：改写后批准）。<c>null</c> = 没改过。
+    ///
+    /// <para>⚠️ <b>这一格必须有，否则记录在撒谎</b>：`ToolUseBlock` 里躺着的是
+    /// **模型原来那段参数**，而用户批准并（可能）改写之后**实际执行的是另一段**。
+    /// 不记它，读记录的人（和重放的人）会以为跑的是模型那一段——
+    /// 那是 `01` §3.6 ①之二那句「最坏的失败不是少了信息，是**多了一条假信息**」。</para>
+    ///
+    /// <para>⚠️ 它与 <see cref="Framing"/> 同属「事实」那一半（落盘、只增不减）。</para>
+    /// </summary>
+    public string? ArgumentsAmended { get; init; }
+
         /// <summary>
         /// 结果的内容。⚠️ **取回时它是空的**（见 <see cref="Ref"/>）——
         /// 「空内容」在**没有 `Ref`** 时才是「这个工具确实什么都没返回」。

@@ -19,6 +19,8 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(SessionArchived), "session.archived")]
 [JsonDerivedType(typeof(SessionDeleted), "session.deleted")]
 [JsonDerivedType(typeof(SessionReclaimed), "session.reclaimed")]
+[JsonDerivedType(typeof(ApprovalRequested), "approval.requested")]
+[JsonDerivedType(typeof(ApprovalResolved), "approval.resolved")]
 [JsonDerivedType(typeof(Error), "error")]
 public abstract record WireEvent
 {
@@ -133,6 +135,37 @@ public abstract record WireEvent
     /// </remarks>
     /// </summary>
     public sealed record SessionReclaimed(string SessionId, string Reason) : WireEvent;
+
+    /// <summary>
+    /// **核心在问用户**（`01` §3.8）。⚠️ <b>它同时投两条流</b>：
+    /// <c>approvals</c>（头最需要的那条，`03` §5）与**会话流**（那个会话自己的订阅者）。
+    ///
+    /// <para>⚠️ <b>为什么两条都要</b>：审批放在独立流上，是为了**不混在会话事件里淹掉**
+    /// （`03` §5 定的）；而只投 `approvals` 会让一个**只订了自己会话**的客户端
+    /// （比如将来的子会话 / 控制台）看不见那个问题。⇒ 两条是**两个视角**，不是两份收件人。</para>
+    ///
+    /// <para>⚠️ <b>`deadlineAt` 可空 = 不超时</b>（`spec.askTimeout` 是 null）。
+    /// 头拿它画倒计时——⚠️ 但**核心不靠它超时**（那是盘面自证，见 `01` §3.8）：
+    /// 头只是提前告诉用户「这个会过期」。</para>
+    /// </summary>
+    /// <param name="Ask">那批问题。⚠️ **它是内存里那份**——重启之后原问题丢了，
+    /// 所以**重启后不会有这条事件被补发**（没有生产者：那次挂起发生在进程死之前）。
+    /// 头要靠 `GET /sessions` 的 `ask` 那一格看到它。</param>
+    /// <param name="AskKindName">
+    /// ⚠️ <b>原名是 <c>Kind</c>，而那是一个**会掀翻整个进程的**字段名</b>——
+    /// 实测（2026-10-08）：`WireEvent` 的多态判别式就叫 <c>kind</c>（camelCase 之后），
+    /// 于是 STJ 抛 <c>PropertyConflictsWithMetadataPropertyName</c>，
+    /// 而那**不是「这条事件序列化失败」，是 `WireJson.Options` 整个类型解析失败** ⇒
+    /// **全进程所有帧的序列化一起炸**，症状是「随便发什么帧都断连」。
+    /// 名字躲开它是唯一解法（不像 `ApprovalResolved.Outcome` 那样只是「语义上该避开」）。
+    /// </param>
+    public sealed record ApprovalRequested(
+        string SessionId, string AskId, string AskKindName, IReadOnlyList<AskItem> Items,
+        IReadOnlyList<AskMemory> Remember, DateTimeOffset? DeadlineAt) : WireEvent;
+
+    /// <summary>**那次询问结束了**（答了 / 作废了 / 超时了）。同投两条流。</summary>
+    /// <param name="Outcome">`submit` / `cancel` / `expired`。</param>
+    public sealed record ApprovalResolved(string SessionId, string AskId, string Outcome) : WireEvent;
 
     // 参数类型必须是 WireEvent（基类）：泛型版在静态类型推断成子类时会静默丢掉判别式。
     public static string StableSerialize(WireEvent value) =>
