@@ -100,7 +100,9 @@ public class ToolTests : IDisposable
 
         var lines = await ListLines("{}");
 
-        Assert.Equal(["_z.txt", "a.txt", "m/"], lines);
+        // ⚠️ 每行是 `名字<TAB>大小`（`01` §9.3 的元数据列）。比较**名字那一格**，
+        // 因为大小是另一件事（由 `List_FilesCarryTheirSize_*` 钉）。
+        Assert.Equal(["_z.txt", "a.txt", "m/"], lines.Select(l => l.Split('\t')[0]));
     }
 
     // ⚠️ 尾随斜杠是**目录的唯一标记**——文件名与目录名可以同名，
@@ -110,7 +112,7 @@ public class ToolTests : IDisposable
     {
         Directory.CreateDirectory(Path.Combine(_root, "dir"));
 
-        Assert.Equal(["dir/"], await ListLines("{}"));
+        Assert.Equal(["dir/"], (await ListLines("{}")).Select(l => l.Split('\t')[0]));
     }
 
     [Fact]
@@ -118,8 +120,8 @@ public class ToolTests : IDisposable
     {
         File.WriteAllText(Path.Combine(_root, "a.txt"), "");
 
-        Assert.Equal(["a.txt"], await ListLines("{}"));
-        Assert.Equal(["a.txt"], await ListLines("""{"path":"."}"""));
+        Assert.Equal(["a.txt"], (await ListLines("{}")).Select(l => l.Split('\t')[0]));
+        Assert.Equal(["a.txt"], (await ListLines("""{"path":"."}""")).Select(l => l.Split('\t')[0]));
     }
 
     [Fact]
@@ -431,5 +433,88 @@ public class ToolTests : IDisposable
             Call("read", $$"""{"path":"big.txt","limit":{{ToolLimits.MaxResultBytes * 3}}}"""), _ctx, default);
 
         Assert.Equal(ToolLimits.MaxResultBytes, Body(outcome).Length);
+    }
+
+    // ---- ls：元数据（`01` §9.3）------------------------------------------------
+    //
+    // ⚠️ **行的形状是「tab 分列」**，不是空格对齐：文件名**可以含空格**，
+    // 用空格分列会让带空格的名字不可解析——而那是"框架与内容不许共用字面量"
+    // 那条判据（G18）在列这一层的同一个形状。
+    // ⚠️ 列挂在**内容**上。表头（`[ls src 前 50 条，共 1240]`）将来归**框架**
+    // （那一步要等 `ls` 学会产出 `Framing`，本 T 不做）。
+
+    private static string[] Cells(string line) => line.Split('\t');
+
+    /// <summary>文件带大小；**目录不带**（目录没有"大小"这件事，给 0 是在撒谎）。</summary>
+    [Fact]
+    public async Task List_FilesCarryTheirSize_DirectoriesDoNot()
+    {
+        File.WriteAllText(Path.Combine(_root, "a.txt"), new string('x', 12));
+        Directory.CreateDirectory(Path.Combine(_root, "dir"));
+
+        var a = (await ListLines("{}")).Single(l => l.Contains("a.txt"));
+        var d = (await ListLines("{}")).Single(l => l.Contains("dir"));
+
+        Assert.Equal(["a.txt", "12 B"], Cells(a)[..2]);
+        Assert.Equal("dir/", Cells(d)[0]);
+        Assert.Equal("", Cells(d)[1]);       // 大小那一格是空的
+    }
+
+    /// <summary>
+    /// ⚠️ **文件名里的空格不许破坏列**——这正是选 tab 而不是空格的理由。
+    /// </summary>
+    [Fact]
+    public async Task List_AFileNameWithSpaces_DoesNotBreakTheColumns()
+    {
+        File.WriteAllText(Path.Combine(_root, "my file.txt"), "x");
+
+        var line = (await ListLines("{}")).Single(l => l.Contains("my file"));
+
+        Assert.Equal("my file.txt", Cells(line)[0]);
+        Assert.Equal("1 B", Cells(line)[1]);
+    }
+
+    /// <summary>大小是**给人/模型读的短写法**，不是字节数原样抖出来。</summary>
+    [Theory]
+    [InlineData(0, "0 B")]
+    [InlineData(1023, "1023 B")]
+    [InlineData(1024, "1.0 KB")]
+    [InlineData(1536, "1.5 KB")]
+    [InlineData(20 * 1024 * 1024, "20.0 MB")]
+    public async Task List_SizeIsAHumanShortForm(int bytes, string expected)
+    {
+        File.WriteAllText(Path.Combine(_root, "f.bin"), new string('x', bytes));
+
+        var line = (await ListLines("{}")).Single(l => l.Contains("f.bin"));
+
+        Assert.Equal(expected, Cells(line)[1]);
+    }
+
+    /// <summary>
+    /// ⚠️ **截断必须明说**（`01` §9.3）：静默截断会让模型以为目录只有这些条目——
+    /// 那是「多了一条假信息」，同 §3.6 ①之二。
+    /// ⚠️ 而且**要说清一共多少条**，否则模型无法判断"还差多少"。
+    /// </summary>
+    [Fact]
+    public async Task List_TruncatesAndSaysHowManyThereAre()
+    {
+        const int total = ToolLimits.MaxDirectoryEntries + 7;
+        for (var i = 0; i < total; i++)
+            File.WriteAllText(Path.Combine(_root, $"f{i:D5}.txt"), "");
+
+        var text = await RunText(new ListTool(), Call("ls", "{}"));
+        var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+        // ⚠️ 判据要钉**结构**，不是钉我恰好选的那句话：
+        // 条目行 = `名字<TAB>大小`（两格）；提示行 = `（…）`。
+        var entries = lines.Where(l => l.Split('\t').Length == 2).ToList();
+        var notices = lines.Where(l => !l.Contains('\t')).ToList();
+
+        Assert.Equal(ToolLimits.MaxDirectoryEntries, entries.Count);
+
+        // 且必须**明说**：总数与显示数都要出现。
+        var notice = Assert.Single(notices);
+        Assert.Contains(total.ToString(), notice);
+        Assert.Contains(ToolLimits.MaxDirectoryEntries.ToString(), notice);
     }
 }

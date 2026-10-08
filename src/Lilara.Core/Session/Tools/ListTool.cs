@@ -128,26 +128,79 @@ public sealed class ListTool : ITool
         // ⚠️ **排序必须显式**：`Directory.EnumerateFileSystemEntries` 的顺序**由文件系统决定**，
         // 不由我们决定（`SessionStore.ListProjects` 那条同一个教训）。工具输出进上下文，
         // 顺序漂一下就是**每一步都可能不同的前缀**。
-        var entries = Directory.EnumerateFileSystemEntries(full)
-            .Select(Path.GetFileName)
-            .OfType<string>()
-            .OrderBy(n => n, StringComparer.Ordinal)
+        //
+        // ⚠️ **用 `EnumerateFileSystemInfos` 而不是 `EnumerateFileSystemEntries` + 逐个
+        // `Directory.Exists`**：后者**每个条目一次系统调用**（大目录是 O(n) 次 IO），
+        // 而 `FileSystemInfo` 已经把类型/大小/时间都带回来了。
+        var entries = new DirectoryInfo(full)
+            .EnumerateFileSystemInfos()
+            .OrderBy(i => i.Name, StringComparer.Ordinal)
             .ToList();
 
         if (entries.Count == 0) return Task.FromResult(ToolText.Of("(空目录)"));
 
+        // ⚠️ **截断在这里，而且它从 `ToolLimits` 读**（本仓的 G17：上限只能有一个源）。
+        // ⚠️ **必须明说截了**：静默截断会让模型以为目录只有这些条目——
+        // 那是「多了一条假信息」（`01` §3.6 ①之二 / §9.3）。而且**总数也要给**，
+        // 否则模型无法判断"还差多少"。
+        var shown = entries.Count > ToolLimits.MaxDirectoryEntries
+            ? entries.Take(ToolLimits.MaxDirectoryEntries).ToList()
+            : entries;
+
         var sb = new StringBuilder();
-        foreach (var name in entries)
+        foreach (var info in shown)
         {
             // ⚠️ 尾随斜杠是**目录的唯一标记**：文件名与目录名可以同名，
             // 不给标记模型分不出来——而它下一步该用 read 还是 ls 正是靠这个。
-            var isDir = Directory.Exists(Path.Combine(full, name));
-            sb.Append(isDir ? name + "/" : name).Append('\n');
+            var isDir = info is DirectoryInfo;
+            // ⚠️ **tab 分列，不是空格对齐**：文件名**可以含空格**，用空格分列会让
+            // 带空格的名字不可解析（同 §3.7 那条「框架与内容不许共用字面量」）。
+            // ⚠️ 目录的"大小"那一格**留空**：目录没有"大小"这件事，给 0 是在**撒谎**。
+            sb.Append(isDir ? info.Name + "/" : info.Name)
+              .Append('\t')
+              .Append(isDir ? "" : Size(info))
+              .Append('\n');
+        }
+
+        if (shown.Count < entries.Count)
+        {
+            sb.Append($"（只列了前 {shown.Count} 条，这个目录一共 {entries.Count} 条）").Append('\n');
         }
 
         // ⚠️ **没有指纹，这是判定的结果不是遗漏**：目录清单随任何一个文件的增删就变，
         // 无「源」可依赖 ⇒ 它是 `00` §5 的第三类（不可重演），无指纹、永不可优化。
         return Task.FromResult(ToolText.Of(sb.ToString()));
+    }
+
+    /// <summary>
+    /// 大小 → **给人/模型读的短写法**（`1023 B` / `1.5 KB` / `20.0 MB`）。
+    ///
+    /// <para>⚠️ <b>它是给人看的，所以按常用的 1024 进制，一位小数</b>——
+    /// `20971520` 这种原样抖出来对模型**没有帮助**（它要判的是"这个该不该 read"，
+    /// 而 `20.0 MB` 一眼就能判）。</para>
+    ///
+    /// <para>⚠️ <b>不列清单（"B/KB/MB/GB/TB" 那种表），改用两个数字</b>——
+    /// 表会腐，而这里只需要跨三个量级。</para>
+    /// </summary>
+    private static string Size(FileSystemInfo info)
+    {
+        long bytes;
+        try
+        {
+            bytes = (info as FileInfo)?.Length ?? 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return "?";     // 问不出来就说"不知道"，**别编一个 0**（那是撒谎）
+        }
+
+        return bytes switch
+        {
+            < 1024 => $"{bytes} B",
+            < 1024 * 1024 => $"{bytes / 1024.0:F1} KB",
+            < 1024L * 1024 * 1024 => $"{bytes / (1024.0 * 1024):F1} MB",
+            _ => $"{bytes / (1024.0 * 1024 * 1024):F1} GB",
+        };
     }
 }
 
