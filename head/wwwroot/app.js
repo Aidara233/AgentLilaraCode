@@ -523,7 +523,8 @@ function renderSlots(slots) {
 
 function setStatus(status, turn) {
   const el = $("status");
-  el.textContent = `${status} · 第 ${turn} 步`;
+  // ⚠️ `turn` 可以是 undefined（调用方拿不到步数时不编一个——那会印出「第 undefined 步」）。
+  el.textContent = turn === undefined || turn === null ? String(status) : `${status} · 第 ${turn} 步`;
   el.className = "chip " + (status === "Running" ? "running" : "live");
 }
 
