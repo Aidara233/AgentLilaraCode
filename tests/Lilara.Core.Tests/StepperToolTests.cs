@@ -240,7 +240,9 @@ public class StepperToolTests : IDisposable
 
         var sent = Assert.Single(
             _adapter.Calls[1].Timeline.OfType<TimelineEvent.ToolResultEvent>());
-        Assert.Equal(big, Assert.IsType<Block.TextBlock>(Assert.Single(sent.Content)).Text);
+        // ⚠️ 请求侧是**两块**：框架 + 内容（`01` §3.7）。框架是渲染期加的独立一块。
+        Assert.Equal(big, Assert.IsType<Block.TextBlock>(sent.Content[1]).Text);
+        Assert.Contains("big.txt", Assert.IsType<Block.TextBlock>(sent.Content[0]).Text);
     }
 
     // 库对象**丢了**时给一段说得清的话，**不抛**——抛会让整个会话再也发不出消息。
@@ -262,7 +264,8 @@ public class StepperToolTests : IDisposable
 
         var sent = Assert.Single(
             _adapter.Calls[1].Timeline.OfType<TimelineEvent.ToolResultEvent>());
-        Assert.Contains("找不到", Assert.IsType<Block.TextBlock>(Assert.Single(sent.Content)).Text);
+        // ⚠️ 内容在 `[1]`；`[0]` 是框架（它**不受**库对象丢失影响 —— 它是事实，不是内容）。
+        Assert.Contains("找不到", Assert.IsType<Block.TextBlock>(sent.Content[1]).Text);
     }
 
     // 工具的调用在**请求**里也回传了（这一步的渲染看得见上一步的调用与结果）。

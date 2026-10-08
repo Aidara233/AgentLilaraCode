@@ -275,4 +275,161 @@ public class ToolTests : IDisposable
         var outcome = await new ReadTool().RunAsync(Call("read", """{"path":"a.txt"}"""), _ctx, default);
         return outcome.Fingerprint;
     }
+
+    // ---- read：offset / limit / 上限（`01` §9.3）--------------------------------
+    //
+    // ⚠️ **框架在 `outcome.Framing` 上，不在 `Content` 里**（`01` §3.7）：
+    // 工具负责**说清这次调用返回了什么**（落盘的事实），而把框架**渲染成一个块**
+    // 是 `TimelineRender` 的事（渲染期）。⇒ 这一组断言的是 `outcome.Framing`；
+    // 「框架渲染成独立一块、恒定在内容之前」由 `TimelineRenderTests` 钉。
+
+    private static ToolFraming Frame(ToolOutcome o) =>
+        Assert.IsType<ToolFraming>(o.Framing);
+
+    private static string Body(ToolOutcome o) =>
+        Assert.IsType<Block.TextBlock>(Assert.Single(o.Content)).Text;
+
+    /// <summary>
+    /// ⚠️ **单次上限真的生效**，而且它从 `ToolLimits` 读（不是本文件里另一个数）。
+    /// </summary>
+    [Fact]
+    public async Task Read_WithoutLimit_IsCappedAtTheLimit()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_root, "big.txt"), new string('x', ToolLimits.MaxResultBytes + 500));
+
+        var outcome = await new ReadTool().RunAsync(Call("read", """{"path":"big.txt"}"""), _ctx, default);
+
+        Assert.Equal(ToolLimits.MaxResultBytes, Body(outcome).Length);
+    }
+
+    /// <summary>
+    /// ⚠️ **宁可明着少，不可暗着假**（`01` §9.3）：被截断这件事必须**说清楚**，
+    /// 否则模型会把「前一段」当成全文——那是「多了一条假信息」。
+    /// 范围由**框架**承载：工具自己的那一半。
+    /// </summary>
+    [Fact]
+    public async Task Read_ReportsItsRangeInTheFrame()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_root, "big.txt"), new string('x', ToolLimits.MaxResultBytes + 500));
+
+        var outcome = await new ReadTool().RunAsync(Call("read", """{"path":"big.txt"}"""), _ctx, default);
+
+        var frame = Frame(outcome).Render();
+        Assert.Contains("big.txt", frame);
+        Assert.Contains((ToolLimits.MaxResultBytes + 500).ToString(), frame);   // 总长在（模型据此知道还没读完）
+    }
+
+    [Fact]
+    public async Task Read_WithOffset_ReturnsTheTail()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_root, "a.txt"), "0123456789");
+
+        var outcome = await new ReadTool().RunAsync(Call("read", """{"path":"a.txt","offset":4}"""), _ctx, default);
+
+        Assert.Equal("456789", Body(outcome));
+    }
+
+    [Fact]
+    public async Task Read_WithOffsetAndLimit_ReturnsTheSlice()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_root, "a.txt"), "0123456789");
+
+        var outcome = await new ReadTool().RunAsync(
+            Call("read", """{"path":"a.txt","offset":2,"limit":3}"""), _ctx, default);
+
+        Assert.Equal("234", Body(outcome));
+    }
+
+    /// <summary>读到文件尾之后不是「空结果」——空结果会让模型以为那次调用没有输出。</summary>
+    [Fact]
+    public async Task Read_WithOffsetPastTheEnd_SaysSo()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_root, "a.txt"), "short");
+
+        var outcome = await new ReadTool().RunAsync(Call("read", """{"path":"a.txt","offset":99}"""), _ctx, default);
+
+        var text = Body(outcome);
+        Assert.Contains("99", text);
+        Assert.Contains("5", text);   // 总长也要给出来
+    }
+
+    /// <summary>
+    /// ⚠️ **四种用错了必须是说人话的结果，不是异常**——异常会让配对的另一半落不下去
+    /// （`01` §3.6 ②：半个在拿到的不是少点内容，是**上游 400**）。
+    /// ⚠️ 尤其 `level:"4"`（字符串）那条：**不替模型猜**，否则一次写错的调用
+    /// 会变成一次**看着正常**的读取。
+    /// </summary>
+    [Theory]
+    [InlineData("""{"path":"a.txt","offset":-1}""")]
+    [InlineData("""{"path":"a.txt","limit":-1}""")]
+    [InlineData("""{"path":"a.txt","limit":0}""")]
+    [InlineData("""{"path":"a.txt","offset":"4"}""")]
+    [InlineData("""{"path":"a.txt","offset":1.5}""")]
+    public async Task Read_BadOffsetOrLimit_IsAResultNotAnException(string args)
+    {
+        await File.WriteAllTextAsync(Path.Combine(_root, "a.txt"), "0123456789");
+
+        var outcome = await new ReadTool().RunAsync(Call("read", args), _ctx, default);
+
+        Assert.NotEmpty(Body(outcome));
+    }
+
+    /// <summary>
+    /// ⚠️ **切点不许落在多字节字符中间**（`01` §9.3 的 Review Focus 1）：
+    /// 偏移是**字节**，而结果要是**文本**。不对齐的后果不是抛异常
+    /// （解码器会把非法序列换成替换字符），而是**首尾多出一个 U+FFFD**——
+    /// 那是**看得见的噪声**，模型可能把它当成「文件里真有个怪字符」。
+    /// </summary>
+    [Fact]
+    public async Task Read_SplittingAMultiByteChar_DoesNotEmitAReplacementChar()
+    {
+        // 「你好世界」每字 3 字节。offset=1 落在第一个字的**中间**。
+        await File.WriteAllTextAsync(Path.Combine(_root, "cn.txt"), "你好世界");
+
+        var outcome = await new ReadTool().RunAsync(Call("read", """{"path":"cn.txt","offset":1}"""), _ctx, default);
+
+        var text = Body(outcome);
+        Assert.DoesNotContain('\uFFFD', text);
+        Assert.Equal("好世界", text);      // 从第一个**完整**的字开始
+    }
+
+
+    /// <summary>
+    /// ⚠️ **切点不许落在多字节字符中间**（`01` §9.3 的 Review Focus 1）：
+    /// 偏移是**字节**，而结果要是**文本**。不对齐的后果不是抛异常
+    /// （解码器会把非法序列换成替换字符），而是**首尾多出一个 U+FFFD**——
+    /// 那是**看得见的噪声**，模型可能把它当成「文件里真有个怪字符」。
+    ///
+    /// <para>⚠️ <b>对齐的方向是「往回切」，不是「往前读」</b>：<c>limit</c> 说的是
+    /// **最多**读多少字节 ⇒ 多读一个字符就越过了它许的额度。
+    /// 所以 <c>limit=4</c> 得到的是「你」（3 字节），<b>不是</b>「你好」（6 字节）——
+    /// 后者会让「最多 4 字节」这句话变成假的。</para>
+    /// </summary>
+    [Fact]
+    public async Task Read_LimitStoppingMidCharacter_CutsBackInsteadOfOverreading()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_root, "cn.txt"), "你好世界");
+
+        // limit=4 落在第二个字（「好」= 字节 3..5）的中间 ⇒ 只留完整的「你」。
+        var outcome = await new ReadTool().RunAsync(
+            Call("read", """{"path":"cn.txt","limit":4}"""), _ctx, default);
+
+        var text = Body(outcome);
+        Assert.DoesNotContain('�', text);
+        Assert.Equal("你", text);
+    }
+    /// <summary>
+    /// ⚠️ **上限不能被 `limit` 绕过**——那是这个功能存在的**全部意义**：
+    /// 模型（或一次写错的调用）给一个巨大的 `limit`，不该把上下文撑爆。
+    /// </summary>
+    [Fact]
+    public async Task Read_WithAHugeLimit_IsStillCapped()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_root, "big.txt"), new string('x', ToolLimits.MaxResultBytes * 3));
+
+        var outcome = await new ReadTool().RunAsync(
+            Call("read", $$"""{"path":"big.txt","limit":{{ToolLimits.MaxResultBytes * 3}}}"""), _ctx, default);
+
+        Assert.Equal(ToolLimits.MaxResultBytes, Body(outcome).Length);
+    }
 }

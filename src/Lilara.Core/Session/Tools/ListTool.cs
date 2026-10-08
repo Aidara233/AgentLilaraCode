@@ -169,7 +169,9 @@ public sealed class ReadTool : ITool
     public string Name => "read";
 
     public string Description =>
-        "读一个文本文件，返回全文。路径相对于工作目录。"
+        "读一个文本文件。路径相对于工作目录。"
+        + "默认返回全文；文件很大时只返回**开头一段**，并在结果第一行写明这一段是整个文件的哪一部分"
+        + "——那行的**总长度**告诉你还有多少没看到，接着读就加 `offset`。"
         + "只想看目录里有什么，用 ls。";
 
     public string ParametersSchemaJson => """
@@ -179,6 +181,14 @@ public sealed class ReadTool : ITool
             "path": {
               "type": "string",
               "description": "相对于工作目录的文件路径。"
+            },
+            "offset": {
+              "type": "integer",
+              "description": "从这个字节开始读（0 基）。接着读上一段时，填上一次第一行给出的下一个位置。省略 = 0。"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "最多读多少字节（正整数）。省略 = 读到文件尾（但单次仍有上限）。"
             }
           },
           "required": ["path"]
@@ -207,29 +217,177 @@ public sealed class ReadTool : ITool
 
         if (!File.Exists(full)) return Task.FromResult(ToolText.Of($"'{rel}' 不存在。"));
 
-        byte[] bytes;
+        // ⚠️ **四个参数错误都是"说人话的结果"，不是异常**（`01` §3.6 ②）：
+        // 异常会让 `tool_use` / `tool_result` 那一对**只落一半** ⇒ 上游 400。
+        var offset = ToolArgs.Number(call.ArgumentsJson, "offset") ?? 0;
+        if (offset < 0) return Task.FromResult(ToolText.Of($"`offset` 不能是负数（给的是 {offset}）。"));
+
+        // ⚠️ **显式给了 limit 但取不出数**（字符串 / 小数 / 给了个非数字）要**说清**，
+        // 不能悄悄当成"没给"——那会让一次写错的调用变成一次**看着正常**的读取。
+        long? limit = null;
+        if (HasKey(call.ArgumentsJson, "limit"))
+        {
+            limit = ToolArgs.Number(call.ArgumentsJson, "limit");
+            if (limit is not { } l || l <= 0)
+                return Task.FromResult(ToolText.Of("`limit` 要是正整数（最多读多少字节）。"));
+        }
+
+        long length;
         try
         {
-            bytes = File.ReadAllBytes(full);
+            length = new FileInfo(full).Length;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return Task.FromResult(ToolText.Of($"读 '{rel}' 失败：{ex.Message}"));
         }
 
-        // ⚠️ **坏编码不是错误，是内容**：一个 GBK 源文件不该让整步失败，更不该让
-        // `tool_use` / `tool_result` 只落一半。替换字符至少是**看得见的**失真；
-        // 静默丢掉整个文件是看不见的。
-        var text = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false)
-            .GetString(bytes);
+        if (offset >= length)
+        {
+            // ⚠️ **不是空结果**：空结果会让模型以为「那次调用没有输出」，
+            // 而它其实只是**读过头了**（同 `fetch` 取不回时那条判据）。
+            return Task.FromResult(ToolText.Of(
+                $"'{rel}' 一共 {length} 字节，从第 {offset} 字节之后就没有内容了。"));
+        }
+
+        // ⚠️ **上限封顶在这里，而且它从 `ToolLimits` 读**（本仓的 G17：
+        // 上限只能有一个源。`ls` 里那句「这个文件太大」读的是同一个数）。
+        //
+        // ⚠️ **两层 `Min` 看着冗余，其实不是**——而且删掉外层的那次变异**差点被放过去**：
+        //   · 内层 `limit ?? Max` 管的是**没给 limit** 那一半
+        //   · 外层那个 `Min(…, Max)` 管的是**给了 limit** 那一半
+        // ⇒ 只留内层时，`{"limit": 786432}` 就**原样读 786432 字节**——
+        //   **上限被模型自己的参数绕过去了**，而那正是这个功能存在的全部意义。
+        // ⚠️ 判据：`limit` 是**请求**，`MaxResultBytes` 是**约束**。请求可以小于约束，不能大于。
+        var count = Math.Min(Math.Min(limit ?? ToolLimits.MaxResultBytes, ToolLimits.MaxResultBytes), length - offset);
+
+        byte[] bytes;
+        try
+        {
+            bytes = ReadRange(full, offset, count);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return Task.FromResult(ToolText.Of($"读 '{rel}' 失败：{ex.Message}"));
+        }
+
+        // ⚠️ **切点不许落在多字节字符中间**：偏差只有几个字节，而代价是
+        // **看得见的噪声**（首尾各一个 U+FFFD），模型可能把它当成「文件里真有个怪字符」。
+        // ⇒ 往前/往后对齐到字符边界（下面的 `Decode`）。
+        var text = Decode(bytes, offset > 0, offset + count < length);
+
+        // ⚠️ **范围写进框架**（`01` §3.7）：被截断这件事必须**明说**，
+        // 否则模型会把「前一段」当成全文——那是「多了一条假信息」（§9.3）。
+        var framing = new ToolFraming(rel.Replace('\\', '/'),
+        [
+            new ToolFramingField("第", $"{offset}–{offset + count}"),
+            new ToolFramingField("共", length.ToString()),
+        ]);
 
         return Task.FromResult(new ToolOutcome
         {
             Content = [new Block.TextBlock(text)],
+            Framing = framing,
             // ⚠️ 分隔符统一成正斜杠：否则同一份历史在 Windows 与别处写出两种「引用」。
             DependsOn = rel.Replace('\\', '/'),
-            Fingerprint = FingerprintOf(rel, bytes),
+            // ⚠️ **指纹仍然算整份文件的**（不是这一段的）：三态判定判的是
+            // 「那个源动没动」，而它是一整个文件。只哈希这一段会让"文件后半被改了"
+            // 被判成「世界没动」——静默的陈旧。
+            Fingerprint = FingerprintOf(rel.Replace('\\', '/'), ReadWholeFile(full)),
         });
+    }
+
+    /// <summary>参数里**显式出现了**这个键吗（哪怕值取不出来）。</summary>
+    private static bool HasKey(string argumentsJson, string key)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(argumentsJson);
+            return doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty(key, out _);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 只读 <paramref name="offset"/> 起的 <paramref name="count"/> 个字节。
+    ///
+    /// <para>⚠️ **不 `ReadAllBytes` 再切**：那样在一个 20 MB 的文件上仍然分配 20 MB
+    /// ——上限防的是**上下文**不是内存，但白花的那份没有必要。</para>
+    /// </summary>
+    private static byte[] ReadRange(string full, long offset, long count)
+    {
+        using var stream = File.OpenRead(full);
+        stream.Seek(offset, SeekOrigin.Begin);
+
+        var buf = new byte[count];
+        var read = 0;
+        while (read < count)
+        {
+            var n = stream.Read(buf, read, (int)(count - read));
+            if (n == 0) break;      // 文件在两次读之间变短了 —— 拿到多少算多少
+            read += n;
+        }
+
+        return read == buf.Length ? buf : buf[..read];
+    }
+
+    private static byte[] ReadWholeFile(string full)
+    {
+        try
+        {
+            return File.ReadAllBytes(full);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// 把一段**可能是半截字符**的字节解成文本，必要时往两侧对齐到字符边界。
+    ///
+    /// <para>⚠️ <b>对齐的做法是「剥掉首尾不完整的序列」，不是「换成 U+FFFD」</b>：
+    /// 替换字符是**看得见的噪声**，模型会以为文件里真有个怪字符。
+    /// 而边界处的半个字符**根本不是内容**——它是我们切出来的。</para>
+    ///
+    /// <para>⚠️ <b>它只处理边界，中间的不完整序列照旧交给解码器**
+    /// （替换字符在那儿是**正确**的：那说明文件本身就是坏编码，
+    /// 而 `Read_WithInvalidUtf8_ReturnsReplacementCharactersInsteadOfThrowing` 钉着那条）。</para>
+    /// </summary>
+    private static string Decode(byte[] bytes, bool trimHead, bool trimTail)
+    {
+        var start = 0;
+        var end = bytes.Length;
+
+        if (trimHead)
+        {
+            // 向前跳到第一个**引导字节**（不是 10xxxxxx 续字节）。
+            while (start < end && (bytes[start] & 0xC0) == 0x80) start++;
+        }
+
+        if (trimTail)
+        {
+            // 从尾往前找**最后一个完整序列**的起点：一个引导字节后面跟足它声明的续字节。
+            var i = end - 1;
+            while (i >= start && (bytes[i] & 0xC0) == 0x80) i--;
+            if (i >= start)
+            {
+                var need = bytes[i] switch
+                {
+                    >= 0xF0 => 4,
+                    >= 0xE0 => 3,
+                    >= 0xC0 => 2,
+                    _ => 1,
+                };
+                if (i + need > end) end = i;   // 末尾那个序列不完整 ⇒ 切掉它
+            }
+        }
+
+        return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false)
+            .GetString(bytes, start, end - start);
     }
 
     /// <summary>
