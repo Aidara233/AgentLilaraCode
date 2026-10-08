@@ -595,6 +595,37 @@ public sealed class CommandDispatcher(
     {
         if (!TryFind(s.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
+        // ⚠️ **撞上「正在等回答」⇒ 先顶替那次询问**（`01` §3.8 的 `Superseded`）。
+        //
+        // ⚠️ **不顶替的话，下一条请求会 400**，而**这次是实测的**（2026-10-08）：
+        // 会话挂起时那条模型消息（含 `tool_use`）**已经落了盘**（必须落，否则答完补的
+        // `tool_result` 悬空），而它的配对结果**要等用户答完才有**。
+        // 用户在这时直接打字（而不是点卡片）⇒ 队列里多一条用户消息 ⇒ 这一步渲染出来的
+        // 请求里那条 `tool_use` **后面没有 `tool_result`** ⇒ 上游原话：
+        // 「`tool_use` ids were found without `tool_result` blocks immediately after」。
+        //
+        // ⇒ 顶替的做法：**先补一条说得清的结果把悬空的那个配对补上**，
+        // 再把这条用户消息当普通输入处理（走下面那条路）。
+        // ⚠️ 判据是「用户**没有回答**那个问题，而是说了别的」——**不能假装他答了**
+        // （那会让模型以为它问的都得到了答复，而真相是没人理它）。
+        if (handle.State.Status == SessionStatus.WaitingForInput && handle.State.Ask is { } superseded)
+        {
+            _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId, Stepper.Supersede(
+                superseded, string.Concat(s.Blocks.OfType<Block.TextBlock>().Select(b => b.Text))));
+
+            handle.AwaitingInput = null;
+            handle.UpdateStateAndPersist(_host.Store, st => st with
+            {
+                Status = SessionStatus.Idle,
+                Ask = null,
+            }, diskStatus: SessionStatus.Idle);
+
+            _bus.Publish(EventBus.ApprovalsTopic,
+                new WireEvent.ApprovalResolved(handle.SessionId, superseded.AskId, "superseded"));
+            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                new WireEvent.ApprovalResolved(handle.SessionId, superseded.AskId, "superseded"));
+        }
+
         // 追加与入队必须紧挨着——分开会产生「已落盘未入队」/「已入队未落盘」两种中间态，各自丢消息。
         // 这两步刻意不拿闸：合并是队列的副产品，而 no-op 的前提是后来的 send 先进得来。
         // 并发安全靠各自那层的锁：`HistoryLog.Append` 自带按路径的锁，`SessionHandle.Enqueue` 自带队列锁。
@@ -735,6 +766,20 @@ public sealed class CommandDispatcher(
         // 下面这次重新 `TryEnterStep()` 是一条普通的新步——不需要「步内循环」那种
         // 会打破状态机的东西。
         if (reply is null) return null;   // 取消 / 失败那两条路（它们的 `error` 事件已经在上面发过）
+
+        // ⚠️ **挂起不是「调了工具」**（`01` §3.8）。
+        //
+        // ⚠️ **这一格漏掉过一次，而它是实测抓出来的**（2026-10-08，真模型 + 真网关）：
+        // 模型调 `ask` ⇒ `Stepper` 挂起、一条结果都没落 ⇒ 状态 `WaitingForInput`，
+        // 可这里**照样**看见 `reply.Blocks` 里那个 `tool_use` ⇒ 接着推下一步
+        // ⇒ 下一次请求里那条 `tool_use` **后面没有 `tool_result`** ⇒ 上游原话
+        // 「`tool_use` ids were found without `tool_result` blocks immediately after」。
+        // ⇒ **那个会话在用户答完之前一点都推不动**，而它当时看起来完全正常。
+        //
+        // ⇒ 判据是**状态**，不是「回复里有没有 tool_use」：挂起是一种**刻意的停顿**，
+        // 而循环的继续权归「等到了回答」那个时刻（`HandleApprovalRespond` 里那次续跑）。
+        if (handle.State.Status == SessionStatus.WaitingForInput) return reply;
+
         return await ContinueIfToolCalledAsync(handle, reply, throwOnFailure);
     }
 
@@ -1373,15 +1418,27 @@ public sealed class CommandDispatcher(
         }
 
         // ---- 问意见：答案就是内容 ----
-        if (awaiting is null)
+        //
+        // ⚠️ **问题从盘上解，不从内存**（`01` §3.8）：内存那半（`handle.AwaitingInput`）
+        // 只在「本进程亲手挂起过」时才在——**任何一次「从盘重新载入」都会丢掉它**。
+        // 而问题原文本来就在盘上（那条模型消息必须落，否则答完补的结果悬空）。
+        //
+        // ⚠️ 这条**是实测逼出来的**（2026-10-08）：我只修了 `/state` 那条（页面看得见问题了），
+        // 忘了这里 ⇒ 用户答完之后拿到的是「会话在等待期间重启过，原来那批问题没能保留」
+        // ——**而问题明明就在盘上**。⇒ 两处必须共用 `AskTool.ItemsOf` 那一份实现。
+        var items = Session.Tools.AskTool.ItemsOf(_host.Store, handle.ProjectKey, handle.SessionId, paused.CallId);
+
+        if (items.Count == 0)
         {
-            // ⚠️ 重启之后问题原文没了（`01` §3.8 认下的代价）。**如实说**，不编答案。
-            return ("用户回答了，但会话在等待期间重启过，原来那批问题没能保留 ⇒ 这次答复取不回来。"
+            // ⚠️ 解不出来才认输：要么是**重启前内存那半丢了且盘上也没有**
+            //（闸门那条询问没有工具参数），要么是模型的参数形状坏了。
+            // **如实说**，不编答案——编一个空值比这坏得多（同 §3.6 ①之二）。
+            return ("用户回答了，但这次询问的问题没能取回来 ⇒ 这次答复对不上任何一项。"
                   + "请重新问一次。", null);
         }
 
         var lines = new List<string>();
-        foreach (var item in awaiting.Ask.Items)
+        foreach (var item in items)
         {
             // ⚠️ **缺项如实写「未回答」**，不编一个空值——那是「多了一条假信息」（`01` §3.6 ①之二）。
             lines.Add(c.Answers.TryGetValue(item.Id, out var v) ? $"{item.Id}: {v}" : $"{item.Id}: （未回答）");
@@ -1390,7 +1447,11 @@ public sealed class CommandDispatcher(
         // ⚠️ **同一批里还有别的调用被这次询问挡下了**：多问是一个信封，而记法要求
         // 一条 `tool_use` 一条 `tool_result`（`01` §3.8）。⇒ 只能配一条，其余的
         // 由这句话交代给模型，它自己去重发。**本批认下的代价，不是设计目标。**
-        if (awaiting.Calls.Count > 1)
+        //
+        // ⚠️ 判据里那个 `awaiting is` 的 null 检查**不是防御性写法**：内存那半可能是 null
+        // （从盘载入过），而**问题本身这时已经从盘上解出来了**——所以这里只是「数不到
+        // 同批还有几条」，而不是「不知道该问什么」。数不到就不说那句，不编一个数。
+        if (awaiting is not null && awaiting.Calls.Count > 1)
         {
             lines.Add($"（同一批里还有 {awaiting.Calls.Count - 1} 次调用被这次询问一起挡下了，"
                     + "它们没有执行——请重新发起。）");

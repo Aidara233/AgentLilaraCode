@@ -63,11 +63,20 @@ public sealed class ClaudeAdapter : IModelAdapter
     internal static bool ShouldWrap(Exception ex, CancellationToken ct) =>
         Cancellation.ShouldWrap(ex, ct);
 
-    /// <summary>把 SDK 的异常翻译成一句人话。</summary>
+    /// <summary>
+    /// 把 SDK 的异常翻译成一句人话。
+    ///
+    /// <para>⚠️ <b>原则：能拿到上游原因的地方，一定带上去。</b>
+    /// 400 那一支原先只印一句「多半是参数不合法」——而**上游已经在那句响应体里写明是哪里不合法了**，
+    /// 我们把它扔了。实测（2026-10-08）：一个真实的 400 只换来一句「检查模型 id 与 max tokens」，
+    /// 而真正的原因无从得知（同族：这个文件下面那段 401 的注释讲的就是同一个毛病）。</para>
+    /// </summary>
     internal static string Describe(Exception ex) => ex switch
     {
+        // ⚠️ **带上上游说的话**：`AnthropicException.Message` 里就含响应体，
+        // 而 400 是**唯一**一类「原因只在上游那边、我们这边猜不出来」的错误。
         Anthropic.Exceptions.AnthropicBadRequestException =>
-            "请求被上游拒绝（400）。多半是参数不合法——检查模型 id 与 max tokens 的设置。",
+            "请求被上游拒绝（400）。上游说：" + ex.Message,
         Anthropic.Exceptions.AnthropicUnauthorizedException =>
             "API key 无效或已吊销（401）。检查 `provider set` 里的 --key。",
         Anthropic.Exceptions.AnthropicForbiddenException =>

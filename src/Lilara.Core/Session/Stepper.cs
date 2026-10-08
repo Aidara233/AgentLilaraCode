@@ -315,6 +315,23 @@ public sealed class Stepper(
     };
 
     /// <summary>
+    /// **用户没有回答，而是说了别的**（`01` §3.8 的 `Superseded`）。
+    ///
+    /// <para>⚠️ <b>它存在的理由与「批准 / 超时」一样：那个 `tool_use` 必须有配对</b>——
+    /// 而这一条**是实测逼出来的**（2026-10-08）：用户对着一个询问直接打字说别的，
+    /// 那条悬空的 `tool_use` 让**下一条请求当场 400**，上游原话
+    /// 「`tool_use` ids were found without `tool_result` blocks immediately after」。</para>
+    ///
+    /// <para>⚠️ <b>措辞不能假装他答了</b>：「用户没有回答这个问题，而是说了别的：…」
+    /// ——那既是事实，也告诉模型**下一步该干什么**（把那句新话当成输入）。
+    /// 编一个答案比这坏得多：模型会以为它问的都得到了答复。</para>
+    /// </summary>
+    /// <param name="said">用户实际说的那句（截断到合理长度——它会进记录）。</param>
+    public static TimelineEvent.ToolResultEvent Supersede(PausedAsk paused, string said) =>
+        Answer(paused, "用户没有回答这个问题，而是说了别的："
+            + (said.Length > 200 ? said[..200] + "…" : said));
+
+    /// <summary>
     /// 一步：**追加 + 入队 + 推进**——`01` §6.1 那条复合动作的完整形态。
     ///
     /// <para>⚠️ 它保留下来是为了**让既有测试的语义不被稀释**：

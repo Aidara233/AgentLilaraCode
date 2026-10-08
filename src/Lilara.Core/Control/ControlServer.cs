@@ -252,9 +252,48 @@ public sealed class ControlServer(
                         Premier = Array.Empty<object>(),
                         Floating = Array.Empty<object>(),
                     },
+
+                    // ⚠️ **待回答的那次询问，含问题原文**（`01` §3.8）。
+                    //
+                    // ⚠️ **`State.Ask` 交不出问题**：它只记「等哪一次调用、等多久」
+                    // （那是**盘面事实**），而问题原文是**渲染产物**。
+                    // ⇒ 只从 `State` 取的话，**打开页面时看不见要问什么**
+                    // ——而那正是头要回答它的前提。
+                    //
+                    // ⚠️ **问题原文从落盘的那条 `tool_use` 参数里重新解出来**
+                    // （实测 2026-10-08）：它在盘上**本来就有**（那条模型消息是必须落的，
+                    // 否则配对悬空），而内存那份只在「本进程亲手挂起过」时才在。
+                    // 只信内存的话，**任何一次「从盘载入」都会丢问题**——不只是重启。
+                    //
+                    // ⚠️ 代价：`ask` 工具的参数是**模型写的**，所以这里可能解不出来
+                    // （形状写错时工具本来会返回一条错误结果、**不会挂起**⇒ 正常路径上解得出）。
+                    // 解不出就退回内存那份；再没有就是空 —— 头必须据此显示
+                    // 「原问题没能保留」，而**不是**画一张空卡。
+                    Ask = handle.State.Ask is { } pa
+                        ? new
+                        {
+                            pa.AskId,
+                            Kind = pa.Kind.ToString(),
+                            pa.ToolName,
+                            pa.DeadlineAt,
+                            Items = ItemsOf(handle, pa) is { Count: > 0 } fromDisk
+                                ? fromDisk
+                                : handle.AwaitingInput?.Ask.Items ?? (IReadOnlyList<AskItem>)[],
+                            Remember = handle.AwaitingInput?.Ask.Remember ?? (IReadOnlyList<AskMemory>)[],
+                        }
+                        : null,
                 },
                 WireJson.Options);
         });
+
+        // 从落盘的那条 `tool_use` 里解出问题（`01` §3.8）。
+        //
+        // ⚠️ **它现在只是转调 `AskTool.ItemsOf`**——那份实现在**答完那条路**上也要用
+        // （`CommandDispatcher` 渲染答复时同样要知道问了什么）。
+        // 各写一份就会出现「页面看得见问题、而回答时说你没答」这种分叉，
+        // 而本仓栽过同形的（两处副本只改一处）。
+        IReadOnlyList<AskItem> ItemsOf(SessionHandle handle, PausedAsk paused) =>
+            Session.Tools.AskTool.ItemsOf(host.Store, handle.ProjectKey, handle.SessionId, paused.CallId);
 
         app.MapGet("/sessions/{id}/history", (string id) =>
         {

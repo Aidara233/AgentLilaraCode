@@ -578,6 +578,43 @@ button:disabled:hover { border-color: var(--rule); }
 .panel:last-child { border-bottom: 0; }
 .panel .note { font-size: 11.5px; color: var(--ink-3); line-height: 1.6; }
 
+/* ---- 待决策卡片（`01` §3.8）--------------------------------------------
+   ⚠️ 这一块**必须显眼**（义务 3）：会话挂在等回答上，而用户不看右栏就发现不了。
+   ⚠️ 但**不用红**：等回答不是**错误**，是一个需要动作的状态——红在本仓留给
+   `error`（同左栏那个 `.askbadge` 的取舍）。 */
+.askitem { margin: 8px 0; }
+.askq { font-size: 12px; line-height: 1.6; margin-bottom: 4px; }
+.askopt { display: block; font-size: 11.5px; color: var(--ink-2); margin: 3px 0; }
+.askopt input { margin-right: 5px; }
+#ask select, #ask textarea {
+  width: 100%;
+  font-family: var(--f-mono);
+  font-size: 11.5px;
+  padding: 4px 6px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  resize: vertical;
+}
+/* ⚠️ `verbatim` 那格装的是模型那段参数原文——等宽 + 等宽字体是**必须**的，
+   按比例字体显示 JSON 会让用户看不出哪里被改了。 */
+.askverbatim { line-height: 1.5; }
+.askfield { display: block; margin: 5px 0; }
+.askfield span { display: block; font-size: 11px; color: var(--ink-3); margin-bottom: 2px; }
+.askremember { display: block; font-size: 11px; color: var(--ink-2); margin: 10px 0 4px; line-height: 1.5; }
+.askremember input { margin-right: 5px; }
+.askactions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.askactions button { padding: 4px 10px; font-size: 11.5px; }
+/* ⚠️ 「拒绝」用 danger 的**边**而不是实心红：它是一个正常的选项，
+   不是一次危险动作——实心红会让用户以为点它就是出事。 */
+.askactions button.deny { color: var(--danger); border-color: var(--danger); }
+.askactions .bad { flex-basis: 100%; color: var(--danger); font-size: 11.5px; line-height: 1.5; }
+/* ⚠️ `.note.warn` / `.note.bad` 是本块新加的**组合子类**——同族的 `note-ok` / `note-bad`
+   是**另一套命名**（连字符），两者并存。刻意不合并：合并要改既有那两处的调用点，
+   而它们与这里没有共享的判据（那两处是「操作结果」，这里是「状态提示」）。 */
+#ask .note.warn { color: var(--warn); }
+
 /* 键值块：左键右值，值一律等宽 —— 「被测量的东西」都用等宽。 */
 .kv { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 3px 8px; font-size: 12px; }
 .kv dt { color: var(--ink-3); }
@@ -798,14 +835,12 @@ button:disabled:hover { border-color: var(--rule); }
     </div>
   </section>
 
-  <!-- 义务 3：审批必须走独立流、且显眼。今天核心侧闸门不存在，页面明说而不是显示空壳。 -->
-  <section class="panel">
+  <!-- 义务 3：审批必须走独立流、且显眼。
+       ⚠️ 2026-10-08：核心侧通了，「核心尚未实现」那条横幅**已经不成立**——
+       这里画的是真卡片（`renderAsk`）：问题原文来自 `GET /sessions/{id}/state` 的 `ask`。 -->
+  <section class="panel" id="ask-panel">
     <h4>待决策</h4>
-    <div class="banner noted">
-      <b>核心侧尚未实现。</b>审批流需要权限闸门，而闸门的前提是「工具」——
-      本核心还没有工具（<code>01</code> §9.1：无插件 ⇒ 工具表为空）。
-      这里不是「暂时没有待审批」，是通道还不存在。
-    </div>
+    <div id="ask"></div>
   </section>
 
   <!-- 提供商 / 会话 / 项目：本版着重的三块。

@@ -277,8 +277,120 @@ public class AskTests : IDisposable
             ApprovalStore.HashArgs("""{"b":2,"a":1}"""));
     }
 
+    /// <summary>
+    /// ⚠️ <b>问题原文从**落盘**的那条 `tool_use` 解出来</b>——不依赖内存那半。
+    ///
+    /// <para>缺陷形状（实测 2026-10-08）：内存那份（`AwaitingInput`）只在「本进程亲手挂起过」
+    /// 时才在，**任何一次「从盘重新载入」都会丢**（不只是重启）⇒ 用户打开页面时
+    /// 问题**是空的**。而它在盘上本来就有。</para>
+    ///
+    /// <para>⚠️ 这条同时钉住「**只有一份实现**」：`/state` 与答复那条路必须走同一个函数，
+    /// 否则会出现「页面看得见问题、而回答时说你没答」——那个分叉**真的发生过**
+    /// （我先只修了 `/state`）。</para>
+    /// </summary>
+    [Fact]
+    public async Task Items_AreRecoveredFromDisk_NotFromMemory()
+    {
+        var handle = NewSession();
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks =
+            [
+                new Block.ToolUseBlock("c1", "ask",
+                    """{"questions":[{"id":"fmt","type":"choice","question":"什么格式？","options":["A","B"]}]}"""),
+            ],
+            StopReason = "tool_use",
+            Refused = false,
+        });
+
+        await StepperWith(_store, _adapter, [new AskTool()]).StepAsync(handle, "go", CancellationToken.None);
+
+        // ⚠️ **模拟「从盘重新载入」**：内存那半丢掉（重启、或只是重新 Activate 一次）。
+        handle.AwaitingInput = null;
+
+        var items = AskTool.ItemsOf(_store, handle.ProjectKey, handle.SessionId, "c1");
+
+        var one = Assert.Single(items);
+        Assert.Equal("fmt", one.Id);
+        Assert.Contains("什么格式", one.Question);
+
+        // 对不上号的 callId ⇒ 空（**不能拿另一条历史询问的问题**顶替）。
+        Assert.Empty(AskTool.ItemsOf(_store, handle.ProjectKey, handle.SessionId, "nope"));
+    }
+
     // ---- 四、ask 工具 ----
 
+    /// <summary>
+    /// ⚠️ <b>挂起之后 agent 循环<b>必须</b>停</b>——而这一格是**实测抓出来的**
+    /// （2026-10-08，真模型 + 真网关）。
+    ///
+    /// <para>缺陷形状：模型调 `ask` ⇒ `Stepper` 挂起、一条结果都没落 ⇒ 状态 `WaitingForInput`，
+    /// 可 `ContinueIfToolCalledAsync` **照样**看见回复里那个 `tool_use` ⇒ 接着推下一步
+    /// ⇒ 下一次请求里那条 `tool_use` 后面没有 `tool_result` ⇒ 上游原话
+    /// 「`tool_use` ids were found without `tool_result` blocks immediately after」。
+    /// ⇒ **那个会话在用户答完之前一点都推不动**，而它当时看起来完全正常
+    /// （状态对、事件对、卡片也对）。</para>
+    ///
+    /// <para>判据：**只调了一次模型**。</para>
+    /// </summary>
+    [Fact]
+    public async Task AwaitingInput_StopsTheToolLoop()
+    {
+        var handle = NewSession();
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", "{}")));
+
+        var host = new CoreHost(_store.DataRoot, _work);
+        host.Register(handle);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), h => new Stepper(_store, _adapter, [new CountingWriter()]));
+
+        var result = await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(handle.SessionId, [new Block.TextBlock("go")]),
+            "c1", awaitCompletion: true, CancellationToken.None);
+
+        Assert.False(result.IsRejected);
+        Assert.Equal(SessionStatus.WaitingForInput, handle.State.Status);
+
+        // ⚠️ **一次，不是两次**：第二次就是那个会 400 的续跑。
+        Assert.Single(_adapter.Calls);
+    }
+
+    /// <summary>
+    /// ⚠️ <b>用户直接打字说别的 ⇒ 顶替那次询问</b>（`01` §3.8 的 `Superseded`）。
+    ///
+    /// <para>也是实测抓出来的：用户对着一个询问不去点卡片、直接打字 ⇒ 那条悬空的
+    /// `tool_use` 让**下一条请求当场 400**。⇒ 发送之前必须先补一条结果把配对补上，
+    /// 而且是**说得清的那种**（「用户没有回答，而是说了别的」）——**不能假装他答了**。</para>
+    /// </summary>
+    [Fact]
+    public async Task SendWhileAwaiting_SupersedesTheAskInsteadOfLeavingItDangling()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", "{}")));
+
+        await StepperWith(_store, _adapter, [writer]).StepAsync(handle, "go", CancellationToken.None);
+        Assert.NotNull(handle.State.Ask);
+
+        // 用户直接打字（不点卡片）。
+        var host = new CoreHost(_store.DataRoot, _work);
+        host.Register(handle);
+        var dispatcher = new CommandDispatcher(host, new EventBus(), h => new Stepper(_store, _adapter, []));
+
+        var result = await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(handle.SessionId, [new Block.TextBlock("算了，先做别的")]),
+            "c2", awaitCompletion: false, CancellationToken.None);
+
+        Assert.False(result.IsRejected);
+        Assert.Null(handle.State.Ask);      // 顶替掉了
+
+        // ⚠️ **那条 `tool_use` 现在有配对了**——而这就是「下一条请求不会 400」的全部内容。
+        var results = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .ToList();
+
+        Assert.Contains(results, r => r.CallId == "c1"
+            && string.Concat(r.Content.OfType<Block.TextBlock>().Select(b => b.Text)).Contains("没有回答"));
+    }
     /// <summary>`ask` 工具声明 <see cref="ITool.AsksBeforeRunning"/> ⇒ 它走「先判全」那一趟。</summary>
     [Fact]
     public void AskTool_DeclaresThatItAsksBeforeRunning()

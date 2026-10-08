@@ -351,6 +351,7 @@ async function openSessionInner(id) {
 
   renderSlots(state.slots);
   renderAxes(state.axes);
+  renderAsk(state);
   renderTitle(state.spec);
   renderSessionPanel(state);
   renderProjectPanel(state);
@@ -1501,8 +1502,11 @@ function handleEvent(p) {
         const v = info.get(p.sessionId);
         if (v) { v.ask = { askId: p.askId, kind: p.askKindName, deadlineAt: p.deadlineAt }; renderSessions(); }
         if (p.sessionId === current) {
-          setStatus("WaitingForInput", undefined);
-          renderMeta(`❓ 在等你回答（askId ${p.askId}）—— 用控制台 approval allow/deny/answer 回它`);
+          setStatus("WaitingForInput");
+          // ⚠️ **重拉**，不是画一行字：那张卡片要的问题原文**不在事件里**
+          // （事件带的是内存里那份 `items`，但核心侧 `/state` 才是头的真相来源，
+          // 而重启之后两者会不一致）。重拉一次两条路就归到同一个答案上。
+          openSession(current);
         }
       }
       break;
@@ -1511,7 +1515,12 @@ function handleEvent(p) {
       {
         const v = info.get(p.sessionId);
         if (v) { v.ask = null; renderSessions(); }
-        if (p.sessionId === current) renderMeta(`（那次询问已结束：${p.outcome}）`);
+        if (p.sessionId === current) {
+          renderMeta("（那次询问已结束：" + p.outcome + "）");
+          // ⚠️ 卡片要消失——它由 `/state` 画，所以重拉一次，而不是就地删节点
+          // （就地删会让面板与核心状态分叉，而下一次事件回来又画出来）。
+          openSession(current);
+        }
       }
       break;
 
@@ -1669,11 +1678,268 @@ $("gc").onclick = () => {
 })();
 
 // ---- 待审批（`01` §3.8） ----
+// ---- 待决策：回答一次询问（`01` §3.8） -----------------------------------
 //
-// ⚠️ **本轮只做「看得见」**：会话列表上标出哪个会话在等人、时间线上画一行提示。
-// **回答的 UI 还没做**——它要一张卡片（多问 + 混合类型 + 改写参数 + remember 两档），
-// 而一个只能填第一个问题的表单**比没有更坏**（用户以为答完整了）。
-// ⇒ 回答走控制台：`approval allow|deny|cancel|answer <会话> <askId> …`。
-//
-// ⚠️ 判据一律是 `ask?.askId`：核心在「没在等」时交的是 `{}`，
+// ⚠️ **判据一律是 `ask?.askId`**（不是 `ask`）：核心在「没在等」时交的是 `{}`，
 // 而 `{}` 在 JS 里是 **truthy**（见 `ControlServer` 里那段注释）。
+//
+// ⚠️ **这一块的存在理由是「能回答」**，而不是「看得见」——看得见只是它的前提。
+// 核心侧 `approval.respond` 是挂起会话的**唯一**解除入口，而它**在头上够不着**
+// 就等于没有：用户不会为了点一个「不准」去开控制台。
+//
+// ⚠️ **问题原文从哪来**：`GET /sessions/{id}/state` 的 `ask`。
+// ⚠️ **不是** `session.state` / `approval.requested` 那两条事件——`PausedAsk`（盘上那份）
+// 只记「等哪一次调用、等多久」，而问题原文是**渲染产物**。⇒ 端点才是头的真相来源。
+//
+// ⚠️ **核心侧问题原文是从落盘的那条 `tool_use` 解出来的**（不是内存）——
+// 所以**重启之后照样有**（实测过：重启后 `/state` 的 `items` 仍带 `shape` 与选项）。
+// 那条「items 为空 ⇒ 显示原问题没能保留」的分支因此是**兜底**，不是常态。
+
+// 待决策那一格。⚠️ `state.ask` 为 null = 没在等；有值而 `items` 空 = 问题没留住（见上）。
+//
+// ⚠️ **判据是 `state.ask` 存在，而<b>不是</b> `items.length > 0`**：
+// 后者会把「问题没留住」那一格**误判成「没在等」** ⇒ 面板静默消失、而会话**卡死**
+// （用户对着一个「没有在等回答」的提示，无从把它解开）。
+function renderAsk(state) {
+  const box = $("ask");
+  if (!box) return;
+  box.innerHTML = "";
+
+  const ask = state && state.ask;
+  if (!ask) {
+    box.innerHTML = '<div class="note">这个会话没有在等回答。</div>';
+    return;
+  }
+
+  // 问题原文。⚠️ 正常路径上**解得出**（核心从落盘那条 `tool_use` 解），
+  // 空只可能是「模型的参数形状坏了」或「闸门那条询问（它没有工具参数）」。
+  const items = Array.isArray(ask.items) ? ask.items : [];
+
+  const note = document.createElement("div");
+  note.className = "note";
+  note.textContent = ask.kind === "permission"
+    ? "模型想跑「" + ask.toolName + "」，等你点头。"
+    : "模型在问你。";
+  box.appendChild(note);
+
+  if (ask.deadlineAt) {
+    const dl = document.createElement("div");
+    dl.className = "note warn";
+    // ⚠️ 说清「过期就按没人回答处理」——用户据此知道不能先放着不管。
+    dl.textContent = "⏱ " + shortTime(ask.deadlineAt) + " 之前有效，过期就按没人回答处理。";
+    box.appendChild(dl);
+  }
+
+  // ---- 问题没留住那一格：没有原文，只能解掉 ----
+  //
+  // ⚠️ **措辞不写「重启过」**：那曾经是唯一的原因，而现在**不是**了——
+  // 核心改成**从落盘的那条 `tool_use` 解问题**之后，重启也会解出来。
+  // ⇒ 走到这里的只剩「模型的参数形状坏了」与「闸门那条询问（它没有工具参数）」。
+  // ⚠️ 乱归因比不归因更坏（用户会去重启、去查数据根，而真相是别的东西）。
+  if (items.length === 0) {
+    const lost = document.createElement("div");
+    lost.className = "banner noted";
+    // ⚠️ **如实说**：状态是诚实的（核心知道自己还在等），而问题没留住。
+    // 编一个问题问用户比这坏得多——他会以为模型真问了那个。
+    lost.textContent = "这次询问的问题取不回来了（多半是模型给的参数形状不对）。"
+      + "点下面那个按钮把它解掉，让模型重新问一次。";
+    box.appendChild(lost);
+    box.appendChild(askButtons(
+      [{ label: "让它重新问", outcome: "cancel", why: "核心会把这次询问作废，模型重新发起" }],
+      ask, new Map()));
+    return;
+  }
+
+  // ---- 正常那格 ----
+  const inputs = new Map();      // 问题 id -> () => 值
+
+  for (const it of items) {
+    const row = document.createElement("div");
+    row.className = "askitem";
+
+    const q = document.createElement("div");
+    q.className = "askq";
+    q.textContent = it.question || it.id;
+    row.appendChild(q);
+
+    inputs.set(it.id, askInputFor(it, row));
+    box.appendChild(row);
+  }
+
+  // 记忆那个复选框。⚠️ **只在核心说可以**（`remember` 非空）时才有——
+  // 问意见（`kind === "question"`）没有「记住」这回事（答案是内容，不是许可）。
+  const remembers = Array.isArray(ask.remember) ? ask.remember : [];
+  if (remembers.length > 0) {
+    const rm = document.createElement("label");
+    rm.className = "askremember";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    rm.appendChild(cb);
+
+    const txt = document.createElement("span");
+    // ⚠️ **粗度必须写出来**：`tool` 那档放行的是这个工具在**本会话里的任何参数**。
+    // 与「记住这些参数」并排成两个长得差不多的复选框，就是让用户批了他没打算批的东西。
+    txt.textContent = "本会话内不再问这个工具（任何参数都放行）";
+    rm.appendChild(txt);
+    rm.title = "勾上之后，同一个工具换参数也不再问你——它比「只批这一次」粗得多";
+    box.appendChild(rm);
+
+    inputs.set("__rememberTool", () => (cb.checked ? "tool" : null));
+  }
+
+  box.appendChild(askButtons([
+    { label: "批准", outcome: "submit", why: "批准这次调用（下一步它就会执行）" },
+    { label: "拒绝", outcome: "submit", deny: true, why: "拒绝，并把理由告诉模型" },
+    { label: "作废", outcome: "cancel", why: "这次询问整个作废，模型重新发起" },
+  ], ask, inputs));
+}
+
+// 按形状造一个输入控件，返回**取值函数**。
+//
+// ⚠️ 三个形状（`01` §3.8）与四个控件：`choice` 单选 / `choice+multi` 多选 /
+// `text` 文本框 / `verbatim` 原样一段可改的参数 JSON / `form` 若干命名框。
+// **`verbatim` 是核心造的**（参数名 `arguments` 是核心与协议之间的约定）⇒ 这里
+// 不能按 `form` 渲染——它的值是**要原样回传的原文**，改一个字节就是改了参数。
+function askInputFor(item, row) {
+  const shape = item.shape;
+
+  if (shape === "choice") {
+    const opts = Array.isArray(item.options) ? item.options : [];
+    if (item.multi) {
+      const chosen = new Set();
+      for (const o of opts) {
+        const l = document.createElement("label");
+        l.className = "askopt";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.onchange = () => { if (cb.checked) chosen.add(o.value); else chosen.delete(o.value); };
+        l.append(cb, document.createTextNode(o.label || o.value));
+        row.appendChild(l);
+      }
+      return () => [...chosen].join("、");
+    }
+
+    const sel = document.createElement("select");
+    // ⚠️ **默认不预选**：`<select>` 的第一项会被浏览器自动选中，而那会让
+    // 「用户没看就点了确认」变成一个**合法**的答案。插一个空占位项挡住它。
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = "（请选一个）";
+    sel.appendChild(ph);
+
+    for (const o of opts) {
+      const op = document.createElement("option");
+      op.value = o.value;
+      // ⚠️ label 空 = 用值（核心侧的约定，见 `AskOption.Label`）。
+      op.textContent = o.label || o.value;
+      sel.appendChild(op);
+    }
+    row.appendChild(sel);
+    sel.value = "";
+    return () => sel.value;
+  }
+
+  if (shape === "text") {
+    const inp = document.createElement("textarea");
+    inp.className = "asktext";
+    inp.rows = 2;
+    if (item.value) inp.value = item.value;
+    row.appendChild(inp);
+    return () => inp.value;
+  }
+
+  // `form` 与 `verbatim` 都是「若干命名框」——差别只在**标签**与**尺寸**。
+  const fields = Array.isArray(item.fields) ? item.fields : [];
+  const getters = [];
+
+  for (const f of fields) {
+    const wrap = document.createElement("label");
+    wrap.className = "askfield";
+    const nm = document.createElement("span");
+    nm.textContent = f.label || f.name;
+    wrap.appendChild(nm);
+
+    const inp = document.createElement("textarea");
+    // ⚠️ **`verbatim` 给足行数**：它装的是模型那段参数 JSON，一行看不出改了什么。
+    inp.rows = shape === "verbatim" ? 6 : 1;
+    if (shape === "verbatim") inp.className = "askverbatim";
+    inp.value = f.value == null ? "" : String(f.value);
+    wrap.appendChild(inp);
+
+    row.appendChild(wrap);
+    getters.push([f.name, () => inp.value]);
+  }
+
+  // ⚠️ `form` 的答案是**逐字段拼**的（键是工具自己定的名）；
+  // 而 `verbatim` **只交那一段原文**（键固定是 `arguments`）——它要原样回传。
+  return () => {
+    const out = {};
+    for (const [n, g] of getters) out[n] = g();
+    return out;
+  };
+}
+
+// 那一排按钮。⚠️ **审批按钮必须走 `commandNow`（等回执）**，不能像别处那样
+// fire-and-forget：这条命令**可能被拒绝**（askId 过期、会话没在等），
+// 而一句「点了没反应」在这里等价于「会话卡住了」。
+function askButtons(specs, ask, inputs) {
+  const bar = document.createElement("div");
+  bar.className = "askactions";
+
+  for (const spec of specs) {
+    const b = document.createElement("button");
+    b.textContent = spec.label;
+    b.title = spec.why;     // 判据给人看：这颗按钮会做什么
+    if (spec.deny) b.className = "deny";
+
+    b.onclick = async () => {
+      // 收集答案。⚠️ **`verbatim` 与 `form` 的取值函数返回对象**——摊平进 `answers`。
+      const answers = {};
+      for (const [id, get] of inputs) {
+        if (id === "__rememberTool") continue;
+        const v = get();
+        if (v && typeof v === "object") Object.assign(answers, v);
+        else if (typeof v === "string" && v.length > 0) answers[id] = v;
+      }
+
+      // 拒绝时带上理由（可选）。⚠️ 理由会**落进记录**并回给模型——
+      // 它比「档位不允许」有用得多（模型据此知道别再重试）。
+      if (spec.deny) {
+        const why = prompt("拒绝的理由（可留空）——它会告诉模型为什么");
+        if (why && why.trim()) answers.reason = why.trim();
+      }
+
+      const remember = inputs.has("__rememberTool") ? inputs.get("__rememberTool")() : null;
+
+      bar.querySelectorAll("button").forEach((x) => { x.disabled = true; });
+
+      const frame = await commandNow("approval-" + crypto.randomUUID(), {
+        kind: "approval.respond",
+        sessionId: current,
+        askId: ask.askId,
+        outcome: spec.outcome,
+        answers,
+        // ⚠️ 只在真的勾了的时候才带上它（不带 = 只这一次）。
+        ...(remember ? { remember } : {}),
+      });
+
+      if (!frame.accepted) {
+        // ⚠️ **失败必须说出来**，而且要说在**这里**（卡片旁边）：时间线上那句会被
+        // 随后的重拉冲掉，用户看到的就是「点了没反应，会话还卡着」。
+        const err = document.createElement("div");
+        err.className = "note bad";
+        err.textContent = "没成功：" + (frame.reason || "核心没有回执");
+        bar.appendChild(err);
+        bar.querySelectorAll("button").forEach((x) => { x.disabled = false; });
+        return;
+      }
+
+      // 成功：核心会续跑，事件会回来；重拉一次让卡片立刻消失（不等事件）。
+      openSession(current);
+    };
+
+    bar.appendChild(b);
+  }
+
+  return bar;
+}

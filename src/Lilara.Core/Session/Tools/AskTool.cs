@@ -122,13 +122,51 @@ public sealed class AskTool : ITool
     }
 
     /// <summary>
+    /// 从**落盘的那条 `tool_use`** 里解出这次询问的问题（`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>为什么不能只信内存那份</b>：问题原文本来住在 `SessionHandle.AwaitingInput`
+    /// （内存），而**任何一次「从盘重新载入」都会把它丢掉**——不只是重启
+    /// （实测 2026-10-08：核心重启后打开页面，问题**是空的**）。
+    /// 而它在盘上**本来就有**：那条模型消息必须落盘（否则答完补的 `tool_result` 悬空），
+    /// 参数就在里面。⇒ **从落盘字节重新解一遍**，内存那半就成了缓存而不是真相来源。</para>
+    ///
+    /// <para>⚠️ <b>必须有<b>唯一</b>一份实现</b>：两个调用点——`CommandDispatcher`（渲染答复）
+    /// 与 `ControlServer`（渲染卡片）——各写一份的话，就会出现「页面看得见问题、
+    /// 而回答时说你没答」这种分叉。⚠️ <b>本仓栽过同形的，而这次是同一批里又栽一次</b>：
+    /// 我先只修了 `/state` 那条，回答那条没修，于是实测里答复变成
+    /// 「会话在等待期间重启过，原来那批问题没能保留」——**而问题明明就在盘上**。</para>
+    /// </summary>
+    /// <param name="callId">被挂起的那次调用的协议 id（`PausedAsk.CallId`）。</param>
+    public static IReadOnlyList<AskItem> ItemsOf(
+        Storage.SessionStore store, string projectKey, string sessionId, string callId)
+    {
+        foreach (var e in store.ReadTimeline(projectKey, sessionId))
+        {
+            if (e is not TimelineEvent.MessageEvent m) continue;
+
+            foreach (var b in m.Blocks.OfType<Block.ToolUseBlock>())
+            {
+                // ⚠️ **两条判据都要**：`callId` 对得上（否则会拿到**另一条历史询问**的
+                // 问题，而用户会对着一个已经问过的问题作答），且名字是 `ask`
+                // （闸门那条询问没有工具参数——它的问题是核心自己造的，见 `Gate.AskFor`）。
+                if (!string.Equals(b.CallId, callId, StringComparison.Ordinal)) continue;
+                if (!string.Equals(b.Name, "ask", StringComparison.Ordinal)) return [];
+
+                return Parse(b.Arguments).Items;
+            }
+        }
+
+        return [];
+    }
+
+    /// <summary>
     /// 解析 <c>questions</c>。返回 (问题列表, 错误话)。⚠️ **两个恰有一个非空**。
     ///
     /// <para>⚠️ <b>宽严同 <see cref="ToolArgs"/>：只认它说的话，不猜</b>——
     /// 但这里**多一步「说清哪里不对」**：`ToolArgs` 只回答「取到值了吗」，
     /// 而模型需要知道**改哪个键**。所以它拿的是 `JsonDocument` 自己走。</para>
     /// </summary>
-    private static (IReadOnlyList<AskItem> Items, string? Error) Parse(string argumentsJson)
+    internal static (IReadOnlyList<AskItem> Items, string? Error) Parse(string argumentsJson)
     {
         JsonDocument doc;
         try
