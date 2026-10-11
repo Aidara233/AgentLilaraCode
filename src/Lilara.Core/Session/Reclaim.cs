@@ -143,6 +143,12 @@ public static class Reclaim
     /// <para>⚠️ <b>没有「本应进库却没进」这一档</b>（用户裁定「不留历史包袱，不加额外兜底」）：
     /// 内容够就够了，不够就**不算可回收**，<b>不抛也不补</b>。
     /// 老记录里那些指向缺失对象的行正落在这里。</para>
+    ///
+    /// <para>⚠️ <b>2026-10-11：这里有<b>两条</b>判据了</b>（`01` §11.3 判据轴）——
+    /// ①**距离**（末尾 N 条之外的，上面那个循环）；②**线**（落在已释放作用域里的，
+    /// 见 <see cref="LineCovers"/>）。⚠️ 取**并集**，不是二选一。
+    /// **点杀**（`Reclaim.Stale`）**不在这里**——它要碰文件系统，由
+    /// `TimelineRender.Render` 那条带 `staleProbe` 的重载并进来（这个方法是纯的）。</para>
     /// </summary>
     public static IReadOnlySet<string> Decide(IReadOnlyList<TimelineEvent> timeline, BlobStore blobs)
     {
@@ -158,8 +164,91 @@ public static class Reclaim
             if (Recoverable(r.Content, blobs)) result.Add(r.Id);
         }
 
+        // ---- 第二条判据：线（`01` §12.4）----
+        //
+        // ⚠️ **判据是「这个源被释放过吗」，不是「它在线的哪一侧」。**
+        // 位置那一读法（「最后一条线以下全收」）**不够用，而且会抖**：放第二次线之后，
+        // 第一条线的领地不再被覆盖 ⇒ 那些结果**又变回新鲜** ⇒ 前缀每放一次线抖一次。
+        // 而「释放过就是释放过」是**单调的** ⇒ 回收集合只增不减，前缀只往前走。
+        // ⇒ 把**所有**释放事件的作用域并起来（不是只看最后一条）。
+        foreach (var r in LineCovers(timeline))
+            if (Recoverable(r.Content, blobs)) result.Add(r.Id);
+
         return result;
     }
+
+    /// <summary>
+    /// **线以下、且落在释放集里的那些结果**（`01` §12.4）。
+    ///
+    /// <para>⚠️ <b>两条口径都是刻意的，且都有出处</b>：</para>
+    /// <list type="number">
+    ///   <item><b>「落在释放集里」而不是「在最后一条线以下」</b>——理由见 <see cref="Decide"/>：
+    ///   位置读法会**抖**。⚠️ 而且 §12.4 那句「`< R` ⇒ 简化」的**范围**在文档里本来就
+    ///   **标着待定**（「以下全简化」与「只有释放集里的简化」两读，倾向后者）——
+    ///   这里落的是**后者**，因为前者会把**模型正在用的东西**一起收掉。</item>
+    ///
+    ///   <item><b>没有任何指称（<see cref="TimelineEvent.ToolResultEvent.DependsOn"/> 为空）
+    ///   的结果<b>照样被收</b></b>——它归不到任何一条资源上，而 §12.4 明写释放还要
+    ///   「连带收起**未改动**的文件（工作集整体退场，不留残渣）」。
+    ///   ⇒ 目录清单（`list_dir` 无指纹无引用）落在这一格里。
+    ///   ⚠️ 换句话说：**这里不问「它属于谁」，问「它有没有可能属于别人」**——
+    ///   有指称的按作用域判，没指称的没有更细的判法，按「工作集退场」收。</item>
+    /// </list>
+    ///
+    /// <para>⚠️ <b>匹配是词法前缀，不碰文件系统</b>：模型给的 scope 与 `DependsOn` 都是
+    /// **工作目录相对**的路径，两边同样规范化（反斜杠 → 正斜杠、去尾部分隔符）再比。
+    /// ⇒ 一条形状怪的 scope 只会**什么也匹配不上**（失败方向是收得少，不是收得多）。
+    /// ⚠️ 前缀那一条要求**落在分隔符上**：不加的话 `src-evil/a.cs` 会被判进 `src` ——
+    /// 与 `SessionToolContext.ResolvePath` 和 §12.1 的路径判据是同一条规则。</para>
+    /// </summary>
+    private static IEnumerable<TimelineEvent.ToolResultEvent> LineCovers(IReadOnlyList<TimelineEvent> timeline)
+    {
+        var scope = new List<string>();
+        foreach (var evt in timeline)
+            if (evt is TimelineEvent.ReleaseEvent release)
+                scope.AddRange(release.Scope);
+
+        if (scope.Count == 0) yield break;
+
+        // ⚠️ **只收释放点<b>之前</b>的结果**：一次释放不可能回收它之后才发生的东西
+        //（那时候它还没被读进来）。⇒ 位置在这里仍然有用，只是它管的是「在不在线上」，
+        // 而「属不属于这个作用域」由上面那份集合管。
+        var lastRelease = -1;
+        for (var i = 0; i < timeline.Count; i++)
+            if (timeline[i] is TimelineEvent.ReleaseEvent) lastRelease = i;
+
+        for (var i = 0; i < lastRelease; i++)
+        {
+            if (timeline[i] is not TimelineEvent.ToolResultEvent r) continue;
+            if (InScope(r.DependsOn, scope)) yield return r;
+        }
+    }
+
+    private static bool InScope(string? dependsOn, IReadOnlyList<string> scope)
+    {
+        // 归不到任何资源上 ⇒ 归「工作集整体退场」那一格（理由见上）。
+        if (string.IsNullOrWhiteSpace(dependsOn)) return true;
+
+        var dep = Normalize(dependsOn);
+        foreach (var s in scope)
+        {
+            if (s is null || string.IsNullOrWhiteSpace(s)) continue;
+
+            var prefix = Normalize(s);
+            if (dep.Equals(prefix, StringComparison.Ordinal)) return true;
+            if (dep.StartsWith(prefix + '/', StringComparison.Ordinal)) return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 路径规范化：反斜杠 → 正斜杠、去尾部分隔符。
+    /// ⚠️ 两处写法必须**同一份**——`DependsOn` 由工具写（它已经转成正斜杠，见 `ReadTool`），
+    /// 而 scope 是**模型原样给的**（它可能写 `src\`）。各写一份就会漂，
+    /// 而漂的表现是「释放了一个目录，一条都没收到」——**静默**。
+    /// </summary>
+    private static string Normalize(string path) => path.Replace('\\', '/').TrimEnd('/');
 
     /// <summary>
     /// 注记——**渲染的一个输入，不是记录里的标记**（`01` §8.0.2 四）。

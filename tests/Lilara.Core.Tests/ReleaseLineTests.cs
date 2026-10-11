@@ -1,0 +1,317 @@
+using Lilara.Core.Kernel;
+using Lilara.Core.Protocol;
+using Lilara.Core.Session;
+using Lilara.Core.Session.Tools;
+using Lilara.Core.Storage;
+using Lilara.Core.Tests.Fakes;
+using Block = Lilara.Core.Kernel.Block;
+
+namespace Lilara.Core.Tests;
+
+/// <summary>
+/// **线**（`01` §12.4）——模型说「这批资源我用完了」，核心把这句话记成一条记录，
+/// 而那条记录让**它之前读的东西**不再留在上下文里。
+///
+/// <para>⚠️ <b>这条链在 2026-10-11 之前一次都没通过</b>：`Reclaim.Decide` 只有
+/// 「最近 N 条之外」一条判据，而 §12.4 那一整节是纸上的
+/// （线上的 `claim.release` 只改 `ClaimStore`、**时间线一个字不写**）。</para>
+///
+/// <para>⚠️ <b>断言落在<b>请求</b>上，不落在盘面上</b>——回收只换渲染、记录一字不动
+/// （`01` §8.0.2 一 / 八）。同 `StepLagTests` / `StaleTests` 那条纪律。</para>
+/// </summary>
+public class ReleaseLineTests : IDisposable
+{
+    private readonly string _tmp = Path.Combine(Path.GetTempPath(), "lilara-line-" + Guid.NewGuid().ToString("N"));
+    private readonly string _work;
+    private readonly SessionStore _store;
+    private readonly FakeAdapter _adapter = new();
+    private readonly Stepper _stepper;
+    private readonly SessionHandle _handle;
+
+    public ReleaseLineTests()
+    {
+        _work = Path.Combine(_tmp, "work");
+        Directory.CreateDirectory(_work);
+
+        _store = new SessionStore(Path.Combine(_tmp, "data"));
+        _stepper = new Stepper(_store, _adapter, BuiltInTools.All);
+
+        // ⚠️ 测试的脚手架，不是被测物（同 `StaleTests`）：这里要的是结果真的落下来。
+        _handle = SessionHandle.Create(_store, _work, Model());
+        _handle.UpdateStateAndPersist(_store, s => s with
+        {
+            Axes = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal)
+            {
+                [Axes.Permission] = "authorized",
+            },
+        }, diskStatus: SessionStatus.Idle);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tmp)) Directory.Delete(_tmp, recursive: true);
+    }
+
+    private static ModelSelection Model() => new()
+    {
+        ProviderId = "p", ModelId = "m", Protocol = Protocols.ClaudeMessages, Effort = "high", MaxTokens = 1000,
+    };
+
+    private static string TextOf(TimelineEvent e) =>
+        string.Concat(((TimelineEvent.ToolResultEvent)e).Content.OfType<Block.TextBlock>().Select(b => b.Text));
+
+    private static Block.ToolUseBlock ReadOf(string callId, string path) =>
+        new(callId, "read", System.Text.Json.JsonSerializer.Serialize(new { path }));
+
+    private static Block.ToolUseBlock ReleaseOf(string callId, params string[] scope) =>
+        new(callId, "release", System.Text.Json.JsonSerializer.Serialize(new { scope }));
+
+    private IReadOnlyList<TimelineEvent.ToolResultEvent> Sent() =>
+        [.. _adapter.Calls[^1].Timeline.OfType<TimelineEvent.ToolResultEvent>()];
+
+    /// <summary>
+    /// ⚠️ **本批的核心一条**：读两个文件 → `release` 其中一个 → 下一步的请求里
+    /// **只有那一个**换成了注记，另一个原样。
+    ///
+    /// <para>⚠️ 那一读一放之间**没有任何东西推进保护带**（两条结果而已），
+    /// 所以这条绿**不可能**是「距离」那一档做的——它是线做的。
+    /// 这正是本条与 `StepLagTests` 那条的区别：那里要靠垫 `ProtectedRecentResults` 条结果。</para>
+    /// </summary>
+    [Fact]
+    public async Task ARelease_ReclaimsWhatItCovers_AndOnlyThat()
+    {
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "甲");
+        Directory.CreateDirectory(Path.Combine(_work, "src"));
+        File.WriteAllText(Path.Combine(_work, "src", "b.txt"), "乙");
+
+        // 第 1 步：读两个文件（一个在 src/ 下，一个不在）。
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt"), ReadOf("c2", "src/b.txt")],
+            StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, "看一眼", default);
+
+        var results = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>().ToList();
+        var aId = results.Single(r => r.DependsOn == "a.txt").Id;
+        var bId = results.Single(r => r.DependsOn == "src/b.txt").Id;
+
+        // 第 2 步：说「src 我用完了」。
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReleaseOf("c3", "src")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, [], default);
+
+        // 第 3 步：纯文本 ⇒ 这一趟的请求就是断言对象。
+        _adapter.Reply("好。");
+        await _stepper.StepAsync(_handle, [], default);
+
+        var sent = Sent();
+        Assert.Contains("[已回收]", TextOf(sent.Single(r => r.Id == bId)), StringComparison.Ordinal);
+        Assert.DoesNotContain("[已回收]", TextOf(sent.Single(r => r.Id == aId)), StringComparison.Ordinal);
+        Assert.Contains("甲", TextOf(sent.Single(r => r.Id == aId)), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ **线不是「范围里的都收」，是「范围里<b>且取回得回</b>的才收」**——
+    /// 那条判据（`01` §8.0.2 二）不是可选的：注记上写着 `fetch(id)`，取不回就是一句假话。
+    /// </summary>
+    [Fact]
+    public async Task AReleasedResult_IsStillFetchable()
+    {
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "原来的内容");
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, "看一眼", default);
+
+        var aId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReleaseOf("c3", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, [], default);
+
+        // 模型照注记发出 fetch(id)。
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [new Block.ToolUseBlock("c9", "fetch",
+                System.Text.Json.JsonSerializer.Serialize(new { id = aId }))],
+            StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, [], default);
+
+        _adapter.Reply("好。");
+        await _stepper.StepAsync(_handle, [], default);
+
+        var fetched = _adapter.Calls[^1].Timeline
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => r.CallId == "c9");
+        Assert.Equal("原来的内容", TextOf(fetched));
+    }
+
+    /// <summary>
+    /// ⚠️ **第二次释放必须至少和第一次一样强**——多覆盖，**绝不撤回**已覆盖的。
+    ///
+    /// <para>⚠️ 这条钉的是一个**具体的错法**：把判据写成「**最后一条线**以下全收」。
+    /// 那样放第二次线之后，第一条线的领地不再被覆盖 ⇒ 那批结果**又变新鲜**
+    /// ⇒ 前缀每放一次线抖一次。⇒ 判据是**集合**（释放过就是释放过），不是**位置**。</para>
+    /// </summary>
+    [Fact]
+    public async Task ASecondRelease_NeverUnReclaimsTheFirst()
+    {
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "甲");
+        File.WriteAllText(Path.Combine(_work, "c.txt"), "丙");
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, "看一眼", default);
+
+        var aId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
+
+        // 第一次：释放 a。
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReleaseOf("c2", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, [], default);
+
+        // 中间再读一个别的东西（它**不在**任何作用域里）。
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c3", "c.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, [], default);
+
+        // 第二次：释放 c。⚠️ 注意它**没有**提 a。
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReleaseOf("c4", "c.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, [], default);
+
+        _adapter.Reply("好。");
+        await _stepper.StepAsync(_handle, [], default);
+
+        // ⚠️ **a 那条必须**仍然**在注记形态**——第二次释放没有撤回它。
+        var sent = Sent();
+        Assert.Contains("[已回收]", TextOf(sent.Single(r => r.Id == aId)), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ **前缀那一条必须落在分隔符上**：`src` 不许盖住 `src-evil/`。
+    ///
+    /// <para>与 `SessionToolContext.ResolvePath` 和 `01` §12.1 的路径判据**同一条规则**
+    /// （那里写着同一个例子：不加分隔符，`C:\work-evil` 会被判成在 `C:\work` 之下）。
+    /// ⇒ 少了分隔符，一次「释放 src」会**静默地**把隔壁目录的内容也收掉。</para>
+    /// </summary>
+    [Fact]
+    public async Task AScope_DoesNotCoverASiblingWithTheSamePrefix()
+    {
+        Directory.CreateDirectory(Path.Combine(_work, "src"));
+        File.WriteAllText(Path.Combine(_work, "src", "a.txt"), "甲");
+        Directory.CreateDirectory(Path.Combine(_work, "src-evil"));
+        File.WriteAllText(Path.Combine(_work, "src-evil", "b.txt"), "乙");
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "src/a.txt"), ReadOf("c2", "src-evil/b.txt")],
+            StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, "看一眼", default);
+
+        var results = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>().ToList();
+        var inside = results.Single(r => r.DependsOn == "src/a.txt").Id;
+        var sibling = results.Single(r => r.DependsOn == "src-evil/b.txt").Id;
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReleaseOf("c3", "src")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, [], default);
+
+        _adapter.Reply("好。");
+        await _stepper.StepAsync(_handle, [], default);
+
+        var sent = Sent();
+        Assert.Contains("[已回收]", TextOf(sent.Single(r => r.Id == inside)), StringComparison.Ordinal);
+        Assert.DoesNotContain("[已回收]", TextOf(sent.Single(r => r.Id == sibling)), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ **线本身不进模型看见的那串事件**——它是给我们自己看的锚。
+    /// 那次释放的 `tool_use` 已经在记录里了，再喂一条是多余的字节。
+    ///
+    /// <para>⚠️ 而它**照样在记录里**（下面顺手核一下）——「不动记录」那条纪律的另一半。</para>
+    /// </summary>
+    [Fact]
+    public async Task TheLine_IsInTheRecord_ButNotInWhatTheModelSees()
+    {
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "甲");
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, "看一眼", default);
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReleaseOf("c2", "a.txt", "docs")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, [], default);
+
+        _adapter.Reply("好。");
+        await _stepper.StepAsync(_handle, [], default);
+
+        // 记录里有这条线（判定读的是它）。
+        var recorded = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ReleaseEvent>().Single();
+        Assert.Equal(["a.txt", "docs"], recorded.Scope);
+
+        // 而模型看见的那串事件里没有它。
+        Assert.DoesNotContain(_adapter.Calls[^1].Timeline, e => e is TimelineEvent.ReleaseEvent);
+
+        // ⚠️ 那次调用的结果照常在（配对不因为它是「标记类」工具而破）。
+        Assert.Contains(_adapter.Calls[^1].Timeline,
+            e => e is TimelineEvent.ToolResultEvent { CallId: "c2" });
+    }
+
+    /// <summary>
+    /// ⚠️ **`scope` 给错形状 ⇒ 不画线**（而不是画一条空 scope 的）。
+    ///
+    /// <para>⚠️ 空 scope 的记录**会把所有没有指称的结果都收掉**（那条「归工作集整体退场」
+    /// 的判据）——那是**凭一条坏参数做的全局决定**。⇒ 宁可什么也不做。</para>
+    /// </summary>
+    [Fact]
+    public async Task AMalformedScope_DrawsNoLine()
+    {
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "甲");
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, "看一眼", default);
+
+        // ⚠️ `scope` 是一个**裸字符串**，不是数组——模型真会这么发。
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [new Block.ToolUseBlock("c2", "release", """{"scope":"a.txt"}""")],
+            StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, [], default);
+
+        Assert.Empty(_store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ReleaseEvent>());
+    }
+}

@@ -40,12 +40,20 @@ namespace Lilara.Core.Session.Tools;
 /// 判据是**模型该用哪个**——改一个已存在的文件时，整份写要求它把全文写对，
 /// 而漏一行是**静默**的；定点改动只碰它点到的那段。
 /// ⇒ 两个都留着，靠 `Description` 各自说清适用面（`00` §1.3：谁的知识谁负责）。</para>
+///
+/// <para>⚠️ <b>`release`（2026-10-11）属于<b>同一条判据的另一半</b>，而且是这一列里最纯的一个</b>：
+/// 它连文件都不碰——它做的是**说出一句话**（「这批资源我用完了」），
+/// 而核心把这句话记成一条 <see cref="Kernel.TimelineEvent.ReleaseEvent"/>（线）。
+/// ⇒ 它是 `01` §12.4「按任务边界回收」的**唯一生产者**：在它之前那一整节是纸上的
+/// （线上的 `claim.release` 只改 `ClaimStore`、**时间线一个字不写** ⇒ 事后没有锚可倒查）。
+/// ⚠️ 与 `update` / `write` 的分工：那两个**动工作目录**，这一个**动上下文**——
+/// 而两者都是「核心的加载 / 渲染机制的入口」，同 `fetch` 给的是「模型能看见自己历史」。</para>
 /// </summary>
 public static class BuiltInTools
 {
     public static IReadOnlyList<ITool> All { get; } =
     [
         new ListTool(), new ReadTool(), new FetchTool(), new AskTool(),
-        new UpdateTool(), new WriteTool(),
+        new UpdateTool(), new WriteTool(), new ReleaseTool(),
     ];
 }

@@ -186,7 +186,10 @@ public class WireFormatTests
             .ToArray();
 
         // 探针：反射若换写法、类型搬走，下面那个空断言会假绿。
-        Assert.Equal(2, types.Length);
+        // 2 → 3：`ReleaseEvent`（2026-10-11，线）。⚠️ **这个数不是装饰**——
+        // 它正是「加一个变体要找出所有消费者」那条纪律**第一道**闸：
+        // 数不对，下面的空断言就是**在数错的那一组类型上**跑的。
+        Assert.Equal(3, types.Length);
 
         var root = Path.Combine(RepoRoot(), "src");
         var offenders = Directory.GetFiles(root, "*.cs", SearchOption.AllDirectories)
@@ -198,7 +201,14 @@ public class WireFormatTests
                 var cut = raw.IndexOf("//", StringComparison.Ordinal);
                 return (f, Line: n + 1, Text: cut < 0 ? raw : raw[..cut]);
             }))
-            .Where(x => types.Any(t => x.Text.Contains($"TimelineEvent.{t})", StringComparison.Ordinal)))
+            // ⚠️ **判据是「<b>强转</b>」，所以模式必须写成 <c>(TimelineEvent.X)</c>——那个左括号是判据的一部分。**
+            // （2026-10-11 收紧）原先写的是 `TimelineEvent.X)`，它把**模式匹配**也一起抓了：
+            // `e is not Kernel.TimelineEvent.ReleaseEvent)`（`ControlServer`）与
+            // `timeline[i] is TimelineEvent.ReleaseEvent`（`Reclaim`）都被判成「强转」。
+            // ⚠️ 而那两处**恰好是这条守卫要护的行为**（switch / 模式分派，不是强转）
+            // ⇒ 那条消息（「改用 switch 分派」）会指着**已经用了 switch 分派的代码**骂。
+            // ⚠️ 这不是放宽：真正的强转写法**一定**带那个左括号。
+            .Where(x => types.Any(t => x.Text.Contains($"(TimelineEvent.{t})", StringComparison.Ordinal)))
             .Select(x => $"{Path.GetFileName(x.f)}:{x.Line}  {x.Text.Trim()}")
             .ToList();
 

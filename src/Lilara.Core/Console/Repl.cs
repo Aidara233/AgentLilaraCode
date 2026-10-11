@@ -227,6 +227,15 @@ public sealed class Repl(
                 case TimelineEvent.ToolResultEvent result:
                     _out.WriteLine($"⚒  {ToolResultLine(result)}");
                     break;
+
+                // ⚠️ **线（`01` §12.4）：给人一条看得见的横线。**
+                // 与模型那一侧**刻意不对称**——模型**看不见**它（`TimelineRender.IsRenderable`
+                // 把它挡在渲染之外，那次释放的 `tool_use` 已经在记录里了），
+                // 而**人看得见**：它是「谁在什么时候说这批资源用完了」的唯一痕迹。
+                case TimelineEvent.ReleaseEvent release:
+                    _out.WriteLine($"── ✂ 释放 {string.Join("、", release.Scope)}"
+                        + (release.Summary is { Length: > 0 } s ? $"（{s}）" : "") + " ──");
+                    break;
             }
         }
     }

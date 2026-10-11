@@ -65,6 +65,43 @@ internal static class ToolArgs
             return null;
         }
     }
+
+    /// <summary>
+    /// 取一个**字符串数组**字段（`release` 的 `scope`）。缺失 / 不是数组 / 元素不是字符串 /
+    /// 整段不是 JSON ⇒ <c>null</c>。
+    ///
+    /// <para>⚠️ <b>「元素不是字符串 ⇒ 整份 <c>null</c>」是刻意的</b>，不是偷懒：
+    /// 悄悄跳过坏元素等于**替模型猜**它想释放哪些路径，而猜错的方向是
+    /// **少释放一条**（静默，且它以为自己说了）。⇒ 与 <see cref="Number"/> 同一条纪律：
+    /// 只认它说的话，不猜。</para>
+    ///
+    /// <para>⚠️ 空数组**不是** <c>null</c>：`[]` 是模型明确说的「没有」，而
+    /// <c>null</c> 是「它没给 / 给坏了」。这一格的分法照 `ToolPaths.HasKey`
+    /// 那条注释（`""` 与「缺失」必须分得开），只是这里分的是 `[]` 与 `null`。</para>
+    /// </summary>
+    public static IReadOnlyList<string>? StringArray(string argumentsJson, string key)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(argumentsJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return null;
+            if (!doc.RootElement.TryGetProperty(key, out var v) || v.ValueKind != JsonValueKind.Array)
+                return null;
+
+            var list = new List<string>(v.GetArrayLength());
+            foreach (var item in v.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.String) return null;
+                list.Add(item.GetString()!);
+            }
+
+            return list;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
 }
 
 /// <summary>

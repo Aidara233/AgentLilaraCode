@@ -66,12 +66,11 @@ public static class TimelineRender
         // 框架那一步都是同一份代码**——差别只有「多不多跑点杀」这一个谓词。
         var reclaimed = Reclaim.Decide(raw, blobs);
         var applied = Reclaim.Apply([.. raw.Select(e => Dereference(e, blobs))], reclaimed);
-        return [.. applied.Select(WithFraming)];
+        return [.. applied.Select(WithFraming).Where(IsRenderable)];
     }
 
     /// <summary>
-    /// 同上，但**多一条判据**：被判定为**过时**的结果也换成注记（`01` §11.3 判据轴上的**点杀**）。
-    ///
+    /// 同上，但**多一条判据**：被判定为**过时**的结果也换成注记（`01` §11.3 判据轴上的**点杀**）。    ///
     /// <para>⚠️ <b>它那个参数就是「判定在渲染<b>外</b>算」那条纪律的落点。</b>
     /// 过时判定要**碰文件系统**（重读那个源、重算指纹），而渲染必须是纯的
     /// （`00` §5 铁律 1）——外人在两次渲染之间改了文件，判定就变，**每步破一次前缀**。
@@ -110,8 +109,23 @@ public static class TimelineRender
         }
 
         var applied = Reclaim.Apply([.. raw.Select(e => Dereference(e, blobs))], reclaimed);
-        return [.. applied.Select(WithFraming)];
+        return [.. applied.Select(WithFraming).Where(IsRenderable)];
     }
+
+    /// <summary>
+    /// ⚠️ <b>「这条记录要不要进「现在要用的那串事件」」</b>。
+    ///
+    /// <para>今天只有一种被挡在外面：<see cref="TimelineEvent.ReleaseEvent"/>——
+    /// 它是**给我们自己看的锚**（倒查 / 线的判据），而不是要喂给模型的东西。
+    /// 那次释放的 `tool_use` 已经在记录里了，再喂一条「我释放了 src/」是多余的字节。</para>
+    ///
+    /// <para>⚠️ <b>它挡的是「渲染」，不是「记录」</b>：释放事件照样落盘、照样是判定的输入
+    /// （`Reclaim.Decide` 从**记录**读它）。⇒ 与「回收只换渲染、记录一字不动」同一条纪律。</para>
+    ///
+    /// <para>⚠️ <b>为什么是一个谓词而不是在 `Apply` / `WithFraming` 里各判一次</b>：
+    /// 两条渲染路径（带头尾槽位与不带的）共用它 ⇒ 一处改、两处同。<b>两层判据必须共用一个谓词</b>。</para>
+    /// </summary>
+    private static bool IsRenderable(TimelineEvent evt) => evt is not TimelineEvent.ReleaseEvent;
 
     /// <summary>
     /// 把框架渲染成**一个独立的文本块**，恒定在<span>内容之前</span>（`01` §3.7）。

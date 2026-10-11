@@ -316,7 +316,14 @@ public sealed class ControlServer(
             var highWater = bus.HighWaterMark(EventBus.SessionTopic(id));
 
             // 返回的是当前可渲染的形态（核心渲染，头只显示）；简化机制还没有，这一步是恒等的。
-            var events = SessionQueries.HistoryOf(host, handle);
+            // ⚠️ **线的事件不进这里**（`01` §12.4）：它是给我们自己看的锚（倒查 / 线的判据），
+            // 不是一条要给人看的对话。它照样落盘、照样是判定的输入，而**渲染出来的形态里没有它**
+            // ——与 `TimelineRender.IsRenderable` 同一份判据。
+            // ⚠️ 不挡的话这里会**抛**（下面那个 `_ =>` 分支）：一个会话只要释放过一次，
+            // 头拉历史就当场 500。
+            var events = SessionQueries.HistoryOf(host, handle)
+                .Where(e => e is not Kernel.TimelineEvent.ReleaseEvent)
+                .ToList();
 
             return Results.Json(new
             {

@@ -203,6 +203,19 @@ public sealed class Stepper(
             var batch = await executor.ExecuteAsync(toolCalls, context, ct);
             pending = batch.Pending;
             events.AddRange(batch.Results);
+
+            // ⚠️ **`release` 的线在这里落盘**（`01` §12.4，2026-10-11）：
+            // 它和别的事件**不一样**——工具只跑出一次「成功」，而**记录上要留的那条不是结果**。
+            // ⇒ 它的输出去处与时间点都在这一句上。
+            //
+            // ⚠️ **顺序无关紧要，因为它是判据的输入而不是判据**：真正读它的是
+            // `Reclaim.Decide`，而那个判定发生在**下一次渲染**（`RecordRelease` 先落、
+            // 下一步开始才渲染）。⇒ 把 `release` 调在最后一条也照样收得掉它前面的东西。
+            //
+            // ⚠️ **配对不受影响**：它照样返回一条（空的）结果、照样配那条 `tool_use`——
+            // 「一对不能拆」那条不变量一个字没动，所以这里不新增任何特例。
+            foreach (var release in toolCalls.Where(c => c.Name == ReleaseTool.NameOf))
+                if (RecordRelease(release, at) is { } line) events.Add(line);
         }
 
         // ⚠️ **有问 ⇒ 中止这一步的「执行」，但那条模型消息照样落盘**（`01` §3.8）。
@@ -321,6 +334,38 @@ public sealed class Stepper(
         }
 
         return [];
+    }
+
+    /// <summary>
+    /// 把一次 `release` 调用记成**线**（`01` §12.4）。
+    ///
+    /// <para>⚠️ <b>位置由调用方定，不由这里的 `events` 定</b>——所以它拿的是
+    /// <paramref name="at"/>（步开始那一刻），与那条模型消息同一个时刻。
+    /// 顺序对判定**无关紧要**（见调用点的注释），所以不为了把它塞进某个位置而排序。</para>
+    ///
+    /// <para>⚠️ <b>参数解析失败 ⇒ 不落这条线</b>（返回 <c>null</c>），而不是落一条空 scope 的：
+    /// 一条 scope 为空的记录在判定那边**什么也收不到**（`Reclaim.LineCovers` 会直接返回），
+    /// 所以它不是一个「更弱的线」，是一个**没有意义的记录**——而它会让
+    /// 「记录里有多少条线」这个问题答出一个假数。
+    /// ⚠️ <b>而且判据必须与工具那一侧是同一个</b>：`ReleaseTool` 对同一份坏参数回一句
+    /// 「读不出来」并**什么也不做**——两处各判一次、判出两个结论，正是本仓那个老形状
+    /// （两层判据必须共用一个谓词）。⇒ 这里也走 `ToolArgs.StringArray`，**同一个谓词**。</para>
+    /// </summary>
+    private static TimelineEvent? RecordRelease(Block.ToolUseBlock call, DateTimeOffset at)
+    {
+        var scope = Tools.ToolArgs.StringArray(call.Arguments, "scope");
+
+        // 解析不出来 / 空数组 ⇒ 不画线。⚠️ **失败方向是「什么也不做」**——
+        // 猜一个 scope 会让一次笔误变成一次**静默的大范围回收**。
+        if (scope is null || scope.Count == 0) return null;
+
+        return new TimelineEvent.ReleaseEvent
+        {
+            Id = Ids.New(),
+            At = at,
+            Scope = scope,
+            Summary = Tools.ToolArgs.String(call.Arguments, "summary"),
+        };
     }
 
     /// <summary>

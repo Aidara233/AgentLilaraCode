@@ -13,6 +13,7 @@ public enum Speaker
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "kind")]
 [JsonDerivedType(typeof(MessageEvent), "message")]
 [JsonDerivedType(typeof(ToolResultEvent), "toolResult")]
+[JsonDerivedType(typeof(ReleaseEvent), "release")]
 public abstract record TimelineEvent
 {
     /// <summary>
@@ -148,6 +149,55 @@ public abstract record TimelineEvent
         /// 合并之后，「同一个对象被两条记录依赖」这件事就表达不出来了。</para>
         /// </summary>
         public string? Fingerprint { get; init; }
+    }
+
+    /// <summary>
+    /// **画一条线**——`01` §12.4 那个「线」的落点，也是回收与压缩共用的那个位置标记。
+    ///
+    /// <para>⚠️ <b>它是一个<b>标记</b>，不是一次对话</b>：`release` 是核心特权工具，
+    /// 它**不返回内容**——没有 <c>tool_use</c> 配套的 `tool_result` 正文，也不渲染成任何块。
+    /// §11.2 给压缩写过同一句：「工具结果为空……它的意义在于<b>标记</b>」。</para>
+    ///
+    /// <para>⚠️ <b>为什么它必须落盘，而「哪条被回收了」不落盘</b>（`01` §8.0.2 那张表）：
+    /// <b>注入边界是事实，逐条的判定是派生的</b>。</para>
+    /// <list type="bullet">
+    ///   <item><b>这条线本身</b>⇒ 模型**声明过**「这一批资源我用完了」——那是一件发生过的事，
+    ///   <b>算不回来</b>（要靠它才能倒查到 <c>R</c>）。⇒ 落盘。</item>
+    ///   <item><b>线以下哪几条该换注记</b>⇒ <c>线 + 判据 ⇒ 结论</c>，纯派生。⇒ **不落盘**。</item>
+    /// </list>
+    /// <para>⇒ 判据 8（能派生的就不要持久化）在这里**两半都成立**：派生的那半不落盘，
+    /// 而**位置不是派生值**——它是这件事的原始事实。</para>
+    ///
+    /// <para>⚠️⚠️ <b>它是一条<b>只追加</b>的记录里的一个新判别式 ⇒ 加它是一次单向门。</b>
+    /// 磁盘上一次写过之后，<b>回滚这个类型 = 那个会话永久读不出来</b>（不是读错，是抛）。
+    /// ⇒ 与 `Reclaim.NoteText` 那条纪律同源：**落盘字节的形状，写下去之前要想清楚**。
+    /// 今天它是安全的：没有会话会写它——那个工具是这一批才加的。</para>
+    ///
+    /// <para>⚠️ <b>它不进「现在要用的那串事件」</b>（`TimelineRender.Render` 会把它过滤掉）：
+    /// 它是**给我们自己**看的锚（倒查、线以下的解释），
+    /// 而模型的上下文里已经有那次 `tool_use` 了——再喂一条「我释放了 src/」是多余的字节。
+    /// ⇒ 两个消费者各取所需：**判定**读它（要从**记录**读，不是从渲染读），
+    /// **模型**看不见它。</para>
+    /// </summary>
+    /// <param name="Scope">
+    /// 释放的声明范围（模型报的路径，**原样**——与 `ClaimAcquire` 的 `Scope` 同形）。
+    /// ⚠️ <b>一份还取不到的副本，如实说</b>：模型的 `tool_use` 参数里同样有它，
+    /// 而今天**没有任何代码去读这里这一份**（判据 8：能派生的就不要持久化）。
+    /// 留着它的理由是**这一条记录的语义要自洽**：一条只说「这个时刻画了一条线」
+    /// 而没有「画在哪些资源上」的锚，日后要回答「这次释放到底覆盖了什么」就只剩
+    /// 「去翻那条 `tool_use` 的参数」——而那是**跨事件反查**，不是本条记录的自述。
+    /// ⇒ 将来要么读它、要么删它，**别假装它在跑**。
+    /// </param>
+    /// <param name="Summary">
+    /// 可空：§12.4 的 `release(scope, summary)` 里那个 `summary`。
+    /// `null` = 这次释放不给摘要（今天的工具不填它）。
+    /// ⚠️ 它**不是**压缩记录——线下放**摘要**是另一条产物（§11.1 那张产物表）。
+    /// </param>
+    public sealed record ReleaseEvent : TimelineEvent
+    {
+        public required IReadOnlyList<string> Scope { get; init; }
+
+        public string? Summary { get; init; }
     }
 
     // 稳定序列化入口。参数类型必须是 TimelineEvent（基类），不能写成泛型 T——
