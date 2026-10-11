@@ -1499,10 +1499,8 @@ function handleEvent(p) {
     // ⚠️ **询问**（`01` §3.8）。它同时投 `approvals` 与会话流 ⇒ 这里收到的是**一条**
     // （两次投递落在**两个不同的 topic** 上，而 `subscribe` 是每 topic 一条连接）。
     //
-    // ⚠️ **本轮只做到「看得见」**：列表上标出来、时间线上画一行。
-    // **回答的 UI 还没做**（那要一颗卡片：多问 + 混合类型 + 改写参数 + remember 两档），
-    // 而它今天**不该被半个实现顶替**——一个只能填第一个问题的表单比没有更坏。
-    // ⇒ 现在的回答途径是控制台：`approval allow <会话> <askId>`（`askId` 印在这一行里）。
+    // ⚠️ 回答的 UI **已经有了**（见 `renderAsk` / `askButtons`）：多问 + 混合类型 +
+    // 改写参数 + remember 两档。这里只负责把列表上那颗徽标点亮、并重拉一次。
     case "approval.requested":
       {
         // ⚠️ **`askKind`**（2026-10-11 改）——字段名曾经是 `askKindName`，因为那时它是
@@ -1798,8 +1796,15 @@ function renderAsk(state) {
   }
 
   box.appendChild(askButtons([
-    { label: "批准", outcome: "submit", why: "批准这次调用（下一步它就会执行）" },
-    { label: "拒绝", outcome: "submit", deny: true, why: "拒绝，并把理由告诉模型" },
+    // ⚠️ **`decision` 是必须的**（2026-10-11 修）。核心判「批没批」的唯一依据是
+    // `answers.decision === "allow"`，而这里原先**一颗按钮都不发它** ⇒
+    // 点「批准」落成的是「用户拒绝了这次调用」（`Reply` 里那条 `!approved` 分支），
+    // 而点「拒绝」多塞一个 `reason` ⇒ 两颗按钮发出去的东西**除了理由之外一模一样**。
+    // 控制台一直是对的（`approval allow` 塞 `decision:"allow"`）——漂的只有头这一侧，
+    // 而它**不报错**，只是每次都把用户的批准记成拒绝。
+    // ⇒ 判据（`01` §3.8）：两层判据必须共用一个谓词。
+    { label: "批准", outcome: "submit", decision: "allow", why: "批准这次调用（下一步它就会执行）" },
+    { label: "拒绝", outcome: "submit", decision: "deny", deny: true, why: "拒绝，并把理由告诉模型" },
     { label: "作废", outcome: "cancel", why: "这次询问整个作废，模型重新发起" },
   ], ask, inputs));
 }
@@ -1911,6 +1916,11 @@ function askButtons(specs, ask, inputs) {
         if (v && typeof v === "object") Object.assign(answers, v);
         else if (typeof v === "string" && v.length > 0) answers[id] = v;
       }
+
+      // ⚠️ **授权卡要有 `decision`**（2026-10-11 修）：核心只看这一个键。
+      // ⚠️ 放在 `reason` **之前**塞——控制台也是这个次序，而 `reason` 是拒绝时
+      // 才补的一格，两者不冲突（`decision` 说「批没批」，`reason` 说「为什么不批」）。
+      if (spec.decision) answers.decision = spec.decision;
 
       // 拒绝时带上理由（可选）。⚠️ 理由会**落进记录**并回给模型——
       // 它比「档位不允许」有用得多（模型据此知道别再重试）。

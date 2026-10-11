@@ -151,7 +151,7 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("session interrupt ", StringComparison.Ordinal))
             return (new CoreCommand.SessionInterrupt(trimmed["session interrupt ".Length..].Trim()), null);
 
-        // `session configure <id> [--provider <pid>] [--model <m>]`——改绑供应商 / 换模型。
+        // `session configure <id> [--provider <pid>] [--model <m>] [--ask-timeout <分钟>]`——改绑供应商 / 换模型。
         // 标志风格与 `provider set` 一致（同为「可空 = 保留」语义，手感该一样）。
         if (trimmed.StartsWith("session configure ", StringComparison.Ordinal))
             return ParseSessionConfigure(trimmed);
@@ -208,9 +208,9 @@ public static class CoreCommandParser
             || string.Equals(trimmed, "session", StringComparison.OrdinalIgnoreCase)
             || string.Equals(trimmed, "preset", StringComparison.OrdinalIgnoreCase))
             return (null, "用法：provider list | provider set <id> … | provider delete <id> | provider test <id>"
-                + "\n      session list | session create [--cwd <目录>] [--title <名>] [--preset <id>]"
+                + "\n      session list | session create [--cwd <目录>] [--title <名>] [--preset <id>] [--ask-timeout <分钟>]"
                 + " | session activate <id> | session interrupt <id>"
-                + "\n      session configure <id> [--provider <pid>] [--model <m>]"
+                + "\n      session configure <id> [--provider <pid>] [--model <m>] [--ask-timeout <分钟>]"
                 + "\n      session deactivate <id> | session archive <id> [--unarchive] | session delete <id>"
                 + " | session gc <id>"
                 + "\n      preset list | preset set <id> <内容> | preset delete <id>");
@@ -224,7 +224,7 @@ public static class CoreCommandParser
 
         // 光一个 `session configure` 不能落回「当成消息」——用户以为在改绑，实际烧了一次模型调用。
         if (string.Equals(trimmed, "session configure", StringComparison.Ordinal))
-            return (null, "用法：session configure <会话 id> [--provider <pid>] [--model <m>]");
+            return (null, "用法：session configure <会话 id> [--provider <pid>] [--model <m>] [--ask-timeout <分钟>]");
 
         // ⚠️ **光杆的销毁动词同样不能落回「当成消息」**：`session delete` 若被当成消息发出去，
         // 用户以为删了，而**会话还在、还烧了一次模型调用**。三条各给各的用法。
@@ -417,7 +417,7 @@ public static class CoreCommandParser
         return (new CoreCommand.ApprovalRespond(session, askId, outcome, answers, remember), null);
     }
 
-    // `session create [--cwd <目录>] [--title <名>] [--preset <id>]`
+    // `session create [--cwd <目录>] [--title <名>] [--preset <id>] [--ask-timeout <分钟>]`
     //
     // ⚠️ **光杆的 `session create` 必须继续成立**（今天控制台的默认手感），
     // 所以这个解析器**不用通用的标志循环**：词数为 2 就是「什么都不给」，直接返回。
@@ -433,6 +433,7 @@ public static class CoreCommandParser
         if (parts.Length == 2) return (new CoreCommand.SessionCreate(), null);
 
         string? cwd = null, title = null, preset = null;
+        double? askTimeout = null;
 
         for (var i = 2; i < parts.Length; i += 2)
         {
@@ -449,13 +450,27 @@ public static class CoreCommandParser
                 case "--title": title = value; break;
                 case "--preset": preset = value; break;
 
+                // ⚠️ **解析成数字在这一层做**，因为「不是数字」是一条**文本**错误
+                // （控制台能把它说成人话）；而「<= 0」那条判据住在命令层，与线上共用。
+                case "--ask-timeout":
+                    if (!double.TryParse(value, System.Globalization.NumberStyles.Float,
+                            System.Globalization.CultureInfo.InvariantCulture, out var mins))
+                    {
+                        return (null, $"`--ask-timeout` 要一个分钟数（给的是 '{value}'）。");
+                    }
+                    askTimeout = mins;
+                    break;
+
                 // 未知标志必须拒绝：拼错的 --cwd 会被静默吞掉、照常建出一个会话，
                 // 而它**落在了核心的工作目录**而不是用户想要的地方。
                 default: return (null, $"未知参数 '{parts[i]}'。");
             }
         }
 
-        return (new CoreCommand.SessionCreate { Cwd = cwd, Title = title, Preset = preset }, null);
+        return (new CoreCommand.SessionCreate
+        {
+            Cwd = cwd, Title = title, Preset = preset, AskTimeoutMinutes = askTimeout,
+        }, null);
     }
 
     // `preset set <id> <内容>` / `preset delete <id>` / `preset list`
@@ -587,7 +602,7 @@ public static class CoreCommandParser
             : (null, "用法：provider test <id>");
     }
 
-    // `session configure <会话 id> [--provider <pid>] [--model <m>]`
+    // `session configure <会话 id> [--provider <pid>] [--model <m>] [--ask-timeout <分钟>]`
     // 只管拆词：省略某个标志 ⇒ null，语义是「保留旧值」（与 `provider set` 逐字同构）。
     // 「两个都没给 ⇒ 拒」的守卫在 dispatcher，不在这里——线上也要吃同一条。
     private static (CoreCommand?, string?) ParseSessionConfigure(string line)
@@ -596,6 +611,7 @@ public static class CoreCommandParser
         var sessionId = parts[2];
 
         string? provider = null, model = null;
+        double? askTimeout = null;
 
         // 从 3 起每次跳两格（标志与值成对；parts[1] == "configure"）。
         for (var i = 3; i < parts.Length; i += 2)
@@ -612,11 +628,22 @@ public static class CoreCommandParser
                 case "--provider": provider = value; break;
                 case "--model": model = value; break;
 
+                // 同 `ParseSessionCreate` 的 `--ask-timeout`：数字在这一层解析（文本错误说人话），
+                // 「<= 0」那条判据住在命令层、与线上共用。
+                case "--ask-timeout":
+                    if (!double.TryParse(value, System.Globalization.NumberStyles.Float,
+                            System.Globalization.CultureInfo.InvariantCulture, out var mins))
+                    {
+                        return (null, $"`--ask-timeout` 要一个分钟数（给的是 '{value}'）。");
+                    }
+                    askTimeout = mins;
+                    break;
+
                 // 未知标志必须拒绝：拼错的 --provder 会被静默吞掉、照常回 ✓，改绑**没发生**而用户以为发生了。
                 default: return (null, $"未知参数 '{parts[i]}'。");
             }
         }
 
-        return (new CoreCommand.SessionConfigure(sessionId, provider, model), null);
+        return (new CoreCommand.SessionConfigure(sessionId, provider, model, askTimeout), null);
     }
 }

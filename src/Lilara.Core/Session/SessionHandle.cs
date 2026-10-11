@@ -184,7 +184,7 @@ public sealed record SessionHandle
     /// </param>
     public static SessionHandle Create(
         SessionStore store, string workingDirectory, ModelSelection model, string? title = null,
-        string? systemPromptPreset = null, string? sessionId = null)
+        string? systemPromptPreset = null, string? sessionId = null, TimeSpan? askTimeout = null)
     {
         // ⚠️ **一次取绝对路径，三处共用同一个值**：算 key、写 spec、定目录。
         // 改之前是**两次独立的** `GetFullPath`（`ProjectKey.FromPath` 内部一次、
@@ -208,6 +208,10 @@ public sealed record SessionHandle
             // 同上：`null` = 没指定 ⇒ 渲染时跟随全局默认（`CorePrompts.DefaultPreset`）。
             // ⚠️ **这里不校验那个预设文件存不存在**（理由见 `SessionCreate.Preset` 的注释）。
             SystemPromptPreset = systemPromptPreset,
+            // ⚠️ `null` = **不超时**（默认）。给值 ⇒ 挂起时算出 `DeadlineAt`（`Stepper.DeadlineOf`）。
+            // ⚠️ 合法性的判据住在命令层（`session.create` / `session.configure` 拒 `<= 0`），
+            // 这里**不再判一次**——两处判据就是漂的温床（`01` §8.0.2 那条老毛病）。
+            AskTimeout = askTimeout,
         };
         var state = new SessionState
         {

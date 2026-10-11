@@ -38,7 +38,31 @@ public class AskTests : IDisposable
 
     public void Dispose()
     {
-        if (Directory.Exists(_tmp)) Directory.Delete(_tmp, recursive: true);
+        // ⚠️ **删临时目录是「尽力而为」，不许把已经通过的测试判红**（2026-10-11 修）。
+        //
+        // <para>⚠️ <b>实测的失败长这样</b>（约 1/10 次全量跑会撞上，而单独跑这个类 10 次全绿）：
+        // <c>System.IO.IOException : The process cannot access the file 'history.jsonl'
+        // because it is being used by another process.</c>，栈顶是**本方法的 `Directory.Delete`**。
+        // 断言早已跑完并且通过了——红的是**拆卸**。</para>
+        //
+        // <para>⚠️ <b>根因是这一批测的那条路本身</b>：`approval.respond` 之后那一步走的是
+        // **fire-and-forget 的 `Task.Run`**（`01` §3.8：答复那条路不阻塞调用方），
+        // 而测试**没法 await 它**（`DispatcherFor` 造的是新 `Stepper`，没有完成信号）。
+        // ⇒ 测试结束时那个后台步可能还攥着 `history.jsonl`。
+        // <b>这不是可以「修好」的东西</b>——要把它变成可等待的，就得给生产代码加一个
+        // 只为测试存在的完成信号。</para>
+        //
+        // ⚠️ 重试几次再放弃：多数情况下那个步几十毫秒内就写完了。
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                if (Directory.Exists(_tmp)) Directory.Delete(_tmp, recursive: true);
+                return;
+            }
+            catch (IOException) { Thread.Sleep(50); }
+            catch (UnauthorizedAccessException) { Thread.Sleep(50); }
+        }
     }
 
     /// <summary>一个**会记数**的写类工具。⚠️ 计数器就是「它到底跑没跑」的判据。</summary>
@@ -171,6 +195,48 @@ public class AskTests : IDisposable
     // ---- 二、超时 ----
 
     /// <summary>
+    /// **`spec.AskTimeout` 真的算出截止时刻**（`01` §3.8 / D4）。
+    ///
+    /// <para>⚠️ <b>这一格原先「全都建好了」而没有任何入口</b>：字段、`DeadlineOf`、
+    /// 盘面自证那条路都在，而 `session.create` / `session.configure` 都不收它
+    /// ⇒ 这条路径**走不通**，而它正是「无人看管的会话撞上要授权的东西」的答案。</para>
+    ///
+    /// <para>⚠️ 判据是**挂起之后盘上那个 `DeadlineAt`**，不是「spec 里存了个值」——
+    /// 存了而没用上，与没存对用户是同一件事。</para>
+    /// </summary>
+    [Fact]
+    public async Task AskTimeout_ProducesADeadlineOnThePause()
+    {
+        var handle = SessionHandle.Create(
+            _store, _work, Model(), sessionId: "s-ask-to", askTimeout: TimeSpan.FromMinutes(5));
+
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", "{}")));
+        var before = CoreClock.Now();
+
+        await StepperWith(_store, _adapter, [new CountingWriter()])
+            .StepAsync(handle, "go", CancellationToken.None);
+
+        var deadline = _store.ReadState(handle.ProjectKey, handle.SessionId).Ask!.DeadlineAt;
+        Assert.NotNull(deadline);
+        // ⚠️ 5 分钟**之后**——不早不晚（给个区间是因为这一步本身要花点时间）。
+        Assert.InRange(deadline!.Value, before.AddMinutes(5), CoreClock.Now().AddMinutes(5));
+    }
+
+    /// <summary>不给 ⇒ **不超时**（`null`）。⚠️ 它是**默认**，不是「漏了」。</summary>
+    [Fact]
+    public async Task NoAskTimeout_LeavesTheDeadlineNull()
+    {
+        var handle = NewSession();      // `NewSession` 不传 askTimeout
+
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", "{}")));
+
+        await StepperWith(_store, _adapter, [new CountingWriter()])
+            .StepAsync(handle, "go", CancellationToken.None);
+
+        Assert.Null(_store.ReadState(handle.ProjectKey, handle.SessionId).Ask!.DeadlineAt);
+    }
+
+    /// <summary>
     /// **超时是盘面自证，不是定时器**（`01` §3.8）：过了 `deadlineAt` 之后再答复，
     /// 答案**不被采用**，按超时合成。⚠️ 授权超时 = **拒绝**（用户裁定）。
     /// </summary>
@@ -266,15 +332,78 @@ public class AskTests : IDisposable
     }
 
     /// <summary>
-    /// ⚠️ **参数哈希只哈希原文**：先解析再序列化会让键序不同的两段撞成同一个哈希，
-    /// 于是用户批的这一条**替另一条放行**。
+    /// **键序不同 = 同一个请求**（`01` §3.8）。⚠️ <b>真模型实测逼出来的</b>（2026-10-11）：
+    /// 同一个 `update` 调用，模型第一次发 <c>{"path":…,"old":…,"new":…}</c>、
+    /// 重发时发 <c>{"new":…,"old":…,"path":…}</c> ⇒ 按原文哈希是两个指纹
+    /// ⇒ 用户批的那一次**不生效** ⇒ 又挂起 ⇒ 活锁（被 `MaxConsecutiveToolSteps` 兜住，
+    /// 而用户看到的是「批了又弹、批了又弹」）。
+    ///
+    /// <para>⚠️ <b>这条测试占的正是原先那条 <c>HashArgs_IsByteExact_NotStructural</c> 的位置</b>
+    /// ——它断言的是**相反的行为**（`NotEqual`），而它错了：JSON 对象无序，
+    /// 倒键序就是同一个请求。整条换掉，理由见 `ApprovalStore.HashArgs`。</para>
     /// </summary>
     [Fact]
-    public void HashArgs_IsByteExact_NotStructural()
+    public void HashArgs_IgnoresKeyOrder()
+    {
+        Assert.Equal(
+            ApprovalStore.HashArgs("""{"a":1,"b":2}"""),
+            ApprovalStore.HashArgs("""{"b":2,"a":1}"""));
+    }
+
+    /// <summary>空白不是语义 ⇒ 同一份参数写成两行也算同一次。</summary>
+    [Fact]
+    public void HashArgs_IgnoresWhitespace()
+    {
+        Assert.Equal(
+            ApprovalStore.HashArgs("""{"a":1,"b":2}"""),
+            ApprovalStore.HashArgs("{ \"a\" : 1,\n  \"b\" : 2 }"));
+    }
+
+    /// <summary>
+    /// ⚠️ <b>值真的不同 ⇒ 指纹必须不同</b>——这条钉的是「规范化没有规范过头」。
+    /// 用户批 <c>{"a":1,"b":2}</c> **不该**替 <c>{"a":1,"b":3}</c> 放行。
+    /// </summary>
+    [Fact]
+    public void HashArgs_StillSeparatesDifferentValues()
     {
         Assert.NotEqual(
             ApprovalStore.HashArgs("""{"a":1,"b":2}"""),
-            ApprovalStore.HashArgs("""{"b":2,"a":1}"""));
+            ApprovalStore.HashArgs("""{"a":1,"b":3}"""));
+
+        // ⚠️ **嵌套**也要排到：键序那个洞在顶层看不出来。
+        Assert.Equal(
+            ApprovalStore.HashArgs("""{"o":{"a":1,"b":2}}"""),
+            ApprovalStore.HashArgs("""{"o":{"b":2,"a":1}}"""));
+        Assert.NotEqual(
+            ApprovalStore.HashArgs("""{"o":{"a":1}}"""),
+            ApprovalStore.HashArgs("""{"o":{"a":2}}"""));
+    }
+
+    /// <summary>
+    /// ⚠️ **数组保序**：`["a","b"]` 与 `["b","a"]` 是两个不同的参数——
+    /// 排序数组会是一次**真的放错了行**（「先删 A 再删 B」变成反过来）。
+    /// </summary>
+    [Fact]
+    public void HashArgs_KeepsArrayOrder()
+    {
+        Assert.NotEqual(
+            ApprovalStore.HashArgs("""{"paths":["a","b"]}"""),
+            ApprovalStore.HashArgs("""{"paths":["b","a"]}"""));
+    }
+
+    /// <summary>
+    /// ⚠️ **坏 JSON 退回哈希原文**，而且**两串不同的坏 JSON 不许撞**——
+    /// 压成一个会让一次写坏的参数**冒充**另一个。
+    /// </summary>
+    [Fact]
+    public void HashArgs_OnInvalidJson_FallsBackToRawAndStaysDistinct()
+    {
+        Assert.NotEqual(
+            ApprovalStore.HashArgs("not json"),
+            ApprovalStore.HashArgs("also not json"));
+
+        // 同一串坏 JSON 照样稳定（幂等）——两次算出来必须一样，否则记忆根本存不住。
+        Assert.Equal(ApprovalStore.HashArgs("not json"), ApprovalStore.HashArgs("not json"));
     }
 
     /// <summary>
@@ -463,6 +592,237 @@ public class AskTests : IDisposable
         Assert.Contains(ToolLimits.MaxAskItems.ToString(), ((Block.TextBlock)outcome.Content[0]).Text);
     }
 
+    // ---- 五之补：三个接缝缺陷的回归（2026-10-11）----
+    //
+    // ⚠️ **这三条都是「`dotnet test` 全绿时躺着」的**：链路的机制全对，
+    // 错的是**它们之间的接缝**——正是 `01` §3.8 末尾那句「接缝只有 E2E 碰得到」。
+    // 它们现在各有一条测试钉着。
+
+    /// <summary>
+    /// **闸门那条链终于在生产里有生产者了**（`01` §3.5 那两格「问」）。
+    ///
+    /// <para>⚠️ <b>这条用的是真 <see cref="UpdateTool"/>，不是替身</b>——本文件其余地方
+    /// 用的 `CountingWriter` 是**探针**，它证明得了「闸门会问」，证明不了
+    /// 「那个被问的东西是核心真有的那个工具」。而这一批要的正是后者：
+    /// 在 `update` 之前，四个内建全只读 ⇒ `Gate.Decide` **从没返回过 `Ask`**。</para>
+    ///
+    /// <para>⚠️ 三档一起钉（`standard` 问 / `authorized` 放行 / `readonly` 拒）：
+    /// 只钉一档的话，「`update` 的类别被改错了」这件事在另外两档上照样绿。</para>
+    /// </summary>
+    [Fact]
+    public async Task TheGateChain_IsReachableWithTheRealUpdateTool()
+    {
+        var work = Path.Combine(_tmp, "gate-work");
+        Directory.CreateDirectory(work);
+        File.WriteAllText(Path.Combine(work, "a.txt"), "hello\n");
+
+        var call = """{"path":"a.txt","old":"hello","new":"hi"}""";
+        var blobs = new BlobStore(_store.DataRoot);
+        var ctx = new SessionToolContext(work, blobs);
+
+        // ① standard ⇒ **问**（挂起，一条都不跑）。
+        var asked = await new ToolExecutor([new UpdateTool()], blobs, "standard")
+            .ExecuteAsync([new Block.ToolUseBlock("c1", "update", call)], ctx, CancellationToken.None);
+        Assert.NotNull(asked.Pending);
+        Assert.Equal(AskKind.Permission, asked.Pending!.Kind);
+        Assert.Empty(asked.Results);
+
+        // ② authorized ⇒ **放行，而且真的改了盘**。
+        var ran = await new ToolExecutor([new UpdateTool()], blobs, "authorized")
+            .ExecuteAsync([new Block.ToolUseBlock("c2", "update", call)], ctx, CancellationToken.None);
+        Assert.Null(ran.Pending);
+        Assert.Single(ran.Results);
+        Assert.Equal("hi\n", File.ReadAllText(Path.Combine(work, "a.txt")));
+
+        // ③ readonly ⇒ **拒**（落一条说得清的结果，且盘上没变）。
+        File.WriteAllText(Path.Combine(work, "a.txt"), "hello\n");
+        var denied = await new ToolExecutor([new UpdateTool()], blobs, "readonly")
+            .ExecuteAsync([new Block.ToolUseBlock("c3", "update", call)], ctx, CancellationToken.None);
+        Assert.Null(denied.Pending);                 // ⚠️ 拒**不挂起**（挂起 = 要问）
+        Assert.Single(denied.Results);
+        Assert.Equal("hello\n", File.ReadAllText(Path.Combine(work, "a.txt")));
+    }
+
+    // ⚠️ **下面这三条都是「`dotnet test` 全绿时躺着」的**：链路的机制全对，
+    // 错的是**它们之间的接缝**——正是 `01` §3.8 末尾那句「接缝只有 E2E 碰得到」。
+
+    /// <summary>
+    /// **D3：头与控制台必须发同一种东西**（`01` §3.8「两层判据共用一个谓词」）。
+    ///
+    /// <para>⚠️ <b>这条是反向的：它先钉住今天的错</b>。缺陷是——核心判「批没批」
+    /// 只看 `answers.decision`，而头的「批准」按钮**一颗都不发它**
+    /// （控制台一直发 `decision:"allow"`）。⇒ 在头上点「批准」，落成的是
+    /// **「用户拒绝了这次调用」**。</para>
+    ///
+    /// <para>⚠️ 判据用**头真发的那种载荷**（`{outcome:"submit"}` + 没有 `decision`），
+    /// 断言它**不许**被当成批准——真批准由控制台那种形状（带 `decision`）证明（见上一条测试）。</para>
+    /// </summary>
+    [Fact]
+    public async Task Decide_TheHeadShapeAloneIsNotAnApproval()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", "{}")));
+
+        await StepperWith(_store, _adapter, [writer]).StepAsync(handle, "go", CancellationToken.None);
+
+        var (dispatcher, _) = DispatcherFor(handle, writer);
+        await dispatcher.DispatchAsync(
+            // ⚠️ 这就是头**修好之前**发的形状：`outcome` 对、而 `decision` 整个没有。
+            new CoreCommand.ApprovalRespond(handle.SessionId, handle.State.Ask!.AskId, "submit",
+                new Dictionary<string, string> { ["arguments"] = "{}" }),
+            "cmd-1", awaitCompletion: false, CancellationToken.None);
+
+        // 「没点头」的后果是**拒绝**——方向是安全的那一侧（宁可漏放，不可错放）。
+        Assert.Contains("拒绝", LastResultText(handle));
+    }
+
+    /// <summary>
+    /// **D2：批准之后，同一个调用必须真的放行**（否则「批准」是句空话）。
+    ///
+    /// <para>⚠️ <b>缺陷的形状是活锁</b>：批准的后果是「下一步带着批准去执行」，
+    /// 而放行的唯一依据是 `ApprovalStore` —— 它原先**只在用户勾了「记住」时才写**。
+    /// ⇒ 批了不勾记住 ⇒ 模型重发 ⇒ 闸门又 `Ask` ⇒ 又挂起，转到熔断为止。</para>
+    ///
+    /// <para>⚠️ <b>判据是「同一个调用第二次进闸门时放行」</b>，而这条只有**跑真闸门**
+    /// 才证得了：断言「store 里有条目」证明的是写进去了，不是**它管事**。</para>
+    /// </summary>
+    [Fact]
+    public async Task Approve_WithoutRemember_StillLetsTheRetryThrough()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", """{"a":1}""")));
+
+        await StepperWith(_store, _adapter, [writer]).StepAsync(handle, "go", CancellationToken.None);
+        Assert.NotNull(handle.State.Ask);
+
+        var (dispatcher, _) = DispatcherFor(handle, writer);
+        await dispatcher.DispatchAsync(
+            // ⚠️ **不传 `Remember`**——「这一次」是默认（`AskMemory` 的注释）。
+            new CoreCommand.ApprovalRespond(handle.SessionId, handle.State.Ask!.AskId, "submit",
+                new Dictionary<string, string> { ["decision"] = "allow" }),
+            "cmd-1", awaitCompletion: false, CancellationToken.None);
+
+        // 模型重发同一条调用 ⇒ 这一次必须**直接跑掉**。
+        var batch = await new ToolExecutor(
+                [writer], new BlobStore(_store.DataRoot), "standard",
+                new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId))
+            .ExecuteAsync([new Block.ToolUseBlock("c1", "write_thing", """{"a":1}""")],
+                new SessionToolContext(_work, new BlobStore(_store.DataRoot)), CancellationToken.None);
+
+        Assert.Null(batch.Pending);          // ⚠️ 不再问
+        Assert.Single(batch.Results);        // 而是真的跑了
+        Assert.Equal(1, writer.Runs);
+    }
+
+    /// <summary>
+    /// **D1：一批里被一起挡下的调用，每一条都要配到结果**（`01` §3.6 ② 配对是结构性的）。
+    ///
+    /// <para>⚠️ <b>缺陷</b>：`PausedAsk` 只装得下一个 `CallId`，而 `ToolExecutor.Merge`
+    /// 把一批里多条被挡下的调用合成**一个**信封 ⇒ 其余几条的 `tool_use` **一直悬着**，
+    /// 而悬空的 `tool_use` 会让**下一条请求 400**（上游原话见 `Stepper.Supersede` 的注释）。</para>
+    ///
+    /// <para>⚠️ <b>判据是「这一批的 `tool_use` 与 `tool_result` 数得一样多」</b>——
+    /// 断言「有一条结果」是不够的（那正是修之前的样子）。</para>
+    /// </summary>
+    [Fact]
+    public async Task Reject_PairsEveryCallThatWasBlockedWithIt()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        // ⚠️ **一批里两条都要问**——这是 `Merge` 的触发条件。
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", """{"a":1}"""), ("c2", "write_thing", """{"b":2}""")));
+
+        await StepperWith(_store, _adapter, [writer]).StepAsync(handle, "go", CancellationToken.None);
+        Assert.NotNull(handle.State.Ask);
+        Assert.Equal(2, handle.AwaitingInput!.Calls.Count);      // 前提：真的挂了两条
+
+        var (dispatcher, _) = DispatcherFor(handle, writer);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ApprovalRespond(handle.SessionId, handle.State.Ask!.AskId, "submit",
+                new Dictionary<string, string> { ["decision"] = "deny" }),
+            "cmd-1", awaitCompletion: false, CancellationToken.None);
+
+        var uses = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.MessageEvent>()
+            .SelectMany(m => m.Blocks.OfType<Block.ToolUseBlock>())
+            .Select(b => b.CallId).OrderBy(x => x, StringComparer.Ordinal).ToList();
+
+        var results = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .Select(r => r.CallId).OrderBy(x => x, StringComparer.Ordinal).ToList();
+
+        // ⚠️ **这条是全部**：两条 `tool_use`，两条 `tool_result`，配对键一一对上。
+        Assert.Equal(uses, results);
+        Assert.Equal(2, results.Count);
+    }
+
+    /// <summary>
+    /// **闸门那条询问的问题，重启之后照样解得出来**（`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>它是跑真模型 + 真重启实测抓出来的</b>（2026-10-11），而单元测试
+    /// 一直碰不到它——因为那条路要「挂起之后重开进程」。而**在此之前它根本不可达**：
+    /// 闸门那两格没有生产者（四个内建全只读），所以 `AskTool.ItemsOf` 里那句
+    /// 「名字不是 `ask` ⇒ 返回空」从来没有害过谁。`update` 一落地它当场露出来。</para>
+    ///
+    /// <para>⚠️ <b>症状</b>：重启之后 `/state` 交出一张**没有问题的卡** ⇒ 头显示
+    /// 「这次询问的问题取不回来了」，而那张**改参数再批准**的卡整个消失——
+    /// 用户只剩「批准 / 拒绝」（`01` §3.8 明确要求那张卡能改参数）。</para>
+    ///
+    /// <para>⚠️ 判据是「**参数原文逐字回得来**」：那张卡的用处就是让用户改参数。</para>
+    /// </summary>
+    [Fact]
+    public void GateAsk_SurvivesARestart_SoTheCardIsNotBlank()
+    {
+        var handle = NewSession();
+        var args = """{"path":"target.txt","old":"world","new":"there"}""";
+
+        // 只落那条模型消息（含 tool_use）——挂起态的**盘面那一半**。
+        _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
+        {
+            Id = Ids.New(),
+            At = CoreClock.Now(),
+            From = Speaker.Model,
+            Blocks = [new Block.ToolUseBlock("c-gate-1", "update", args)],
+        });
+
+        // ⚠️ 这条**只走盘**（没有内存那半）——正是「重启之后」的形状。
+        var items = AskTool.ItemsOf(_store, handle.ProjectKey, handle.SessionId, "c-gate-1");
+
+        Assert.Single(items);
+        Assert.Equal(AskShape.Verbatim, items[0].Shape);
+        // ⚠️ **逐字**：用户要改的就是这段原文，规范化一个空格都会让改写后的参数
+        // 与「原来的」哈希对不上（`ApprovalStore.HashArgs` 那条逐字判据）。
+        Assert.Equal(args, items[0].Fields.Single(f => f.Name == "arguments").Value);
+        Assert.Contains("update", items[0].Question);
+    }
+
+    /// <summary>
+    /// **`ask` 那条路不受影响**：它的问题来自工具参数，仍然由 `Parse` 解。
+    /// ⚠️ 两条路在同一个方法里分叉，所以修闸门那条时**必须同时钉住这一条**
+    /// ——否则「把分叉写反」会让 `ask` 也走闸门那条重建（问句变样、选项全丢）。
+    /// </summary>
+    [Fact]
+    public void AskToolQuestions_StillComeFromTheToolArguments()
+    {
+        var handle = NewSession();
+        var args = """{"questions":[{"id":"q1","question":"用哪个？","type":"choice","options":["A","B"]}]}""";
+
+        _store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
+        {
+            Id = Ids.New(), At = CoreClock.Now(), From = Speaker.Model,
+            Blocks = [new Block.ToolUseBlock("c-ask-1", "ask", args)],
+        });
+
+        var items = AskTool.ItemsOf(_store, handle.ProjectKey, handle.SessionId, "c-ask-1");
+
+        Assert.Single(items);
+        Assert.Equal(AskShape.Choice, items[0].Shape);       // ⚠️ 不是 Verbatim
+        Assert.Equal("用哪个？", items[0].Question);
+        Assert.Equal(2, items[0].Options.Count);             // ⚠️ 选项在
+    }
+
     // ---- 脚手架 ----
 
     /// <summary>
@@ -472,8 +832,7 @@ public class AskTests : IDisposable
     /// 没有脚本时会返回空回复，正好让续跑那一步安静地结束。
     /// </summary>
     private (CommandDispatcher Dispatcher, EventBus Bus) DispatcherFor(
-        SessionHandle handle, params ITool[] tools)
-    {
+        SessionHandle handle, params ITool[] tools)    {
         var bus = new EventBus();
         var host = new CoreHost(_store.DataRoot, _work);
         host.Register(handle);

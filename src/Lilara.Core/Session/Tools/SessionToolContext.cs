@@ -12,7 +12,10 @@ namespace Lilara.Core.Session.Tools;
 /// <param name="workingDirectory">会话的工作目录。⚠️ **必须是绝对路径**——
 /// 相对路径会让 <see cref="ResolvePath"/> 的判据依赖进程的当前目录，而那是全局可变状态
 /// （`SessionHandle.Create` 已保证 spec 里存的是绝对路径）。</param>
-/// <param name="blobs">库。读用（`fetch` 靠它按地址取字节）；**工具没有写库的手**。</param>
+/// <param name="blobs">库。读用（`fetch` 靠它按地址取字节）。
+/// ⚠️ <b>「工具没有写库的手」这句在 2026-10-11 之后要读得准一点</b>：工具仍然**拿不到**
+/// 这个对象，而 <see cref="EnsureStored"/> 给了它一支**专用笔**（存进去、换回一个地址）——
+/// 那是 `update` 保住旧版本用的。本条不是「工具不能写盘」，是「工具不该自己决定快照存哪儿」。</param>
 /// <param name="timeline">**记录**那一份时间线（不是渲染后的形态）。
 /// ⚠️ 取地址必须从**记录**取：回收只换渲染、记录不动（`01` §8.0.2 一 / 八）——
 /// 若拿渲染后的形态去算地址，被回收的那条算出来就是**那段注记**的哈希，`fetch` 当场永久取不回。</param>
@@ -68,6 +71,19 @@ public sealed class SessionToolContext(
     }
 
     public byte[]? ReadBlob(string sha256) => blobs.TryGet(sha256);
+
+    /// <summary>
+    /// 存进库、交回地址。⚠️ <b>见 <see cref="IToolContext.EnsureStored"/> 的注释</b>：
+    /// 这是本类**唯一**会改到东西的方法，而它改的**不是用户的文件**、是库，
+    /// 且内容寻址 ⇒ 幂等 ⇒ 存两次不占两份空间。
+    ///
+    /// <para>⚠️ 本类顶上那句「**它是只读的，而且这件事由类型保证**」说的是
+    /// **工作目录**（工具不该有改盘的手）——那条**没有被这条方法削弱**：
+    /// 工具仍然拿不到 <c>BlobStore</c>，它只能把一个 byte[] 交出去换一个地址回来。
+    /// 真正改盘的那一下（`update` 的 `AtomicFile.Write`）住在工具自己身上，
+    /// 而它拿到的路径来自 <see cref="ResolvePath"/> 那**唯一**一道越界闸。</para>
+    /// </summary>
+    public string EnsureStored(byte[] content) => blobs.Put(content);
 
     /// <summary>
     /// 按记录的稳定 id 取回**当时那串块**。

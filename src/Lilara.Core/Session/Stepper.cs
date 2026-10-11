@@ -288,10 +288,17 @@ public sealed class Stepper(
     /// （见 `AskItem` 的注释：多问是一个信封）。⚠️ 那么另外那些 `tool_use` 呢？
     /// ⇒ **它们会一直悬着**，而悬空的 `tool_use` 会让下一步的请求非法（`01` §3.6）。
     /// 今天的答案：**这条询问的答复落到 <see cref="SessionState.PausedAsk.CallId"/>
-    /// 指的那一条上**，其余的被 `Answer` 里那句「同一批里还有 N 条调用被这次询问挡下了，
-    /// 请重新发起」交代掉——由**模型**去重发。
-    /// ⚠️ 这是本批**认下的代价**，不是设计目标：多条 `tool_use` 共用一个信封是罕见的
-    /// （模型极少一步里连发两个要授权的写操作），而修它要动记法。**别当成已解决。**</para>
+    /// 指的那一条上**，其余的交由 <see cref="Blocked"/> **各补一条结果**
+    /// （拒绝 / 超时 / 作废那三条路），或由 `Answer` 里那句「同一批里还有 N 条调用
+    /// 被这次询问挡下了，请重新发起」交代掉（**批准**那条路）。
+    ///
+    /// <para>⚠️ <b>它曾经是「认下的代价」而现在已经补上一半</b>（2026-10-11）：
+    /// 原先三条收尾**全都**只靠那句话让模型重发 ⇒ 那些 `tool_use` **一直悬着**，
+    /// 而悬空的 `tool_use` 会让下一条请求 400。⇒ 现在「这批不跑了」的三种收尾
+    /// 由 <see cref="Blocked"/> 补齐配对。
+    /// ⚠️ **批准那条仍然只配一条**（它让第一条重发，而其余几条「还没轮到你」
+    /// 没有一个说得清的说法）——那一条**仍是认下的代价**，见 `01` §14 #31。
+    /// **别把这里读成已解决。**</para>
     ///
     /// <para>⚠️ <b>落的是<b>那一刻</b>算好的最终正文</b>——它此后冻结（`DenyReason` 那条
     /// 「理由不能渲染时重算」的判据在这里同样成立）。</para>
@@ -313,6 +320,41 @@ public sealed class Stepper(
         Content = [new Block.TextBlock(text)],
         ArgumentsAmended = amended,
     };
+
+    /// <summary>
+    /// **同一批里被这次询问一起挡下的其余调用，各补一条结果**（`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>为什么必须有它</b>：`PausedAsk` 只装得下一个 `CallId`，而
+    /// `ToolExecutor.Merge` 会把**一批**里多条被挡下的调用合成**一个**信封。
+    /// ⇒ 「一条 `tool_use` 对多条 `tool_result`」在记法上做不出来，
+    /// 于是其余几条的 `tool_use` 一直悬着——而悬空的 `tool_use` 会让
+    /// **下一条请求当场 400**（上游原话：「`tool_use` ids were found without
+    /// `tool_result` blocks immediately after」，`Supersede` 那条注释里记着实测）。</para>
+    ///
+    /// <para>⚠️ <b>`first` 那一格是「跳过几条」</b>：调用方已经用
+    /// <see cref="Answer"/> 给第一条配过了（那是真正的答复），这里从第
+    /// <c>first</c> 条之后开始补。⇒ 两条路**合起来**才凑齐这一批。</para>
+    ///
+    /// <para>⚠️ <b>只用在「这批不跑了」的三种收尾上</b>（拒绝 / 超时 / 作废）——
+    /// 那时「这些调用被一起作废」是**真话**。⚠️ **批准那条路不走这里**：
+    /// 批准只让第一条重发，其余几条的语义是「还没轮到你」，而今天**没有**一个
+    /// 说得清的说法——⇒ 那条路维持原样，如实记在 `01` §14 #31。</para>
+    /// </summary>
+    /// <param name="calls">被挂住的那些调用（`SessionHandle.PendingAsk.Calls`）。</param>
+    /// <param name="first">从第几条之后开始补（调用方已配过的那条不算）。</param>
+    /// <param name="said">写进每一条结果的话（三条收尾各有各的措辞）。</param>
+    public static IReadOnlyList<TimelineEvent.ToolResultEvent> Blocked(
+        IReadOnlyList<Block.ToolUseBlock> calls, int first, string said) =>
+        [.. calls.Skip(first).Select(call => new TimelineEvent.ToolResultEvent
+        {
+            // ⚠️ 一条结果一个稳定 id（同 `Answer` 那条：它不是某一步的产物）。
+            Id = Ids.New(),
+            At = CoreClock.Now(),
+            // ⚠️ **配对键是这条调用自己的 `CallId`**——不是 `paused.CallId`。
+            // 用后者会配到同一条上两次，而真正的悬空那条还是悬着。
+            CallId = call.CallId,
+            Content = [new Block.TextBlock(said)],
+        })];
 
     /// <summary>
     /// **用户没有回答，而是说了别的**（`01` §3.8 的 `Superseded`）。

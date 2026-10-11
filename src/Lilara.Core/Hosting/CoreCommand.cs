@@ -127,6 +127,20 @@ public abstract record CoreCommand
         /// 而它恰恰是最常见的那条（用户还没写呢）。</para>
         /// </summary>
         public string? Preset { get; init; }
+
+        /// <summary>
+        /// **一次询问最多等多久**（分钟，`01` §3.8）。不给 ⇒ `null` = **不超时**（默认）。
+        ///
+        /// <para>⚠️ <b>给的是分钟而不是 <c>TimeSpan</c></b>：线上是 JSON、控制台是命令行，
+        /// 两边都得有一个**人写得出来**的形态。`TimeSpan` 的线上形状（`"00:05:00"`）
+        /// 对两个入口都是负担，而「等多久」这件事的常用单位就是分钟。</para>
+        ///
+        /// <para>⚠️ <b>必须 &gt; 0</b>：<see cref="SessionSpec.AskTimeout"/> 的注释明写
+        /// <c>TimeSpan.Zero</c> 非法（「等 0 分钟」读不出意思）。
+        /// ⇒ 0 或负数在这里就 rejected，**不让它悄悄等于「立刻超时」**
+        /// ——那会让一次写错的参数看起来像「用户故意不让我等」。</para>
+        /// </summary>
+        public double? AskTimeoutMinutes { get; init; }
     }
 
     public sealed record SessionActivate(string SessionId) : CoreCommand;
@@ -157,7 +171,9 @@ public abstract record CoreCommand
     /// <para>⚠️ **不是「命令不合法」的那一类**，除非：会话不存在 / 供应商不存在 / 两个参数都没给。
     /// 「换过去了但那个供应商连不上」是**业务结果**，走 `error` 事件。</para>
     /// </summary>
-    public sealed record SessionConfigure(string SessionId, string? ProviderId, string? ModelId) : CoreCommand;
+    public sealed record SessionConfigure(
+        string SessionId, string? ProviderId, string? ModelId, double? AskTimeoutMinutes = null)
+        : CoreCommand;
 
     /// <summary>
     /// 把会话**摘出内存**。⚠️ **磁盘上什么都没变**——这正是它与

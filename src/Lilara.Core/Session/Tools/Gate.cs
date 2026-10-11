@@ -154,6 +154,39 @@ public static class Gate
         var cls = tool.PermissionClass;
         var current = level is null ? "未知" : Axes.LabelOf(Axes.Permission) + "＝" + level;
 
+        return new AskRequest
+        {
+            Id = Ids.New(),
+            Kind = AskKind.Permission,
+            Items = SecondHalfOf(call, cls, current),
+            // ⚠️ 两档都给，**粗的那档由卡片负责写明**（见 `AskMemory`）。
+            Remember = [AskMemory.Args, AskMemory.Tool],
+        };
+    }
+
+    /// <summary>
+    /// 闸门那条询问的**问题**（`01` §3.8）——「准不准跑这一次，参数可以改」。
+    ///
+    /// <para>⚠️ <b>它被抽出来，是因为它有两个调用点，而它们必须给出**同一张卡**</b>：
+    /// ① <see cref="AskFor"/>（刚挂起时，内存里那份）；
+    /// ② `AskTool.ItemsOf`（**重启之后**，从盘上那条 `tool_use` 重新解）。
+    /// 两处各写一份的话，就会出现「刚挂起时能改参数、重启之后那张卡变成空的」——
+    /// 而那正是本仓那条「两层判据必须共用一个谓词」的形状。</para>
+    ///
+    /// <para>⚠️ <b>为什么「重启之后」也要解得出来</b>：内存那半
+    /// （`SessionHandle.AwaitingInput`）**只在「本进程亲手挂起过」时才在**
+    /// ——任何一次从盘载入都会丢掉它。而闸门这条询问的问题**只有重建得出来的那一半**
+    /// 才活得下去：`Verbatim` 里的参数原文来自<b>落盘的那条 <c>tool_use</c></b>，
+    /// 而**问句本身是从类别现推的**。⇒ 参数原文逐字保真，问句由
+    /// <paramref name="cls"/> / <paramref name="current"/> 重建。
+    /// ⚠️ 判据是：**那张卡对用户仍然有用**（他看得到参数、能改、能批），
+    /// 而不是「他看到的每个字都与当时逐字相同」——后者做不到（类别是工具当时的，
+    /// 而工具表可以在两次载入之间变）。</para>
+    /// </summary>
+    /// <param name="call">那条 `tool_use`（参数原文从这里来）。</param>
+    public static IReadOnlyList<AskItem> SecondHalfOf(
+        Block.ToolUseBlock call, PermissionClass cls, string current)
+    {
         var what = cls switch
         {
             PermissionClass.Writing => "会改动东西",
@@ -161,19 +194,31 @@ public static class Gate
             _ => "需要授权",
         };
 
-        return new AskRequest
-        {
-            Id = Ids.New(),
-            Kind = AskKind.Permission,
-            Items =
-            [
-                AskItem.Verbatim(
-                    "arguments",
-                    $"要跑 `{tool.Name}`（{what}），当前档位（{current}）要求先问你。可以改参数再批准。",
-                    call.Arguments),
-            ],
-            // ⚠️ 两档都给，**粗的那档由卡片负责写明**（见 `AskMemory`）。
-            Remember = [AskMemory.Args, AskMemory.Tool],
-        };
+        return
+        [
+            AskItem.Verbatim(
+                "arguments",
+                $"要跑 `{call.Name}`（{what}），当前档位（{current}）要求先问你。可以改参数再批准。",
+                call.Arguments),
+        ];
     }
+
+    /// <summary>
+    /// 从**落盘的那条调用**重建那张卡——`AskTool.ItemsOf` 重启之后走这条。
+    ///
+    /// <para>⚠️ <b>类别从哪来</b>：优先用**当时那条调用所属的工具**（`tools` 里按名字找），
+    /// 找不到就退回「需要授权」这句不点名的措辞——**不编一个类别**
+    /// （工具表可以在两次载入之间变，而编一个会让用户看到一个假的「它是写入类」）。</para>
+    ///
+    /// <para>⚠️ 档位**用当前的**：`level` 由调用方现读。这与「拒绝理由在执行那一刻冻结」
+    /// （<see cref="DenyReason"/>）**不冲突**——那条说的是**落进记录的**理由不能重算；
+    /// 而这里是一张**问用户的卡**，它本来就该反映此刻的档位（用户要据此判断该不该提权）。</para>
+    /// </summary>
+    public static IReadOnlyList<AskItem> SecondHalfOf(Block.ToolUseBlock call, string? level) =>
+        SecondHalfOf(call, ClassOf(call.Name),
+            level is null ? "未知" : Axes.LabelOf(Axes.Permission) + "＝" + level);
+
+    private static PermissionClass ClassOf(string toolName) =>
+        BuiltInTools.All.FirstOrDefault(t => string.Equals(t.Name, toolName, StringComparison.Ordinal))
+            ?.PermissionClass ?? PermissionClass.Destructive;
 }

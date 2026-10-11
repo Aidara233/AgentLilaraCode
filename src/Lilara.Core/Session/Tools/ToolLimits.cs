@@ -50,4 +50,22 @@ internal static class ToolLimits
     /// 撑爆的是**人的耐心**，不是上下文。</para>
     /// </summary>
     public const int MaxAskItems = 8;
+
+    /// <summary>
+    /// `update` 一次**最多动多大的文件**（`01` §9.3）。
+    ///
+    /// <para>⚠️ **占位值**，理由同上：§9.3 只裁定了「必须有所限制」，没说多少。</para>
+    ///
+    /// <para>⚠️ <b>它与 <see cref="MaxResultBytes"/> 不是同一个上限，别合并</b>：
+    /// 那个管「一次结果**进上下文**多少字节」（读出来给模型看），
+    /// 这个管「一次**写**动多少字节」（改盘上的东西）。
+    /// `update` 把**整个文件**读进内存做匹配，所以这里防的其实是**内存 + 一次全量重写**，
+    /// 而 <see cref="MaxResultBytes"/> 防的是上下文。两者数值相同纯属巧合——
+    /// 将来调其中一个时，**没有理由**跟着调另一个。</para>
+    ///
+    /// <para>⚠️ 超限是**拒绝**，不是「只改一部分」：静默截断会让模型以为改动生效了
+    /// （同 <see cref="MaxDirectoryEntries"/> 那条「截断必须明说」的判据，
+    /// 而这里连「明说」都做不到——写一半的文件是坏的）。</para>
+    /// </summary>
+    public const int MaxUpdateBytes = 256 * 1024;
 }

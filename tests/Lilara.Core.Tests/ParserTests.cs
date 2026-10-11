@@ -428,6 +428,49 @@ public class ParserTests
         Assert.NotNull(err);
     }
 
+    // `--ask-timeout`（`01` §3.8）：给的是**分钟数**，落成 `AskTimeoutMinutes`。
+    // ⚠️ 这一层只把它解析成数字；「必须 > 0」那条判据住在命令层（与线上共用一份）。
+    [Fact]
+    public void SessionCreate_ParsesAskTimeout()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session create --ask-timeout 5");
+
+        Assert.Null(err);
+        var c = Assert.IsType<CoreCommand.SessionCreate>(cmd);
+        Assert.Equal(5, c.AskTimeoutMinutes);
+    }
+
+    // 不给 ⇒ null = **不超时**（默认）。⚠️ 与「给了一个取不出来的值」要分开。
+    [Fact]
+    public void SessionCreate_WithoutAskTimeout_LeavesItNull()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session create --title t");
+
+        Assert.Null(err);
+        Assert.Null(Assert.IsType<CoreCommand.SessionCreate>(cmd).AskTimeoutMinutes);
+    }
+
+    // ⚠️ **不是数字 ⇒ 报错，不许静默当成「没给」**：那会让一次写错的参数
+    // 变成一次「没有上限」的会话，而用户以为自己设了超时。
+    [Fact]
+    public void SessionCreate_WithANonNumericAskTimeout_IsAnError()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session create --ask-timeout 五分钟");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
+
+    // `session configure` 同样收这一格。
+    [Fact]
+    public void SessionConfigure_ParsesAskTimeout()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("session configure s1 --ask-timeout 2.5");
+
+        Assert.Null(err);
+        Assert.Equal(2.5, Assert.IsType<CoreCommand.SessionConfigure>(cmd).AskTimeoutMinutes);
+    }
+
     // 反向对照：词边界。session creates … 必须落回 (null, null)（⇒ 当消息）。
     [Fact]
     public void SessionCreate_NeedsAWordBoundary()

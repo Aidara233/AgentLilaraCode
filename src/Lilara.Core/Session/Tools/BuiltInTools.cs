@@ -26,9 +26,19 @@ namespace Lilara.Core.Session.Tools;
 ///
 /// <para>⚠️ <b>顺序必须确定</b>（工具表在 Claude 协议下位于前缀最前端，
 /// `00` §7 判据 5）：它是一份**字面量数组**，不经过任何容器枚举。</para>
+///
+/// <para>⚠️ <b>`update` 进来了（2026-10-11），而它是第一个<b>写类</b>内建</b>——
+/// 在它之前四个全是只读，于是 `Gate` 那张表的「问」那两格**从来没有生产者**
+/// （只读在所有档位都自动放行）。⇒ 加上它之后，`01` §3.5 的
+/// `| 标准(3) × 写入 = 问 |` 那一格**第一次在生产里可达**。</para>
+///
+/// <para>⚠️ **它仍然属于「机制」那一侧**，判据同上面那条拆读：`update` 给的不是
+/// 「干活的能力」（跑命令、装包、连数据库——那些全在插件那侧），而是
+/// **「模型能改自己的工作目录」这条机制的入口**，与 `ls` / `read` 给的是同一类东西：
+/// 它们合起来才构成「这个核心**能操作**一个工作目录」这件最小的事。</para>
 /// </summary>
 public static class BuiltInTools
 {
     public static IReadOnlyList<ITool> All { get; } =
-        [new ListTool(), new ReadTool(), new FetchTool(), new AskTool()];
+        [new ListTool(), new ReadTool(), new FetchTool(), new AskTool(), new UpdateTool()];
 }

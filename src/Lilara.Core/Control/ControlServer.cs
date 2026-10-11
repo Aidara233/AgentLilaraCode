@@ -300,8 +300,13 @@ public sealed class ControlServer(
         // （`CommandDispatcher` 渲染答复时同样要知道问了什么）。
         // 各写一份就会出现「页面看得见问题、而回答时说你没答」这种分叉，
         // 而本仓栽过同形的（两处副本只改一处）。
+        //
+        // ⚠️ **档位现读、传进去**（2026-10-11）：闸门那条询问的问句里要印当前档位，
+        // 而重建它的人（`Gate.SecondHalfOf`）拿不到会话状态。不传的话它只能印
+        // 「未知」，而用户**正是靠这句话判断该不该提权**（`01` §3.5：模型不能自提权）。
         IReadOnlyList<AskItem> ItemsOf(SessionHandle handle, PausedAsk paused) =>
-            Session.Tools.AskTool.ItemsOf(host.Store, handle.ProjectKey, handle.SessionId, paused.CallId);
+            Session.Tools.AskTool.ItemsOf(host.Store, handle.ProjectKey, handle.SessionId, paused.CallId,
+                handle.State.Axes?.GetValueOrDefault(Axes.Permission));
 
         app.MapGet("/sessions/{id}/history", (string id) =>
         {
@@ -674,6 +679,8 @@ public sealed class ControlServer(
             {
                 Cwd = Opt(payload, "cwd"),
                 Title = Opt(payload, "title"),
+                // ⚠️ 数字不是字符串 ⇒ 走 OptNumber（`Opt` 只收字符串，拿它取数字会静默给 null）。
+                AskTimeoutMinutes = OptNumber(payload, "askTimeoutMinutes"),
             },
             "session.activate" => new CoreCommand.SessionActivate(payload.GetProperty("sessionId").GetString()!),
             "session.interrupt" => new CoreCommand.SessionInterrupt(payload.GetProperty("sessionId").GetString()!),
@@ -692,7 +699,8 @@ public sealed class ControlServer(
             // 用 GetProperty 会在头只想换模型、不提 provider 时抛 KeyNotFoundException。
             "session.configure" => new CoreCommand.SessionConfigure(
                 payload.GetProperty("sessionId").GetString()!,
-                Opt(payload, "providerId"), Opt(payload, "model")),
+                Opt(payload, "providerId"), Opt(payload, "model"),
+                OptNumber(payload, "askTimeoutMinutes")),
             // 同 session.setAxis：线上解析是第三条线。
             // 只有 release、没有 acquire（头的认领走控制台）；字段名是 scope（数组），不是 path。
             "claim.release" => new CoreCommand.ClaimRelease(
@@ -772,6 +780,14 @@ public sealed class ControlServer(
 
         static string? Opt(JsonElement e, string name) =>
             e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+        // 数字版。⚠️ **只认 JSON 数字**——字符串 `"5"` 一律当「没给」，同上面 `Opt` 那条粒度取舍
+        // （`"false"` 不被当成布尔 false）。⚠️ 用它取数字而不是 `Opt`：
+        // `Opt` 只收字符串，拿它去取一个数字键会**静默给 null**——而那个 null 的含义是
+        // 「用户没设超时」，即一次写错类型的参数变成一次静默的「没有上限」。
+        static double? OptNumber(JsonElement e, string name) =>
+            e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number
+            && v.TryGetDouble(out var n) ? n : null;
 
         // 布尔版。⚠️ **只认 `true` / `false` 两个字面量**，其余（缺失 / null / 字符串 `"false"` /
         // 数字）一律当「没给」⇒ 在 `session.archive` 上就是**归档**。

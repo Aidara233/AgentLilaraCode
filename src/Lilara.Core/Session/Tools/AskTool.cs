@@ -137,8 +137,16 @@ public sealed class AskTool : ITool
     /// 「会话在等待期间重启过，原来那批问题没能保留」——**而问题明明就在盘上**。</para>
     /// </summary>
     /// <param name="callId">被挂起的那次调用的协议 id（`PausedAsk.CallId`）。</param>
+    /// <param name="permissionLevel">
+    /// 当前权限档位。⚠️ <b>只有闸门那条询问用它</b>（问句里要印「当前档位是什么」，
+    /// 用户据此判断该不该提权——`01` §3.5：模型不能自提权，只能请求）；
+    /// `ask` 那条用不上（它的问题是模型自己写的）。
+    /// ⚠️ 传 <c>null</c> 是**合法**的（读点拿不到轴时），那问句会印「未知」——
+    /// 差一点信息，但**不编一个档位**（编的那个会让用户提出一个无效的请求）。
+    /// </param>
     public static IReadOnlyList<AskItem> ItemsOf(
-        Storage.SessionStore store, string projectKey, string sessionId, string callId)
+        Storage.SessionStore store, string projectKey, string sessionId, string callId,
+        string? permissionLevel = null)
     {
         foreach (var e in store.ReadTimeline(projectKey, sessionId))
         {
@@ -146,13 +154,24 @@ public sealed class AskTool : ITool
 
             foreach (var b in m.Blocks.OfType<Block.ToolUseBlock>())
             {
-                // ⚠️ **两条判据都要**：`callId` 对得上（否则会拿到**另一条历史询问**的
-                // 问题，而用户会对着一个已经问过的问题作答），且名字是 `ask`
-                // （闸门那条询问没有工具参数——它的问题是核心自己造的，见 `Gate.AskFor`）。
                 if (!string.Equals(b.CallId, callId, StringComparison.Ordinal)) continue;
-                if (!string.Equals(b.Name, "ask", StringComparison.Ordinal)) return [];
 
-                return Parse(b.Arguments).Items;
+                return string.Equals(b.Name, "ask", StringComparison.Ordinal)
+                    // `ask` 那条：问题原文在**工具参数**里，解出来就是。
+                    ? Parse(b.Arguments).Items
+                    // 闸门那条（`Gate.AskFor`）。
+                    //
+                    // ⚠️ **它不是「解不出来」，是「没有可解的输入」**——而这里原先直接
+                    // `return []`，把那件事说成了「问题没留住」。⇒ 页面显示
+                    // 「这次询问的问题取不回来了」，而那张**改参数再批准**的卡**整个消失**，
+                    // 用户只剩「批准 / 拒绝」两颗按钮（`01` §3.8 明确要求那张卡能改参数）。
+                    //
+                    // ⚠️ 而这条路径的**唯一入口就是重启之后**：内存那半
+                    // （`SessionHandle.AwaitingInput`）在进程活着时是好的，只有从盘载入才会走到这里。
+                    // ⚠️ **它是跑真模型实测抓出来的**（2026-10-11）——单元测试碰不到它，
+                    // 因为那条路要「挂起之后重开进程」。而在此之前它**根本不可达**
+                    // （闸门那两格没有生产者），所以这个洞一直没有露出来。
+                    : Gate.SecondHalfOf(b, permissionLevel);
             }
         }
 

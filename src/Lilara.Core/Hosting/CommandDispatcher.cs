@@ -488,8 +488,15 @@ public sealed class CommandDispatcher(
         }
 
         var model = _host.Providers.ToSelection(provider, null, "high", 16000);
+
+        // ⚠️ 只拒 `<= 0`（`TimeSpan.Zero` 非法，见 `SessionSpec.AskTimeout`）；
+        // 合法性的**唯一**判据在下面那两行，`SessionHandle.Create` 不重判。
+        if (c.AskTimeoutMinutes is { } mins && mins <= 0)
+            return Reject(id, $"`--ask-timeout` 要大于 0 分钟（给的是 {mins}）。要「不超时」就别给这个参数。");
+
         var handle = SessionHandle.Create(
-            _host.Store, workingDirectory, model, Trimmed(c.Title), Trimmed(c.Preset));
+            _host.Store, workingDirectory, model, Trimmed(c.Title), Trimmed(c.Preset),
+            askTimeout: c.AskTimeoutMinutes is { } m ? TimeSpan.FromMinutes(m) : null);
 
         // 登记进激活表——快照端点据此避免读到盘上过期的 Idle。
         _host.Register(handle);
@@ -949,9 +956,19 @@ public sealed class CommandDispatcher(
     {
         if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
-        // 两个都没给 ⇒ 这不是一次「成功的 no-op」，是一次没说清的命令。拒绝，别静默成功。
-        if (string.IsNullOrWhiteSpace(c.ProviderId) && string.IsNullOrWhiteSpace(c.ModelId))
-            return Reject(id, "没说要改什么。用法：session configure <会话> [--provider <id>] [--model <id>]");
+        // 都没给 ⇒ 这不是一次「成功的 no-op」，是一次没说清的命令。拒绝，别静默成功。
+        if (string.IsNullOrWhiteSpace(c.ProviderId) && string.IsNullOrWhiteSpace(c.ModelId)
+            && c.AskTimeoutMinutes is null)
+        {
+            return Reject(id, "没说要改什么。用法：session configure <会话> "
+                + "[--provider <id>] [--model <id>] [--ask-timeout <分钟>]");
+        }
+
+        // ⚠️ **超时必须 > 0**（`SessionSpec.AskTimeout` 的注释明写 `TimeSpan.Zero` 非法：
+        // 「等 0 分钟」读不出意思）。在这里拒，而不是让它悄悄等于「立刻超时」——
+        // 后者会让一次写错的参数看起来像「用户故意不让我等」。
+        if (c.AskTimeoutMinutes is { } mins && mins <= 0)
+            return Reject(id, $"`--ask-timeout` 要大于 0 分钟（给的是 {mins}）。要「不超时」就别给这个参数。");
 
         // 换绑到一个**不存在**的供应商必须拒绝。⚠️ 这一条是本命令存在的主要理由之一：
         // `provider.delete` 刻意不阻止删除被引用的供应商（理由见 HandleProviderDelete），
@@ -976,6 +993,10 @@ public sealed class CommandDispatcher(
         var next = handle.UpdateSpecAndPersist(_host.Store, s =>
         {
             var b = s.Model;
+            // ⚠️ 超时这一格也要判「变没变」，否则「只改超时」会落成 `changed == false`
+            // ⇒ 不发事件、回执里也没有那句话，而盘上**真的变了**（静默生效）。
+            var timeoutChanged = c.AskTimeoutMinutes is { } t && s.AskTimeout != TimeSpan.FromMinutes(t);
+
             var m = b with
             {
                 ProviderId = string.IsNullOrWhiteSpace(c.ProviderId) ? b.ProviderId : c.ProviderId!,
@@ -985,8 +1006,18 @@ public sealed class CommandDispatcher(
                 // 可以被 `provider set --protocol` 改掉）。这里只是让快照跟上此刻的定义。
                 Protocol = target?.Protocol ?? b.Protocol,
             };
-            changed = m != b;
-            return s with { Model = m };
+            changed = m != b || timeoutChanged;
+            // ⚠️ 超时那一格与 `Model` 是**两个字段**，但同在一次 `UpdateSpecAndPersist` 里改：
+            // 两条独立的写会各自读-改-写，后写的把前写的整份盖掉（丢更新）。
+            return s with
+            {
+                Model = m,
+                // ⚠️ 「没给」= 保留旧值（同上面两个字段的语义）。
+                // ⇒ 想**取消**超时要怎么表达？今天没有这个入口——如实记着（`01` §14 #13）。
+                // 不发明一个 `--ask-timeout none`，因为「没有值」与「值叫 none」在这里
+                // 没法从一个 `double?` 里分辨（本仓那条「一个值承担两种含义」的老毛病）。
+                AskTimeout = c.AskTimeoutMinutes is { } mins ? TimeSpan.FromMinutes(mins) : s.AskTimeout,
+            };
             // ⚠️ 没变时**也写了盘**（`UpdateSpecAndPersist` 是无条件的）。这是代价，不是疏漏：
             // 想省掉这次写就得把「比不比得出差别」挪到锁外判，而那正是上面刚关掉的那个丢更新窗口。
             // 内容逐字节相同的 `spec.json` 重写一次没有可观测后果（`AtomicFile` 是整份原子替换）。
@@ -1322,6 +1353,40 @@ public sealed class CommandDispatcher(
         _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId,
             Stepper.Answer(paused, text, amended));
 
+        // ⚠️ **同一批里其余的调用要各补一条结果**（`01` §3.8 / D1，2026-10-11 修）。
+        //
+        // <para>⚠️ <b>不补就是悬空</b>：`PausedAsk` 只装得下一个 `CallId`，
+        // 而这一批可能有好几条被挡下的调用（`ToolExecutor.Merge` 把它们的**问题**
+        // 合成了一张卡，而 `CallId` 那一格只有一个）。⇒ 其余几条的 `tool_use`
+        // 一直悬着，而**悬空的 `tool_use` 会让下一条请求当场 400**。
+        // 原先靠正文里一句「请重新发起」交代——那是**记法上的欠账**，不是设计目标。</para>
+        //
+        // ⚠️ **只在这三种「这批不跑了」的收尾上补**（拒绝 / 超时 / 作废）：
+        // 那时「这些调用被一起作废了」是**真话**。⚠️ **批准不走这里**——
+        // 它只让第一条重发，其余几条是「还没轮到你」，今天没有一个说得清的说法
+        //（见 `Stepper.Blocked` 的注释）。⇒ 那条**仍是认下的代价**。
+        //
+        // ⚠️ 判据是「不能续跑」。批准之后模型会重发第一条，那时它会重新发整批
+        //（它看得见自己上一条消息里有几条 `tool_use`）——所以批准那条不补也是安全的。
+        //
+        // ⚠️ `awaiting` 可能是 null（从盘载入过、内存那半没了）⇒ 那时数不出条数，
+        // **不编一个数**（同 `Reply` 里那条既有的判断），退回今天的单条行为。
+        var notRunning = expired
+            || string.Equals(c.Outcome, "cancel", StringComparison.Ordinal)
+            || !IsApproved(c);
+
+        if (notRunning && awaiting is { Calls.Count: > 1 })
+        {
+            var said = expired
+                ? "（这一批里的这次调用和它一起被作废了：等待超时，没有人回答。）"
+                : string.Equals(c.Outcome, "cancel", StringComparison.Ordinal)
+                    ? "（这一批里的这次调用和它一起被作废了：用户把这次询问整个作废了。）"
+                    : "（这一批里的这次调用和它一起被作废了：用户拒绝了。）";
+
+            _host.Store.AppendEvents(handle.ProjectKey, handle.SessionId,
+                Stepper.Blocked(awaiting.Calls, first: 1, said));
+        }
+
         // 挂起态清干净（内存 + 盘）——⚠️ **与「拿到闸」无关**：这一步不跑推进。
         handle.AwaitingInput = null;
         handle.UpdateStateAndPersist(_host.Store, s => s with
@@ -1352,6 +1417,23 @@ public sealed class CommandDispatcher(
             Note = expired ? "已经超时了，按超时处理。" : null,
         });
     }
+
+    /// <summary>
+    /// **用户批没批**（`01` §3.8）。⚠️ <b>整个核心判这一件事只有这一处</b>。
+    ///
+    /// <para>⚠️ <b>它被抽出来，是因为原先有两个副本</b>（2026-10-11）：一份在
+    /// <see cref="Reply"/> 里决定落哪句话，另一份本来要写在
+    /// <see cref="HandleApprovalRespond"/> 里决定「要不要给同批其余调用补配对」。
+    /// 两份判据的漂法很具体——**头与控制台发的东西不一样**（头原先把 `decision` 整个漏了，
+    /// 而控制台一直在发），所以「批没批」这件事在两边各判一次时，**头那一侧全判错**。
+    /// ⇒ 本仓那条「两层判据必须共用一个谓词」在这里的形态就是：**谓词只有一个**。</para>
+    ///
+    /// <para>⚠️ 三个拼法都收（`allow` / `approve` / `yes`）：它们都是「同意」的自然说法，
+    /// 而**判定放宽不需要用户知道**。⚠️ 空字典 ⇒ 没批（这是**默认**，不是特例）：
+    /// 缺 `decision` 就是没点头，而「没点头」的后果是拒绝——方向是安全的那一侧。</para>
+    /// </summary>
+    private static bool IsApproved(CoreCommand.ApprovalRespond c) =>
+        c.Answers.TryGetValue("decision", out var d) && (d == "allow" || d == "approve" || d == "yes");
 
     /// <summary>
     /// 超时时那条结果（`01` §3.8）。⚠️ <b>两种 Kind 的后果不同</b>（用户裁定）：
@@ -1389,24 +1471,37 @@ public sealed class CommandDispatcher(
         // ---- 授权 ----
         if (paused.Kind == AskKind.Permission)
         {
-            var approved = c.Answers.TryGetValue("decision", out var d)
-                        && (d == "allow" || d == "approve" || d == "yes");
-
-            if (!approved)
+            if (!IsApproved(c))
                 return ("用户拒绝了这次调用。" + Reason(c), null);
 
-            // 记忆（`01` §3.8）：用户说了「记住」才写。
-            if (c.Remember is { Length: > 0 } rm)
-            {
-                var store = new ApprovalStore(_host.Store.DataRoot, handle.ProjectKey, handle.SessionId);
-                store.Add(new Approval(paused.ToolName, paused.ArgsHash,
-                    ToolWide: string.Equals(rm, nameof(AskMemory.Tool), StringComparison.Ordinal),
-                    At: CoreClock.Now()));
-            }
+            // ⚠️ **批准必须当场写一条记忆，哪怕用户没勾「记住」**（2026-10-11 修）。
+            //
+            // <para>⚠️ <b>原先这里写的是「用户说了『记住』才写」，而那句话让「批准」变成空话</b>：
+            // 批准的后果是「下一步带着批准去执行」（见 <see cref="Reply"/>），而放行的唯一依据
+            // 就是这个 store ⇒ 不写 ⇒ 模型重发 ⇒ 闸门又 `Ask` ⇒ 又挂起。
+            // **转圈**，被 `MaxConsecutiveToolSteps` 兜住，而用户看到的是「批了又弹、批了又弹」。</para>
+            //
+            // <para>⚠️ <b>判据是「记忆的粒度本来就是『这一次调用』」</b>——用户裁定过
+            // 「这一次」是**默认**（`AskMemory` 的注释：「当成一个枚举成员会让『没选』
+            // 与『选了这一次』两件事长得一样」）。⇒ 勾选**不是**「要不要记住」，
+            // 是「要不要把粒度放宽到整个工具」。批准 = 写一条 `ToolWide: false` 的
+            // （键 = 工具名 + 参数哈希，正是「这一次」）；勾了粗档才写 `ToolWide: true`。</para>
+            //
+            // <para>⚠️ 由此推出：这条记忆在语义上是「这一次」，而它**不设过期**——
+            // `ApprovalStore` 今天只增不减，随会话目录同生共死。</para>
+            var store = new ApprovalStore(_host.Store.DataRoot, handle.ProjectKey, handle.SessionId);
+            store.Add(new Approval(paused.ToolName, paused.ArgsHash,
+                ToolWide: c.Remember is { Length: > 0 } rm
+                          && string.Equals(rm, nameof(AskMemory.Tool), StringComparison.Ordinal),
+                At: CoreClock.Now()));
 
-            // ⚠️ 改写过的参数：**逐字比较**，不是「解析后比对象」——
-            // 那段原文是逐字保真的（`01` §9），而规范化一次就会把「改了空格」
-            // 这种真实差异吃掉。见 `ApprovalStore.HashArgs` 那条同源的理由。
+            // ⚠️ 改写过的参数：比的是**规范化之后的指纹**（`ApprovalStore.HashArgs`）。
+            //
+            // <para>⚠️ <b>这里原先写的是「逐字比较」，而那句话已经不成立</b>（2026-10-11 修）：
+            // 规范化上线之后，用户**只把键序倒了一下**不再算「改了参数」——而那是**对的**，
+            // 因为 JSON 对象无序，倒键序就是同一个请求（理由见 `ApprovalStore.HashArgs`）。
+            // ⇒ 这段原文仍然照样逐字交回执行那条路（`01` §9 那条铁律管的是**落盘的原文**，
+            // 不是「改写检测的粒度」），**只判「改了没有」的粒度变粗了**。</para>
             var amended = c.Answers.TryGetValue("arguments", out var a) ? a : null;
             var changed = amended is not null
                        && !string.Equals(ApprovalStore.HashArgs(amended), paused.ArgsHash, StringComparison.Ordinal);

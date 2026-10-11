@@ -80,15 +80,78 @@ public sealed class ApprovalStore(string dataRoot, string projectKey, string ses
         AtomicFile.Write(Path_, System.Text.Json.JsonSerializer.Serialize(approvals.ToList(), Kernel.Json.Options));
 
     /// <summary>
-    /// 参数原文的哈希。
+    /// 参数的**规范化**指纹（`01` §3.8）。
     ///
-    /// <para>⚠️ <b>它是这套东西里唯一「判两个调用是不是同一次」的东西</b>——
-    /// 所以它<b>只许哈希那段原文</b>：先 <c>JsonDocument.Parse</c> 再重新序列化
-    /// 会让 `{"a":1,"b":2}` 与 `{"b":2,"a":1}` 撞成同一个哈希，于是**用户批的这一条
-    /// 会替另一条放行**。逐字比较才是对的。</para>
+    /// <para>⚠️ <b>它答的问题是「这两个字符串是不是同一次调用」</b>，所以判据是
+    /// <b>「重排键序 / 加空格之后还是不是同一个请求」</b>——答案是**是**。
+    /// ⇒ 先解析、按键序递归重排、再哈希；**解析不了**（不是合法 JSON）时退回哈希原文
+    /// （形状坏了不该让两种不同的坏形状撞成一个）。</para>
+    ///
+    /// <para>⚠️ <b>它曾经是「只哈希原文」，而那是个错误——真模型实测逼出来的</b>
+    /// （2026-10-11，真模型 + 真网关 + 隔离数据根）。原注释写的理由是
+    /// 「规范化会让 <c>{"a":1,"b":2}</c> 与 <c>{"b":2,"a":1}</c> 撞成同一个哈希
+    /// ⇒ 用户批的这一条替另一条放行」。</para>
+    ///
+    /// <para>⚠️ <b>那句断言是错的，而且它把方向搞反了</b>：JSON 对象**无序**，
+    /// 那两串是**同一个请求**——模型重发一次、键序换一下，用户批的那一次**本来就该**
+    /// 放行。按原文哈希的后果是**每次重发都重新问一遍**（实测：同一个 <c>update</c>
+    /// 调用，第一次 <c>{"path":…,"old":…,"new":…}</c>、重发
+    /// <c>{"new":…,"old":…,"path":…}</c> ⇒ 两个哈希 ⇒ 批准**不生效** ⇒ 活锁，
+    /// 被 `MaxConsecutiveToolSteps` 兜住）。</para>
+    ///
+    /// <para>⚠️ <b>而它当年真正想防的那件事，靠的是另一条判据</b>：
+    /// 「批的是这一次调用」表达在 <see cref="Approval.ToolWide"/> 上
+    /// （<c>false</c> ⇒ 只有同一个工具 + 同一份参数才放行），
+    /// **不是**靠哈希对原文的敏感性。哈希的职责是**认出同一个请求**，
+    /// 不是拒绝承认它是同一个请求。⇒ 两个方向的差别只体现在
+    /// <c>{"a":1,"b":2}</c> 与 <c>{"b":3,"a":1}</c> 这种**值真的不同**的情形上，
+    /// 而那两串规范化之后照样不同。</para>
+    ///
+    /// <para>⚠️ <b>它<b>不是</b>「参数的语义等价」</b>：只做键序重排与空白规范化，
+    /// **不碰值的表示**（<c>1</c> 与 <c>1.0</c> 是两串不同的原文 ⇒ 两个哈希）。
+    /// 判据是「同一个请求的两种写法」，不是「算出来一样的东西」——
+    /// 后者要懂每个工具的参数语义，而核心**不该懂**（`00` §5）。</para>
     /// </summary>
-    public static string HashArgs(string argumentsJson) =>
-        Convert.ToHexStringLower(
+    public static string HashArgs(string argumentsJson)
+    {
+        string canonical;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(argumentsJson);
+            canonical = Canonical(doc.RootElement);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            // ⚠️ 解析不了就哈希**原文**：这一支不是「兜底」，是判据的另一半——
+            // 两串不同的坏 JSON 是两个不同的东西，压成一个会让一次写坏的参数**冒充**另一个。
+            canonical = argumentsJson;
+        }
+
+        return Convert.ToHexStringLower(
             System.Security.Cryptography.SHA256.HashData(
-                System.Text.Encoding.UTF8.GetBytes(argumentsJson)));
+                System.Text.Encoding.UTF8.GetBytes(canonical)));
+    }
+
+    /// <summary>
+    /// 递归规范化：对象**按键名 ordinal 排序**，数组**保序**（顺序是语义），
+    /// 其余原样写回。⚠️ 输出是给人看不了的中间形态，只为哈希稳定——**它不落盘**。
+    /// </summary>
+    private static string Canonical(System.Text.Json.JsonElement e) => e.ValueKind switch
+    {
+        // ⚠️ 数组**不许排序**：`["a","b"]` 与 `["b","a"]` 是两个不同的参数。
+        System.Text.Json.JsonValueKind.Array =>
+            "[" + string.Join(",", e.EnumerateArray().Select(Canonical)) + "]",
+
+        // ⚠️ ordinal 排序（不是文化序）：本仓那条「ordinal 不是文化序」的老规矩——
+        // 文化序会让同两串在不同 locale 下算出不同哈希，而那会让批准**跨机器不成立**。
+        System.Text.Json.JsonValueKind.Object =>
+            "{" + string.Join(",", e.EnumerateObject()
+                .OrderBy(p => p.Name, StringComparer.Ordinal)
+                .Select(p => System.Text.Json.JsonSerializer.Serialize(p.Name) + ":" + Canonical(p.Value)))
+            + "}",
+
+        // ⚠️ `GetRawText()` 而不是 `ToString()`：后者对数字会走格式化
+        // （`1.50` 可能变成 `1.5`），而**值的表示不许动**——那属于语义等价，不在本方法职责内。
+        _ => e.GetRawText(),
+    };
 }
