@@ -197,42 +197,13 @@ public sealed class UpdateTool : ITool
         });
     }
 
-    /// <summary>参数里**显式出现了**这个键吗（哪怕值是个空串）。同 `ReadTool.HasKey`。</summary>
-    private static bool HasKey(string argumentsJson, string key)
-    {
-        try
-        {
-            using var doc = System.Text.Json.JsonDocument.Parse(argumentsJson);
-            return doc.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
-                && doc.RootElement.TryGetProperty(key, out _);
-        }
-        catch (System.Text.Json.JsonException)
-        {
-            return false;
-        }
-    }
+    /// <summary>参数里**显式出现了**这个键吗（哪怕值是个空串）。⚠️ 实现在 `ToolPaths`（2026-10-11 合并）。</summary>
+    private static bool HasKey(string argumentsJson, string key) => ToolPaths.HasKey(argumentsJson, key);
 
     /// <summary>
-    /// 当时的指纹。⚠️ **与 <see cref="ReadTool"/> 那份是同一个形状，而这是刻意的复制**：
-    /// 两者算的都是「路径 + 内容」的哈希，且都带着那两条堵洞的规则
-    /// （长度写在内容前、路径进哈希）。
-    ///
-    /// <para>⚠️ <b>为什么不抽成一处共享</b>：抽出去就得选一个住址，而
-    /// `read` 那一份住在 <c>ListTool.cs</c>（`ReadTool` 与 `ToolArgs` 同文件），
-    /// 那是个**跟它没关系**的地方。相比「多一个 30 行的函数」，
-    /// 「让 `update` 的指纹规则与 `read` 的**漂开**」才是真代价——
-    /// 而漂开的后果是**同一个文件被两条记录用两个指纹指称**，
-    /// 三态判定随即错乱。⇒ 两份实现各自带着一条指向对方的注释，
-    /// 改一处时另一处**在 diff 里看得见**。</para>
+    /// 当时的指纹。⚠️ **实现在 `ToolPaths`**（2026-10-11 合并）——它原先在这里与
+    /// `ReadTool` 各一份，注释写着「刻意的复制」，而**第三个写类工具落地时那个取舍翻面了**。
     /// </summary>
-    private static string FingerprintOf(string rel, string content)
-    {
-        var bytes = Encoding.UTF8.GetBytes(content);
-        var meta = Encoding.UTF8.GetBytes($"{bytes.Length}\n{rel}\n");
-        var buf = new byte[meta.Length + bytes.Length];
-        meta.CopyTo(buf, 0);
-        bytes.CopyTo(buf, meta.Length);
-
-        return Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(buf));
-    }
+    private static string FingerprintOf(string rel, string content) =>
+        ToolPaths.FingerprintOf(rel, Encoding.UTF8.GetBytes(content));
 }

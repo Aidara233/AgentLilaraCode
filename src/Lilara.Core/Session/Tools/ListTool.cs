@@ -286,7 +286,7 @@ public sealed class ReadTool : ITool
         // ⚠️ **显式给了 limit 但取不出数**（字符串 / 小数 / 给了个非数字）要**说清**，
         // 不能悄悄当成"没给"——那会让一次写错的调用变成一次**看着正常**的读取。
         long? limit = null;
-        if (HasKey(call.ArgumentsJson, "limit"))
+        if (ToolPaths.HasKey(call.ArgumentsJson, "limit"))
         {
             limit = ToolArgs.Number(call.ArgumentsJson, "limit");
             if (limit is not { } l || l <= 0)
@@ -359,18 +359,8 @@ public sealed class ReadTool : ITool
     }
 
     /// <summary>参数里**显式出现了**这个键吗（哪怕值取不出来）。</summary>
-    private static bool HasKey(string argumentsJson, string key)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(argumentsJson);
-            return doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty(key, out _);
-        }
-        catch (JsonException)
-        {
-            return false;
-        }
-    }
+    /// <summary>参数里**显式出现了**这个键吗（哪怕值是个空串）。⚠️ 实现在 `ToolPaths`（2026-10-11 合并）。</summary>
+    private static bool HasKey(string argumentsJson, string key) => ToolPaths.HasKey(argumentsJson, key);
 
     /// <summary>
     /// 只读 <paramref name="offset"/> 起的 <paramref name="count"/> 个字节。
@@ -452,24 +442,9 @@ public sealed class ReadTool : ITool
     }
 
     /// <summary>
-    /// 当时的指纹。
-    ///
-    /// <para>⚠️ <b>它把「路径」也哈希进去，这不是随手加的字段</b>：
-    /// 只哈希内容的话，「把 <c>a.txt</c> 删掉、再把另一个文件改名成 <c>a.txt</c>」
-    /// **换不出同一个指纹**——于是三态判定会说「世界没动」并沿用旧快照，
-    /// 而那个旧快照记录的是**另一个文件**的语义。带路径把这个著名的一致性洞堵住。</para>
-    ///
-    /// <para>⚠️ <b>长度写在内容前面，也是为了堵洞</b>：不写长度的话，
-    /// 「<c>ab</c> + 分隔符 + <c>c</c>」与「<c>a</c> + 分隔符 + <c>bc</c>」拼出来的字节相同
-    /// ⇒ 两种不同的（路径, 内容）组合撞成同一个指纹。</para>
+    /// 当时的指纹。⚠️ **实现在 `ToolPaths`**（2026-10-11 合并）——
+    /// 它原先在这里、另有一份在 `UpdateTool`，而第三个写类工具落地时那个
+    /// 「两份各自带注释」的取舍就不成立了（理由见 `ToolPaths`）。
     /// </summary>
-    private static string FingerprintOf(string rel, byte[] bytes)
-    {
-        var meta = Encoding.UTF8.GetBytes($"{bytes.Length}\n{rel}\n");
-        var buf = new byte[meta.Length + bytes.Length];
-        meta.CopyTo(buf, 0);
-        bytes.CopyTo(buf, meta.Length);
-
-        return Convert.ToHexStringLower(SHA256.HashData(buf));
-    }
+    private static string FingerprintOf(string rel, byte[] bytes) => ToolPaths.FingerprintOf(rel, bytes);
 }
