@@ -567,6 +567,9 @@ public sealed class CommandDispatcher(
         // **在下一个渲染窗口里取不回**（判据与后果见 `TimelineRender.Render` 的注释）。
         // ⇒ 判定现在住在渲染里（每次现算），这条命令因此只是个**观察口**：
         // 它的独有价值是「立刻算一次并把结果说出去」，**不是任何东西的前提**。
+        // ⚠️ **它算的是「可恢复」那一档**（`Reclaim.Decide`），**不含点杀**——
+        // 点杀要一个 `IToolContext`，而这条命令的用途是「看一眼收了多少」，
+        // 不是「冻结这一步的世界」（那件事归 `Stepper`）。
         var count = Reclaim.Decide(
             _host.Store.ReadTimeline(handle.ProjectKey, handle.SessionId),
             new Storage.BlobStore(_host.Store.DataRoot)).Count;

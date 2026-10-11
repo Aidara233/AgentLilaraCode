@@ -1,5 +1,6 @@
 using System.Text;
 using Lilara.Core.Kernel;
+using Lilara.Core.Session.Tools;
 using Lilara.Core.Storage;
 
 namespace Lilara.Core.Session;
@@ -24,6 +25,79 @@ public static class Reclaim
     /// 按「条数」而不是 token 的理由见 §11.3：保护带保护的是**动作链**，而 token 会不可预测地塌缩。</para>
     /// </summary>
     public const int ProtectedRecentResults = 4;
+
+    /// <summary>
+    /// **那个源现在长什么样** —— 三态判定（`00` §5）**第一个真的会去读它的消费者**（2026-10-11）。
+    ///
+    /// <para>⚠️ <b>它把「点杀」判据从一句纸上契约变成一次真比对</b>：记录里存着
+    /// <see cref="TimelineEvent.ToolResultEvent.DependsOn"/>（依赖什么）与
+    /// <see cref="TimelineEvent.ToolResultEvent.Fingerprint"/>（当时什么样），
+    /// 本方法**当场重解析那个指称、重算指纹、与记录里那个比**。</para>
+    ///
+    /// <list type="bullet">
+    ///   <item><b>没依赖 / 没指纹</b>（`list_dir`、发邮件、取时间）⇒ 恒 <c>false</c>。
+    ///   ⚠️ 这是 `00` §5 那条硬约束，不是漏了：<b>无指纹 ⇒ 永不可优化</b>。
+    ///   ⚠️ 而且它以 <c>Fingerprint is null</c> 为准，**不看 <c>DependsOn</c> 有没有值**——
+    ///   一个填了引用却没填指纹的工具，我们**判不了**它动没动，只能当作没动。</item>
+    ///   <item><b>路径越出工作目录 / 文件不在了</b> ⇒ 恒 <c>false</c>。
+    ///   ⚠️ 「不在了」**不是**「不动了」——一个已删的文件同样可能被重建、也可能正是模型要的信息。
+    ///   要收它得另有判据（今天没有）。⇒ 走 <see cref="IToolContext.ResolvePath"/> 那**一道**
+    ///   越界闸，与工具执行期共用同一个谓词（`DependsOn` 是**模型造出来的**，它不可信）。</item>
+    ///   <item><b>比得上 / 比不上</b> ⇒ 逐字节相同就是「没动」，一个字节不同就是「动了」。</item>
+    /// </list>
+    ///
+    /// <para>⚠️ <b>它必须是纯的、而且不抛</b>：调用方是渲染那条路，读失败 / 形状坏
+    /// 一律退成 <c>false</c>（= 当作没发现过时）。⚠️ 但<b>纯是调用方保证的</b>——
+    /// 「哪一刻读的」由调用方冻一次（同 <c>Stepper</c> 里的 <c>now</c>），
+    /// 否则**步内两次渲染**就能给出两个答案，而那是每步破前缀。</para>
+    ///
+    /// <para>⚠️ <b>不能把结论缓存起来当真相来源</b>（这一点是上一批刚栽过的）：
+    /// 可缓存的是**位置**（状态型脏指示，`01` §12.7），不是判定。缓存的判定只在
+    /// 「某个维护点跑过之后」才新鲜，而没人能保证那个维护点覆盖了所有请求路径。</para>
+    /// </summary>
+    public static bool Stale(TimelineEvent.ToolResultEvent result, IToolContext context)
+    {
+        // ⚠️ **`Fingerprint is null` 是这一句的主语**：无指纹 = 不可重演 = 永不过时。
+        if (result.Fingerprint is not { } recorded) return false;
+        if (string.IsNullOrWhiteSpace(result.DependsOn)) return false;
+
+        var bytes = ReadSource(result.DependsOn, context);
+
+        // 读不到（越界 / 不存在 / 形状坏）⇒ 不作断言。
+        if (bytes is null) return false;
+
+        // ⚠️ 重算走**工具那一份**（`ToolPaths`），不在这里另写一遍——
+        // 各写一遍就是「两层判据必须共用一个谓词」那个老形状，
+        // 而漂的后果是**每一条都比不上**（于是每一条都被判成过时）。
+        return !string.Equals(
+            ToolPaths.FingerprintOf(result.DependsOn.Replace('\\', '/'), bytes),
+            recorded, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 按 <see cref="TimelineEvent.ToolResultEvent.DependsOn"/> 读回那个源的**字节**。
+    ///
+    /// <para>⚠️ <b>`DependsOn` 今天只被文件类工具写过一个相对路径</b>（`read` / `write` / `update`
+    /// 都写 `rel`，`list_dir` 不写）⇒ 这里**当名义相对路径**用。而它的形状是**工具自己定的**
+    /// （`01` §3.6：HTTP 工具是 URL、DB 工具是连接串）⇒ 将来出现别的形状时，
+    /// **改的是这个开关**，不是 <see cref="Stale"/> 的判据。
+    /// ⇒ 不认识的指称**一律返回 <c>null</c>**（= 判不了），而不是猜一种读法。</para>
+    /// </summary>
+    private static byte[]? ReadSource(string dependsOn, IToolContext context)
+    {
+        var full = context.ResolvePath(dependsOn);
+        if (full is null) return null;
+
+        try
+        {
+            return File.ReadAllBytes(full);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            // 目录、权限、竞态删掉——一律「读不到」。**不抛**：调用方在渲染那条路上。
+            return null;
+        }
+    }
 
     /// <summary>
     /// 这段内容**自己就够**——不需要去库里补一个**缺失**的对象。

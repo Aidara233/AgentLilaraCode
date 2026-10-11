@@ -28,6 +28,16 @@ public static class SessionQueries
     /// <para>⚠️ <b>它必须与 `Stepper` 喂给模型的那份是同一个函数</b>（`TimelineRender.Render`）：
     /// 各写一份的话，用户看到的与模型看到的会**悄悄分叉**——而两边各自都「看起来是对的」，
     /// 这正是本仓栽过的形状（两处副本只改一处）。</para>
+    ///
+    /// <para>⚠️ <b>它走的是<b>不带点杀</b>的那条重载，这是刻意的</b>（2026-10-11）：
+    /// 过时判定（`Reclaim.Stale`）要碰文件系统，而它冻的是**「步开始那一刻」**——
+    /// 这条读路径**不在一个步里**（它回答的是「现在盘上是什么样」）。
+    /// 而更实在的一条：这条路径上**没有 `SessionToolContext`**——句柄在核心里的构造点
+    /// 只有 `Stepper` 两处（工具执行期），`ControlServer` / 控制台都看不到工作目录。
+    /// ⇒ 今天它显示的是**不带点杀**的形态。⚠️ <b>这条差额要如实说</b>：
+    /// 用户可能看到一条「还新鲜」的结果，而下一步模型收到的是注记。
+    /// 抹平它要把句柄提到核心层（`IToolContext` 的建设点从 `Stepper` 上移），
+    /// 那是独立的一批（`01` §14 #21）。</para>
     /// </summary>
     public static IReadOnlyList<TimelineEvent> HistoryOf(CoreHost host, SessionHandle handle) =>
         Session.TimelineRender.Render(host.Store, handle);

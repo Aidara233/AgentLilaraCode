@@ -60,7 +60,55 @@ public static class TimelineRender
         // 它跑在原本就要 `ReadTimeline` + 逐块解引用的那条路上，边际成本是一次 stat。
         // ⚠️ 它收不了几样东西（保护带 `ProtectedRecentResults = 4` 是**占位值**）⇒
         // 它的主要效果是**让注记可兑现**，不是省上下文。别把它读成「一个激进的回收策略」。
+        //
+        // ⚠️ **这里只有「距离 + 可恢复」两条判据**（2026-10-11 补记）：**点杀**要走下面那个
+        // 带 `staleProbe` 的重载（它要多读一次文件系统）。两条渲染路径的**次序、判据、
+        // 框架那一步都是同一份代码**——差别只有「多不多跑点杀」这一个谓词。
         var reclaimed = Reclaim.Decide(raw, blobs);
+        var applied = Reclaim.Apply([.. raw.Select(e => Dereference(e, blobs))], reclaimed);
+        return [.. applied.Select(WithFraming)];
+    }
+
+    /// <summary>
+    /// 同上，但**多一条判据**：被判定为**过时**的结果也换成注记（`01` §11.3 判据轴上的**点杀**）。
+    ///
+    /// <para>⚠️ <b>它那个参数就是「判定在渲染<b>外</b>算」那条纪律的落点。</b>
+    /// 过时判定要**碰文件系统**（重读那个源、重算指纹），而渲染必须是纯的
+    /// （`00` §5 铁律 1）——外人在两次渲染之间改了文件，判定就变，**每步破一次前缀**。
+    /// ⇒ 调用方在**步开始那一刻**把 <paramref name="context"/> 冻一次（同 `Stepper` 里的 `now`），
+    /// 于是这一步里无论如何重复渲染，拿到的都是**同一批字节、同一个判定**
+    /// ⇒ 推给模型的形态在步内逐字节稳定。</para>
+    ///
+    /// <para>⚠️ <b>没有 context 时行为与上面那条<b>逐字节相同</b></b>：只跑「可恢复」那一档。
+    /// 那是三条只读观察路径（控制台 `history`、`/state`、`/history`）的形态——
+    /// 它们**没有**「步内必须一致」这条约束（看的不是要发出去的请求），
+    /// 而让它们保持无状态，换到的是**回滚与工具执行期那两处不必考虑 `Stale`**
+    /// （那两处用的是步开始时冻的那一份，不重新读）。代价如实记在 `01` §11.3。</para>
+    ///
+    /// <para>⚠️ <b>为什么它自己不做兜底</b>（比如「没有 context 就从 handle 现造一个」）：
+    /// 那会把「这一刻是几点的世界」这件事藏进渲染里，而**冻哪一刻是调用方的事**。
+    /// 一个自己造 context 的渲染会读**此刻**的文件——那就不是步内冻结，是隐式的每步重新判定。</para>
+    /// </summary>
+    public static IReadOnlyList<TimelineEvent> Render(
+        SessionStore store, SessionHandle handle, Kernel.IToolContext? staleProbe)
+    {
+        if (staleProbe is null) return Render(store, handle);
+
+        var raw = store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+        var blobs = new BlobStore(store.DataRoot);
+
+        // ⚠️ **两条判据取<b>并集</b>**（`01` §11.3：「判据轴上三者并列取并集，不是三选一」）：
+        // 可恢复那一条管「内容自己就够」，点杀那一条管「这个源后来被动过」。
+        // 并集而不是交集，因为两者收的理由不同：一个是不需要了，一个是不对了。
+        var reclaimed = new HashSet<string>(Reclaim.Decide(raw, blobs), StringComparer.Ordinal);
+        foreach (var r in raw.OfType<TimelineEvent.ToolResultEvent>())
+        {
+            // ⚠️ **过时的那一条仍然要过 `Recoverable`**：注记上写着「fetch(id) 取回」，
+            // 而取不回的东西换成注记就是**一句假话**（`01` §8.0.2 二那条判据不是可选的）。
+            if (Reclaim.Stale(r, staleProbe) && Reclaim.Recoverable(r.Content, blobs))
+                reclaimed.Add(r.Id);
+        }
+
         var applied = Reclaim.Apply([.. raw.Select(e => Dereference(e, blobs))], reclaimed);
         return [.. applied.Select(WithFraming)];
     }

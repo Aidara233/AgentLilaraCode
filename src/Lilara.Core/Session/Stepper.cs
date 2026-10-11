@@ -57,6 +57,15 @@ public sealed class Stepper(
         // 「now 冻结在步开始」（00 §2.5）——同一步内重复渲染必须逐字节相同
         var at = CoreClock.Now();
 
+        // ⚠️ **过时判定（点杀）这一刻冻住**（2026-10-11）：`Reclaim.Stale` 要**碰文件系统**
+        // （重读那个源、重算指纹），而渲染必须是纯的 ⇒ 判定在渲染**外**算。
+        // 冻在这一刻的理由与上面那行 `now` 逐字相同：这一步里无论如何重复渲染，
+        // 拿到的都是**同一批字节、同一个判定** ⇒ 步内逐字节稳定。
+        // ⚠️ **它就是那个「更窄的那一刻」**（`01` §11.7 找了三轮的东西）：
+        // 不是「进了内存」（`Activate` 太宽，头扫一眼列表就会走），是「**第一步真的要拿它渲染**」。
+        var staleProbe = new Tools.SessionToolContext(
+            handle.Spec.WorkingDirectory, new BlobStore(_store.DataRoot));
+
         // ⚠️ 先记下落盘的那份，失败了原样放回去。
         // 调用方 catch 之后继续用**同一个把手**：不回滚的话，
         // 用户刚看着一步失败，`status` 却报 Running——而磁盘上从来没写过 Running。
@@ -123,7 +132,7 @@ public sealed class Stepper(
                 // 以及把 `fetch` 的 `Ref` 解开。三件事都得在这里做完——**适配器只看见普通块**。
                 // ⚠️ 那份渲染**与头 / 控制台读的是同一个函数**（`SessionQueries.HistoryOf` 也走它）：
                 // 各写一份就会出现「模型看到的」与「用户看到的」悄悄分叉。
-                Timeline = TimelineRender.Render(_store, handle),
+                Timeline = TimelineRender.Render(_store, handle, staleProbe),
             };
 
             // 调用（抛异常时直接传播——这一步没完成，Turn 不动）
@@ -327,6 +336,12 @@ public sealed class Stepper(
     /// <para>⚠️ <b>它不新增执行点</b>：跑的还是 <see cref="ToolExecutor"/>，
     /// 只是从「下一步」挪到「这一步」。判据是 <c>ArgsBypass==</c>那种「谁执行工具」
     /// 仍然只有一个答案。</para>
+    ///
+    /// <para>⚠️ <b>它<b>不</b>重新渲染</b>（2026-10-11 明确下来）：<see cref="StepAsync"/>
+    /// 里那份渲染与 <c>staleProbe</c> 是**为「调模型」冻的**，而这一步**不调模型**
+    /// （答复是用户给的，结果由核心自己拼）。⇒ 这里不读时间线、也不跑点杀。
+    /// ⚠️ 这不是省事：若这里也跑一次点杀，冻结的那一刻就**不是**「步开始」而是
+    /// 「用户按下答应的那一刻」——同一步里就会有两个判定，而那正是要躲的每步破前缀。</para>
     ///
     /// <para>⚠️ <b>改写过的参数在这里生效</b>：<paramref name="calls"/> 是调用方
     /// 按用户改的那份**换过**的调用（见 <see cref="Amended"/>），所以「用户改的就是执行的」。
