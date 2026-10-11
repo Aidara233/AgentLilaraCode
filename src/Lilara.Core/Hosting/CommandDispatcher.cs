@@ -713,7 +713,7 @@ public sealed class CommandDispatcher(
             if (step.Refused is { } asked)
             {
                 var requested = new WireEvent.ApprovalRequested(
-                    handle.SessionId, asked.Id, asked.Kind.ToString(), asked.Items,
+                    handle.SessionId, asked.Id, asked.Kind, asked.Items,
                     asked.Remember, step.DeadlineAt);
 
                 _bus.Publish(EventBus.ApprovalsTopic, requested);

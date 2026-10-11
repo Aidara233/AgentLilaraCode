@@ -246,10 +246,16 @@ function renderSessions() {
 
       // ⚠️ **「这个会话在等我」必须看得见**（`01` §3.8）：一条只有点进去才知道的
       // 待审批，等于没有。判据是 `ask?.askId`——没在等时核心交 `{}`，而 `{}` 是 truthy。
+      //
+      // ⚠️ **`kind` 是小写 `"permission"`**（2026-10-11 改）。这里曾经拿 PascalCase 去比：
+      // 那时核心在 `/sessions` 上手写 `.ToString()`（PascalCase），而同一份数据在
+      // `/state` 里走 `JsonStringEnumConverter(camelCase)` ⇒ **同一条响应两种拼法**。
+      // 核心已统一成 camelCase（同 `"event"` / `"toolUse"` 那些线上枚举值），
+      // 拿旧拼法去比**不会报错**，只会静默把「？授权」画成「？提问」。
       if (v.ask?.askId) {
         const badge = document.createElement("span");
         badge.className = "askbadge";
-        badge.textContent = v.ask.kind === "Permission" ? "？授权" : "？提问";
+        badge.textContent = v.ask.kind === "permission" ? "？授权" : "？提问";
         badge.title = "这个会话在等你回答" + (v.ask.deadlineAt ? `（${shortTime(v.ask.deadlineAt)} 之前）` : "");
         row.appendChild(badge);
         row.classList.add("waiting");
@@ -1499,8 +1505,12 @@ function handleEvent(p) {
     // ⇒ 现在的回答途径是控制台：`approval allow <会话> <askId>`（`askId` 印在这一行里）。
     case "approval.requested":
       {
+        // ⚠️ **`askKind`**（2026-10-11 改）——字段名曾经是 `askKindName`，因为那时它是
+        // 一个 `string`（手写 `ToString()`）。现在核心直接交枚举、由序列化器出值，
+        // 于是字段名回到了 `askKind`，**值是小写 `"permission"` / `"question"`**
+        // （与 `/sessions` 的 `ask.kind`、`/state` 的 `ask.kind` 三处同一个来源）。
         const v = info.get(p.sessionId);
-        if (v) { v.ask = { askId: p.askId, kind: p.askKindName, deadlineAt: p.deadlineAt }; renderSessions(); }
+        if (v) { v.ask = { askId: p.askId, kind: p.askKind, deadlineAt: p.deadlineAt }; renderSessions(); }
         if (p.sessionId === current) {
           setStatus("WaitingForInput");
           // ⚠️ **重拉**，不是画一行字：那张卡片要的问题原文**不在事件里**

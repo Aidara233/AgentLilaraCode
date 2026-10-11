@@ -198,15 +198,21 @@ public sealed class ControlServer(
                 Ask = state.Ask is { } a
                     ? new
                     {
-                        // ⚠️ 显式 `(string?)` 不是多余的：两个分支的匿名类型**必须逐字段同名同型**
-                        // 才会被编译器合并成同一个类型——否则这里是一个 CS8619（可空性不匹配），
-                        // 而解法不是 `!`（那会撒谎），是让两支**真的是同一个形状**。
+                        // ⚠️ 显式 `(string?)` / `(AskKind?)` 不是多余的：两个分支的匿名类型
+                        // **必须逐字段同名同型**才会被编译器合并成同一个类型——否则这里是一个
+                        // CS8619（可空性不匹配），而解法不是 `!`（那会撒谎），是让两支**真的是同一个形状**。
+                        //
+                        // ⚠️ **`Kind` 直接交枚举，不 `.ToString()`**（2026-10-11 改）：
+                        // 手写的 `.ToString()` **绕开了 `WireJson.Options`**（那是 `JsonStringEnumConverter(camelCase)`）
+                        // ⇒ 线上一半 `"Permission"`、一半 `"permission"`（同一条 `/state` 响应里两种都有，
+                        // 见下面那个 `Ask`）。头拿 PascalCase 去比 ⇒ 「？授权」徽标画成「？提问」。
+                        // ⇒ 让序列化器接管：线上拼法此后只有一个来源。
                         AskId = (string?)a.AskId,
                         ToolName = (string?)a.ToolName,
-                        Kind = (string?)a.Kind.ToString(),
+                        Kind = (AskKind?)a.Kind,
                         a.DeadlineAt,
                     }
-                    : new { AskId = (string?)null, ToolName = (string?)null, Kind = (string?)null,
+                    : new { AskId = (string?)null, ToolName = (string?)null, Kind = (AskKind?)null,
                             DeadlineAt = (DateTimeOffset?)null },
             };
         });
@@ -273,7 +279,9 @@ public sealed class ControlServer(
                         ? new
                         {
                             pa.AskId,
-                            Kind = pa.Kind.ToString(),
+                            // ⚠️ 同样交枚举、不 `.ToString()`——与上面 `/sessions` 那一格**必须同拼法**
+                            // （同一条响应里 `state.ask.kind` 与顶层 `ask.kind` 不一致，实测抓到过）。
+                            Kind = pa.Kind,
                             pa.ToolName,
                             pa.DeadlineAt,
                             Items = ItemsOf(handle, pa) is { Count: > 0 } fromDisk

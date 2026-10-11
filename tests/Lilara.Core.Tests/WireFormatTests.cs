@@ -48,6 +48,28 @@ public class WireFormatTests
         Assert.Contains("\"value\":\"max\"", json);
     }
 
+    // ⚠️ 询问那两条事件的**载荷形状**（2026-10-11 加）。
+    //
+    // `askKind` 曾经是 `string`，而它是在调用点手写 `asked.Kind.ToString()` 造出来的
+    // ⇒ 线上 `"Permission"`（PascalCase），与**同一份数据**在 `/sessions` · `/state` 上的
+    // 拼法不一致（那两处走 `JsonStringEnumConverter(camelCase)`）。头拿 PascalCase 去比
+    // ⇒ 「？授权」徽标静默画成「？提问」。
+    // ⇒ 现在类型是枚举、由序列化器出值，判据是「线上只有一种拼法」。
+    [Fact]
+    public void WireEvent_ApprovalRequested_SpellsAskKindInCamelCase()
+    {
+        var json = WireEvent.StableSerialize(new WireEvent.ApprovalRequested(
+            "s1", "a1", Kernel.AskKind.Permission,
+            [Kernel.AskItem.Choice("q1", "跑吗？", ["是", "否"])],
+            [], null));
+
+        Assert.Contains("\"kind\":\"approval.requested\"", json);
+        // ⚠️ **字段名是 `askKind`，不是 `askKindName`**——后者是「它曾经是个 string」的化石，
+        // 而头是按真字段名取值的（`app.js` 的 `p.askKind`）⇒ 名字一漂，头拿到的就是 `undefined`。
+        Assert.Contains("\"askKind\":\"permission\"", json);
+        Assert.DoesNotContain("Permission", json);
+    }
+
     // 嵌套 Block 的判别式取自静态声明类型，少了它头收到一串没有类型的块。
     [Fact]
     public void WireEvent_NestedBlocksKeepTheirDiscriminator()

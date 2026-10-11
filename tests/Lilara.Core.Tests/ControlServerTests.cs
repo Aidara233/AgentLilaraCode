@@ -1304,6 +1304,49 @@ public class ControlServerTests : IAsyncLifetime
     // ---- 全量会话状态（`01` §3.8）：一次拿全，供头顶「哪个会话在等我」----
 
     /// <summary>
+    /// ⚠️ <b>同一条已知数据经两个端点交出去时，<b>线上拼法必须相同</b></b>（2026-10-11 加）。
+    ///
+    /// <para>这条抓的是一个**真出过的**缺陷：`/sessions` 上那一格是手写的
+    /// <c>a.Kind.ToString()</c>（⇒ <c>"Permission"</c>），而 <c>/state</c> 上那一格直接交枚举、
+    /// 走 <c>JsonStringEnumConverter(camelCase)</c>（⇒ <c>"permission"</c>）。
+    /// ⇒ <b>同一条 <c>/state</c> 响应里两种拼法并存</b>（顶层 `ask.kind` 与内层 `state.ask.kind`），
+    /// 而任何一处都不报错——头只是把「？授权」徽标静默画成「？提问」。</para>
+    ///
+    /// <para>⚠️ <b>为什么必须钉「两个端点一致」而不是各钉各的字面量</b>：各钉各的能抓住
+    /// 「改了一处」，但抓不住「本来就分叉」——分叉正是这次的形状。一致性判据没有第二个副本。</para>
+    /// </summary>
+    [Fact]
+    public async Task AskKind_IsSpelledTheSameWayOnEveryEndpoint()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        var projectKey = _host.Store.FindSession(sid)!.Value.ProjectKey;
+        var handle = _host.Activate(projectKey, sid);
+        handle.UpdateStateAndPersist(_host.Store, s => s with
+        {
+            Status = SessionStatus.WaitingForInput,
+            Ask = new PausedAsk("ask-1", AskKind.Permission, "call-1", "bash", "hash", null),
+        }, diskStatus: SessionStatus.WaitingForInput);
+
+        using var list = JsonDocument.Parse(await Client.GetStringAsync(Http("/sessions")));
+        var listKind = list.RootElement.EnumerateArray()
+            .Single(e => e.GetProperty("sessionId").GetString() == sid)
+            .GetProperty("ask").GetProperty("kind").GetString();
+
+        using var state = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/state")));
+        var outerKind = state.RootElement.GetProperty("ask").GetProperty("kind").GetString();
+        var innerKind = state.RootElement.GetProperty("state").GetProperty("ask").GetProperty("kind").GetString();
+
+        Assert.Equal(listKind, outerKind);
+        Assert.Equal(outerKind, innerKind);
+
+        // 顺带钉死它**是哪一个**拼法——只钉「三处一致」的话，三处一起变成 PascalCase 也照样绿，
+        // 而那会让头（按 camelCase 写）再一次静默失配。
+        Assert.Equal("permission", listKind);
+    }
+
+    /// <summary>
     /// ⚠️ <b>这条钉的是「读不能有副作用」</b>——而这个端点最容易写错的地方正是它：
     /// `/sessions/{id}/state` 在激活表 miss 时会**载入并登记**那个会话，
     /// 照着它写 ⇒ **打开一次列表 = 全库载入**（`01` §11.7 那次事故的形状）。
@@ -1376,7 +1419,12 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Equal("WaitingForInput", row.GetProperty("status").GetString());
         var ask = row.GetProperty("ask");
         Assert.Equal("ask-1", ask.GetProperty("askId").GetString());
-        Assert.Equal("Permission", ask.GetProperty("kind").GetString());
+
+        // ⚠️ **camelCase，不是 `"Permission"`**（2026-10-11 改）：核心这里曾经手写 `.ToString()`
+        // ⇒ PascalCase，而同一份数据在 `/state` 里是 camelCase（`JsonStringEnumConverter`）
+        // ⇒ **同一条响应两种拼法**。头拿 PascalCase 去比 ⇒ 「？授权」徽标静默画成「？提问」。
+        // ⇒ 判据是「线上只有一种拼法」，而它与**每一个**线上枚举值一致（`"event"` / `"toolUse"` …）。
+        Assert.Equal("permission", ask.GetProperty("kind").GetString());
         Assert.Equal("bash", ask.GetProperty("toolName").GetString());
 
         // ⚠️ 内部配对用的那两格**不进线上 schema**（交出去等于把实现细节写进协议）。

@@ -151,16 +151,26 @@ public abstract record WireEvent
     /// <param name="Ask">那批问题。⚠️ **它是内存里那份**——重启之后原问题丢了，
     /// 所以**重启后不会有这条事件被补发**（没有生产者：那次挂起发生在进程死之前）。
     /// 头要靠 `GET /sessions` 的 `ask` 那一格看到它。</param>
-    /// <param name="AskKindName">
-    /// ⚠️ <b>原名是 <c>Kind</c>，而那是一个**会掀翻整个进程的**字段名</b>——
+    /// <param name="AskKind">
+    /// ⚠️ <b>字段名原名是 <c>Kind</c>，而那是一个**会掀翻整个进程的**名字</b>——
     /// 实测（2026-10-08）：`WireEvent` 的多态判别式就叫 <c>kind</c>（camelCase 之后），
     /// 于是 STJ 抛 <c>PropertyConflictsWithMetadataPropertyName</c>，
     /// 而那**不是「这条事件序列化失败」，是 `WireJson.Options` 整个类型解析失败** ⇒
     /// **全进程所有帧的序列化一起炸**，症状是「随便发什么帧都断连」。
-    /// 名字躲开它是唯一解法（不像 `ApprovalResolved.Outcome` 那样只是「语义上该避开」）。
+    /// 名字躲开它是唯一解法（不像 `ApprovalResolved.Outcome` 那样只是「语义上该避开」）。</param>
+    /// <param name="AskKindName">
+    /// ⚠️ <b>参数名叫 `AskKindName`、类型是枚举——那个名字是历史</b>（2026-10-11 改）。
+    /// 它**曾经是 `string`**，调用点手写 `asked.Kind.ToString()` ⇒ 线上是 <c>"Permission"</c>
+    /// （PascalCase），而**同一份数据在 `/sessions/{id}/state` 里是 <c>"permission"</c>**
+    /// （走 `WireJson.Options` 的 `JsonStringEnumConverter(camelCase)`）⇒ **同一条响应里两种拼法**。
+    /// 头因此把 `"？授权"` 徽标画成了 `"？提问"`（`app.js` 拿 PascalCase 去比）。
+    ///
+    /// <para>⇒ 改成**让序列化器接管枚举**：线上的拼法此后只有一个来源，手写 `ToString()`
+    /// 那条路（它绕开了 `WireJson.Options`）不再存在。⚠️ 判据是「线上一律 camelCase」——
+    /// 同 `message.appended` 的 `"event"` / `"message"` / `"toolUse"` 等**每一个线上枚举值**。</para>
     /// </param>
     public sealed record ApprovalRequested(
-        string SessionId, string AskId, string AskKindName, IReadOnlyList<AskItem> Items,
+        string SessionId, string AskId, AskKind AskKind, IReadOnlyList<AskItem> Items,
         IReadOnlyList<AskMemory> Remember, DateTimeOffset? DeadlineAt) : WireEvent;
 
     /// <summary>**那次询问结束了**（答了 / 作废了 / 超时了）。同投两条流。</summary>
