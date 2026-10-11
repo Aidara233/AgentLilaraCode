@@ -65,10 +65,84 @@ public class AskTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// **重启之后批准，参数照样是对的**（`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>这条是 E2E 抓出来的</b>（2026-10-11，真模型 + 真重启）：那条 `update`
+    /// **真的执行了**（直接执行那条路是通的），却报「缺少 `path` 参数」——
+    /// 因为内存那半（`AwaitingInput`）在重启后是 null，而当时退回了「凭空造一条调用」，
+    /// 编出来的参数是空的。⇒ 与 `AskTool.ItemsOf` **同一个形状**：
+    /// **内存是缓存，盘上那条 `tool_use` 才是真相**。同一个形状在同一天栽了两次。</para>
+    /// </summary>
+    [Fact]
+    public async Task Approved_AfterRestart_UsesTheArgumentsFromDisk()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        var args = """{"a":1}""";
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", args)));
+
+        await StepperWith(_store, _adapter, [writer]).StepAsync(handle, "go", CancellationToken.None);
+        Assert.NotNull(handle.State.Ask);
+
+        // ⚠️ **模拟「重启」**：摘掉内存那半，只留盘上那份挂起账。
+        handle.AwaitingInput = null;
+        var paused = _store.ReadState(handle.ProjectKey, handle.SessionId).Ask!;
+
+        var (dispatcher, _) = DispatcherFor(handle, writer);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ApprovalRespond(handle.SessionId, paused.AskId, "submit",
+                new Dictionary<string, string> { ["decision"] = "allow" }),
+            "cmd-1", awaitCompletion: false, CancellationToken.None);
+
+        await WaitUntil(() => writer.Seen is not null);
+
+        // ⚠️ **判据是工具收到的那份原文**——编出来的那条会是 `{}`。
+        Assert.Equal(args, writer.Seen);
+    }
+
+    /// <summary>
+    /// **批准会记一条「这一次」**（`01` §3.8）——于是同一个调用**本合同参数**再来时不再问。
+    ///
+    /// <para>⚠️ <b>它的角色在 2026-10-11 变了</b>：从前它是「批准生效」的**唯一机制**
+    /// （重发要靠它放行）⇒ 没写就活锁；现在批准**直接执行**，它退化成**一个优化**。
+    /// ⚠️ 但**它仍然要写**：不写的话
+    /// ① 头的「记住」复选框是个哑的；② 模型每次重发同一条都要重新问一遍。</para>
+    /// </summary>
+    [Fact]
+    public async Task Approved_RecordsTheApprovalSoTheSameCallDoesNotAskAgain()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", """{"a":1}""")));
+
+        await StepperWith(_store, _adapter, [writer]).StepAsync(handle, "go", CancellationToken.None);
+
+        var (dispatcher, _) = DispatcherFor(handle, writer);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ApprovalRespond(handle.SessionId, handle.State.Ask!.AskId, "submit",
+                new Dictionary<string, string> { ["decision"] = "allow" }),
+            "cmd-1", awaitCompletion: false, CancellationToken.None);
+
+        await WaitUntil(() => writer.Runs > 0);
+
+        // 同一条调用**再进一次闸门** ⇒ 不再问（记忆命中了）。
+        var batch = await new ToolExecutor(
+                [writer], new BlobStore(_store.DataRoot), "standard",
+                new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId))
+            .ExecuteAsync([new Block.ToolUseBlock("c9", "write_thing", """{"a":1}""")],
+                new SessionToolContext(_work, new BlobStore(_store.DataRoot)), CancellationToken.None);
+
+        Assert.Null(batch.Pending);
+    }
+
     /// <summary>一个**会记数**的写类工具。⚠️ 计数器就是「它到底跑没跑」的判据。</summary>
     private sealed class CountingWriter : ITool
     {
         public int Runs;
+
+        /// <summary>工具**收到的那份参数原文**——用来证明用户改的那份真的被执行了。</summary>
+        public string? Seen;
 
         public string Name => "write_thing";
         public PermissionClass PermissionClass => PermissionClass.Writing;
@@ -78,8 +152,28 @@ public class AskTests : IDisposable
         public Task<ToolOutcome> RunAsync(ToolCall call, IToolContext context, CancellationToken ct)
         {
             Runs++;
+            Seen = call.ArgumentsJson;
             return Task.FromResult(new ToolOutcome { Content = [new Block.TextBlock("写了")] });
         }
+    }
+
+    /// <summary>
+    /// 等一个条件成立，**有界**。
+    ///
+    /// <para>⚠️ <b>它不是「睡一会儿」</b>：答复之后那一跑走的是 fire-and-forget 的
+    /// `Task.Run`（`01` §3.8：答复那条路不阻塞调用方），测试**没法 await 它**。
+    /// ⇒ 唯一能做的就是等那个可观测的后果出现，而**超时要失败**——
+    /// 无条件 `Task.Delay` 会让「根本没跑」也变成绿。</para>
+    /// </summary>
+    private static async Task WaitUntil(Func<bool> done, int timeoutMs = 5000)
+    {
+        for (var waited = 0; waited < timeoutMs; waited += 20)
+        {
+            if (done()) return;
+            await Task.Delay(20);
+        }
+
+        Assert.Fail($"等了 {timeoutMs}ms，那个条件始终没成立（多半是那条后台推进根本没跑）。");
     }
 
     private static ModelSelection Model() => new()
@@ -275,17 +369,29 @@ public class AskTests : IDisposable
 
     // ---- 三、答复 ----
 
-    /// <summary>批准 ⇒ 落一条说得清的结果，且**不在这里执行那个工具**（执行只归 `ToolExecutor`）。</summary>
+    /// <summary>
+    /// **批准 ⇒ 直接执行**（`01` §3.8，2026-10-11 改）——这一批之前走的是「让模型重新发起」。
+    ///
+    /// <para>⚠️ <b>旧行为与它的代价</b>：批准只落一句「请重新发起它，这次会放行」，
+    /// 而重发要模型**再走一次往返** ⇒ 多一次模型调用、多一个失败面（模型可能不重发）、
+    /// 而且**用户改过的参数要绕一圈经过模型才被执行**（`ArgumentsAmended` 那一格
+    /// 本来是为此存在的，而它在 `src/` 里零读取点——设计意图与实现对不上）。
+    /// ⇒ 现在批准就执行：跑的还是 `ToolExecutor`，执行点仍然只有一个。</para>
+    ///
+    /// <para>⚠️ <b>判据是「工具真的跑了」</b>（`writer.Runs`）——不是「回话里有『批准』」。
+    /// 断言措辞会让这条测试在「批准了但没跑」时照样绿，而那正是要防的。</para>
+    /// </summary>
     [Fact]
-    public async Task Approved_LeavesAResultSayingSo_AndDoesNotRunTheTool()
+    public async Task Approved_RunsTheToolInsteadOfAskingTheModelToRetry()
     {
         var handle = NewSession();
         var writer = new CountingWriter();
-        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", "{}")));
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", """{"a":1}""")));
 
         await StepperWith(_store, _adapter, [writer])
             .StepAsync(handle, "go", CancellationToken.None);
         Assert.NotNull(handle.State.Ask);
+        Assert.Equal(0, writer.Runs);        // 前提：挂起时一次都没跑
 
         var (dispatcher, _) = DispatcherFor(handle, writer);
         await dispatcher.DispatchAsync(
@@ -293,15 +399,145 @@ public class AskTests : IDisposable
                 new Dictionary<string, string> { ["decision"] = "allow" }),
             "cmd-1", awaitCompletion: false, CancellationToken.None);
 
-        // ⚠️ **那个工具仍然一次没跑**：批准只是「下一步会放行」，
-        // 而「跑」是模型重新发起之后 `ToolExecutor` 的事。把执行塞进这里
-        // 会让「谁执行工具」有两个答案。
-        Assert.Equal(0, writer.Runs);
-        Assert.Contains("批准", LastResultText(handle));
+        // ⚠️ **后台那条路是 `Task.Run`**，测试没法 await ⇒ 等它跑完（有界）。
+        await WaitUntil(() => writer.Runs > 0);
+
+        Assert.Equal(1, writer.Runs);        // ⚠️ 真的跑了，而且只跑一次
+
+        // 那条 `tool_use` 配上了——而这就是「不悬空」的全部内容。
+        var results = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>().ToList();
+        Assert.Contains(results, r => r.CallId == "c1");
 
         // 挂起态清干净了（内存 + 盘）。
         Assert.Null(handle.AwaitingInput);
         Assert.Null(_store.ReadState(handle.ProjectKey, handle.SessionId).Ask);
+    }
+
+    /// <summary>
+    /// **用户改过的参数就是执行用的参数**（`01` §3.8）。
+    ///
+    /// <para>⚠️ 这条钉的是那条路上最容易丢的东西：改写跟着 `tool_result` 的
+    /// `ArgumentsAmended` 走，而**那个格子在 `src/` 里零读取点**——
+    /// 重发那条路根本不传参数（只发「你重新发起」那句话）。
+    /// ⇒ 现在由 <see cref="Stepper.Amended"/> 把它**换进调用本身**。</para>
+    /// </summary>
+    [Fact]
+    public async Task Approved_WithEditedArguments_ExecutesTheEditedOnes()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", """{"a":1}""")));
+
+        await StepperWith(_store, _adapter, [writer])
+            .StepAsync(handle, "go", CancellationToken.None);
+
+        var (dispatcher, _) = DispatcherFor(handle, writer);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ApprovalRespond(handle.SessionId, handle.State.Ask!.AskId, "submit",
+                new Dictionary<string, string>
+                {
+                    ["decision"] = "allow",
+                    ["arguments"] = """{"a":999}""",     // ⚠️ 用户改成了 999
+                }),
+            "cmd-1", awaitCompletion: false, CancellationToken.None);
+
+        await WaitUntil(() => writer.Seen is not null);
+
+        // ⚠️ **判据是工具收到的那份原文**——不是「记录里有个 amended 键」。
+        Assert.Equal("""{"a":999}""", writer.Seen);
+    }
+
+    /// <summary>
+    /// **一张卡盖住一批时，每一条都执行、每一条都配上对**（`01` §14 #31 ① 的那个缺口）。
+    ///
+    /// <para>⚠️ 这条在旧行为下**根本写不出来**：那时批准只让模型重发第一条，
+    /// 其余几条的 `tool_use` 一直悬着。</para>
+    /// </summary>
+    [Fact]
+    public async Task Approved_CoversEveryCallThatWasWaiting()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        _adapter.ReplyWith(_ => Calls(
+            ("c1", "write_thing", """{"a":1}"""), ("c2", "write_thing", """{"b":2}""")));
+
+        await StepperWith(_store, _adapter, [writer])
+            .StepAsync(handle, "go", CancellationToken.None);
+        Assert.Equal(2, handle.AwaitingInput!.Calls.Count);
+
+        var (dispatcher, _) = DispatcherFor(handle, writer);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ApprovalRespond(handle.SessionId, handle.State.Ask!.AskId, "submit",
+                new Dictionary<string, string> { ["decision"] = "allow", ["arguments"] = """{"a":1}""" }),
+            "cmd-1", awaitCompletion: false, CancellationToken.None);
+
+        await WaitUntil(() => writer.Runs >= 2);
+
+        // ⚠️ **两条都跑了**（旧行为下第二条从来不会跑）。
+        Assert.Equal(2, writer.Runs);
+
+        var uses = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.MessageEvent>()
+            .SelectMany(m => m.Blocks.OfType<Block.ToolUseBlock>())
+            .Select(b => b.CallId).OrderBy(x => x, StringComparer.Ordinal).ToList();
+
+        var results = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .Select(r => r.CallId).OrderBy(x => x, StringComparer.Ordinal).ToList();
+
+        Assert.Equal(uses, results);       // ⚠️ 一一对上，一条不剩
+        Assert.Equal(2, results.Count);
+    }
+
+    /// <summary>
+    /// **`ask`（问意见）批准之后不跑任何工具**——答案是内容，工具一个字都不碰。
+    /// ⚠️ 它与上面那几条是**两个 Kind 的两条路**，别混：授权那条跑，
+    /// 提问那条落用户给的答案（`01` §3.8 的判据是「答完谁动手」）。
+    /// </summary>
+    [Fact]
+    public async Task AnsweringAQuestion_RecordsTheAnswerWithoutRunningAnything()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        // ⚠️ **工具表里必须有 `ask`**，否则那条调用会落成「没有这个工具」的拒绝结果
+        // ——而那**不会挂起**（挂起的判据是「有问」）。
+        var ask = new AskTool();
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks =
+            [
+                (Block)new Block.ToolUseBlock("c1", "ask",
+                    """{"questions":[{"id":"fmt","type":"text","question":"什么格式？"}]}"""),
+            ],
+            StopReason = "tool_use",
+            Refused = false,
+        });
+
+        await StepperWith(_store, _adapter, [ask, writer])
+            .StepAsync(handle, "go", CancellationToken.None);
+        Assert.NotNull(handle.State.Ask);
+
+        var (dispatcher, _) = DispatcherFor(handle, ask, writer);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ApprovalRespond(handle.SessionId, handle.State.Ask!.AskId, "submit",
+                new Dictionary<string, string> { ["fmt"] = "Markdown" }),
+            "cmd-1", awaitCompletion: false, CancellationToken.None);
+
+        // ⚠️ 判据要**容忍「还没有结果」**——`LastResultText` 在空时间线上会抛
+        //（`Last()` 空序列）。等一个条件时那个条件必须能安全地问「到了吗」。
+        await WaitUntil(() => _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .Any(r => string.Concat(r.Content.OfType<Block.TextBlock>().Select(b => b.Text)).Contains("fmt")));
+
+        // ⚠️ **核心自己把答案拼进去，不经过模型**（这正是这一批的重点之一）。
+        Assert.Contains("fmt: Markdown", LastResultText(handle));
+        Assert.Equal(0, writer.Runs);
+
+        // ⚠️ **而且没有多调一次模型**——那条路**只有一次**模型调用（最开始那一步）。
+        // 这一格是这条测试真正的判据：答复之后核心直接往下走，
+        // 旧行为（落一句正文 + 安排下一步）会**再调一次模型**去把答案转述出来。
+        Assert.Single(_adapter.Calls);
     }
 
     /// <summary>
@@ -686,9 +922,14 @@ public class AskTests : IDisposable
     ///
     /// <para>⚠️ <b>判据是「同一个调用第二次进闸门时放行」</b>，而这条只有**跑真闸门**
     /// 才证得了：断言「store 里有条目」证明的是写进去了，不是**它管事**。</para>
+    ///
+    /// <para>⚠️ <b>2026-10-11 之后这条测的是「记忆」本身</b>：批准那条路现在**直接执行**
+    /// （不再靠记忆让重发放行，见 <c>Approved_RunsTheToolInsteadOfAskingTheModelToRetry</c>）
+    /// ⇒ 这里问的变成「**同一个参数下次还要不要问**」，而那正是记忆那一格的含义。
+    /// ⚠️ 它仍然要钉：`standards` 档 + 写类 ⇒ 闸门本来会 `Ask`，是**记忆**把它降成 `Allow` 的。</para>
     /// </summary>
     [Fact]
-    public async Task Approve_WithoutRemember_StillLetsTheRetryThrough()
+    public async Task RememberingTheApproval_LetsTheSameCallThroughNextTime()
     {
         var handle = NewSession();
         var writer = new CountingWriter();
@@ -697,14 +938,13 @@ public class AskTests : IDisposable
         await StepperWith(_store, _adapter, [writer]).StepAsync(handle, "go", CancellationToken.None);
         Assert.NotNull(handle.State.Ask);
 
-        var (dispatcher, _) = DispatcherFor(handle, writer);
-        await dispatcher.DispatchAsync(
-            // ⚠️ **不传 `Remember`**——「这一次」是默认（`AskMemory` 的注释）。
-            new CoreCommand.ApprovalRespond(handle.SessionId, handle.State.Ask!.AskId, "submit",
-                new Dictionary<string, string> { ["decision"] = "allow" }),
-            "cmd-1", awaitCompletion: false, CancellationToken.None);
+        // 直接写一条记忆（等价于用户勾了「这一次」）——⚠️ 这一步**不走批准**：
+        // 批准现在直接执行，跑不到「下一次进闸门」那一格。
+        new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId)
+            .Add(new Approval("write_thing", ApprovalStore.HashArgs("""{"a":1}"""),
+                ToolWide: false, CoreClock.Now()));
 
-        // 模型重发同一条调用 ⇒ 这一次必须**直接跑掉**。
+        // 同一个调用**再进一次闸门** ⇒ 这一次必须直接跑掉。
         var batch = await new ToolExecutor(
                 [writer], new BlobStore(_store.DataRoot), "standard",
                 new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId))

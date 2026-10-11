@@ -39,6 +39,51 @@ public sealed class ToolExecutor(
     ApprovalStore? approvals = null)
 {
     /// <summary>
+    /// **用户批过的那几条：跳闸门，直接执行**（`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>`null` = 走正常那条路</b>（所有调用都过闸门）。非空 ⇒ 列在里面那些
+    /// `callId` **跳过判定、直接跑**。</para>
+    ///
+    /// <para>⚠️ <b>它为什么必须存在，而不是「写条记忆让闸门自己放行」</b>：
+    /// 批准那一步是 `CommandDispatcher` 里落的结果，而**它没法把参数原文送回来**——
+    /// 用户改过的参数只走 `tool_result` 的 <c>ArgumentsAmended</c> 那一格，
+    /// 而形状上「一条 `tool_result` 对一条 `tool_use`」（`01` §3.6 ①）。
+    /// ⇒ 一批里第 2..N 条**拿不到属于它们的那份改写**。由调用方把**执行用的参数**
+    /// 直接交进来，这一层就不需要知道「用户改没改」。</para>
+    ///
+    /// <para>⚠️ <b>传进来的不只是原样重发</b>：调用方（`Stepper.ResumeAsync`）会把
+    /// 那几条调用换成用户改写后的参数，并把「用户对那次询问的答复」也传进来
+    /// —— 于是「那几项没有被回答」这句话由**核心**写，不再绕经模型。</para>
+    /// </summary>
+    public sealed record Reply(
+        AskKind Kind,
+        IReadOnlyList<string> CallIds,
+        IReadOnlyList<AskItem> Items,
+        IReadOnlyDictionary<string, string> Answers)
+    {
+        /// <summary>这次回复盖住了这条调用吗。（空列表 = 全都不盖。）</summary>
+        public bool Covers(string callId) =>
+            CallIds.Any(id => string.Equals(id, callId, StringComparison.Ordinal));
+
+        /// <summary>
+        /// 按 id 拼回**一条**结果（`01` §3.8：一次询问一个信封）。
+        /// ⚠️ 缺项如实写「未回答」，**不编一个空值**——那是「多了一条假信息」。
+        /// </summary>
+        public string Compose()
+        {
+            var lines = new List<string>();
+            foreach (var item in Items)
+            {
+                lines.Add(Answers.TryGetValue(item.Id, out var v)
+                    ? $"{item.Id}: {v}"
+                    : $"{item.Id}: （未回答）");
+            }
+
+            return string.Join("\n", lines);
+        }
+    }
+
+    /// <summary>
     /// 全部执行完，返回与入参**一一对应、同序**的结果。
     ///
     /// <para>⚠️ <b>三趟，次序是刻意的</b>：</para>
@@ -76,7 +121,8 @@ public sealed class ToolExecutor(
     /// <b>而这是查过语言规则才定的，不是试出来的</b>。</para>
     /// </returns>
     public async Task<Batch> ExecuteAsync(
-        IReadOnlyList<Block.ToolUseBlock> calls, IToolContext context, CancellationToken ct)
+        IReadOnlyList<Block.ToolUseBlock> calls, IToolContext context, CancellationToken ct,
+        Reply? reply = null)
     {
         var byName = tools.ToDictionary(t => t.Name, StringComparer.Ordinal);
 
@@ -84,12 +130,20 @@ public sealed class ToolExecutor(
         var plans = new List<Plan>(calls.Count);
         foreach (var call in calls)
         {
-            // ⚠️ **三路，次序是刻意的**：不存在的工具 → 闸门 → 询问。
-            // ⚠️ 闸门在这里（**执行期**）而不是工具表里（请求期）：那是 `01` §9.2 的分工，
-            // 改闸门**零前缀代价**，而改工具表破最前端。
             if (!byName.TryGetValue(call.Name, out var tool))
             {
                 plans.Add(new Plan(call, null, Verdict.Deny, $"没有名为 '{call.Name}' 的工具。"));
+                continue;
+            }
+
+            // ⚠️ **用户刚批过的那几条：跳闸门**（`01` §3.8）。判据是「用户已经就这一次调用
+            // 说过话」——而不是「写没写过记忆」。这两件事在**这一批**上看着等效，
+            // 但只对**回复盖住的那些**成立：没被盖住的那几条**照样要问**
+            //（一张卡可能只答了三条，而模型发了五条）。
+            // ⚠️ 它**跳的是判定，不是执行**——工具照常由下面那一趟跑，执行点仍然只有这一个。
+            if (reply is not null && reply.Covers(call.CallId))
+            {
+                plans.Add(new Plan(call, tool, Verdict.Allow, ""));
                 continue;
             }
 
@@ -115,6 +169,9 @@ public sealed class ToolExecutor(
             // 不存在的工具与硬拒：它们**不问**，理由在 `Says` 里。
             if (plan.Tool is null || plan.Verdict is Verdict.Deny) continue;
 
+            // ⚠️ 已答复过的调用不再收问（它与上面那条跳闸门是同一条判据的两半）。
+            if (reply is not null && reply.Covers(plan.Call.CallId)) continue;
+
             if (plan.Verdict is Verdict.Ask)
             {
                 asks.Add(Gate.AskFor(plan.Tool, plan.Call, permissionLevel));
@@ -138,6 +195,30 @@ public sealed class ToolExecutor(
         var results = new List<TimelineEvent.ToolResultEvent>(calls.Count);
         foreach (var plan in plans)
         {
+            // ⚠️ **问意见（`Question`）那条：用户答复过的不跑**（`01` §3.8）。
+            //
+            // <para>`ask` 问的不是「准不准跑」——它问的是「你怎么想」，而**答案本身就是内容**
+            // （`AskKind.Question`）⇒ 那条调用落的是用户给的内容，工具一个字都不碰。</para>
+            //
+            // <para>⚠️ <b>授权（`Permission`）那条恰好相反</b>：用户说「可以」的意思就是
+            // **让它跑**——那条调用在挂起时**一次都没执行过**，所以这里**必须**往下走去执行。
+            // ⇒ 两处判据只在 `Question` 上分叉，而这一格写错的表现是
+            // 「批准了、结果也落了，而工具一次都没跑」——**看着完全正常**。</para>
+            if (reply is { Kind: AskKind.Question } && reply.Covers(plan.Call.CallId))
+            {
+                results.Add(new TimelineEvent.ToolResultEvent
+                {
+                    Id = Ids.New(),
+                    At = CoreClock.Now(),
+                    CallId = plan.Call.CallId,
+                    // ⚠️ 内容由**核心**拼（`Reply.Compose`），**不经过模型**——
+                    // 这是这一批的重点：让模型「把答案转述一遍」既多一次往返，
+                    // 也会让答案在转述里走样。
+                    Content = [new Block.TextBlock(reply.Compose())],
+                });
+                continue;
+            }
+
             // ⚠️ **被拒的调用绝不 `RunAsync`**——否则就是「拒了，但还是删了库」。
             var outcome = plan.Tool is not null && plan.Verdict is Verdict.Allow
                 ? await plan.Tool.RunAsync(

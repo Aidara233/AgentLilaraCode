@@ -253,6 +253,154 @@ public sealed class Stepper(
         return new StepOutcome(reply);
     }
 
+    /// <summary>
+    /// **把用户改写的参数换进要执行的那些调用**（`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>为什么这件事必须在这里发生</b>：用户改的那份原文跟着 <c>tool_result</c>
+    /// 走，而一条 `tool_result` 只对一条 `tool_use`（`01` §3.6 ①）⇒ 一批里第 2..N 条
+    /// **拿不到属于它们的那份改写**。而重发那条路根本不传参数（只发「你重新发起」那句话）。
+    /// ⇒ 把改写**换进调用本身**，执行那一层就不需要知道「用户改没改」。</para>
+    ///
+    /// <para>⚠️ <b>只换被盖住的那些</b>：没答到的调用保持原样，它们要重新挂起。
+    /// ⚠️ <b>换的是 <see cref="Block.ToolUseBlock.Arguments"/> 那一格</b>——
+    /// 它正是 `ToolExecutor` 交给工具的那份：逐字、不改写（`01` §9）。</para>
+    /// </summary>
+    /// <param name="calls">等待中的调用（原样那份）。</param>
+    /// <param name="paused">盘上那份（要拿它的 `CallId` 与哈希来判「改了没有」）。</param>
+    /// <param name="amended">用户改过的参数原文；没有就是 `null`。</param>
+    public static IReadOnlyList<Block.ToolUseBlock> Amended(
+        IReadOnlyList<Block.ToolUseBlock> calls, PausedAsk paused, string? amended)
+    {
+        if (amended is null) return calls;
+
+        // ⚠️ **规范化之后比**（与 `ApprovalStore.HashArgs` 同一条判据）：
+        // 用户只把键序倒了一下不算「改了参数」——JSON 对象无序。
+        if (string.Equals(ApprovalStore.HashArgs(amended), paused.ArgsHash, StringComparison.Ordinal))
+            return calls;
+
+        return [.. calls.Select(c => string.Equals(c.CallId, paused.CallId, StringComparison.Ordinal)
+            ? c with { Arguments = amended }
+            : c)];
+    }
+
+    /// <summary>
+    /// **从盘上把被挂起的那一批调用重新解出来**（`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>为什么必须有它</b>：`SessionHandle.AwaitingInput` 是**内存那半**，
+    /// 而**任何一次「从盘重新载入」都会把它丢掉**（不只是重启）。那时若退回
+    /// 「凭空造一条调用」，参数就没了——而工具会拿到一个空参数对象。</para>
+    ///
+    /// <para>⚠️ <b>这个洞是 E2E 抓出来的</b>（2026-10-11，真模型 + 重启）：
+    /// 那条 `update` **真的执行了**（直接执行那条路是通的），却报「缺少 `path` 参数」
+    /// ——因为它收到的是我编的 <c>{}</c>。⚠️ 而**它与 `AskTool.ItemsOf` 是同一个形状**
+    /// （「问题从盘上解不出」）：内存那半是**缓存**，盘上那条 `tool_use` 才是真相来源。
+    /// **同一个形状在同一天栽了两次。**</para>
+    ///
+    /// <para>⚠️ 返回的是**那一条模型消息里的全部 `tool_use`**（不是只有 `callId` 那条）
+    /// ——一张卡可能盖着好几条，而配对要按整批来。</para>
+    /// </summary>
+    public static IReadOnlyList<Block.ToolUseBlock> RecordedCalls(
+        SessionStore store, string projectKey, string sessionId, string callId)
+    {
+        foreach (var e in store.ReadTimeline(projectKey, sessionId))
+        {
+            if (e is not TimelineEvent.MessageEvent m) continue;
+
+            var uses = m.Blocks.OfType<Block.ToolUseBlock>().ToList();
+            if (uses.Any(u => string.Equals(u.CallId, callId, StringComparison.Ordinal)))
+                return uses;
+        }
+
+        return [];
+    }
+
+    /// <summary>
+    /// **答复之后直接执行**（`01` §3.8）——这一批之前走的是「让模型重新发起」。
+    ///
+    /// <para>⚠️ <b>为什么不再让模型重发</b>：那条路上批准只是落一句
+    /// 「请重新发起它，这次会放行」，而重发要模型**再走一次往返**。代价三条：
+    /// ① 多烧一次模型调用（延迟 + token）；② 多一个失败面（模型可能不重发、或重发时改了点什么）；
+    /// ③ **用户改过的参数要绕一圈经过模型才被执行**——而那是**用户**的决定，
+    /// 模型可能重新排版、甚至丢掉改动（那段原文本来是 `ArgumentsAmended` 要保的，
+    /// 而它在 `src/` 里**零读取点**：写进去了、没人读——设计意图与实现对不上）。</para>
+    ///
+    /// <para>⚠️ <b>它不新增执行点</b>：跑的还是 <see cref="ToolExecutor"/>，
+    /// 只是从「下一步」挪到「这一步」。判据是 <c>ArgsBypass==</c>那种「谁执行工具」
+    /// 仍然只有一个答案。</para>
+    ///
+    /// <para>⚠️ <b>改写过的参数在这里生效</b>：<paramref name="calls"/> 是调用方
+    /// 按用户改的那份**换过**的调用（见 <see cref="Amended"/>），所以「用户改的就是执行的」。
+    /// ⚠️ 未被回复盖住的等待中调用会**重新挂起**——一张卡可能只答了一部分，
+    /// 而那几条的 `tool_use` 一条都还不能配对。</para>
+    /// </summary>
+    /// <param name="calls">等待中的那些调用（已按用户改写换过参数）。</param>
+    /// <param name="reply">用户对那次询问的答复（盖住哪几条、答了什么）。</param>
+    public async Task<StepOutcome> ResumeAsync(
+        SessionHandle handle, IReadOnlyList<Block.ToolUseBlock> calls,
+        ToolExecutor.Reply reply, CancellationToken ct, PausedAsk paused)
+    {
+        var events = new List<TimelineEvent>();
+
+        if (calls.Count > 0)
+        {
+            var blobs = new BlobStore(_store.DataRoot);
+            var executor = new ToolExecutor(
+                _tools, blobs, handle.State.Axes![Axes.Permission],
+                new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId));
+            var context = new SessionToolContext(
+                handle.Spec.WorkingDirectory, blobs,
+                _store.ReadTimeline(handle.ProjectKey, handle.SessionId));
+
+            var batch = await executor.ExecuteAsync(calls, context, ct, reply);
+            events.AddRange(batch.Results);
+
+            // ⚠️ **还有没答到的**（一张卡只答了一部分）⇒ 重新挂起，那些 `tool_use` 继续悬着
+            // ——而这次悬着是**对的**：它们确实还没被回答。
+            if (batch.Pending is { } again)
+            {
+                _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
+
+                handle.AwaitingInput = new SessionHandle.PendingAsk(again, calls);
+                handle.UpdateStateAndPersist(_store, s => s with
+                {
+                    Status = SessionStatus.WaitingForInput,
+                    Ask = new PausedAsk(
+                        again.Id, again.Kind, calls[0].CallId, calls[0].Name,
+                        ApprovalStore.HashArgs(calls[0].Arguments),
+                        DeadlineOf(handle.Spec.AskTimeout)),
+                    Turn = s.Turn + 1,
+                }, diskStatus: SessionStatus.WaitingForInput);
+
+                return new StepOutcome(NoReply, again, handle.State.Ask?.DeadlineAt);
+            }
+        }
+
+        _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
+
+        handle.UpdateStateAndPersist(_store, s => s with
+        {
+            Status = SessionStatus.Idle,
+            Turn = s.Turn + 1,
+        }, diskStatus: SessionStatus.Idle);
+
+        return new StepOutcome(NoReply);
+    }
+
+    /// <summary>
+    /// **这一步没有模型回复**——答复那条路不调模型（用户答完是核心自己往下走）。
+    ///
+    /// <para>⚠️ 它不是一个「空回复」的占位：<see cref="StepOutcome.Reply"/> 那一格
+    /// 被读的地方只有 `CommandDispatcher`（发 `message.appended` 与判循环），
+    /// 而这两个判断都按「**没有模型消息**」处理才是对的。⇒ 用一个**说得出名字**的
+    /// 常量，而不是在调用点 `null!` 或者现造一个空 `ModelReply`。</para>
+    /// </summary>
+    private static readonly ModelReply NoReply = new()
+    {
+        Blocks = [],
+        StopReason = "end_turn",
+        Refused = false,
+    };
+
     /// <para>⚠️ <b><see cref="Refused"/> 是新增的</b>：`Stepper` 刻意**不碰事件总线**
     /// （模型消息与 `step.end` 都由 `CommandDispatcher` 发，这样控制台敲的那句话
     /// 在头上也看得见）。挂起那条路**本来没打算发事件**，但 `WireFormatTests` 有一条
@@ -336,9 +484,11 @@ public sealed class Stepper(
     /// <c>first</c> 条之后开始补。⇒ 两条路**合起来**才凑齐这一批。</para>
     ///
     /// <para>⚠️ <b>只用在「这批不跑了」的三种收尾上</b>（拒绝 / 超时 / 作废）——
-    /// 那时「这些调用被一起作废」是**真话**。⚠️ **批准那条路不走这里**：
-    /// 批准只让第一条重发，其余几条的语义是「还没轮到你」，而今天**没有**一个
-    /// 说得清的说法——⇒ 那条路维持原样，如实记在 `01` §14 #31。</para>
+    /// 那时「这些调用被一起作废」是**真话**。
+    /// ⚠️ <b>批准那条路不走这里</b>，而理由在 2026-10-11 变了：它原先走的是
+    /// 「只让第一条重发」（其余几条的语义说不清），**现在是直接执行全部**
+    /// （`ToolExecutor` 按 `Reply.Covers` 逐条跑、逐条配对）⇒ 它**不需要** `Blocked`，
+    /// 因为那些调用**全都真的执行了**。</para>
     /// </summary>
     /// <param name="calls">被挂住的那些调用（`SessionHandle.PendingAsk.Calls`）。</param>
     /// <param name="first">从第几条之后开始补（调用方已配过的那条不算）。</param>

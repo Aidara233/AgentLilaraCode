@@ -708,10 +708,37 @@ public sealed class CommandDispatcher(
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                 new WireEvent.StepBegin(handle.SessionId, handle.State.Turn + 1, CoreClock.Now()));
 
-            // 取空队列——合并是队列的副产品。
-            var blocks = handle.DrainQueue();
-            var step = await _resolveStepper(handle).StepAsync(handle, blocks, stepCts.Token);
-            reply = step.Reply;
+            ModelReply replyForLoop;
+            Stepper.StepOutcome step;
+
+            if (handle.TakeResume() is { } pending)
+            {
+                // ---- 答复之后直接执行（`01` §3.8）----
+                //
+                // ⚠️ **它走的仍是这一步的整条仪式**（闸 / `step.begin` / 事件 / 落盘 / 循环续推）
+                // ——这正是它**不另开一条路**的理由：另开一条会把这些一条条抄一遍，
+                // 而抄漏一条的表现是「答复之后那个会话看起来正常，而它推不动了」。
+                step = await _resolveStepper(handle).ResumeAsync(
+                    handle, pending.Calls, pending.Reply, stepCts.Token, pending.Paused);
+
+                // ⚠️ 答复那条路**不发模型消息**（没有模型消息可发）——`ResumeAsync` 交回的
+                // `Reply` 是那个「说得出名字的空回复」，喂给下面的事件与循环判断正好。
+                reply = step.Reply;
+                replyForLoop = step.Reply;
+            }
+            else
+            {
+                // 取空队列——合并是队列的副产品。
+                var blocks = handle.DrainQueue();
+                step = await _resolveStepper(handle).StepAsync(handle, blocks, stepCts.Token);
+                reply = step.Reply;
+                replyForLoop = step.Reply;
+
+                // 模型消息由这里发（`Stepper` 不碰事件总线）；判据与它落盘时一致：拒答 / 空块不产生模型消息。
+                if (!reply.Refused && reply.Blocks.Count > 0)
+                    _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                        new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, CoreClock.Now()));
+            }
 
             // ⚠️ **挂起也要发事件**（`01` §3.8）：一条头收不到的问题 = 会话被**静默挂起**。
             // ⚠️ 它同时投**两条流**（`approvals` 与这条会话流），理由见
@@ -727,12 +754,7 @@ public sealed class CommandDispatcher(
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId), requested);
             }
 
-            // 模型消息由这里发（`Stepper` 不碰事件总线）；判据与它落盘时一致：拒答 / 空块不产生模型消息。
-            if (!reply.Refused && reply.Blocks.Count > 0)
-                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                    new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, CoreClock.Now()));
-
-            PublishStepEnd(handle, reply);
+            PublishStepEnd(handle, replyForLoop);
 
             // ⚠️ **这里刻意不 `return`**：要让 `finally` 先跑（它 `ExitStep()` 放掉那把标志，
             // 而下一步要重新拿它）。返回值在 finally 之后的续推那一步给出。
@@ -1345,41 +1367,139 @@ public sealed class CommandDispatcher(
         // ⚠️ 看它的人只有这里（以及将来 `session.send` 那条 Superseded 路）。
         // 过期 ⇒ **用户的答案不采用**（它来晚了），按超时合成。
         var expired = paused.DeadlineAt is { } dl && CoreClock.Now() >= dl;
+        var cancelled = string.Equals(c.Outcome, "cancel", StringComparison.Ordinal);
 
+        // ⚠️ **批准 = 直接执行**（2026-10-11 改）。
+        //
+        // <para>⚠️ <b>原先走的是「让模型重新发起」</b>：批准只落一句「请重新发起它，
+        // 这次会放行」，而重发要模型**再走一次往返**。那个方案的代价在实测里全露出来了：
+        // ① 多一次模型调用；② 多一个失败面（模型可能不重发）；③ **用户改过的参数要绕一圈
+        // 经过模型才被执行**——而那是用户的决定，模型可能重新排版、甚至丢掉改动
+        //（`ArgumentsAmended` 那一格本来是为此存在的，而它在 `src/` 里**零读取点**：
+        // 写进去了、没人读，设计意图与实现对不上）。</para>
+        //
+        // <para>⚠️ <b>关键的判据是「批准只对这一次调用说话」</b>：它**不写记忆**
+        //（记忆是「以后这一类别再问了」）。没有记忆 ⇒ 模型重发同一批时闸门**照样会问**
+        // ——那正是「批了又弹」的活锁。⇒ 直接执行把它从根上去掉。</para>
+        //
+        // <para>⚠️ **拒绝 / 超时 / 作废不走这里**：那时「这些调用被一起作废了」是真话，
+        // 落结果、不执行（`Stepper.Blocked` 给每一条都补上配对）。</para>
+        // ⚠️ **被盖住的是哪几条、以及用户答了什么**——两个 Kind 的判据不一样（`01` §3.8）：
+        //
+        //   · **提问（`Question`）** ⇒ 只有那一条（那个 `ask` 调用本身）。它的答案
+        //     由核心拼进结果（`ToolExecutor` 的 `Kind: Question` 分支），工具一个字不碰。
+        //   · **授权（`Permission`）且批准** ⇒ **等待中的全部**。⚠️ 这是刻意的：
+        //     那张授权卡盖住的每一条都还没执行过，而「用户按了批准」就是对**这一批**说的。
+        //     ⇒ 全部执行、全部配对，`01` §14 #31 ① 那个「其余几条悬着」的缺口就此关掉。
+        //   · **拒绝 / 超时 / 作废 / 没批准** ⇒ 空（一条都不跑，走下面那条落结果的路）。
+        // ⚠️ 写上目标类型：下面那个嵌套条件表达式里既有集合表达式又有整型/字符串混排，
+        // 不写的话编译器推不出共同类型（CS0173）——而**不是**「风格问题」。
+        //
+        // ⚠️ **内存那半可能是 null**（从盘载入过 / 重启过）⇒ 那时**从盘上解**
+        // （`Stepper.RecordedCalls`），**不许凭空造一条**：编出来的那条参数是空的，
+        // 而工具会拿到一个空参数对象——实测里那句「缺少 `path` 参数」就是这么来的。
+        // ⚠️ 与 `AskTool.ItemsOf` 同一个形状：**内存是缓存，盘上那条 `tool_use` 才是真相**。
+        var waiting = awaiting?.Calls
+            ?? Stepper.RecordedCalls(_host.Store, handle.ProjectKey, handle.SessionId, paused.CallId);
+
+        IReadOnlyList<string> covered =
+            (expired || cancelled || (paused.Kind == AskKind.Permission && !IsApproved(c)))
+                ? []
+                : paused.Kind == AskKind.Question
+                    ? [paused.CallId]
+                    : waiting.Count > 0 ? [.. waiting.Select(x => x.CallId)] : [paused.CallId];
+
+        var reply = new Lilara.Core.Session.Tools.ToolExecutor.Reply(
+            paused.Kind, covered,
+            paused.Kind == AskKind.Question
+                ? Session.Tools.AskTool.ItemsOf(_host.Store, handle.ProjectKey, handle.SessionId, paused.CallId)
+                : [],
+            c.Answers);
+
+        // ---- 往下走（批准 / 提问），还是就此收尾（拒 / 超时 / 作废）----
+        //
+        // ⚠️ **判据按 Kind 分**（`01` §3.8）：
+        //   · **提问** ⇒ 一律往下走（用户答的就是内容，没有「拒」这回事）。
+        //   · **授权** ⇒ 只有**批准**才往下走；没批 / 超时 / 作废落一句拒绝结果、就此收尾。
+        var goesDownstream = paused.Kind == AskKind.Question || IsApproved(c);
+
+        // ⚠️ **批准 = 直接执行**（2026-10-11 改）。
+        //
+        // <para>⚠️ <b>原先走的是「让模型重新发起」</b>：批准只落一句「请重新发起它，
+        // 这次会放行」，而重发要模型**再走一次往返**。代价三条：
+        // ① 多烧一次模型调用；② 多一个失败面（模型可能不重发）；
+        // ③ **用户改过的参数要绕一圈经过模型才被执行**——而那是用户的决定，
+        // 模型可能重新排版、甚至丢掉改动（`ArgumentsAmended` 那一格本来是为此存在的，
+        // 而它在 `src/` 里**零读取点**：写进去了、没人读）。</para>
+        //
+        // <para>⚠️ <b>提问那条也走这里</b>：它的答案是内容，而「让模型转述一遍」
+        // 同样多一次往返、且会让答案在转述里走样 ⇒ 核心直接拼进结果。</para>
+        if (!expired && !cancelled && goesDownstream)
+        {
+            var edited = c.Answers.TryGetValue("arguments", out var a) ? a : null;
+
+            // ⚠️ **记一条批准**（`01` §3.8）。⚠️ <b>它的角色变了</b>（2026-10-11）：
+            // 从前它是「批准生效」的**唯一机制**（重发要靠它放行），于是「没写它就活锁」；
+            // 现在批准**直接执行**（见下面那段），它退化成**一个优化**——
+            // 「同一个调用本合同参数再来一次就别问了」。
+            //
+            // <para>⚠️ 判据是「记忆的粒度本来就是『这一次调用』」——用户裁定过
+            // 「这一次」是**默认**。勾选**不是**「要不要记住」，是「要不要把粒度放宽到整个工具」。</para>
+            var store = new ApprovalStore(_host.Store.DataRoot, handle.ProjectKey, handle.SessionId);
+            store.Add(new Approval(paused.ToolName, paused.ArgsHash,
+                ToolWide: c.Remember is { Length: > 0 } rm
+                          && string.Equals(rm, nameof(AskMemory.Tool), StringComparison.Ordinal),
+                At: CoreClock.Now()));
+
+            // ⚠️ **参数改写在这里生效**：把用户改的那份换进要执行的调用
+            // ⇒ 「用户改的就是执行的」（`Stepper.Amended`）。提问那条没有参数改写（`edited` 恒 null）。
+            var calls = waiting.Count == 0
+                ? new List<Block.ToolUseBlock> { new(paused.CallId, paused.ToolName, edited ?? "{}") }
+                : [.. Stepper.Amended(waiting, paused, edited)];
+
+            handle.QueueResume(new SessionHandle.PendingResume(calls, reply, paused));
+            ClearPause(handle);
+
+            _bus.Publish(EventBus.SessionTopic(c.SessionId),
+                new WireEvent.ApprovalResolved(c.SessionId, c.AskId, c.Outcome));
+            _bus.Publish(EventBus.ApprovalsTopic,
+                new WireEvent.ApprovalResolved(c.SessionId, c.AskId, c.Outcome));
+
+            // ⚠️ **拿不到闸就不续跑**（已经有一次推进在飞）。
+            // ⚠️ 拿不到时那次 `QueueResume` **留在槽里**，会被那次在飞的推进的**下一次**
+            // `TakeResume` 取走：它取走的正是「用户刚答的那一件」，语义对。
+            if (!handle.TryEnterStep())
+                return new DispatchResult(new Ack.Accepted { CommandId = id, Note = "已记录答复，稍后执行。" });
+
+            _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
+                CancellationToken.None);
+
+            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = "已批准，正在执行。" });
+        }
+
+        // ---- 拒 / 超时 / 作废：落结果、不执行 ----
+        //
+        // ⚠️ **这三条走到这里时「这批不跑了」是真话** ⇒ 每条等待中的调用各配一条结果
+        // （`Stepper.Blocked`）。⚠️ **批准不走这里**（它从上面那条直接执行的路出去了），
+        // 所以原先那句「批准那条仍只配一条、是认下的代价」**已经不成立了**——
+        // 现在**四条收尾每条都给全部被挡下的调用配对**。
+        // 提问那条没有「拒」这回事；走到这里的**只有授权被否**。
         var (text, amended) = expired
             ? (TimeoutText(paused.Kind, handle.Spec.AskTimeout), null)
-            : Reply(c, paused, handle, awaiting);
+            : cancelled
+                ? ("用户把这次询问作废了。", null)
+                : Reply(c, paused, handle, awaiting);
 
         _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId,
             Stepper.Answer(paused, text, amended));
 
-        // ⚠️ **同一批里其余的调用要各补一条结果**（`01` §3.8 / D1，2026-10-11 修）。
-        //
-        // <para>⚠️ <b>不补就是悬空</b>：`PausedAsk` 只装得下一个 `CallId`，
-        // 而这一批可能有好几条被挡下的调用（`ToolExecutor.Merge` 把它们的**问题**
-        // 合成了一张卡，而 `CallId` 那一格只有一个）。⇒ 其余几条的 `tool_use`
-        // 一直悬着，而**悬空的 `tool_use` 会让下一条请求当场 400**。
-        // 原先靠正文里一句「请重新发起」交代——那是**记法上的欠账**，不是设计目标。</para>
-        //
-        // ⚠️ **只在这三种「这批不跑了」的收尾上补**（拒绝 / 超时 / 作废）：
-        // 那时「这些调用被一起作废了」是**真话**。⚠️ **批准不走这里**——
-        // 它只让第一条重发，其余几条是「还没轮到你」，今天没有一个说得清的说法
-        //（见 `Stepper.Blocked` 的注释）。⇒ 那条**仍是认下的代价**。
-        //
-        // ⚠️ 判据是「不能续跑」。批准之后模型会重发第一条，那时它会重新发整批
-        //（它看得见自己上一条消息里有几条 `tool_use`）——所以批准那条不补也是安全的。
-        //
         // ⚠️ `awaiting` 可能是 null（从盘载入过、内存那半没了）⇒ 那时数不出条数，
-        // **不编一个数**（同 `Reply` 里那条既有的判断），退回今天的单条行为。
-        var notRunning = expired
-            || string.Equals(c.Outcome, "cancel", StringComparison.Ordinal)
-            || !IsApproved(c);
-
-        if (notRunning && awaiting is { Calls.Count: > 1 })
+        // **不编一个数**（同 `Reply` 里那条既有的判断），退回单条行为。
+        if (awaiting is { Calls.Count: > 1 })
         {
             var said = expired
                 ? "（这一批里的这次调用和它一起被作废了：等待超时，没有人回答。）"
-                : string.Equals(c.Outcome, "cancel", StringComparison.Ordinal)
+                : cancelled
                     ? "（这一批里的这次调用和它一起被作废了：用户把这次询问整个作废了。）"
                     : "（这一批里的这次调用和它一起被作废了：用户拒绝了。）";
 
@@ -1387,20 +1507,21 @@ public sealed class CommandDispatcher(
                 Stepper.Blocked(awaiting.Calls, first: 1, said));
         }
 
-        // 挂起态清干净（内存 + 盘）——⚠️ **与「拿到闸」无关**：这一步不跑推进。
-        handle.AwaitingInput = null;
-        handle.UpdateStateAndPersist(_host.Store, s => s with
-        {
-            Status = SessionStatus.Idle,
-            Ask = null,
-        }, diskStatus: SessionStatus.Idle);
+        ClearPause(handle);
 
         _bus.Publish(EventBus.SessionTopic(c.SessionId), new WireEvent.ApprovalResolved(c.SessionId, c.AskId, c.Outcome));
         _bus.Publish(EventBus.ApprovalsTopic, new WireEvent.ApprovalResolved(c.SessionId, c.AskId, c.Outcome));
 
-        // ⚠️ **中断也走这里**：答复落完了，但**不续跑**——用户说了「别跑了」。
-        if (string.Equals(c.Outcome, "cancel", StringComparison.Ordinal))
-            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = "已作废这次询问。" });
+        // ⚠️ **作废与超时都走这里**：结果落完了，但**不续跑**——这批不跑了。
+        // ⚠️ 超时那条也**不续跑**：续跑没有意义（那个调用没执行，而模型没在等新东西）。
+        if (cancelled || expired)
+        {
+            return new DispatchResult(new Ack.Accepted
+            {
+                CommandId = id,
+                Note = cancelled ? "已作废这次询问。" : "已经超时了，按超时处理。",
+            });
+        }
 
         // ⚠️ `TryEnterStep` 在这里：拿不到就**不续跑**（已经有一次推进在飞）。
         // 与 `ContinueIfToolCalledAsync` 那条同样处理——不需要重新入队，因为
@@ -1434,6 +1555,23 @@ public sealed class CommandDispatcher(
     /// </summary>
     private static bool IsApproved(CoreCommand.ApprovalRespond c) =>
         c.Answers.TryGetValue("decision", out var d) && (d == "allow" || d == "approve" || d == "yes");
+
+    /// <summary>
+    /// **挂起态清干净（内存 + 盘）**（`01` §3.8）。⚠️ **与「拿到闸」无关**：这一步不跑推进。
+    ///
+    /// <para>⚠️ <b>批准与拒 / 超时 / 作废四条路都要它，所以抽成一处</b>：两份实现会漂，
+    /// 而漂的后果是**某一条路上那个会话永远卡在 `WaitingForInput`**
+    /// （磁盘上那个状态是合法的，所以重启也救不回来）。</para>
+    /// </summary>
+    private void ClearPause(SessionHandle handle)
+    {
+        handle.AwaitingInput = null;
+        handle.UpdateStateAndPersist(_host.Store, s => s with
+        {
+            Status = SessionStatus.Idle,
+            Ask = null,
+        }, diskStatus: SessionStatus.Idle);
+    }
 
     /// <summary>
     /// 超时时那条结果（`01` §3.8）。⚠️ <b>两种 Kind 的后果不同</b>（用户裁定）：
@@ -1471,45 +1609,9 @@ public sealed class CommandDispatcher(
         // ---- 授权 ----
         if (paused.Kind == AskKind.Permission)
         {
-            if (!IsApproved(c))
-                return ("用户拒绝了这次调用。" + Reason(c), null);
-
-            // ⚠️ **批准必须当场写一条记忆，哪怕用户没勾「记住」**（2026-10-11 修）。
-            //
-            // <para>⚠️ <b>原先这里写的是「用户说了『记住』才写」，而那句话让「批准」变成空话</b>：
-            // 批准的后果是「下一步带着批准去执行」（见 <see cref="Reply"/>），而放行的唯一依据
-            // 就是这个 store ⇒ 不写 ⇒ 模型重发 ⇒ 闸门又 `Ask` ⇒ 又挂起。
-            // **转圈**，被 `MaxConsecutiveToolSteps` 兜住，而用户看到的是「批了又弹、批了又弹」。</para>
-            //
-            // <para>⚠️ <b>判据是「记忆的粒度本来就是『这一次调用』」</b>——用户裁定过
-            // 「这一次」是**默认**（`AskMemory` 的注释：「当成一个枚举成员会让『没选』
-            // 与『选了这一次』两件事长得一样」）。⇒ 勾选**不是**「要不要记住」，
-            // 是「要不要把粒度放宽到整个工具」。批准 = 写一条 `ToolWide: false` 的
-            // （键 = 工具名 + 参数哈希，正是「这一次」）；勾了粗档才写 `ToolWide: true`。</para>
-            //
-            // <para>⚠️ 由此推出：这条记忆在语义上是「这一次」，而它**不设过期**——
-            // `ApprovalStore` 今天只增不减，随会话目录同生共死。</para>
-            var store = new ApprovalStore(_host.Store.DataRoot, handle.ProjectKey, handle.SessionId);
-            store.Add(new Approval(paused.ToolName, paused.ArgsHash,
-                ToolWide: c.Remember is { Length: > 0 } rm
-                          && string.Equals(rm, nameof(AskMemory.Tool), StringComparison.Ordinal),
-                At: CoreClock.Now()));
-
-            // ⚠️ 改写过的参数：比的是**规范化之后的指纹**（`ApprovalStore.HashArgs`）。
-            //
-            // <para>⚠️ <b>这里原先写的是「逐字比较」，而那句话已经不成立</b>（2026-10-11 修）：
-            // 规范化上线之后，用户**只把键序倒了一下**不再算「改了参数」——而那是**对的**，
-            // 因为 JSON 对象无序，倒键序就是同一个请求（理由见 `ApprovalStore.HashArgs`）。
-            // ⇒ 这段原文仍然照样逐字交回执行那条路（`01` §9 那条铁律管的是**落盘的原文**，
-            // 不是「改写检测的粒度」），**只判「改了没有」的粒度变粗了**。</para>
-            var amended = c.Answers.TryGetValue("arguments", out var a) ? a : null;
-            var changed = amended is not null
-                       && !string.Equals(ApprovalStore.HashArgs(amended), paused.ArgsHash, StringComparison.Ordinal);
-
-            return (changed
-                ? $"用户批准了这次调用，**但改了参数**。请用改后的参数重新发起它。"
-                : "用户批准了这次调用。请重新发起它，这次会放行。",
-                changed ? amended : null);
+            // ⚠️ **批准走不到这里**（它在上面那条直接执行的路出去了）⇒ 只剩「拒」。
+            _ = handle;
+            return ("用户拒绝了这次调用。" + Reason(c), null);
         }
 
         // ---- 问意见：答案就是内容 ----

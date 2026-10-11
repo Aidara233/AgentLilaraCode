@@ -120,6 +120,31 @@ public sealed record SessionHandle
     public void ResetToolSteps() => Volatile.Write(ref _toolSteps, 0);
 
     /// <summary>
+    /// **答复那条路要交给下一步的东西**（`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>为什么不走「重新入队」那条路</b>：答复不是一条用户消息
+    /// ——入队会被当成「要发给用户的话」落进记录，而它根本不是。
+    /// ⇒ 用一个**一次性**的交接槽：`CommandDispatcher` 放下，`RunStepAsync` 取走。</para>
+    ///
+    /// <para>⚠️ <b>取走即清（`TakeResume`）</b>：放两次只会有一次生效，
+    /// 而「忘了清」的表现是**每一步都重放同一次答复**——那会无限重复执行同一批工具。</para>
+    /// </summary>
+    /// <param name="Calls">等待中的那些调用（**已按用户改写换过参数**，见 `Stepper.Amended`）。</param>
+    /// <param name="Reply">用户对那次询问的答复。</param>
+    /// <param name="Paused">盘上那份（`ResumeAsync` 要它的哈希判改写）。</param>
+    public sealed record PendingResume(
+        IReadOnlyList<Block.ToolUseBlock> Calls,
+        Tools.ToolExecutor.Reply Reply,
+        Kernel.PausedAsk Paused);
+
+    private PendingResume? _resume;
+
+    public void QueueResume(PendingResume resume) => Volatile.Write(ref _resume, resume);
+
+    /// <summary>取走并清空（⚠️ **一次性**：两个线程只有一个拿得到）。</summary>
+    public PendingResume? TakeResume() => Interlocked.Exchange(ref _resume, null);
+
+    /// <summary>
     /// **挂起的那次询问**（`01` §3.8）。非 null ⟺ <see cref="SessionState.Ask"/> 非 null。
     /// ⚠️ 名字与那个**盘上**的类型（<see cref="Kernel.PausedAsk"/>）分开，是刻意的：
     /// 它们是这件事的两半，一半在盘上、一半在内存（见下面那个嵌套类型的注释）。
