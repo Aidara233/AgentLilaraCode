@@ -56,6 +56,9 @@ public sealed class Repl(
         // 同 claim list：本地盘点，不走命令通道。判据共用 ⇒ 差一个空格不会被当成消息。
         if (CoreCommandParser.IsProviderList(trimmed)) { PrintProviders(); return true; }
         if (CoreCommandParser.IsSessionList(trimmed)) { PrintSessions(); return true; }
+        // `/fetch <id>`：看见注记却够不着它是这条链最后一处只写了一半的地方（01 §8.0.2 六）。
+        // 判据来自共用函数——多一个少一个词都落回「当消息」（那是个看得见的错）。
+        if (CoreCommandParser.FetchId(trimmed) is { } fetchId) { PrintFetched(fetchId); return true; }
 
         var (parsed, parseError) = CoreCommandParser.Parse(trimmed, Current?.SessionId);
         if (parseError is not null) { _out.WriteLine(parseError); return true; }
@@ -247,6 +250,24 @@ public sealed class Repl(
         if (one.Length > 120) one = one[..120] + "…";
 
         return $"[{result.CallId[..Math.Min(8, result.CallId.Length)]}] {one}";
+    }
+
+    /// <summary>
+    /// `/fetch &lt;id&gt;`——把一条旧工具结果取回来（`01` §8.0.2 六）。
+    ///
+    /// <para>⚠️ <b>它印出来的是<b>当时那份字节</b>，不是现在的值</b>：控制台与模型走
+    /// **同一份语义**（见 <see cref="Session.FetchQuery"/>）。用户要现在的值，
+    /// 自己重跑那条命令——那是另一个问题。</para>
+    ///
+    /// <para>⚠️ <b>注意它看的不是 `history` 那份渲染</b>：`history` 会把已回收的条目
+    /// 换成注记，而这里要的恰恰是注记背后那串**原文**。⇒ 两者各读各的，这不是「两处副本」
+    /// ——注记是**渲染**，取回是**读存档**，本就不该是同一件事。</para>
+    /// </summary>
+    private void PrintFetched(string id)
+    {
+        if (Current is null) { _out.WriteLine("还没有会话。用 `session create` 建一个。"); return; }
+
+        _out.WriteLine(Session.FetchQuery.ById(_host.Store, Current, id));
     }
 
     private void PrintStatus()

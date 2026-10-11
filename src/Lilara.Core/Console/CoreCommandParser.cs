@@ -20,6 +20,29 @@ public static class CoreCommandParser
     public static bool IsProviderList(string line) => IsListVerb(line, "provider");
     public static bool IsSessionList(string line) => IsListVerb(line, "session");
 
+    /// <summary>
+    /// `fetch &lt;id&gt;`——控制台**唯一有参数**的本地查询（`01` §8.0.2 六）。
+    ///
+    /// <para>⚠️ <b>它为什么是本地查询而<b>不是</b>核心命令</b>：取回是**只读**的
+    /// （读 `store/&lt;sha256&gt;` 原样交回），而「HTTP 只读快照、改走 WS 命令」
+    /// 那条边界分的是**写**。⇒ 它与 `history` / `claim list` 同一档，
+    /// 不必长成一条带 ack / 事件 / 四条线的命令。</para>
+    ///
+    /// <para>⚠️ <b>但「不是命令」不等于「不判」</b>：把 <c>fetch abc</c> 当成普通消息
+    /// 发给模型是**看得见的**错（模型收到一句莫名其妙的话），而把
+    /// <c>fetch --help</c> 当成 id 是**看不见的**错（用户以为工具坏了）。
+    /// ⇒ 判据：**恰好两个词**，多一个少一个都落回「当消息」——那是可看见的处理。</para>
+    /// </summary>
+    public static string? FetchId(string line)
+    {
+        if (!StartsWithToken(line, "fetch")) return null;
+
+        var words = line.Trim()["fetch".Length..]
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+
+        return words.Length == 1 ? words[0] : null;
+    }
+
     // 三条本地查询共用的判据：「以 token 打头、后面**恰好一个词**且是 list」。
     // 走 StartsWithToken（宽口径边界）⇒ provider<TAB>list / provider list<NBSP> 都认。
     private static bool IsListVerb(string line, string token)

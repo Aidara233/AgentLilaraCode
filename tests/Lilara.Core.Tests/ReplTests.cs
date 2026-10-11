@@ -687,4 +687,90 @@ public class ReplTests : IDisposable
         Assert.Contains("用法", _out.ToString());
         Assert.Empty(_adapter.Calls);
     }
+
+    // ---- `/fetch`（`01` §8.0.2 六）---------------------------------------------
+
+    /// <summary>
+    /// ⚠️ **控制台也要够得着取回**：它看的 `history` 与模型看的是同一份渲染
+    /// ⇒ 它也会看见注记（`[已回收] … fetch(id="…")`）。看见地址却够不着，
+    /// 是这条链上最后一处只写了一半的地方。
+    ///
+    /// <para>⚠️ **这条同时钉住「注记 ≠ 取回」这**两件事不是一回事****：
+    /// `history` 印的是**这一刻的渲染**（被收的换成注记），而 `/fetch` 印的是
+    /// **当时那份原文**。⇒ 两者读的不是同一份东西，而这不是「两处副本」——
+    /// 注记是渲染，取回是读存档。</para>
+    /// </summary>
+    [Fact]
+    public async Task Fetch_PrintsTheOriginal_WhileHistoryShowsTheNote()
+    {
+        var (repl, _, session) = NewHarness();
+
+        var original = "改之前的内容";
+        _store.AppendEvents(session.ProjectKey, session.SessionId,
+        [
+            new TimelineEvent.ToolResultEvent
+            {
+                Id = "r1",
+                At = CoreClock.Now(),
+                CallId = "call-1",
+                Content = [new Block.TextBlock(original)],
+            },
+            // ⚠️ 垫够保护带，否则 `r1` 落在窗口内 ⇒ 渲染成原文、这条测试就测不到注记那一半。
+            // 用**常量**算，不写死 4——那个数是占位值，写死了它一改这条就静默失效。
+            .. Enumerable.Range(0, Reclaim.ProtectedRecentResults).Select(i =>
+                new TimelineEvent.ToolResultEvent
+                {
+                    Id = $"pad{i}",
+                    At = CoreClock.Now(),
+                    CallId = $"padcall{i}",
+                    Content = [new Block.TextBlock("垫")],
+                }),
+        ]);
+
+        await repl.ExecuteAsync("history", CancellationToken.None);
+        var history = _out.ToString();
+
+        // 历史那一份：被收的换成了注记，而注记里给的正是 `/fetch` 要的那个 id。
+        Assert.Contains("[已回收]", history);
+        Assert.Contains("fetch(id=\"r1\")", history);
+        Assert.DoesNotContain(original, history);
+
+        _out.GetStringBuilder().Clear();
+
+        await repl.ExecuteAsync("fetch r1", CancellationToken.None);
+
+        // 取回那一份：**当时那串原文**。
+        Assert.Contains(original, _out.ToString());
+    }
+
+    /// <summary>
+    /// ⚠️ **找不到时那句人话要点名「有两个 id」**（`01` §8.0.2 七）：
+    /// 注记给的是**记录** id，而 `tool_use` 上那个是**协议** id，两者都是短十六进制串。
+    /// 只回一句「没找到」会让用户去怀疑记录坏了——而**最可能的**原因是他抄错了那一个。
+    /// </summary>
+    [Fact]
+    public async Task Fetch_WithAnUnknownId_ExplainsWhichIdItWants()
+    {
+        var (repl, _, _) = NewHarness();
+
+        await repl.ExecuteAsync("fetch deadbeef", CancellationToken.None);
+
+        Assert.Contains("deadbeef", _out.ToString());
+        Assert.Contains("两个 id", _out.ToString());
+    }
+
+    /// <summary>
+    /// ⚠️ **多一个词不能当成 id**：那会把 `fetch --help` 变成一次「取不回」的查询，
+    /// 而真正该发生的是**落回「当消息」**（一个看得见的处理）。
+    /// </summary>
+    [Fact]
+    public async Task Fetch_WithTooManyWords_FallsBackToBeingAMessage()
+    {
+        var (repl, _, _) = NewHarness();
+
+        await repl.ExecuteAsync("fetch --help me", CancellationToken.None);
+
+        // 落到模型那条路（当前会话存在 ⇒ 它被当成一条消息发出去）。
+        Assert.Single(_adapter.Calls);
+    }
 }

@@ -177,30 +177,15 @@ public sealed record SessionHandle
     /// </param>
     public sealed record PendingAsk(AskRequest Ask, IReadOnlyList<Block.ToolUseBlock> Calls);
 
-    /// <summary>
-    /// **这一份会话里被回收的结果**（记录 id 的集合）。⚠️ <b>内存账，不落盘</b>
-    /// （`01` §8.0.2 八：「持久化永远存原文；注入与否只取决于 GC 状态，而 GC 状态不落盘」）。
-    ///
-    /// <para>不落盘不是省事，是 `00` §7 判据 8（能派生的就不要持久化）已经推出来的结果：
-    /// 边界 + 策略 ⇒ 结论，**没有第二个真相来源**。顺带的好处是<b>回收策略改了不破磁盘格式</b>。</para>
-    ///
-    /// <para>⚠️ <b>它只在被触发时才算</b>（今天的触发源是 `session.gc` 命令）。⇒ 两条后果要认：</para>
-    /// <list type="number">
-    ///   <item><b>新出现的工具结果不在集合里</b> ⇒ 不被回收。这是对的——它们本来就在保护带内。</item>
-    ///   <item><b>`deactivate` 之后再 `activate`，这个集合就没了</b>（handle 被丢弃、重新 `Load`）
-    ///   ⇒ 要重新触发一次。这正是「重启即重新决定」的字面形态，**符合设计**。</item>
-    /// </list>
-    /// </summary>
-    private IReadOnlySet<string> _reclaimed = NoReclaimed;
-
-    // ⚠️ 共享的空集要**保证没人改它**：写进去的集合一律由 `Reclaim.Decide` 新造，
-    // 这里只做「换一个引用」，不做增删。
-    private static readonly IReadOnlySet<string> NoReclaimed = new HashSet<string>();
-
-    public IReadOnlySet<string> Reclaimed => Volatile.Read(ref _reclaimed);
-
-    /// <summary>换掉整份回收集合。⚠️ 调用方（`session.gc`）必须先算完再进来——这里不判、不算。</summary>
-    public void SetReclaimed(IReadOnlySet<string> ids) => Volatile.Write(ref _reclaimed, ids);
+    // ⚠️ **这里曾经有一个 `Reclaimed` 字段（+ `SetReclaimed`）——已经删掉**（2026-10-11）。
+    //
+    // 它是一份**内存账**：由 `session.gc` 命令写、由 `TimelineRender` 读。删它的理由是
+    // **判定属于渲染，不属于 handle**：判据是「这一刻该喂给模型什么」，而记录一步一变
+    // ⇒ 任何存在这里的缓存都只在「某个维护点跑过」之后才新鲜，而**没人能保证那个维护点
+    // 覆盖了所有请求路径**。实测抓到的两处：答复那条路（`ResumeAsync`）落下结果后直接推
+    // 下一步、不经过推进器里的重算点；而 `Load` 出来的 handle 更是**恒为空集**。
+    // ⇒ `TimelineRender.Render` 现在每次现算（`Reclaim.Decide(raw, blobs)`）。
+    // 完整推理与「为什么它不违反 §11.7 那两档」见那里的注释。
 
     /// <param name="sessionId">
     /// ⚠️ <b>可空，而且正常路径**必须**不传</b>：给它的唯一用途是**可测性**

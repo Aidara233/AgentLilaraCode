@@ -325,19 +325,23 @@ public class StepperToolTests : IDisposable
         var history = Path.Combine(_store.SessionDirectory(handle.ProjectKey, handle.SessionId), "history.jsonl");
         var before = File.ReadAllBytes(history);
 
-        // 触发的那一次（`session.gc` 走的就是这个判定）。
-        var reclaimed = Reclaim.Decide(
-            _store.ReadTimeline(handle.ProjectKey, handle.SessionId), new BlobStore(_store.DataRoot));
-        Assert.NotEmpty(reclaimed);
-        handle.SetReclaimed(reclaimed);
+        // ⚠️ **回收是渲染的事——这里不用（也不该）显式触发它**：判定住在
+        // `TimelineRender.Render` 里，而它每次现算（2026-10-11 之前这里要手写一句
+        // `handle.SetReclaimed(…)`，那份内存账已经删掉）。
+        // ⚠️ 也就是说**当前这一条的时间线读出来时就已经收了**，不需要先设好再读。
 
-        // ⚠️ 回收**只动注入、不动持久化**——盘面逐字节不变。
+        // ⚠️ **回收只动注入、不动持久化**——盘面逐字节不变。
         Assert.Equal(before, File.ReadAllBytes(history));
 
         // 下一步的请求里：原文没了、注记在、`tool_use` 原样。
         _adapter.Reply("好");
         await _stepper.StepAsync(handle, [], default);
         var sent = _adapter.Calls[^1].Timeline;
+
+        // 被收的那些：**从盘上现判一遍**（渲染用什么，这里就用什么——别各判一套）。
+        var reclaimed = Reclaim.Decide(
+            _store.ReadTimeline(handle.ProjectKey, handle.SessionId), new BlobStore(_store.DataRoot));
+        Assert.NotEmpty(reclaimed);
 
         // `tool_use` 一个字不动（它是模型自己的输出，也是那个**锚**）。
         Assert.Contains(sent, e =>

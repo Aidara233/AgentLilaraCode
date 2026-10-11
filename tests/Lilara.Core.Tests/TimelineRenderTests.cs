@@ -7,8 +7,15 @@ namespace Lilara.Core.Tests;
 /// <summary>
 /// **记录 → 这一刻的形态**（`TimelineRender`）。
 ///
-/// <para>⚠️ <b>它现在做两件事</b>（曾经是三步，第三步「解 `Ref`」随那条机制一起删了）：
-/// 解库引用 · 换回收渲染。下面各钉一件。</para>
+/// <para>⚠️ <b>它做三件事</b>（曾经是两步，第三步「解 `Ref`」随那条机制一起删了，
+/// 而 2026-10-11 起多了一件）：解库引用 · **判回收** · 换回收渲染。下面各钉一件。</para>
+///
+/// <para>⚠️ <b>「判」与「换」都在这里，是这一组测试的做法与别处不同的原因</b>：
+/// 在那之前，回收集合是 `SessionHandle` 上的一份**内存账**（由 `session.gc` 命令写），
+/// 于是测试得先 `SetReclaimed(…)` 再渲染。现在判据住在渲染里
+/// ⇒ 测试**造出真实的形态**（垫够保护带），让渲染自己判出来。
+/// 这不是风格问题：那个「先设好再渲染」的写法**测不到**「集合是不是这一刻的记录算出来的」，
+/// 而那正是 `fetch` 取不回那个缺陷的所在（见 <see cref="StepLagTests"/>）。</para>
 /// </summary>
 public class TimelineRenderTests : IDisposable
 {
@@ -48,6 +55,18 @@ public class TimelineRenderTests : IDisposable
     };
 
     private IReadOnlyList<TimelineEvent> Render() => TimelineRender.Render(_store, _handle);
+
+    /// <summary>
+    /// **垫够保护带**，让 `[…]` 里那些结果落进回收范围（`Reclaim.Decide` 只收最近的
+    /// `ProtectedRecentResults` 条**之前**的）。
+    ///
+    /// <para>⚠️ 垫的那些**本身也可回收**，所以它们会一起被收——按 id 精确断言的那些测试
+    /// 因此各钉各的。⚠️ 而这条正是「判据在渲染里」的形状：`Decide` 是纯函数，
+    /// 同一份时间线永远得到同一个集合。</para>
+    /// </summary>
+    private void PadPastTheProtectionBand() =>
+        Append([.. Enumerable.Range(0, Reclaim.ProtectedRecentResults)
+            .Select(i => Result($"pad{i}", $"padcall{i}", new Block.TextBlock("垫")))]);
 
     private static TimelineEvent.ToolResultEvent ResultAt(IReadOnlyList<TimelineEvent> rendered, int i) =>
         (TimelineEvent.ToolResultEvent)rendered[i];
@@ -95,23 +114,60 @@ public class TimelineRenderTests : IDisposable
     [Fact]
     public void ReclaimedResults_RenderAsTheNote_OthersUntouched()
     {
+        // ⚠️ **本测试钉的是「被收的换成注记、没被收的原样」这**两半****，
+        // 不是「收了几条」——所以按「**这一条在不在集合里**」逐个对，
+        // 而垫的那些放**最后**（保护带在末尾 ⇒ 它们原样，正好当「没被收」的那一半）。
         Append(
             Result("r1", "c1", new Block.TextBlock("被收的")),
-            Result("r2", "c2", new Block.TextBlock("留着的")));
+            Result("r2", "c2", new Block.TextBlock("也被收的")));
+        PadPastTheProtectionBand();
 
-        _handle.SetReclaimed(new HashSet<string> { "r1" });
         var rendered = Render();
+        var reclaimed = Reclaim.Decide(
+            _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId), _blobs);
+
+        Assert.Contains("r1", reclaimed);
+        Assert.Contains("r2", reclaimed);
 
         var note = Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(rendered, 0).Content)).Text;
         Assert.Contains("[已回收]", note);
         Assert.Contains("r1", note);        // 注记给的是**记录 id**
         Assert.Contains("fetch(id=", note); // 而且是一条能直接抄走的调用
 
-        Assert.Equal("留着的", Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(rendered, 1).Content)).Text);
+        // ⚠️ **保护带里那些原样**——那正是「只降一部分」的另一半。
+        var untouched = rendered.OfType<TimelineEvent.ToolResultEvent>()
+            .Where(r => !reclaimed.Contains(r.Id)).ToList();
+        Assert.NotEmpty(untouched);
+        Assert.All(untouched, r => Assert.Equal("垫",
+            Assert.IsType<Block.TextBlock>(Assert.Single(r.Content)).Text));
 
-        // ⚠️ **记录没动**：再读一遍盘，两条都还是原文（回收不写盘）。
+        // ⚠️ **记录没动**：再读一遍盘，那条还是原文（回收不写盘）。
         var raw = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId);
-        Assert.Equal("被收的", Assert.IsType<Block.TextBlock>(Assert.Single(((TimelineEvent.ToolResultEvent)raw[0]).Content)).Text);
+        Assert.Equal("被收的", Assert.IsType<Block.TextBlock>(Assert.Single(((TimelineEvent.ToolResultEvent)raw
+            .First(e => e is TimelineEvent.ToolResultEvent r && r.Id == "r1")).Content)).Text);
+    }
+
+    /// <summary>
+    /// ⚠️ **判定住在渲染里，所以它跟着记录变**（2026-10-11）。
+    ///
+    /// <para>这条钉的是那个**曾经不存在**的性质：同一份时间线上再落一条工具结果，
+    /// 保护带挪一格 ⇒ 下一次渲染的结论就不同。**没有第二次「触发」**。</para>
+    ///
+    /// <para>⚠️ 它为什么值得单独一条：旧形状下集合是 `session.gc` 写进去的，
+    /// 不喊就不变；而那个形状的后果是**注记上给的 id 在下一个渲染窗口里取不回**
+    /// （见 <see cref="StepLagTests"/>）。⇒ 这里不再有「谁记得喊」这一环。</para>
+    /// </summary>
+    [Fact]
+    public void TheDecision_FollowsTheRecord_WithNoOneTriggeringIt()
+    {
+        Append(Result("r1", "c1", new Block.TextBlock("大")));
+        // ⚠️ 先确认前提：**只有一条**工具结果时，它落在保护带里 ⇒ 不收。
+        Assert.Contains("大", Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(Render(), 0).Content)).Text);
+
+        PadPastTheProtectionBand();
+
+        // 再来一次 —— 中间**没有任何人**触发过什么。
+        Assert.Contains("[已回收]", Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(Render(), 0).Content)).Text);
     }
 
     /// <summary>
@@ -122,8 +178,8 @@ public class TimelineRenderTests : IDisposable
     public void ReclaimedResults_ThatWereStoreBlocks_RenderAsTheNote_NotAsAMissingObject()
     {
         Append(Result("r1", "c1", new Block.TextBlock(new string('x', BlobStore.InlineThresholdBytes + 1))));
+        PadPastTheProtectionBand();
 
-        _handle.SetReclaimed(new HashSet<string> { "r1" });
         var text = Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(Render(), 0).Content)).Text;
 
         Assert.Contains("[已回收]", text);
@@ -170,8 +226,8 @@ public class TimelineRenderTests : IDisposable
     public void Reclaim_ReplacesTheContent_ButNotTheFrame()
     {
         Append(Framed("r1", "c1", "read", new Block.TextBlock("正文")));
+        PadPastTheProtectionBand();
 
-        _handle.SetReclaimed(new HashSet<string> { "r1" });
         var content = ResultAt(Render(), 0).Content;
 
         // 框架仍在，而且**还是那一句**（回收状态不影响它——它是事实）。

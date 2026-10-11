@@ -31,9 +31,38 @@ public static class TimelineRender
         // ⚠️ 这里**曾经还有一步「解 `Ref`」**（把 `fetch` 结果的引用换成被引用那条的内容）。
         // 那一步连同 `Ref` 这个机制一起删了（2026-10-06，用户裁定，理由见
         // `TimelineEvent.ToolResultEvent.Ref` 的注释）——`fetch` 的结果今天带的是**内容**。
-        var dereferenced = raw.Select(e => Dereference(e, blobs));
-        var reclaimed = Reclaim.Apply([.. dereferenced], handle.Reclaimed);
-        return [.. reclaimed.Select(WithFraming)];
+        //
+        // ⚠️ **判定在<b>这里</b>做，而且只在这里**（2026-10-11）——它**不是**一个后台维护的
+        // 集合，而是一次渲染的**纯函数输入**：
+        //
+        // <list type="number">
+        //   <item><b>判定的输入必须是这一刻的记录。</b>判据是「这一刻喂给模型的东西」，
+        //   而记录一步一变 ⇒ 任何缓存的集合都会在某个时刻**陈旧**。陈旧的表现不是「晚一步」，
+        //   是**取不回**：注记上写着 <c>fetch(id)</c>，而模型照它发 `fetch` 时，
+        //   缓存里还没有那个 id ⇒ `SnapshotOf` 在它自己那一趟的时间线里找不到，
+        //   回一句「没有这一条」——**而内容明明还在**。</item>
+        //
+        //   <item><b>它原先是个内存账</b>（<c>SessionHandle.Reclaimed</c> + <c>SetReclaimed</c>，
+        //   由 <c>session.gc</c> 命令写入）。那条路有两个洞：① 它**要求有人记得喊**
+        //   （`00` §4 那四个触发源一个都不存在 ⇒「重启即重新决定」实际是「只有你手动喊」）；
+        //   ② 更要命的是**没人能保证它在每次渲染前都是新的**——我第一版把它挂在推进器里，
+        //   结果答复那条路（`ResumeAsync`）落下结果之后直接推下一步，**不经过**那个落点，
+        //   于是注记与 `fetch` 在同一个窗口里对不上；而 `SessionHandle.Load` 出来的那份
+        //   更是**恒为空集**（它压根不经过任何重算点）⇒ 「重启即重新决定」名存实亡。</item>
+        //
+        //   <item><b>它不违反 §11.7 的两档判据</b>：那一节分的「窗口触发（捡）／压力触发（买）」
+        //   说的是**要不要主动制造失效**。判定本身**不制造任何失效**——记录一步一变
+        //   本来就是每步破前缀的原因，判据只是**读**它。⇒ 这是「捡」那一档，
+        //   而且落点正是 §11.7 指定的那一刻：「**第一步真的要拿它渲染**」。</item>
+        // </list>
+        //
+        // ⚠️ **代价如实说**：每次渲染多一次时间线扫描 + 对候选结果各一次 `Has`。
+        // 它跑在原本就要 `ReadTimeline` + 逐块解引用的那条路上，边际成本是一次 stat。
+        // ⚠️ 它收不了几样东西（保护带 `ProtectedRecentResults = 4` 是**占位值**）⇒
+        // 它的主要效果是**让注记可兑现**，不是省上下文。别把它读成「一个激进的回收策略」。
+        var reclaimed = Reclaim.Decide(raw, blobs);
+        var applied = Reclaim.Apply([.. raw.Select(e => Dereference(e, blobs))], reclaimed);
+        return [.. applied.Select(WithFraming)];
     }
 
     /// <summary>

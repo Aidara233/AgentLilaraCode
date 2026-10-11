@@ -549,31 +549,27 @@ public sealed class CommandDispatcher(
     /// 头处理事件时要重拉历史，那一步会清空时间线，把回执刚画上的那行一起抹掉
     /// ⇒ 页面一个字都不说。⇒ 现在头把这句话画在<b>重拉之后</b>，位置就不重要了。</para>
     ///
-    /// <para>⚠️ <b>它<b>不</b>搬动磁盘、也<b>不</b>碰库</b>：`Decide` 只读。这条命令的全部效果
-    /// 是「换一份内存里的渲染」——所以它**可逆、无副作用**，随时可以再触发一次。</para>
+    /// <para>⚠️ <b>它<b>不</b>搬动磁盘、也<b>不</b>碰库</b>：`Decide` 只读。
+    /// ⚠️ <b>而 2026-10-11 起它也不再改任何内存</b>——判定搬进了渲染
+    /// （`TimelineRender.Render` 每次现算，见那里的注释）⇒ 这条命令的全部效果
+    /// 是「**算一遍、把结果说出去**」。它因此**可逆、无副作用**，随时可以再触发一次。</para>
     /// </summary>
     private DispatchResult HandleSessionGc(CoreCommand.SessionGc g, string id)
     {
         if (!TryFind(g.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
-        var gate = _host.GateFor(handle.SessionId);
-        gate.Wait();
-
-        int count;
-        try
-        {
-            // ⚠️ 判定读的是**记录**（`_host.Store.ReadTimeline`），不是渲染后的形态。
-            var reclaimed = Reclaim.Decide(
-                _host.Store.ReadTimeline(handle.ProjectKey, handle.SessionId),
-                new Storage.BlobStore(_host.Store.DataRoot));
-
-            handle.SetReclaimed(reclaimed);
-            count = reclaimed.Count;
-        }
-        finally
-        {
-            gate.Release();
-        }
+        // ⚠️ **它不再持闸**（2026-10-11）：它原先要在 `gate` 里写一份内存账（`SetReclaimed`），
+        // 所以必须与推进互斥。现在它**只观察**——读一遍记录、算一遍判定、说个数
+        // ⇒ 与 `Stepper` 的 `ReadTimeline` 同级，不碰任何可变状态。
+        //
+        // ⚠️ **判定不再由它落进任何地方**：它原先写到 `handle` 上那份**内存账**里，
+        // 而那份账**只在有人喊的时候才更新** ⇒ 陈旧的那份会让注记上给出的 id
+        // **在下一个渲染窗口里取不回**（判据与后果见 `TimelineRender.Render` 的注释）。
+        // ⇒ 判定现在住在渲染里（每次现算），这条命令因此只是个**观察口**：
+        // 它的独有价值是「立刻算一次并把结果说出去」，**不是任何东西的前提**。
+        var count = Reclaim.Decide(
+            _host.Store.ReadTimeline(handle.ProjectKey, handle.SessionId),
+            new Storage.BlobStore(_host.Store.DataRoot)).Count;
 
         // ⚠️ **回执里必须说结果**，不能只回一个「收到了」：回收常常**一条都收不了**
         // （都在保护带里 / 内容指向的对象不在库里）——那时渲染一字未变，
