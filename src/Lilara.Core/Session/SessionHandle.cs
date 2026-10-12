@@ -141,6 +141,13 @@ public sealed record SessionHandle
 
     public void QueueResume(PendingResume resume) => Volatile.Write(ref _resume, resume);
 
+    /// <summary>
+    /// **槽里有东西吗**——只读，**不取走**。
+    /// ⚠️ 与 <see cref="TakeResume"/> 分开是刻意的：那个是**取走即清**的，
+    /// 拿它来回答「有没有」会**把东西吃掉**（`LiveSessions` 只想知道有没有在等）。
+    /// </summary>
+    public bool HasPendingResume => Volatile.Read(ref _resume) is not null;
+
     /// <summary>取走并清空（⚠️ **一次性**：两个线程只有一个拿得到）。</summary>
     public PendingResume? TakeResume() => Interlocked.Exchange(ref _resume, null);
 
