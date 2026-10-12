@@ -86,6 +86,19 @@ public sealed class LiveSessions
         lock (_gate) return [.. _live.Where(kv => kv.Value > 0).Select(kv => kv.Key)];
     }
 
+    /// <summary>
+    /// **这个会话被踢出去了**（`session.deactivate`）——把它的凭证整个撤掉。
+    ///
+    /// <para>⚠️ <b>与 <see cref="Clear"/> 不是一件事，别合并</b>：那个是「**这一趟**推进跑完了」
+    /// 的配对动作（`Mark` 的反面，计数减一）；这个是「这个会话不在内存里了」。
+    /// 用 `Clear` 顶替它会让计数与真实推进次数脱钩（下一次 `Mark` 起来的数少一格）；
+    /// 用这个顶替 `Clear` 则会把**还在跑的**那一趟的凭证一起撤掉。</para>
+    /// </summary>
+    public void Forget(string sessionId)
+    {
+        lock (_gate) _live.Remove(sessionId);
+    }
+
     /// <summary>所有**曾经**进过推进的会话 id（含计数归零的那些）。见 <see cref="Clear"/> 那条代价。</summary>
     public IReadOnlyList<string> Known()
     {

@@ -17,6 +17,14 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
     private readonly SessionStore _store = new(dataRoot);
     private readonly ProviderStore _providers = new(dataRoot);
 
+    /// <summary>
+    /// **哪些会话现在真的有东西在替它往下走**（`01` §11.6）。
+    ///
+    /// <para>⚠️ 它<b>不落盘</b>：判据是「有东西在动」，而那件事**只在内存里**
+    /// （`Running` 从不落盘、队列与答复槽也都在内存）⇒ 进程一重启它就该是空的。</para>
+    /// </summary>
+    public LiveSessions Live { get; } = new();
+
     /// <summary>已激活的会话。快照端点先查这里——见 <see cref="TryGetActivated"/>。</summary>
     private readonly ConcurrentDictionary<string, SessionHandle> _activated = new();
 
@@ -73,8 +81,21 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
     /// <para>⚠️ `_gates` / `_cts` **刻意不摘**：`GateFor` 是 `GetOrAdd` 懒创建的
     /// ⇒ 摘了下次自动重建；而 `_cts` 在**正常运行时也在**（那正是 `interrupt`
     /// 找得到它的原因），拿「它在不在」当「能不能摘」会整段误伤。</para>
+    /// <para>⚠️ <b>摘掉时顺手把活跃性凭证也清掉</b>：一个被踢出去的会话**不该**再算活跃
+    /// ——凭证的判据是「有东西在动」，而它那个把手已经不在表里了。
+    /// ⚠️ 今天「在内存里」与「有东西在动」**同延**（§6.1 的队列随内存一起丢），
+    /// 所以这一句是**保持两者一致**，不是新增语义。见 `03` §6 的记账。</para>
+    ///
+    /// <para>⚠️ <b>用 <see cref="LiveSessions.Forget"/> 而不是 <c>Clear</c></b>：
+    /// 后者是「**这一趟**推进跑完了」的**配对**动作（`Mark` 的反面），
+    /// 用在这里会让计数与真实推进次数**脱钩**——离线那个会话下一次 `Mark` 起来的数就少一格。
+    /// 这两件事（一趟跑完 / 这个会话被踢出去）共用同一个计数字段，但**不是同一个事件**。</para>
     /// </summary>
-    public bool Deactivate(string sessionId) => _activated.TryRemove(sessionId, out _);
+    public bool Deactivate(string sessionId)
+    {
+        Live.Forget(sessionId);
+        return _activated.TryRemove(sessionId, out _);
+    }
 
     /// <summary>
     /// 内存里的状态优先，miss 才读盘。

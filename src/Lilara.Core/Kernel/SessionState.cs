@@ -64,7 +64,15 @@ public sealed record SessionState
     public required int Turn { get; init; }
 
     // 待办集合 = 消息队列，进 state.json，崩溃重启后不丢。
-    // 最小闭环是交互式的（入队即启动），队列表恒为空。
+    //
+    // ⚠️ **2026-10-12（打断批）更正：这句话今天是假的，而它不是「还没做」**——
+    // 它**装不下**：`IReadOnlyList<string>` 放不下 `03` §9.1 那种带附件块的 `session.send`。
+    // ⚠️ 而更要紧的是**没有任何路径能把队列烘进来**：`session.send` 拿不到那把标志就
+    // **还没入队**（`CommandDispatcher` 里 `TryEnterStep` 在 `Enqueue` 之前），
+    // 拿得到就**立刻排空** ⇒ 队列**只在「这个会话不在内存里」时有值**，而「不在内存里」
+    // 按定义 = 进程不在 ⇒ **队列落盘今天是个零收益的动作**。
+    // ⇒ 本字段**零读零写**（0 读 0 写 ⇒ 老文件逐字节不变、金样不用改），
+    // 保留它只为磁盘形状不动。判据与完整推理见 `01` §6.1。
     public required IReadOnlyList<string> Pending { get; init; }
 
     // 行为控制轴的当前值。
@@ -88,7 +96,45 @@ public sealed record SessionState
     /// 这里可空是**语义**。老文件缺这个键 ⇒ `WhenWritingNull` 让盘上键不出现 ⇒ **逐字节不变**。</para>
     /// </summary>
     public PausedAsk? Ask { get; init; }
+
+    /// <summary>
+    /// **上一次试图落盘、但可能没落成的那个「待答复的调用」**（`01` §12.8 的崩溃语义）。
+    ///
+    /// <para>⚠️ <b>它要解决的问题很具体</b>：`SessionStore.AppendEvents`
+    /// （`history.jsonl`）与 `WriteState`（`state.json`）是**两次独立写**，
+    /// 而一次收尾/挂起要写<b>两处</b> ⇒ 崩在两次之间，`history.jsonl` 里躺着一条
+    /// 「没有配对 <c>tool_result</c> 的 <c>tool_use</c>」，而 `state.json` <b>不知道</b>有它。
+    /// 重启之后那个会话会在**下一步**撞上游的 400
+    /// （「`tool_use` ids were found without `tool_result` blocks immediately after」）。</para>
+    ///
+    /// <para>⚠️ <b>写序是先记录、后 state</b>，而在**前一步成功过**的前提下
+    /// 「文件里末回合是悬空的 <c>tool_use</c>」⟺「这次写没成功」——两处**同真同假**，
+    /// 所以不需要另一份日志（判据 8：能派生的就不要持久化）。
+    /// ⇒ 本次写成功后**清掉**它，失败则留着让下一次重试。</para>
+    ///
+    /// <para>⚠️ <b>它<b>不</b>承载「谁在等」的全部事实</b>，只承载
+    /// 「我可能欠一条结果」这一个问题——`Ask` 另有一份，两者不重复。
+    /// 老文件缺这个键 ⇒ `WhenWritingNull` 让盘上键不出现 ⇒ <b>逐字节不变</b>。</para>
+    /// </summary>
+    public PendingIntent? PendingIntent { get; init; }
 }
+
+/// <summary>
+/// 「上一次那两处写，可能没写完」的痕迹（<see cref="SessionState.PendingIntent"/>）。
+///
+/// <para>⚠️ <b>它只有两个消费者，且都是「补一条配对」那条路</b>：
+/// ① 下一次成功落盘时清除它；② 启动 / 心跳时若发现记录里确实缺配对，补上并清掉。
+/// ⚠️ ⇒ 它<b>不是</b>「重放模型调用」的钩子——本批<b>不做</b>「重启后接着跑」
+/// （两条实现各有硬代价，见 `01` §12.8 的记账）。</para>
+///
+/// <para>⚠️ <b>字段只有两个，因为它们都要能独立核对</b>：<c>Turn</c> 用来判
+/// 「那一步算不算跑过」（见 <c>01</c> §8.0.2 的 <c>turn</c> 与记录条数可对），
+/// 而 <c>CallId</c> 是**记录里**那条悬空调用的协议 id。</para>
+///
+/// <para>⚠️ <b>没有 <c>SessionId</c>：它在 <c>state.json</c> 里，一个字都不多存</b>
+/// ——同仓那条「同一事实的第二副本」的老毛病。</para>
+/// </summary>
+public sealed record PendingIntent(int Turn, string CallId);
 
 /// <summary>
 /// **一次挂起的询问**（`01` §3.8）。

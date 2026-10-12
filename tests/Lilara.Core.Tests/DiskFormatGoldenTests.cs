@@ -70,12 +70,12 @@ public class DiskFormatGoldenTests
         };
 
         var onDisk = JsonSerializer.Serialize(spec, Json.Options);
-        Assert.StartsWith("""{"version":5,""", onDisk);
+        Assert.StartsWith("""{"version":6,""", onDisk);
 
         // 线上那一份：同一批选项（`WireFormatTests` 钉着两份设置一致），端点又直接序列化这个类型
         // ⇒ 版本号跟着走。**这就是它出现在头那边的原因**，不是谁忘了挡。
         var onWire = JsonSerializer.Serialize(spec, Hosting.WireJson.Options);
-        Assert.StartsWith("""{"version":5,""", onWire);
+        Assert.StartsWith("""{"version":6,""", onWire);
     }
 
     [Fact]
@@ -91,7 +91,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":5,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
+            """{"version":6,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -112,7 +112,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":5,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
+            """{"version":6,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -154,7 +154,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":5,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"systemPromptPreset":"task"}""",
+            """{"version":6,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"systemPromptPreset":"task"}""",
             JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -164,7 +164,7 @@ public class DiskFormatGoldenTests
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"version":5,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":6,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -326,7 +326,7 @@ public class DiskFormatGoldenTests
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"version":5,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":6,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -341,7 +341,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":5,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
+            """{"version":6,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 }

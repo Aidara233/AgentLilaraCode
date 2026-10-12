@@ -120,6 +120,20 @@ public sealed record SessionHandle
     public void ResetToolSteps() => Volatile.Write(ref _toolSteps, 0);
 
     /// <summary>
+    /// **从盘上恢复链长**（`01` §6.2 的熔断）。
+    ///
+    /// <para>⚠️ <b>类型注释里那句「它是内存账，不落盘」只对了一半</b>，2026-10-12 更正：
+    /// 它<b>不单独落一个字段</b>——但它的值**能从 `state.Turn` 推出来**
+    /// （链长 = 那次崩的一步算进去之后的 `Turn`，而用户消息到达时归零）。
+    /// ⇒ 重启不恢复等于「熔断只在没重启过时有效」，那正是最容易失控的那种会话
+    /// （`Program.cs` 启动时**恰好会**把最近一个会话载入内存）。</para>
+    ///
+    /// <para>⚠️ <b>只升不降</b>（调用点判 `&lt;`）：内存里那个数更小，只可能是
+    /// 「刚归过零」或「还没跑到那么远」——两种情况都**不该**被盘上那个更大的数盖掉。</para>
+    /// </summary>
+    public void RestoreToolSteps(int turn) => Volatile.Write(ref _toolSteps, turn);
+
+    /// <summary>
     /// **答复那条路要交给下一步的东西**（`01` §3.8）。
     ///
     /// <para>⚠️ <b>为什么不走「重新入队」那条路</b>：答复不是一条用户消息

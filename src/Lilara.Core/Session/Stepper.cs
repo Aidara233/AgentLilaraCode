@@ -57,6 +57,22 @@ public sealed class Stepper(
         // 「now 冻结在步开始」（00 §2.5）——同一步内重复渲染必须逐字节相同
         var at = CoreClock.Now();
 
+        // ⚠️ **收尾排在最前**（`01` §12.8）——它必须在**装配请求之前**，而装配请求的地方
+        // 只有这一处。两件事都在里面：① 上一次那一步可能崩在两次写之间（`PendingIntent` 说
+        // 「我可能欠一条 `tool_result`」）② 挂着的询问可能已经过期（`deadline` 过了，
+        // 而**没有任何定时器在等它**）。
+        // ⚠️ 排在这里的另一个理由：**用户答复会被下面那把闸挡在外面**
+        // （`RunStepAsync` 拿的是会话闸）⇒ 从这一刻到 `TakeResume` 之间，
+        // 没有第二条路径能碰 `Ask`，所以在这里合成答复是安全的。
+        Recovery.BeforeStep(_store, handle, at, hasNewInput: blocks.Count > 0);
+
+        // ⚠️ **熔断计数从盘上恢复**（`01` §6.2）。不恢复的话，一次重启就把它清零
+        // ⇒ 「自上次用户输入以来跑了多少步」这个语义**只在没重启过时成立**，
+        // 而失控的循环只要跨过一次重启就再也停不下来。
+        // ⚠️ 它**不是**陈旧值：`Turn` 是盘上的事实（那次崩的一步已经被 `Recovery` 计过），
+        // 而链长只在**用户消息到达时**归零（`HandleSessionSend`）——重启不改变这一点。
+        if (handle.ConsecutiveToolSteps < handle.State.Turn) handle.RestoreToolSteps(handle.State.Turn);
+
         // ⚠️ **过时判定（点杀）这一刻冻住**（2026-10-11）：`Reclaim.Stale` 要**碰文件系统**
         // （重读那个源、重算指纹），而渲染必须是纯的 ⇒ 判定在渲染**外**算。
         // 冻在这一刻的理由与上面那行 `now` 逐字相同：这一步里无论如何重复渲染，
@@ -242,10 +258,9 @@ public sealed class Stepper(
         // （见 `PausedAsk` 的注释）。
         if (pending is not null)
         {
-            _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
-
             handle.AwaitingInput = new SessionHandle.PendingAsk(pending, toolCalls);
-            handle.UpdateStateAndPersist(_store, s => s with
+            WritePair(handle, events,
+                new PendingIntent(handle.State.Turn + 1, toolCalls[0].CallId), _store, s => s with
             {
                 Status = SessionStatus.WaitingForInput,
                 Ask = new PausedAsk(
@@ -275,13 +290,39 @@ public sealed class Stepper(
         // 实参是**调用前**求值的，而那一刻内存里还是上面刚置的 `Running` ⇒
         // 那会把 `Running` 写进磁盘，正是整套机制要防的那件事（`SessionStatus` 的类型注释里有完整后果）。
         // 一句话：**「原样落盘」不能用「读当前值」来表达**，因为调用点往往正好处在「内存已经领先」的时刻。
+        // ⚠️ **`PendingIntent` 要在这里清掉**：这一步的两个产物都落成了（记录 + 它自己的结果）
+        // ⇒ 那个「我可能欠一条」的痕迹**已经被兑现**。不清的后果是**下一步开始时会再补一条**
+        // ——那会给模型一条重复的结果（多了一条假信息）。
         handle.UpdateStateAndPersist(_store, s => s with
         {
             Status = SessionStatus.Idle,
             Turn = s.Turn + 1,
+            PendingIntent = null,
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(reply);
+    }
+
+    /// <summary>
+    /// **先记录、后 state，而那条「我可能欠一条」的痕迹跟着走**（`01` §12.8）。
+    ///
+    /// <para>⚠️ <b>顺序不能反</b>：痕迹是「<b>那一步的 `Turn`</b> + <b>哪一条调用</b>」两件事，
+    /// 而它们恰好是 `UpdateStateAndPersist` 里 <c>change</c> 的两个输入
+    /// （<c>s.Turn + 1</c> 与那条调用）⇒ 在**写入点**算一遍，而不是在读取点猜。
+    /// 反过来的后果是静默的：崩在两次写之间会留下一条没人认得出来的悬空调用
+    /// （记录里缺配对、而 `state.json` 不知道有它）⇒ 那一步永远修不好。</para>
+    ///
+    /// <para>⚠️ <b>崩在「记录已落、state 未写」时痕迹<b>不在</b>盘上</b>——那一刻它还在内存里。
+    /// ⇒ 重启之后那个会话照样修得回来，但靠的是<b>另</b>一条路：<c>Ask</c> 在 `state.json` 里
+    /// （它上一次挂起时写下的那份）⇒ 心跳那一趟会发现「记录末回合悬着、而 state 说在等」，
+    /// 于是按超时收掉。两条路各有各的适用面，<b>不是重复</b>。</para>
+    /// </summary>
+    private static void WritePair(
+        SessionHandle handle, IReadOnlyList<TimelineEvent> events, PendingIntent intent,
+        SessionStore store, Func<SessionState, SessionState> change, string diskStatus)
+    {
+        store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
+        handle.UpdateStateAndPersist(store, s => change(s) with { PendingIntent = intent }, diskStatus);
     }
 
     /// <summary>

@@ -35,6 +35,66 @@ public sealed class CommandDispatcher(
     private readonly PresetStore _presets = new(host.DataRoot);
 
     /// <summary>
+    /// **「启动」那个推进出口**——§6.1 三条判据的第二次落点，也是**收尾之后接着走**
+    /// 唯一的那扇门（`Recovery` 跑在 `Stepper.StepAsync` 里，本身不认识命令层）。
+    ///
+    /// <para>⚠️ <b>判据只剩一条：拿得到那把标志。**超时/断裂那一半搬进了推进器**</b>
+    /// ——它们都要读记录、且都要在**装配请求之前**发生，而那一点在 `StepAsync` 里。
+    /// 三个适配器各补一次等于把同一条规则抄三遍，而抄漏一个的后果是
+    /// **那一条协议上，那个会话从此发不出消息**（上游 400，且报的是与真因隔了一层的话）。</para>
+    ///
+    /// <para>⚠️ <b>同步等结果</b>（`throwOnFailure: true`）：它只在**不在请求路径上**的
+    /// 那几条（收尾残踪）用，那里没有「立刻回执」的需要，而失败要能冒上去
+    /// （静默吞掉会让断裂永远收不掉）。</para>
+    /// </summary>
+    private void RunStep(SessionHandle handle, bool throwOnFailure)
+    {
+        if (!handle.TryEnterStep()) return;
+
+        // ⚠️ **打点与 `TryEnterStep` 同处**：那两处就是 `SessionHandle._step` 翻转的地方，
+        // 多打一处就多一个会漂的地方（`LiveSessions` 的类注释）。
+        _host.Live.Mark(handle.SessionId);
+        try
+        {
+            RunStepAsync(handle, CancellationToken.None, throwOnFailure).GetAwaiter().GetResult();
+        }
+        finally
+        {
+            _host.Live.Clear(handle.SessionId);
+        }
+    }
+
+    /// <summary>
+    /// **收尾之后接着走**（`01` §12.8）——三条时机的第三个，也是唯一一个**同步**的。
+    ///
+    /// <para>⚠️ <b>它复用的就是推进器自己那段收尾</b>（`Stepper.StepAsync` 开头那几行），
+    /// 所以这里不需要知道「欠了哪一条」——`PendingIntent` 会告诉它。</para>
+    /// </summary>
+    /// <param name="throwOnFailure">
+    /// 心跳那条传 <c>false</c>：一条会话失败不该让整轮扫描停掉（那会让排在它后面的会话永远收不了）。
+    /// 「载入 / 取当前会话」那两条传 <c>true</c>：那里失败要能冒上去。
+    /// </param>
+    public void RecoverThenRun(SessionHandle handle, bool throwOnFailure) =>
+        RunStep(handle, throwOnFailure);
+
+    /// <summary>
+    /// **「启动」那个推进口**——拿到闸就起一步，拿不到就什么都不做。
+    ///
+    /// <para>⚠️ <b>打点与 <c>TryEnterStep</c> 同处</b>：那两处就是 `SessionHandle._step`
+    /// 翻转的地方，多打一处就多一个会漂的地方（`LiveSessions` 的类注释）。
+    /// ⚠️ **异常不许冒上来**（`throwOnFailure: false`）：这条走控制面，失败由 `error` 事件说。</para>
+    /// </summary>
+    private bool Start(SessionHandle handle)
+    {
+        if (!handle.TryEnterStep()) return false;
+
+        _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
+            CancellationToken.None);
+
+        return true;
+    }
+
+    /// <summary>
     /// 分派一条命令。
     /// <paramref name="awaitCompletion"/>：控制台传 true——它没有视图，唯一的输出就是这次的返回值，
     /// 「命令投递即返回」于是在本地退化成同步拿回执；控制面传 false——立刻回 ack，模型回话经事件流出。
@@ -706,6 +766,16 @@ public sealed class CommandDispatcher(
         // ⚠️ 声明在 try **外面**：循环的续推发生在 finally 之后（那边得先 `ExitStep`），
         // 所以结果要活过 try 这个作用域。
         ModelReply? reply = null;
+
+        // ⚠️ **摘槽排在这里**（2026-10-12 打断批）——不是因为它必须早于下面那把闸
+        // （**调用方已经拿过 `_step` 那把标志了**，所以这一趟本来就是独占的），
+        // 而是因为它必须**早于**任何可能再放一次槽的路径。⚠️ 原先那两句挪到
+        // `await gate.WaitAsync` **之后**写的版本在 `AskTests` 里复现过一个真缺陷
+        // （同一条调用补了两条结果）——那是**我错判了「拿标志」发生在这里**造成的：
+        // 标志在调用方拿到，而槽在那个窗口里能被别的路径再放一次。
+        // ⇒ 槽是**一次性**的：谁先取走谁负责，而「先」就是**进这个方法的第一件事**。
+        var pending = handle.TakeResume();
+        _host.Live.Mark(handle.SessionId);
         try
         {
             await gate.WaitAsync(stepCts.Token);
@@ -718,7 +788,7 @@ public sealed class CommandDispatcher(
             ModelReply replyForLoop;
             Stepper.StepOutcome step;
 
-            if (handle.TakeResume() is { } pending)
+            if (pending is not null)
             {
                 // ---- 答复之后直接执行（`01` §3.8）----
                 //
@@ -791,6 +861,7 @@ public sealed class CommandDispatcher(
         {
             _host.SetCts(handle.SessionId, null);   // 先摘掉，再让 using 释放
             handle.ExitStep();
+            _host.Live.Clear(handle.SessionId);
             if (acquired) gate.Release();
         }
 
@@ -893,12 +964,44 @@ public sealed class CommandDispatcher(
             new WireEvent.StateChanged(handle.SessionId, handle.State.Status, handle.State.Turn));
     }
 
+    /// <summary>
+    /// **「启动」**（`01` §6.1）——留的那个显式推进口，今天**仍然不是自动档**。
+    ///
+    /// <para>⚠️ <b>它曾经是个纯 no-op，而那个 no-op 有一处会咬人</b>：线上
+    /// <c>session.start</c> 是**接了**的（`ControlServer.ParseCommand` 认它）⇒ 一个头的客户端
+    /// 或脚本**合理地**先 `start` 再 `send`，会拿到 <c>ack</c>、而**一步都不跑**，且**不报错**。
+    /// ⇒ 本批把「启动」真做出来：**拿到闸 ⇒ 必然推进一步**（哪怕队列空——那正是「继续」）。</para>
+    ///
+    /// <para>⚠️ <b>这不该改自动行为</b>：`HandleSessionSend` 是**先拿标志、再入队**
+    /// ⇒ 两个客户端同时对同一会话发命令时，只有一个拿得到闸 ⇒ 仍然合并成一次推进
+    /// （「合并是队列的副产品」一个字没动）。</para>
+    ///
+    /// <para>⚠️ <b>回执必须说得清结果</b>（照 <c>session.gc</c> 的先例）：拿不到闸时
+    /// 那条 <c>Note</c> 不是客套——没有它，用户看到的「已受理」与「什么都没发生」长得一样。</para>
+    ///
+    /// <para>⚠️ <b>它不再自己查超时</b>：那件事搬进了 `Stepper.StepAsync` 的收尾
+    /// （**装配请求的地方只有一处**，三个适配器各补一次等于把同一条规则抄三遍）。
+    /// 而这条命令的效果没变——它推进，而推进前那段收尾顺带把过期的询问合成掉。</para>
+    /// </summary>
     private DispatchResult HandleSessionStart(CoreCommand.SessionStart s, string id)
     {
-        if (!TryFind(s.SessionId, out _, out var notFound)) return Reject(id, notFound!);
+        if (!TryFind(s.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
-        // 当前 send 已直接完成一步，故此处是 no-op。
-        return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = s.SessionId });
+        var queued = handle.QueueDepth > 0;
+
+        if (!Start(handle))
+            return new DispatchResult(new Ack.Accepted
+            {
+                CommandId = id, SessionId = s.SessionId, Note = "已经在推进了。",
+            });
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id, SessionId = s.SessionId,
+            // ⚠️ **两句话不同，而它们说的是同一件事的两半**：队列空而照样推进
+            // （=「继续」）是这条命令的**新行为**，用户必须看得到它发生了。
+            Note = queued ? "开始推进。" : "没有待办，直接推进一步（继续）。",
+        });
     }
 
     private DispatchResult HandleSessionInterrupt(CoreCommand.SessionInterrupt i, string id)
@@ -1082,6 +1185,7 @@ public sealed class CommandDispatcher(
 
         if (IsRunning(handle))
             return Reject(id, RunningRefusal(c.SessionId));
+
 
         _host.Deactivate(c.SessionId);
         // ⚠️ 只丢**这一个**会话的 stepper——它下次被激活时 `StepperFor` 会重新解析。
@@ -1536,8 +1640,14 @@ public sealed class CommandDispatcher(
         if (!handle.TryEnterStep())
             return new DispatchResult(new Ack.Accepted { CommandId = id, Note = "已记录答复。" });
 
-        _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
-            CancellationToken.None);
+        // ⚠️ **打点必须与 `TryEnterStep` 同处**（那两处就是 `_step` 翻转的地方）——
+        // 收尾的异常绝不许冒上来（它跑在心跳里，一条会话失败不该让整轮扫描停掉）。
+        _host.Live.Mark(handle.SessionId);
+        _ = Task.Run(async () =>
+        {
+            try { await RunStepAsync(handle, CancellationToken.None, throwOnFailure: false); }
+            finally { _host.Live.Clear(handle.SessionId); }
+        }, CancellationToken.None);
 
         return new DispatchResult(new Ack.Accepted
         {
