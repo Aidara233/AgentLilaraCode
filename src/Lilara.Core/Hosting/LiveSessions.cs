@@ -104,4 +104,21 @@ public sealed class LiveSessions
     {
         lock (_gate) return [.. _live.Keys];
     }
+
+    /// <summary>
+    /// **这个会话被「碰过」了**——它进了内存（`Activate` / `Register`）。
+    ///
+    /// <para>⚠️ <b>与 <see cref="Mark"/> 的区别是「动没动」</b>：`Mark` 是「有一趟推进在飞」，
+    /// 而这个只是「它被载进来了」——两者都让这个 id 进 `Known()`（**心跳要遍历它**），
+    /// 但**只有 `Mark` 让 `IsLive` 答真**。</para>
+    ///
+    /// <para>⚠️ **为什么心跳要遍历「被碰过」而不只是「在跑的」**：一个挂在
+    /// `WaitingForInput` 上的会话**没有任何东西在动**（那正是它挂着的定义），
+    /// 而它的询问**可能有截止时刻**（`01` §5「超时是盘面自证」）
+    /// ⇒ 不收尾的话它会**永久**停在那里（实测：过了 75 秒纹丝不动）。</para>
+    /// </summary>
+    public void Touch(string sessionId)
+    {
+        lock (_gate) _ = _live.TryAdd(sessionId, 0);
+    }
 }

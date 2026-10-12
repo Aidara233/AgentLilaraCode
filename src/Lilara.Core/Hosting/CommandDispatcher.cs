@@ -65,6 +65,43 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
+    /// **心跳那一趟收尾**（`01` §12.8 的第三条时机）。
+    ///
+    /// <para>⚠️ <b>它只做两件事，而且对没有断口的会话写零字节</b>
+    /// （`Recovery.BeforeStep` 在「没有痕迹 / 没有到期」时**立刻返回**）
+    /// ⇒ 一次扫描 = 每个已知会话一次 `history.jsonl` 读。</para>
+    ///
+    /// <para>⚠️ <b>唯一一件必须在这里做的事是「询问到期」</b>：那是**唯一**一条
+    /// 没有外部触发动的路（用户不理它、也没有别的客户端会碰那个会话）。
+    /// 断裂那条不吃心跳——它下一次带输入 / `session.start` 时收得掉。</para>
+    ///
+    /// <para>⚠️ <b>失败只吞不掉</b>：一条会话收尾失败不该让整轮扫描停掉
+    /// （那会让排在它后面的会话永远收不了）。</para>
+    /// </summary>
+    public void SweepExpiredAsks()
+    {
+        foreach (var sessionId in _host.Live.Known())
+        {
+            // ⚠️ **先看「它在不在跑」**：在跑的会话自己会收（它下一步开头就干这件事）
+            // ⇒ 插进去只会和那一趟抢闸。
+            if (_host.Live.IsLive(sessionId)) continue;
+            if (_host.Store.FindSession(sessionId) is not { } found) continue;
+
+            var handle = _host.Activate(found.ProjectKey, sessionId);
+            if (Session.Recovery.BeforeStep(
+                    _host.Store, handle, Kernel.CoreClock.Now(), hasNewInput: false) == 0) continue;
+
+            // ⚠️ **收尾真的动了手才发事件**：头要重拉才看得见新的那条结果。
+            _bus.Publish(EventBus.SessionTopic(sessionId),
+                new WireEvent.SessionReclaimed(sessionId, "有一次询问超时了，已经按超时处理。"));
+
+            // ⚠️ **收完之后**才让它接着走：`Recovery` 已经把悬空的那条配上对了，
+            // 而「接着走」需要那一趟推进（`Start` 拿得到闸才动）。
+            Start(handle);
+        }
+    }
+
+    /// <summary>
     /// **收尾之后接着走**（`01` §12.8）——三条时机的第三个，也是唯一一个**同步**的。
     ///
     /// <para>⚠️ <b>它复用的就是推进器自己那段收尾</b>（`Stepper.StepAsync` 开头那几行），

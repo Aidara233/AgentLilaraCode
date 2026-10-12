@@ -475,4 +475,31 @@ public sealed class LiveSessionsTests : IDisposable
         Assert.True(host.Deactivate(handle.SessionId));
         Assert.False(host.Live.IsLive(handle.SessionId));
     }
+
+    /// <summary>
+    /// ⚠️ **「上一次是不是崩了」的真值表**——三个格子，一个也不能错。
+    ///
+    /// <para>⚠️ <b>方向写反了<b>不报错</b></b>（实测时我第一版就是 `!File.Exists`）：
+    /// 「正常退出」会被判成崩溃、「强杀」被判成正常，而两条路的**唯一**可观差别
+    /// 就是那句横幅 ⇒ 没有这条测试，**没有任何东西会红**。</para>
+    /// </summary>
+    [Fact]
+    public void TheCrashMarker_ReadsTheTruthTable()
+    {
+        var root = Path.Combine(_tmp, "marker");
+        var work = Path.Combine(_tmp, "marker-work");
+        Directory.CreateDirectory(work);
+
+        // ① **全新数据根**（连 `projects/` 都没有）⇒ 不算崩。
+        // ⚠️ 这一格是给「第一次启动」的：那时报「上一次崩了」是**一句假话**。
+        Assert.False(new CoreHost(root, work).RecoveredFromACrash);
+
+        // ② 用过（有 `projects/`）、而心跳文件**不在** ⇒ 上一次是**正常退出**的。
+        Directory.CreateDirectory(Path.Combine(root, "projects"));
+        Assert.False(new CoreHost(root, work).RecoveredFromACrash);
+
+        // ③ 心跳文件**在** ⇒ 上一次**没走到那条正常退出的路**（强杀 / 断电）。
+        File.WriteAllText(CoreClock.HeartbeatPath(root), "");
+        Assert.True(new CoreHost(root, work).RecoveredFromACrash);
+    }
 }

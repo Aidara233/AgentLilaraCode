@@ -26,4 +26,19 @@ public static class CoreClock
 {
     /// <summary>当前时刻，**UTC**。位移（本地时区）是显示层的事，不是这里的。</summary>
     public static DateTimeOffset Now() => DateTimeOffset.UtcNow;
+
+    /// <summary>
+    /// **心跳文件的路径**（数据根下的一个空文件）。
+    ///
+    /// <para>⚠️ <b>它的存在只回答一个问题：「上一次那个进程是<b>正常退出</b>的吗」</b>
+    /// ——正常退出（`quit` / Ctrl-C）会删掉它；**强杀 / 断电不会**。
+    /// ⇒ 启动时「文件在不在」就是那条判据，而它**不需要**任何额外记录。</para>
+    ///
+    /// <para>⚠️ <b>为什么不能只靠「进程根本不在了」</b>：核心是唯一的（数据根锁），
+    /// 所以「没有别的核心在跑」是常态，判不出「它上一次是被杀死的」。</para>
+    ///
+    /// <para>⚠️ <b>它是 L2 派生数据</b>（`01` §8.0）：丢了（比如手工删掉）最多让下一次启动
+    /// 多跑一次收尾扫描——**而那是无害的**（收尾幂等，见 `Recovery`）。</para>
+    /// </summary>
+    public static string HeartbeatPath(string dataRoot) => Path.Combine(dataRoot, ".lilara-running");
 }

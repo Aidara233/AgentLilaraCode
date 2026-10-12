@@ -42,6 +42,27 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
     public string WorkingDirectory { get; } = workingDirectory;
 
     /// <summary>
+    /// **这一次启动，上一次是不是被强杀 / 断电弄死的**（`01` §12.8 的崩溃语义）。
+    ///
+    /// <para>判据只有一条：**心跳文件还在**（<see cref="CoreClock.HeartbeatPath"/>）。
+    /// 正常退出（`quit` / Ctrl-C）会**删掉**它，而**强杀删不掉** ⇒
+    /// 文件**在** = 上一次没走到那一步 = 崩了。</para>
+    ///
+    /// <para>⚠️ <b>这里的方向容易写反，而且写反了<b>不报错</b></b>（实测时我先写成了
+    /// `!File.Exists`）：那样「正常退出」会被判成崩溃、「强杀」被判成正常，
+    /// 而两条路的**唯一**可观差别就是那句横幅——**没有别的测试会红**。</para>
+    ///
+    /// <para>⚠️ **全新数据根不算崩**：没有 `projects/` 说明这台机器上还没用过核心，
+    /// 那时报「上一次崩了」是一句**假话**（而且会吓到第一次启动的人）。</para>
+    /// </summary>
+    public bool RecoveredFromACrash { get; } =
+        Directory.Exists(Path.Combine(dataRoot, "projects"))
+        && File.Exists(CoreClock.HeartbeatPath(dataRoot));
+
+    /// <summary>心跳那一趟的周期。⚠️ 见 `CommandDispatcher.SweepExpiredAsks`。</summary>
+    public static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(20);
+
+    /// <summary>
     /// 数据根。暴露出来是为了**诊断**：核心跑在哪个数据根上，是「为什么我看不到我配的 provider」
     /// 这类问题唯一的答案来源（`GET /info` 与启动横幅都用它）。
     /// </summary>
@@ -52,14 +73,25 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
     /// 幂等是硬要求：两个实例会让 `State` 分叉，而 `State` 是可变属性。
     /// </summary>
     public SessionHandle Activate(string projectKey, string sessionId) =>
-        _activated.GetOrAdd(sessionId, _ => SessionHandle.Load(_store, projectKey, sessionId));
+        _activated.GetOrAdd(sessionId, _ =>
+        {
+            // ⚠️ **碰一下就登记进 `Known`**：心跳那一趟要遍历「被碰过」的会话
+            // （一个挂在等回答上的会话**没有任何东西在动** —— 那正是它挂着的定义 ——
+            // 而它的询问可能有截止时刻）。见 `SweepExpiredAsks`。
+            Live.Touch(sessionId);
+            return SessionHandle.Load(_store, projectKey, sessionId);
+        });
 
     /// <summary>
     /// 登记一个**已经建好**的 handle（`session.create` 用的）。
     /// 与 <see cref="Activate"/> 的区别：那个是「从磁盘载入」，这个是「手里已经有了」——
     /// 让 create 走 Activate 会白读一次盘，而且在文件刚写完的窗口里可能读到半截。
     /// </summary>
-    public void Register(SessionHandle handle) => _activated[handle.SessionId] = handle;
+    public void Register(SessionHandle handle)
+    {
+        Live.Touch(handle.SessionId);   // 同 `Activate`：心跳要遍历它
+        _activated[handle.SessionId] = handle;
+    }
 
     /// <summary>
     /// 快照端点必须**先查这里**再回落磁盘。

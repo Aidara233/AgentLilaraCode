@@ -102,6 +102,41 @@ else
 var bus = new EventBus();
 var dispatcher = new CommandDispatcher(host, bus, host.StepperFor);
 
+// ⚠️ **心跳**（`01` §12.8 的第三条时机）：每 20 秒扫一遍**已知会话**，把到期没人答的询问收掉。
+//
+// <para>⚠️ <b>它是「超时自动」唯一的落点，因为超时**没有**定时器</b>
+//（§5「超时是盘面自证」）：一个挂着等回答的会话**没有任何东西在动它**
+//（那正是它挂着的定义）⇒ 没有这一趟，它会**永久**停在那里。
+// 实测过：过截止 75 秒之后 `state.json` 还是 `WaitingForInput`。</para>
+//
+// <para>⚠️ <b>它绝不碰回收</b>（`01` §11.7 栽过的那一跤）：只做「询问到期」一件事，
+// 而没有断口的会话**一个字节都不写**。</para>
+//
+// <para>⚠️ **心跳文件**：正常退出时删它，强杀删不掉 ⇒ 下一次启动据此知道
+// 「上一次是被弄死的」，于是**对当前会话先收一次尾**。</para>
+var heartbeatFile = CoreClock.HeartbeatPath(dataRoot);
+
+if (host.RecoveredFromACrash)
+{
+    Console.WriteLine("  ⚠️ 上一次核心没有正常退出（被强杀或断电）。正在收尾……");
+}
+File.WriteAllText(heartbeatFile, "");   // ⚠️ 必须在**读**过之后才建
+
+using var heartbeat = new CancellationTokenSource();
+var heartbeatTask = Task.Run(async () =>
+{
+    while (!heartbeat.Token.IsCancellationRequested)
+    {
+        try { await Task.Delay(CoreHost.HeartbeatInterval, heartbeat.Token); }
+        catch (OperationCanceledException) { return; }
+
+        // ⚠️ **失败绝不许掀翻这一趟循环**：一条会话收尾失败不该让心跳死掉
+        //（死了之后所有挂着的询问就永远没人收了，而**没有任何东西会告诉你**）。
+        try { dispatcher.SweepExpiredAsks(); }
+        catch (Exception ex) { Console.Error.WriteLine($"（心跳那一趟出错了：{ex.Message}）"); }
+    }
+}, heartbeat.Token);
+
 // ⚠️ 端口**可注入**（环境变量），只在**默认值**上不许静默换（05 §2.1）。
 // 可注入是硬需求：不然测试里两个 host 并行跑必然互撞，集成测试根本写不出来。
 // ⚠️ 但**用户没法靠它绕开「一设备一核心」**——那条守卫在**数据根**上（见上面 `DataRootLock`），
@@ -176,6 +211,16 @@ while (true)
 // ⚠️ 退出前停掉控制面：不 `StopAsync` 的话监听 socket 会挂到进程被强杀为止，
 // 紧接着重启会撞上「端口仍被占」——而那个报错**看起来**像另一个核心在跑。
 if (api is not null) await api.StopAsync(CancellationToken.None);
+
+// ⚠️ **心跳要停、心跳文件要删**（顺序：先停循环再删文件）。
+// - 不删文件 ⇒ 下一次启动会**误报**「上一次崩了」；
+// - 不停循环 ⇒ 那个 `Task` 还攥着 `dispatcher`，而进程正要退出。
+// ⚠️ **这两句只覆盖「正常退出」**：强杀 / 断电走不到这里，而**那正是判据本身**
+//（心跳文件还在 ⇒ 下一次知道要收尾）。
+await heartbeat.CancelAsync();
+await heartbeatTask;
+try { File.Delete(heartbeatFile); } catch (IOException) { /* 删不掉最多误报一次崩溃 */ }
+
 return 0;
 
 /// <summary>
