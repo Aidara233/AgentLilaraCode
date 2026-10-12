@@ -1,3 +1,4 @@
+using Lilara.Core.Session;
 using System.Text.Json;
 using Lilara.Core.Kernel;
 using Lilara.Core.Protocol;
@@ -23,7 +24,7 @@ public class OpenAiToolTests
         Protocol = protocol,
         Effort = "high",
         Temperature = null,
-        SystemBlocks = [],
+        Slots = PromptSlots.Empty,
         Tools = tools ?? [],
         Timeline = timeline,
     };

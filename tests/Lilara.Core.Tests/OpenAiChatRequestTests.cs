@@ -1,3 +1,4 @@
+using Lilara.Core.Session;
 using System.Text.Json;
 using Lilara.Core.Protocol;
 using Lilara.Core.Protocol.OpenAi;
@@ -18,7 +19,7 @@ public class OpenAiChatRequestTests
     {
         Protocol = Protocols.OpenAiChat,
         ModelId = "deepseek-flash", MaxTokens = 16000, Effort = "high", Temperature = null,
-        SystemBlocks = [], Timeline = tl,
+        Slots = PromptSlots.Empty, Timeline = tl,
         Tools = [],
     };
 
@@ -78,7 +79,7 @@ public class OpenAiChatRequestTests
     {
         var request = Req(Msg(Speaker.User, new Block.TextBlock("hi"))) with
         {
-            SystemBlocks = [new Block.TextBlock("你是助手")],
+            Slots = new PromptSlots([new Block.TextBlock("你是助手")], [], []),
         };
 
         var messages = Parse(OpenAiChatRequest.Build(request)).GetProperty("messages");
@@ -181,10 +182,10 @@ public class OpenAiChatRequestTests
     [Fact]
     public void Build_OmitsSystemWhenSystemBlocksHaveNoText()
     {
-        // SystemBlocks.Count != 0 但拼出来是空串，那就是一个空的 system 消息。
+        // 块数 != 0 但拼出来是空串，那就是一个空的 system 消息。
         var request = Req(Msg(Speaker.User, new Block.TextBlock("hi"))) with
         {
-            SystemBlocks = [new Block.ReasoningBlock("sig", "想想")],
+            Slots = new PromptSlots([new Block.ReasoningBlock("sig", "想想")], [], []),
         };
 
         var messages = Parse(OpenAiChatRequest.Build(request)).GetProperty("messages");
@@ -233,5 +234,84 @@ public class OpenAiChatRequestTests
         var root = Parse(OpenAiChatRequest.Build(Req(Msg(Speaker.User, new Block.TextBlock("hi")))));
 
         Assert.False(root.TryGetProperty("temperature", out _));
+    }
+
+    // ---- 空时间线 + 槽位 / 头两块的顺序 / 尾块（2026-10-11）----
+    //
+    // ⚠️ 这几条与 `ClaudeRequestBuilderTests` 里同名的那几条**是同一批判据**，
+    // 而**两条链路各测一遍不是冗余**：判据写在两个文件里（两条协议形状不同），
+    // 只测一条的话，另一条被改坏**没有任何东西会红**——而三条链路的「什么算合法请求」
+    // 一旦分叉，表现是「换个 provider 静默换一种行为」。
+
+    /// <summary>⚠️ 空时间线 + 有系统块 ⇒ 构造得出来（Chat 下 system 就是一条普通消息）。</summary>
+    [Fact]
+    public void Build_WithEmptyTimeline_ButASystemBlock_Succeeds()
+    {
+        var req = Req() with { Slots = new PromptSlots([new Block.TextBlock("你是助手")], [], []) };
+
+        var root = Parse(OpenAiChatRequest.Build(req));
+
+        var messages = root.GetProperty("messages");
+        Assert.Equal(1, messages.GetArrayLength());
+        Assert.Equal("system", messages[0].GetProperty("role").GetString());
+        Assert.Equal("你是助手", messages[0].GetProperty("content").GetString());
+    }
+
+    /// <summary>⚠️ 反向控制：两个槽位都空 + 空时间线 ⇒ 仍然早失败。</summary>
+    [Fact]
+    public void Build_WithEmptyTimeline_AndNoSlotsAtAll_StillThrows()
+    {
+        var ex = Assert.Throws<ArgumentException>(() => OpenAiChatRequest.Build(Req()));
+
+        Assert.Contains("时间线为空", ex.Message);
+    }
+
+    /// <summary>⚠️ 两块头槽位的顺序是契约：系统块在前、首要块在后（`01` §3.1）。Chat 下它们拼成**同一条**消息。</summary>
+    [Fact]
+    public void Build_PutsSystemBeforePremier_InTheSameSystemMessage()
+    {
+        var req = Req(Msg(Speaker.User, new Block.TextBlock("hi"))) with
+        {
+            Slots = new PromptSlots([new Block.TextBlock("系统")], [new Block.TextBlock("首要")], []),
+        };
+
+        var root = Parse(OpenAiChatRequest.Build(req));
+
+        Assert.Equal("系统首要", root.GetProperty("messages")[0].GetProperty("content").GetString());
+    }
+
+    /// <summary>
+    /// ⚠️ **Chat 的尾块自己起一条 user 消息**，而**不是拼进上一条**。
+    ///
+    /// <para>判据是 Chat 的形状：工具结果是**独立的 `role:"tool"` 消息**（不像 Claude
+    /// 塞进 user 消息的块）⇒ 往那条里拼正文是**非法的**（它的 `content` 是工具输出）。
+    /// ⇒ 同一个尾块，两条链路落点不同，而**模型看到的内容逐字相同**。</para>
+    /// </summary>
+    [Fact]
+    public void Build_PutsTheTailInItsOwnUserMessage()
+    {
+        var req = Req(Msg(Speaker.User, new Block.TextBlock("hi"))) with
+        {
+            Slots = new PromptSlots([], [], [new Block.TextBlock("框架输入")]),
+        };
+
+        var root = Parse(OpenAiChatRequest.Build(req));
+
+        var messages = root.GetProperty("messages");
+        Assert.Equal(2, messages.GetArrayLength());
+        Assert.Equal("user", messages[0].GetProperty("role").GetString());
+        Assert.Equal("框架输入", messages[1].GetProperty("content").GetString());
+        Assert.Equal("user", messages[1].GetProperty("role").GetString());
+    }
+
+    /// <summary>⚠️ 空尾块 ⇒ 一条消息都不多（与 `temperature` / `tools` 同一条判据）。</summary>
+    [Fact]
+    public void Build_WithAnEmptyTail_AddsNoMessage()
+    {
+        var req = Req(Msg(Speaker.User, new Block.TextBlock("hi")));
+
+        var root = Parse(OpenAiChatRequest.Build(req));
+
+        Assert.Equal(1, root.GetProperty("messages").GetArrayLength());
     }
 }

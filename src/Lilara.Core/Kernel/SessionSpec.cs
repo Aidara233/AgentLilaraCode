@@ -92,6 +92,24 @@ public sealed record SessionSpec
     public string? SystemPromptPreset { get; init; }
 
     /// <summary>
+    /// 这个会话用哪份**首要**提示词（`premiers/&lt;id&gt;.md`）。`null` = **没指定，跟随全局默认**
+    /// （<see cref="CorePrompts.DefaultPremier"/>）。
+    ///
+    /// <para>⚠️ <b>与 <see cref="SystemPromptPreset"/> 是<b>两个字段</b>，不是同一个字段的两种用法</b>——
+    /// 两块的可写面不对称（`01` §3.1：系统块**插件不可注入**、首要块是**插件的落点**），
+    /// 而「谁能改这份共享字节」正是那一节的全部内容。合成一个字段就等于把那个区分抹掉。</para>
+    ///
+    /// <para>⚠️ <b>它与系统块「找不到文件」的后果<b>不同</b></b>：系统块回落到内置模板，
+    /// 首要块**没有兜底内容**（核心不替用户编人设）⇒ 文件不在 = 没有块。
+    /// 见 <see cref="CorePrompts.DefaultPremier"/>。</para>
+    ///
+    /// <para>⚠️ <b>今天没有任何东西往这里写</b>（插件宿主不存在、项目层配置没有落点）——
+    /// 所以它恒为 `null`、首要块恒空。**字段先在这里**是为了让「两块各有各的来源」
+    /// 这条设计在类型上立得住；等插件贡献落地时它才有第一个写手。</para>
+    /// </summary>
+    public string? PremierPrompt { get; init; }
+
+    /// <summary>
     /// 一次询问**最多等多久**（`01` §3.8）。`null` = **不超时**（默认）。
     ///
     /// <para>⚠️ <b>超时的后果按 Kind 分</b>：<see cref="AskKind.Permission"/> 超时 =

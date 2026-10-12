@@ -14,13 +14,38 @@ public static class OpenAiResponsesRequest
 
     public static string Build(ModelRequest request)
     {
-        if (request.Timeline.Count == 0)
-            throw new ArgumentException("时间线为空，无法构造请求", nameof(request));
+        // ⚠️ 判据与另两条**必须逐字相同**（空时间线 + 两槽位都空才早失败）。
+        if (request.Timeline.Count == 0
+            && request.Slots.System.Count == 0
+            && request.Slots.Premier.Count == 0)
+            throw new ArgumentException("时间线为空，且没有任何槽位内容，无法构造请求", nameof(request));
 
         var input = new JsonArray();
         foreach (var evt in request.Timeline)
             foreach (var item in ToItems(evt, request.Protocol))
                 input.Add(item);
+
+        // ---- 尾槽位：**拼进末尾那条 user 消息**（`01` §3.2 / §3.3）----
+        //
+        // ⚠️ 与 Chat 那条链路**同一个形状、同一个理由**：Responses 把工具结果做成
+        // 与消息并列的 `function_call_output` 项 ⇒ 末尾通常**不是** user，
+        // 所以这里补一条 message 项。（Claude 那边是块、能拼进去，故那边不补。）
+        // ⚠️ 项必须带 `"type":"message"`——少了它上游报 upstream_error（本文件开头那条实测）。
+        if (OpenAiChatRequest.TailText(request.Slots.Tail) is { Length: > 0 } tail)
+        {
+            input.Add(new JsonObject
+            {
+                ["type"] = "message",
+                ["role"] = "user",
+                // ⚠️ 始终发 part 数组（单块也是）：与下面 MessageToItems 同一条判据——
+                // 数组对单块/多块是同一条路径，少一处无覆盖的代码。
+                ["content"] = new JsonArray(new JsonObject
+                {
+                    ["type"] = "input_text",
+                    ["text"] = tail,
+                }),
+            });
+        }
 
         var body = new JsonObject
         {
@@ -33,10 +58,12 @@ public static class OpenAiResponsesRequest
         if (request.Temperature is { } temperature)
             body["temperature"] = temperature;
 
-        // 系统提示走顶层 instructions（不占一条消息）。空时不发这个字段，而不是发个空串：
+        // 两块头槽位走顶层 instructions（不占一条消息）。空时不发这个字段，而不是发个空串：
+        // ⚠️ **顺序是契约**：系统块在前、首要块在后（`01` §3.1）——见 Claude 那边同一条注释。
         // 判空必须落在拼接后的文本上，非空输入若全是非文本块会拼出空串。
         var systemText = string.Concat(
-            request.SystemBlocks.OfType<Block.TextBlock>().Select(b => b.Text));
+            request.Slots.System.Concat(request.Slots.Premier)
+                .OfType<Block.TextBlock>().Select(b => b.Text));
         if (systemText.Length > 0)
             body["instructions"] = systemText;
 

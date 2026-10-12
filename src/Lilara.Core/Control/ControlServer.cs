@@ -243,21 +243,23 @@ public sealed class ControlServer(
                     Spec = handle.Spec,
 
                     // 三个槽（系统 / 首要 / 浮动）：渲染归核心、显示归头。
-                    // ⚠️ **系统那格今天是真的了**（2026-10-07，预设批）：它读的就是发请求时用的那一份
-                    // （`SystemBlock.Render`），所以头显示什么、模型收到什么**同一个来源**。
-                    // ⚠️ 首要与浮动仍然恒空——装配器只做了系统块这一半，如实交空数组、不省略字段。
+                    // ⚠️ **三格今天全是真的了**（2026-10-11，提示词拼装批）：
+                    // 系统块自 2026-10-07 起读 `presets/<id>.md`，本批补上首要块
+                    // （`premiers/<id>.md`）与浮动槽（核心每步现算的轴表）。
+                    // ⚠️ **它们与请求走同一个来源**（`SystemBlock.Render`）——
+                    // 各算一份的话，「头显示什么」与「模型收到什么」会悄悄分叉，
+                    // 而那正是 `05` §3 那条「渲染归核心」要防的事。
                     //
                     // ⚠️ **读的时刻与「步」无关**：这里没有步的概念（这是个 HTTP 快照端点），
-                    // 所以它拿的是**此刻**的文件内容。而发请求那一侧是**步开始冻结**的
+                    // 所以它拿的是**此刻**的文件内容与轴值。而发请求那一侧是**步开始冻结**的
                     // （见 `SystemBlock.Render` 的注释）⇒ 用户在步中途改文件时，
-                    // 这一格会**先**变、而请求里要等下一步才变。那不是缺陷，是两条不同的时间轴：
+                    // 这几格会**先**变、而请求里要等下一步才变。那不是缺陷，是两条不同的时间轴：
                     // 快照端点回答「现在是什么」，请求回答「这一步是什么」。
-                    Slots = new
-                    {
-                        System = SystemBlock.Render(new PresetStore(host.DataRoot), handle.Spec.SystemPromptPreset),
-                        Premier = Array.Empty<object>(),
-                        Floating = Array.Empty<object>(),
-                    },
+                    //
+                    // ⚠️ **缺席与「空」是两回事**：三格都可能是 `[]`（用户删了预设 / 没有轴），
+                    // 头必须把它显示成**缺席**而不是画一张空卡——同 `05` §7.1 那条
+                    // 「空的也要显示（标『（空）』）」。
+                    Slots = SlotsOf(handle),
 
                     // ⚠️ **待回答的那次询问，含问题原文**（`01` §3.8）。
                     //
@@ -436,6 +438,45 @@ public sealed class ControlServer(
     /// 但那不是「谁说的话」），另给 <c>kind:"toolResult"</c> 与配对的 <c>callId</c>。
     /// ⇒ 头那边不认识这个 kind 时**只是不显示它**，不会崩（`textOf` 按 kind 过滤）。</para>
     /// </summary>
+    /// <summary>
+    /// `/state` 的三个槽——<b>与请求走同一个来源</b>（`SystemBlock.Render`），头显示什么、
+    /// 模型收到什么因此**不可能分叉**（`05` §3：渲染归核心，头只显示）。
+    ///
+    /// <para>⚠️ <b>三格都可能是空数组，而空数组是<b>一条事实</b></b>：「这个会话没配过那一块」。
+    /// 头必须把它显示成缺席（「（空）」），而不是画一张空卡——同 `05` §7.1 那条。
+    /// ⚠️ 所以这里**不省略字段、也不用 <c>null</c>**：省略让「空」与「这个核心没实现它」
+    /// 在线上**长得一模一样**，而那正是本批要消掉的那个歧义。</para>
+    ///
+    /// <para>⚠️ <b>首要块今天恒为空</b>（没有插件宿主、没有项目层配置 ⇒ `PremierPrompt` 恒 <c>null</c>
+    /// ⇒ `premiers/default.md` 通常不存在）。<b>但这一格是真的</b>：往那个路径放一个文件，
+    /// 它当场就有内容，而且是**模型真的收到的那一份**。别把「今天恒空」读成「还没接」。</para>
+    ///
+    /// <para>⚠️ <b>轴值用 <c>!</c> 是 <c>Load</c> / <c>Create</c> 的契约</b>，与同一响应里
+    /// 顶层那个 <c>Axes = handle.State.Axes!</c> **同一份依据**（`CompleteAxes` 保证非空）。
+    /// ⇒ 两处都从同一个 handle 读同一件事，不给其中一处编一个「差不多」的默认值——
+    /// 那会让头里的两块面板显示两个不同的档位。</para>
+    /// </summary>
+    private object SlotsOf(SessionHandle handle)
+    {
+        var slots = SystemBlock.Render(
+            new PresetStore(host.DataRoot, PresetStore.SystemDir),
+            new PresetStore(host.DataRoot, PresetStore.PremierDir),
+            handle.Spec.SystemPromptPreset,
+            handle.Spec.PremierPrompt,
+            handle.State.Axes!);
+
+        return new
+        {
+            System = slots.System,
+            Premier = slots.Premier,
+            // ⚠️ **线上那一格叫 `floating`（浮动），代码里叫 Tail（尾槽位）**——
+            // 两个名字指的是同一块（`01` §2.4「浮动上下文 = 槽位」/ §3.2「尾槽位」）。
+            // ⇒ **别把线上那个键改名去迁就代码**：头（`app.js` 的 `renderSlots`）
+            // 早就按 `floating` 读了，改名会让那一格**静默变空**。
+            Floating = slots.Tail,
+        };
+    }
+
     private static object Render(Kernel.TimelineEvent evt) => evt switch
     {
         Kernel.TimelineEvent.MessageEvent m => new

@@ -808,7 +808,7 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Equal("dev", axes.GetProperty("safety").GetString());
     }
 
-    // 三个槽位（头两个 + 尾槽位「浮动」）：空的也要显示 ⇒ 恒在且是数组，省略字段会让头分不清「空」与「没有这个概念」。
+    // 三个槽位（系统 / 首要 / 浮动）：空的也要显示 ⇒ 恒在且是数组，省略字段会让头分不清「空」与「没有这个概念」。
     [Fact]
     public async Task State_CarriesThreeSlots_FloatingIncluded()
     {
@@ -818,10 +818,28 @@ public class ControlServerTests : IAsyncLifetime
         using var doc = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/state")));
         var slots = doc.RootElement.GetProperty("slots");
 
+        // 三格**恒在**、恒是数组——这一条与内容无关，它是「头分不清空与没有」那个歧义的守卫。
         Assert.Equal(JsonValueKind.Array, slots.GetProperty("system").ValueKind);
         Assert.Equal(JsonValueKind.Array, slots.GetProperty("premier").ValueKind);
         Assert.Equal(JsonValueKind.Array, slots.GetProperty("floating").ValueKind);
-        Assert.Empty(slots.GetProperty("floating").EnumerateArray());
+
+        // ⚠️ **2026-10-11 反过来了**：这三格原先**恒空**（装配器只做了系统块那一半），
+        // 所以这里曾断言 `Assert.Empty(floating)`——那句钉的是「还没实现」，
+        // 而不是任何设计性质。本批之后三格都是**真的**：
+        //   系统：没配过预设 ⇒ 内置兜底那句（**非空**）
+        //   首要：没配过 `<数据根>/premiers/default.md` ⇒ **空**（核心不替用户编人设）
+        //   浮动：核心每步现算的轴表 ⇒ **非空**
+        // ⇒ 现在钉的是**各自的真相**，而不是「都空」。
+        Assert.NotEmpty(slots.GetProperty("system").EnumerateArray());
+        Assert.Empty(slots.GetProperty("premier").EnumerateArray());
+        Assert.NotEmpty(slots.GetProperty("floating").EnumerateArray());
+
+        // ⚠️ 尾块的内容**从轴来**——所以它里面必须看得见轴值与那个自我声明。
+        // 只断言「非空」的话，一个恒定输出「x」的实现照样绿。
+        var floating = slots.GetProperty("floating").EnumerateArray().Single().GetProperty("text").GetString()!;
+        Assert.Contains(CorePrompts.TailDeclaration, floating);
+        Assert.Contains("权限", floating);
+        Assert.Contains(Axes.Defaults()[Axes.Permission], floating);
     }
 
     [Fact]
@@ -1155,7 +1173,7 @@ public class ControlServerTests : IAsyncLifetime
 
         Assert.Equal(
             ["ArchivedAt:Nullable`1", "AskTimeout:Nullable`1", "CreatedAt:DateTimeOffset",
-             "Model:ModelSelection", "ProjectKey:String", "SessionId:String",
+             "Model:ModelSelection", "PremierPrompt:String", "ProjectKey:String", "SessionId:String",
              "SystemPromptPreset:String", "Title:String",
              "Version:Int32", "WorkingDirectory:String"],
             Shape(typeof(SessionSpec)));

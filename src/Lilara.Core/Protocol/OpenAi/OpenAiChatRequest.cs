@@ -12,21 +12,39 @@ public static class OpenAiChatRequest
 
     public static string Build(ModelRequest request)
     {
-        if (request.Timeline.Count == 0)
-            throw new ArgumentException("时间线为空，无法构造请求", nameof(request));
+        // ⚠️ 判据与 Claude 那条**必须逐字相同**（空时间线 + 两槽位都空才早失败）——
+        // 三条链路对「什么算合法的请求」各判一套的话，换个 provider 就会静默换一种行为。
+        if (request.Timeline.Count == 0
+            && request.Slots.System.Count == 0
+            && request.Slots.Premier.Count == 0)
+            throw new ArgumentException("时间线为空，且没有任何槽位内容，无法构造请求", nameof(request));
 
         var messages = new JsonArray();
 
-        // 系统提示放第一条消息（Chat 协议没有独立 system 字段）。
-        // 判空必须落在拼接后的文本上，不能判 SystemBlocks.Count：非空的输入若全是非文本块，
+        // 两块头槽位放**同一条** system 消息（Chat 协议没有独立 system 字段）。
+        // ⚠️ **顺序是契约**：系统块在前、首要块在后（`01` §3.1）——见 Claude 那边同一条注释。
+        // 判空必须落在拼接后的文本上，不能判块数：非空的输入若全是非文本块，
         // 拼接结果是空串，发出去就是一个空 system 消息（空串 vs 不存在）。
         var systemText = string.Concat(
-            request.SystemBlocks.OfType<Block.TextBlock>().Select(b => b.Text));
+            request.Slots.System.Concat(request.Slots.Premier)
+                .OfType<Block.TextBlock>().Select(b => b.Text));
         if (systemText.Length > 0)
             messages.Add(new JsonObject { ["role"] = "system", ["content"] = systemText });
 
         foreach (var evt in request.Timeline)
             messages.Add(ToMessage(evt, request.Protocol));
+
+        // ---- 尾槽位：**拼进末尾那条 user 消息**（`01` §3.2 / §3.3）----
+        //
+        // ⚠️ **判据只有一条：末尾是不是 user。** 是 ⇒ 拼进去；不是 ⇒ 补一条 user 消息。
+        // ⚠️ **但 Chat 这一条多一格**：工具结果在 Chat 下是**独立的 `role:"tool"` 消息**
+        // （不像 Claude 那样塞进 user 消息的块）⇒ 时间线的末尾**通常是 `tool`**。
+        // 往 `role:"tool"` 里拼正文是**非法的**（那条消息的 `content` 是工具输出），
+        // 所以这里补一条 user 消息——而 Claude 那边走的是「拼进去」。
+        // ⚠️ **两条链路的形状差异是协议给的**，不是这里偷懒：同一个尾块在两条链路上
+        // 落点不同，而模型看到的内容**逐字相同**（这是判据，「落在同一个位置」不是）。
+        if (TailText(request.Slots.Tail) is { Length: > 0 } tail)
+            messages.Add(new JsonObject { ["role"] = "user", ["content"] = tail });
 
         var body = new JsonObject
         {
@@ -60,6 +78,28 @@ public static class OpenAiChatRequest
             body["temperature"] = temperature;
 
         return body.ToJsonString(Json.Options);
+    }
+
+    /// <summary>
+    /// 尾槽位的块 → 一段正文。⚠️ <b>非文本块直接抛</b>，与两条 OpenAI 链路处理工具结果
+    /// 时那条判据同源（静默丢一块 = 少一条信息，而那比抛坏）。
+    ///
+    /// <para>⚠️ <b>它住在 Chat 这个类里，而两条 OpenAI 协议共用它</b>——
+    /// 理由是「块怎么念成文本」这件事**两条 OpenAI 协议完全一样**（Claude 那边不一样：
+    /// 它发的是**块**、不是文本，所以那边没有对应的助手）。放在任一处都行，
+    /// 放这里是随手挑的；**别为它另建一个文件**——五行的东西配一个类只会让下一个人
+    /// 去猜它是不是还有别的用途。</para>
+    /// </summary>
+    internal static string? TailText(IReadOnlyList<Block> tail)
+    {
+        if (tail.Count == 0) return null;
+
+        return string.Concat(tail.Select(b => b switch
+        {
+            Block.TextBlock t => t.Text,
+            _ => throw new ArgumentException(
+                $"尾槽位里有无法翻译的块（{b.GetType().Name}）", nameof(tail)),
+        }));
     }
 
     /// <summary>

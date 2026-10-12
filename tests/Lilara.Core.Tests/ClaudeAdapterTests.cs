@@ -1,3 +1,4 @@
+using Lilara.Core.Session;
 using Lilara.Core.Kernel;
 using System.Net;
 using Anthropic.Exceptions;
@@ -27,7 +28,7 @@ public class ClaudeAdapterTests
         Protocol = Protocols.ClaudeMessages,
         Effort = "high",
         Temperature = null,
-        SystemBlocks = [],
+        Slots = PromptSlots.Empty,
         Tools = [],
         Timeline = [],
     };

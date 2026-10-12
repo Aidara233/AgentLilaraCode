@@ -104,13 +104,22 @@ public sealed class Stepper(
                 Effort = handle.State.Axes![Axes.Effort],
                 Temperature = Axes.NumberOrNull(Axes.Temperature, handle.State.Axes![Axes.Temperature]),
 
-                // ⚠️ **系统块在步开始读一次、冻进这一趟**（与上面那行 `now` 同一个道理）。
-                // 它是**每步都可能变的外部输入**（预设是个用户随时能编辑的文件），
+                // ⚠️ **三块提示词在步开始读一次、冻进这一趟**（与上面那行 `now` 同一个道理）。
+                // 两块文件是**每步都可能变的外部输入**（预设是用户随时能编辑的文件），
                 // 而「渲染是纯函数」要求同一步内重复渲染**逐字节相同** ⇒ 随手现读会变成
                 // 「半新半旧 ⇒ 每步破前缀」。⚠️ 所以这里**不是**每步缓存的偷懒，
                 // 而是**刻意的每步一冻**：跨步实时（下一步就生效）、步内冻结。
                 // 完整理由见 `SystemBlock.Render` 的注释。
-                SystemBlocks = SystemBlock.Render(new PresetStore(_store.DataRoot), handle.Spec.SystemPromptPreset),
+                //
+                // ⚠️ **它整块交给下面**（`SystemBlocks` / `PremierBlocks` / `TailBlocks` 各取一块），
+                // 而不是在这里分三次调——「哪一块从哪来」的判据只有 `SystemBlock` 一处。
+                // ⚠️ 轴值从 **handle 的 State** 读（不是从 spec）：轴是活的，
+                // 而 `!` 是 `Load` / `Create` 的契约（见上面 `Effort` 那行）。
+                Slots = SystemBlock.Render(
+                    new PresetStore(_store.DataRoot, PresetStore.SystemDir),
+                    new PresetStore(_store.DataRoot, PresetStore.PremierDir),
+                    handle.Spec.SystemPromptPreset, handle.Spec.PremierPrompt,
+                    handle.State.Axes!),
 
                 // ⚠️ 工具表**从工具表投影**，不是从 spec 读的——spec 里没有它，
                 // 而「这一步有哪些工具」是**派生**的（04 §1.3：工具表不是独立实体）。

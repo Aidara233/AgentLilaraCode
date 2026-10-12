@@ -39,6 +39,18 @@ public sealed class PresetTests : IDisposable
 
     private PresetStore Store => new(_root);
 
+    /// <summary>首要块那个目录。⚠️ 与系统块**分开**（`PresetStore.PremierDir`）——两个槽位各读各的。</summary>
+    private PresetStore PremierStore => new(_root, PresetStore.PremierDir);
+
+    /// <summary>
+    /// 装配三个槽。⚠️ **默认轴值是 <see cref="Axes.Defaults"/>**（不是空表）——
+    /// 尾块的内容来自轴，给一个空表会让「尾块该不该有」这件事**全测成 false**，
+    /// 而那正是本批要证明存在的那一格。要测「轴缺失」那条路就显式传空表。
+    /// </summary>
+    private PromptSlots Slots(
+        string? systemId, string? premierId = null, IReadOnlyDictionary<string, string>? axes = null) =>
+        SystemBlock.Render(Store, PremierStore, systemId, premierId, axes ?? Axes.Defaults());
+
     private (CoreHost Host, CommandDispatcher Dispatcher) NewHarness()
     {
         var host = new CoreHost(_root, _work);
@@ -59,7 +71,7 @@ public sealed class PresetTests : IDisposable
     [Fact]
     public void NoFile_FallsBackToBuiltIn()
     {
-        var blocks = SystemBlock.Render(Store, null);
+        var blocks = Slots(null).System;
 
         var text = Assert.IsType<Block.TextBlock>(Assert.Single(blocks));
         Assert.Equal(CorePrompts.SystemFallback, text.Text);
@@ -80,7 +92,7 @@ public sealed class PresetTests : IDisposable
     {
         Store.Save("default", "");
 
-        Assert.Empty(SystemBlock.Render(Store, null));
+        Assert.Empty(Slots(null).System);
     }
 
     /// <summary>文件有内容 ⇒ 那一块就是它，逐字。</summary>
@@ -90,7 +102,7 @@ public sealed class PresetTests : IDisposable
         const string mine = "你是测试用的。\n\n第二段。";
         Store.Save("default", mine);
 
-        var text = Assert.IsType<Block.TextBlock>(Assert.Single(SystemBlock.Render(Store, null)));
+        var text = Assert.IsType<Block.TextBlock>(Assert.Single(Slots(null).System));
         Assert.Equal(mine, text.Text);
     }
 
@@ -101,7 +113,7 @@ public sealed class PresetTests : IDisposable
         Store.Save("default", "默认那份");
         Store.Save("task", "任务那份");
 
-        var text = Assert.IsType<Block.TextBlock>(Assert.Single(SystemBlock.Render(Store, "task")));
+        var text = Assert.IsType<Block.TextBlock>(Assert.Single(Slots("task").System));
         Assert.Equal("任务那份", text.Text);
     }
 
@@ -111,7 +123,7 @@ public sealed class PresetTests : IDisposable
     {
         Store.Save("default", "默认那份");
 
-        var text = Assert.IsType<Block.TextBlock>(Assert.Single(SystemBlock.Render(Store, "typo")));
+        var text = Assert.IsType<Block.TextBlock>(Assert.Single(Slots("typo").System));
         Assert.Equal(CorePrompts.SystemFallback, text.Text);
     }
 
@@ -124,13 +136,13 @@ public sealed class PresetTests : IDisposable
     [Fact]
     public void AtMostOneBlock_OnEveryPath()
     {
-        Assert.Single(SystemBlock.Render(Store, null));          // 内置兜底
+        Assert.Single(Slots(null).System);          // 内置兜底
 
         Store.Save("default", "有内容");
-        Assert.Single(SystemBlock.Render(Store, null));          // 文件内容
+        Assert.Single(Slots(null).System);          // 文件内容
 
         Store.Save("default", "");
-        Assert.Empty(SystemBlock.Render(Store, null));           // 纯 chat
+        Assert.Empty(Slots(null).System);           // 纯 chat
     }
 
     // ---- 实时引用（`SessionSpec.SystemPromptPreset` 是引用，不是快照）----
@@ -148,11 +160,11 @@ public sealed class PresetTests : IDisposable
     {
         Store.Save("default", "第一版");
         Assert.Equal("第一版",
-            Assert.IsType<Block.TextBlock>(Assert.Single(SystemBlock.Render(Store, null))).Text);
+            Assert.IsType<Block.TextBlock>(Assert.Single(Slots(null).System)).Text);
 
         Store.Save("default", "第二版");
         Assert.Equal("第二版",
-            Assert.IsType<Block.TextBlock>(Assert.Single(SystemBlock.Render(Store, null))).Text);
+            Assert.IsType<Block.TextBlock>(Assert.Single(Slots(null).System)).Text);
     }
 
     // ---- 存储层 ----
@@ -197,7 +209,7 @@ public sealed class PresetTests : IDisposable
         Assert.False(Store.Delete("task"));   // 不幂等：第二次没有文件可删
 
         Assert.Equal(CorePrompts.SystemFallback,
-            Assert.IsType<Block.TextBlock>(Assert.Single(SystemBlock.Render(Store, "task"))).Text);
+            Assert.IsType<Block.TextBlock>(Assert.Single(Slots("task").System)).Text);
     }
 
     /// <summary>
@@ -342,8 +354,8 @@ public sealed class PresetTests : IDisposable
         var sid = Assert.IsType<Ack.Accepted>(r.Ack).SessionId!;
 
         // 建出来了，而且渲染照样有块（内置模板）。
-        Assert.Single(SystemBlock.Render(
-            Store, host.Store.ReadSpec(ProjectKey.FromPath(_work), sid).SystemPromptPreset));
+        Assert.Single(Slots(
+            host.Store.ReadSpec(ProjectKey.FromPath(_work), sid).SystemPromptPreset).System);
     }
 
     // ---- 端到端：出站请求里真的带上了它（三个适配器共用的那一格）----
@@ -369,7 +381,7 @@ public sealed class PresetTests : IDisposable
         await d.DispatchAsync(
             new CoreCommand.SessionSend(sid, [new Block.TextBlock("在吗")]), "s1", true, CancellationToken.None);
 
-        var sent = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[^1].SystemBlocks));
+        var sent = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[^1].Slots.System));
         Assert.Equal("你是被测试的那一份。", sent.Text);
     }
 
@@ -387,7 +399,7 @@ public sealed class PresetTests : IDisposable
         await d.DispatchAsync(
             new CoreCommand.SessionSend(sid, [new Block.TextBlock("在吗")]), "s1", true, CancellationToken.None);
 
-        var sent = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[^1].SystemBlocks));
+        var sent = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[^1].Slots.System));
         Assert.Equal(CorePrompts.SystemFallback, sent.Text);
     }
 
@@ -420,7 +432,7 @@ public sealed class PresetTests : IDisposable
         // 步已经跑完，此刻改文件——记下来的那个请求必须还是「第一版」。
         Store.Save("mine", "第二版");
 
-        var sent = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[^1].SystemBlocks));
+        var sent = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[^1].Slots.System));
         Assert.Equal("第一版", sent.Text);
     }
 }

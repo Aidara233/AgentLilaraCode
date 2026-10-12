@@ -74,28 +74,45 @@ public sealed class HeadScriptTests
     }
 
     /// <summary>
-    /// ⚠️ <b>浮动槽那一格必须在「槽为空」时也画得出来。</b>
+    /// ⚠️ <b>三个槽必须走<b>同一个</b>助手，而那个助手里必须判空。</b>
     ///
-    /// <para>裸的 <c>slots.floating.map(...)</c> 在槽为 `[]` 时**不抛**——但它一旦写成
+    /// <para>⚠️ <b>这条 2026-10-11 改过形状，而改的是<b>判据</b>不是措辞</b>：
+    /// 原来只盯浮动槽那一格（那时它写着「尚未实现」，所以核交的是 `[]`）。
+    /// 现在三格都可能是空数组（用户删了预设 / 没配过首要块 / 一条轴都没进上下文），
+    /// ⇒ 真正要防的从「浮动那一格忘了判空」变成「**三格里有一格走了另一条路**」——
+    /// 后者才是那种「只在空槽下才炸、而三格里你只测了有内容的那两格」的形状。</para>
+    ///
+    /// <para>⚠️ 裸的 <c>slots.floating.map(...)</c> 在槽为 `[]` 时**不抛**——但它一旦写成
     /// <c>slots.floating.map(textOf)</c>（或任何「把槽当成一串块来 map」的形状），
-    /// 就落进上面那个形状里。真正要防的是**取用之前先判空**。</para>
+    /// 就落进「块级逻辑被抄了第二遍」那类里。下面第二条断言仍然盯它。</para>
     /// </summary>
     [Fact]
-    public void FloatingSlot_IsGuardedAgainstAnEmptySlot()
+    public void EverySlot_GoesThroughTheSameEmptySafeHelper()
     {
         var js = AppJs();
 
-        // 好形状：先判 `slots.floating && slots.floating.length`，或整体交给收空数组的助手。
-        var guarded = Regex.IsMatch(js, @"slots\.floating\s*&&\s*slots\.floating\.length")
-                   || Regex.IsMatch(js, @"slotText\(\s*slots\.floating\s*\)");
+        // 三个槽各自的取用点：抓 `助手名($("槽的 id"), …)` 里的助手名。
+        var calls = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var id in new[] { "slot-system", "slot-premier", "floating-body" })
+        {
+            var m = Regex.Match(js, @"(\w+)\(\s*\$\(""" + Regex.Escape(id) + @"""\)\s*,");
+            Assert.True(m.Success, $"找不到槽 '{id}' 的取用点——它要么被删了，要么绕开了那个助手。");
+            calls[id] = m.Groups[1].Value;
+        }
 
-        Assert.True(guarded,
-            "浮动槽取用之前必须判空（核心对尚未实现的槽交的是 `[]`）。"
-            + "用 `slots.floating && slots.floating.length` 或整个交给 `slotText(...)`。");
+        Assert.True(calls.Values.Distinct(StringComparer.Ordinal).Count() == 1,
+            "三个槽必须走**同一个**助手（各自一套 = 总有一格忘了判空，而那只在空槽下才炸）。"
+            + $"实际：{string.Join(" · ", calls.Select(kv => $"{kv.Key}→{kv.Value}"))}");
 
-        // ⚠️ 而且**不许**出现「裸取槽里的块」：`slots.floating.map(...)` 说明有人在块这一层
+        // ⚠️ 而那个助手本身不许裸取：它必须是「先判空、再交给 slotText」的形状。
+        var helper = Regex.Escape(calls["floating-body"]);
+        Assert.True(
+            Regex.IsMatch(js, @"const\s+" + helper + @"\s*=\s*\([^)]*\)\s*=>\s*\{[^}]*slotText\("),
+            $"助手 '{calls["floating-body"]}' 必须把块交给 slotText（空数组由它收），别自己抽文本。");
+
+        // ⚠️ **不许**出现「裸取槽里的块」：`slots.X.map(...)` 说明有人在块这一层
         // 手写遍历，而块级逻辑只有 `textOf` 一份实现（两处各写一遍 = 改一处忘一处，静默）。
-        Assert.False(Regex.IsMatch(js, @"slots\.floating\.map\("),
+        Assert.False(Regex.IsMatch(js, @"slots\.\w+\.map\("),
             "别在槽上直接 .map(...)：块级抽文本只有 textOf 一份实现。交给 slotText(...)。");
     }
 

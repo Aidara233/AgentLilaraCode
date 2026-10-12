@@ -1,3 +1,4 @@
+using Lilara.Core.Session;
 using System.Text.Json;
 using Anthropic.Models.Messages;
 using Lilara.Core.Kernel;
@@ -25,7 +26,7 @@ public class ClaudeToolTests
         Protocol = Protocols.ClaudeMessages,
         Effort = "high",
         Temperature = null,
-        SystemBlocks = [],
+        Slots = PromptSlots.Empty,
         Tools = tools ?? [],
         Timeline = timeline,
     };

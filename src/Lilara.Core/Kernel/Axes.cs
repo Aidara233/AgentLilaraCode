@@ -179,12 +179,35 @@ public static class Axes
         axis is null ? null : Table.FirstOrDefault(s => s.Name == axis);
 
     /// <summary>
-    /// 轴名，**按渲染顺序**（`01` §3.5 表格的顺序）。
+    /// 轴名，**按表序**（`01` §3.5 表格的顺序）。
     /// ⚠️ **从 <see cref="Table"/> 派生**，不是另写一份名单——另写就有第二个地方要同步，
     /// 而顺序不稳等于每步重排。派生之后「标签与轴名同序」这条约定**不再存在**：
     /// 它们本来就是同一行的两个字段（原本 `Names` 有序、`Labels` 是 `Dictionary`，枚举序未定义）。
+    ///
+    /// <para>⚠️ <b>它是<b>人</b>看的序</b>（控制面 `/axes` 照它发，头照它铺面板）——表序与
+    /// `01` §3.5 那张表逐行对应，而那张表是**按语义分组**排的（先三条行为轴、再两条请求参数轴）。
+    /// <b>提示词模板用的不是它</b>，见 <see cref="RenderOrder"/>：那两处的读者不同，序的理由也不同。</para>
     /// </summary>
     public static readonly IReadOnlyList<string> Names = Table.Select(s => s.Name).ToList();
+
+    /// <summary>
+    /// 轴名，**按 ordinal 升序**——<b>提示词模板</b>的序（`01` §3.2）。
+    ///
+    /// <para>⚠️ <b>为什么模板那一格不直接用 <see cref="Names"/></b>：表序是**人**排的
+    /// （按语义分组），而模板要的是「同一份数据、任何机器、任何区域设置 ⇒ 同样的字节」。
+    /// 这两个要求今天**恰好不冲突**（<see cref="Table"/> 是字面量，逐机一致），
+    /// 但它们的**理由**不同——把「模板的序」挂在「人怎么排那张表」上，
+    /// 等于让下一次给表分组的人**顺手改掉前缀**。</para>
+    ///
+    /// <para>⚠️ <b>ordinal，不是文化序</b>——理由与 `01` §9.1 给工具表的那条**逐字相同**：
+    /// 默认的 <c>OrderBy(x =&gt; x)</c> / <c>string.CompareTo</c> 走 **ICU 文化序**，
+    /// <c>i</c> 与 <c>I</c> 在 <c>en-US</c> 与 <c>tr-TR</c>（土耳其无点 i）下**序不同**
+    /// ⇒ 同一份数据、两台机器、两个顺序，而且是**静默破前缀**。
+    /// ⚠️ 本仓已有家法：<c>PresetStore</c> · <c>SessionStore</c> · <c>ProviderStore</c> ·
+    /// <c>EventBus</c> · <c>ListTool</c> · <c>ApprovalStore</c> 六处都显式写 <c>StringComparer.Ordinal</c>。</para>
+    /// </summary>
+    public static readonly IReadOnlyList<string> RenderOrder =
+        [.. Table.Select(s => s.Name).OrderBy(n => n, StringComparer.Ordinal)];
 
     /// <summary>
     /// 轴的中文名（`01` §3.5 的表格）。⚠️ **它归核心**（`05` §3：渲染归核心，头只显示）——
@@ -192,6 +215,13 @@ public static class Axes
     ///
     /// <para>⚠️ **未知轴原样返回**（与 <see cref="ValuesOf"/> 的「未知 → null」同一套约定）；
     /// **`null` 返回空串**——`null` 是「轴名没给」，没有半截标签可回吐，给空串与「未知轴」同向。</para>
+    ///
+    /// <para>⚠️ <b>那个「原样返回」的兜底今天<b>够不着</b>，而它曾经是一次真的漂</b>：
+    /// 它与 <see cref="Table"/> 里那一行**是两个词汇表**（表里是「权限」，兜底吐的是
+    /// <c>permission</c>），所以谁把某条轴的 <c>Label</c> 写漏，头上那一格就会印出英文档名
+    /// ——而 <c>EveryAxis_HasItsOwnChineseLabel_NotTheFallbackName</c> 早就钉住了「每个轴都有自己的标签」，
+    /// 于是那个兜底**只可能**在未知轴那一格生效，而那一格由 <see cref="IsKnown"/> 先挡着。
+    /// ⇒ 留着它是因为类型上需要一条返回路径，**不是因为它在生产里会被走到**。</para>
     /// </summary>
     public static string LabelOf(string? axis) => Find(axis)?.Label ?? (axis ?? "");
 

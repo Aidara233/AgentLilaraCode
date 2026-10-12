@@ -10,16 +10,31 @@ public static class ClaudeRequestBuilder
 {
     public static MessageCreateParams Build(ModelRequest request)
     {
-        // 空 messages 会被 API 400 拒绝，早失败。
-        if (request.Timeline.Count == 0)
-            throw new ArgumentException("时间线为空，无法构造请求", nameof(request));
+        // ⚠️ **空时间线不是错误——前提是有槽位撑着**（2026-10-11 改，本批之前这里是无条件抛）。
+        //
+        // ⚠️ **原判据（「空 messages 会被 API 400 拒绝」）是对的一半**：裸的空 messages
+        // 确实发不出去，所以**两个槽位都空 + 没有历史**时这里仍然早失败。
+        // 但**有系统块时 `messages: []` 是合法的**——本机网关实测（2026-10-11）：
+        // Claude 形状下 `system` + `messages: []` 回 HTTP 200 并正常作答。
+        //
+        // ⚠️ **而这不是「放开一个守卫」**：合法性的**来源**是本批新增的槽位。
+        // 本批之前 `Timeline.Count == 0` 时确实无路可走（那时系统块可能为空、尾块不存在），
+        // 那句 throw 是**当时正确的**。⇒ 改判据要连着「谁提供了合法性」一起改。
+        //
+        // ⚠️ **它挡的是一个真实的新会话路径**：用户 `session create` 之后发的第一句话，
+        // 时间线里**只有**那条用户消息——而 `session.start` 是 no-op、没有别的入口
+        // 能造出「有历史」的会话。所以这条守卫一旦错判，**每个新会话都跑不起来**。
+        if (request.Timeline.Count == 0
+            && request.Slots.System.Count == 0
+            && request.Slots.Premier.Count == 0)
+            throw new ArgumentException("时间线为空，且没有任何槽位内容，无法构造请求", nameof(request));
 
         return new MessageCreateParams
         {
             Model = request.ModelId,
             MaxTokens = request.MaxTokens,
-            Messages = BuildMessages(request.Timeline, request.Protocol),
-            System = BuildSystem(request.SystemBlocks),
+            Messages = BuildMessages(request.Timeline, request.Slots.Tail, request.Protocol),
+            System = BuildSystem(request.Slots.System, request.Slots.Premier),
 
             // ⚠️ 空工具表 ⇒ **不发这个键**（不是发一个空数组）：与 `System` 同一条判据——
             // 空值会改变前缀的字节，而「没有工具」的会话应当与加工具支持之前**逐字节相同**。
@@ -50,7 +65,8 @@ public static class ClaudeRequestBuilder
 
     // canonical 时间线 → 协议消息列表。合并相邻同角色的事件：拒答不写模型事件，
     // 于是时间线上会出现连着两条 user，而上游把 `roles must alternate` 列为 400。
-    private static List<MessageParam> BuildMessages(IReadOnlyList<TimelineEvent> timeline, string protocol)
+    private static List<MessageParam> BuildMessages(
+        IReadOnlyList<TimelineEvent> timeline, IReadOnlyList<CanonicalBlock> tail, string protocol)
     {
         var messages = new List<MessageParam>();
 
@@ -91,6 +107,42 @@ public static class ClaudeRequestBuilder
             Flush();
             pending = blocks;
             pendingIsUser = isUser;
+        }
+
+        // ---- 尾槽位：**拼进末尾那条 user 消息**（`01` §3.2 / §3.3）----
+        //
+        // ⚠️ **判据只有一条：末尾是不是 user。** 是 ⇒ 拼进去；不是 ⇒ 补一条 user 消息。
+        //
+        // ⚠️ **为什么不一律补一条独立的消息**：尾槽位的语义是**替换而非追加**
+        // （「水面」——永远在最后、永远只有一份）。而**拼进末尾**这个做法与那条语义
+        // 一个字都不冲突：它照样每步只出现一次、不累积。
+        // ⚠️ 反过来，一律补一条的代价是实在的：**多一个块、多一条消息**，
+        // 而 Claude 协议对相邻同角色是有约束的（上面那个 `Flush` 合并正是为它写的）。
+        //
+        // ⚠️ **为什么今天几乎总是走「拼进去」那一支**：每轮 = 模型的 `tool_use`（assistant）
+        // + 我们的 `tool_result`（**user** 角色）⇒ 时间线**恰好总是以 user 结尾**。
+        // ⚠️ **不精确的那一格如实记**：用户刚 `send` 完、那一步还没跑完时，
+        // 末尾是那条**用户消息**，于是尾块追加在它后面而不是独立成块。
+        // 那不是缺陷（内容一字不差），是「拼进末尾」这个方向的固有代价。
+        if (tail.Count > 0)
+        {
+            // ⚠️ 只取文本块：尾块是核心拼出来的**一段话**（`SystemBlock`），
+            // 里面不会有别的种类。真有的话这里**静默少一块**——所以下面的
+            // `pending` 为空那条分支仍要判（别假设它一定非空）。
+            var tailBlocks = tail.OfType<CanonicalBlock.TextBlock>()
+                .Select(t => (ContentBlockParam)new TextBlockParam { Text = t.Text })
+                .ToList();
+
+            if (pending is not null && pendingIsUser == true)
+            {
+                pending.AddRange(tailBlocks);
+            }
+            else
+            {
+                Flush();
+                pending = tailBlocks;
+                pendingIsUser = true;
+            }
         }
 
         Flush();
@@ -237,13 +289,19 @@ public static class ClaudeRequestBuilder
         }).ToList();
     }
 
-    // 没有系统块时不设 System，而不是设成空串或空表：空值会变成一个真实的空 system 块，白白改变前缀。
-    private static MessageCreateParamsSystem? BuildSystem(IReadOnlyList<CanonicalBlock> blocks)
+    // 两块头槽位 → `system`。**顺序是契约**：系统块在前、首要块在后（`01` §3.1
+    // 「头槽位 = [系统提示词块][首要提示词块]」）——倒过来会让「位置 0 是核心的字节」
+    // 这条前提作废，而它是失效半径那套论证（§2.3）的地基。
+    //
+    // 没有块时不设 System，而不是设成空串或空表：空值会变成一个真实的空 system 块，白白改变前缀。
+    private static MessageCreateParamsSystem? BuildSystem(
+        IReadOnlyList<CanonicalBlock> system, IReadOnlyList<CanonicalBlock> premier)
     {
         // 先 materialize 再判空：输入非空但全是非文本块时过滤后是空列表，会发出一个空的 system 块。
-        var text = blocks.OfType<CanonicalBlock.TextBlock>()
-                        .Select(t => new TextBlockParam { Text = t.Text })
-                        .ToList();
+        var text = system.Concat(premier)
+                         .OfType<CanonicalBlock.TextBlock>()
+                         .Select(t => new TextBlockParam { Text = t.Text })
+                         .ToList();
 
         // 用早返回而不是三元：三元会让可空流经隐式转换触发 CS8604（本项目警告即错误）。
         if (text.Count == 0) return null;

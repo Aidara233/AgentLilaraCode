@@ -1,3 +1,4 @@
+using Lilara.Core.Session;
 using System.Text.Json;
 using Lilara.Core.Protocol;
 using Lilara.Core.Protocol.OpenAi;
@@ -16,7 +17,7 @@ public class OpenAiResponsesRequestTests
     {
         Protocol = Protocols.OpenAiResponses,
         ModelId = "deepseek-flash", MaxTokens = 16000, Effort = "high", Temperature = null,
-        SystemBlocks = [], Timeline = tl,
+        Slots = PromptSlots.Empty, Timeline = tl,
         Tools = [],
     };
 
@@ -81,7 +82,7 @@ public class OpenAiResponsesRequestTests
         // Responses 的系统提示是顶层 instructions，不是一条消息。
         var request = Req(Msg(Speaker.User, new Block.TextBlock("hi"))) with
         {
-            SystemBlocks = [new Block.TextBlock("你是助手")],
+            Slots = new PromptSlots([new Block.TextBlock("你是助手")], [], []),
         };
 
         Assert.Equal("你是助手", Parse(OpenAiResponsesRequest.Build(request)).GetProperty("instructions").GetString());
@@ -139,7 +140,7 @@ public class OpenAiResponsesRequestTests
         // instructions 只在有系统文本时才出现，且插在 input 之前。
         var request = Req(Msg(Speaker.User, new Block.TextBlock("hi"))) with
         {
-            SystemBlocks = [new Block.TextBlock("你是助手")],
+            Slots = new PromptSlots([new Block.TextBlock("你是助手")], [], []),
         };
 
         Assert.Equal(
@@ -190,10 +191,10 @@ public class OpenAiResponsesRequestTests
     [Fact]
     public void Build_OmitsInstructionsWhenSystemBlocksHaveNoText()
     {
-        // SystemBlocks.Count != 0 但拼出来是空串，那就是一个空的 instructions。
+        // 块数 != 0 但拼出来是空串，那就是一个空的 instructions。
         var request = Req(Msg(Speaker.User, new Block.TextBlock("hi"))) with
         {
-            SystemBlocks = [new Block.ReasoningBlock("sig", "想想")],
+            Slots = new PromptSlots([new Block.ReasoningBlock("sig", "想想")], [], []),
         };
 
         var root = Parse(OpenAiResponsesRequest.Build(request));
@@ -240,5 +241,81 @@ public class OpenAiResponsesRequestTests
         var root = Parse(OpenAiResponsesRequest.Build(Req(Msg(Speaker.User, new Block.TextBlock("hi")))));
 
         Assert.False(root.TryGetProperty("temperature", out _));
+    }
+
+    // ---- 空时间线 + 槽位 / 头两块的顺序 / 尾块（2026-10-11）----
+    //
+    // ⚠️ 判据与另两条链路**逐字相同**，而三条各测一遍**不是冗余**（见 Chat 那边同一条注释）。
+
+    /// <summary>⚠️ 空时间线 + 有系统块 ⇒ 构造得出来（Responses 下 system 走顶层 `instructions`）。</summary>
+    [Fact]
+    public void Build_WithEmptyTimeline_ButASystemBlock_Succeeds()
+    {
+        var req = Req() with { Slots = new PromptSlots([new Block.TextBlock("你是助手")], [], []) };
+
+        var root = Parse(OpenAiResponsesRequest.Build(req));
+
+        Assert.Equal("你是助手", root.GetProperty("instructions").GetString());
+        Assert.Equal(0, root.GetProperty("input").GetArrayLength());
+    }
+
+    /// <summary>⚠️ 反向控制：两个槽位都空 + 空时间线 ⇒ 仍然早失败。</summary>
+    [Fact]
+    public void Build_WithEmptyTimeline_AndNoSlotsAtAll_StillThrows()
+    {
+        var ex = Assert.Throws<ArgumentException>(() => OpenAiResponsesRequest.Build(Req()));
+
+        Assert.Contains("时间线为空", ex.Message);
+    }
+
+    /// <summary>⚠️ 两块头槽位的顺序是契约（`01` §3.1）；Responses 下它们拼进同一个 `instructions`。</summary>
+    [Fact]
+    public void Build_PutsSystemBeforePremier_InTheSameInstructions()
+    {
+        var req = Req(Msg(Speaker.User, new Block.TextBlock("hi"))) with
+        {
+            Slots = new PromptSlots([new Block.TextBlock("系统")], [new Block.TextBlock("首要")], []),
+        };
+
+        var root = Parse(OpenAiResponsesRequest.Build(req));
+
+        Assert.Equal("系统首要", root.GetProperty("instructions").GetString());
+    }
+
+    /// <summary>
+    /// ⚠️ **尾块自己起一条 `message` 项**（工具结果在 Responses 下是并列的
+    /// `function_call_output`，末尾通常不是 user，拼不进去）。
+    /// ⚠️ 而且它**必须带 `"type":"message"`**——少了它上游报 upstream_error（本文件开头那条实测）。
+    /// </summary>
+    [Fact]
+    public void Build_PutsTheTailInItsOwnMessageItem()
+    {
+        var req = Req(Msg(Speaker.User, new Block.TextBlock("hi"))) with
+        {
+            Slots = new PromptSlots([], [], [new Block.TextBlock("框架输入")]),
+        };
+
+        var root = Parse(OpenAiResponsesRequest.Build(req));
+
+        var input = root.GetProperty("input");
+        Assert.Equal(2, input.GetArrayLength());
+
+        var tail = input[1];
+        Assert.Equal("message", tail.GetProperty("type").GetString());
+        Assert.Equal("user", tail.GetProperty("role").GetString());
+
+        // ⚠️ 用户侧的 part 用 `input_text`（不是 `output_text`）——写错了是 400，不是静默降级。
+        var part = tail.GetProperty("content")[0];
+        Assert.Equal("input_text", part.GetProperty("type").GetString());
+        Assert.Equal("框架输入", part.GetProperty("text").GetString());
+    }
+
+    /// <summary>⚠️ 空尾块 ⇒ 一个 input 项都不多。</summary>
+    [Fact]
+    public void Build_WithAnEmptyTail_AddsNoItem()
+    {
+        var root = Parse(OpenAiResponsesRequest.Build(Req(Msg(Speaker.User, new Block.TextBlock("hi")))));
+
+        Assert.Equal(1, root.GetProperty("input").GetArrayLength());
     }
 }

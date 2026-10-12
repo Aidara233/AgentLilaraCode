@@ -81,7 +81,7 @@ public class StepperResolverTests : IDisposable
                     Protocol = Protocols.ClaudeMessages,
                     Effort = "high",
                     Temperature = null,
-                    SystemBlocks = [],
+                    Slots = PromptSlots.Empty,
                     Tools = [],
                     Timeline = [],
                 },

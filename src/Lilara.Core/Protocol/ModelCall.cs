@@ -27,8 +27,26 @@ public sealed record ModelRequest
     /// </summary>
     public required double? Temperature { get; init; }
 
-    /// <summary>系统块。核心不带提示词，最小闭环恒为空；「块数恒定」说的是最多各 1 块，不是非有不可。</summary>
-    public required IReadOnlyList<Block> SystemBlocks { get; init; }
+    /// <summary>
+    /// **三个槽位各自的产物**（`01` §3.1 / §3.2）——系统块 · 首要块 · 尾块。
+    ///
+    /// <para>⚠️ <b>为什么是一格而不是三格</b>：它们的<b>来源判据是同一件事</b>
+    /// （`SessionBlock.Render` 的三条路），而三格会让「哪一块从哪来」在类型上
+    /// 分给三个地方各自回答。一个 <see cref="Session.PromptSlots"/> 里装着三块，
+    /// 而**适配器那一侧仍然按位置取**（Claude：前两块进 `system`、尾块进消息；
+    /// Chat：前两块进首条 system 消息、尾块进末条消息）——位置语义没有被这一格藏起来。</para>
+    ///
+    /// <para>⚠️ <b>尾块<b>不是</b>「一条永远追加的消息」</b>：它的语义是**替换**——
+    /// 同一份 <see cref="Session.PromptSlots"/> 每次渲染都给出**一份**尾块，
+    /// 各构造器把它<b>拼进</b>该去的地方（Claude 拼进末尾那条 user 消息），
+    /// 所以「永远只有一份、不累积」这条性质由**构造器**保证，不靠调用方自觉。</para>
+    ///
+    /// <para>⚠️ <b>三块都可以是空的</b>（`04` §1.3 推论 1：裸核心 = 纯 chat）。
+    /// 三个构造器都按「空 ⇒ 不发这个键 / 不加这个块」处理，
+    /// 与 <see cref="Temperature"/> 的 `null`、<see cref="Tools"/> 的空表**同一条判据**：
+    /// 没配过的东西，请求**逐字节**与加它之前相同。</para>
+    /// </summary>
+    public required Session.PromptSlots Slots { get; init; }
 
     /// <summary>
     /// 工具表。⚠️ **它在 Claude 协议下位于前缀的最前端** ⇒ 改它是最贵的操作

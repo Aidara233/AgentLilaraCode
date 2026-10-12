@@ -509,9 +509,14 @@ function appendTimeline(el) {
 
 function renderSlots(slots) {
   // 空的也要显示：区分「核心没配提示词」与「头坏了」。
-  // ⚠️ **系统那一格从 2026-10-07 起是**真的**了**（预设批）：核心以前恒交空数组，
-  // 现在它交的是 `presets/<id>.md` 的内容。缺的只是核心侧那份数据。
-  // ⇒ 显示「（空）」现在意味着「这个会话选了空预设 / 纯 chat」，不再意味着「没实现」。
+  // ⚠️ **三格从 2026-10-11 起都是**真的**了**（提示词拼装批）。在那之前只有系统那格是真的
+  // （2026-10-07 预设批），另外两格恒交空数组、页面写着「尚未实现」。
+  // ⇒ 显示「（空）」现在三格的含义**各自明确**，都不再意味着「没实现」：
+  //   系统 —— 这个会话选了空预设 / 纯 chat（`presets/<id>.md` 是个空文件）
+  //   首要 —— 没配过 `<数据根>/premiers/<id>.md`（核心**不替用户编人设**）
+  //   浮动 —— 核心每步现算的轴表；空 = 一条轴都没进上下文（罕见，但判定上是合法的）
+  // ⚠️ **这正是义务 1 要的东西**（`05` §4）：两块的**有无**要并排看得见，
+  // 而「看得见空」不等于「看得见一个空壳」——见 `slotText` 那条契约。
 
   // ⚠️ 抽文本走 `slotText`，**不用 `textOf`**：后者的契约是「一串块」，
   // 而这里手上是「一个槽的块列表」（不是块、也不是槽信封）。
@@ -522,10 +527,9 @@ function renderSlots(slots) {
   };
   put($("slot-system"), slots && slots.system);
   put($("slot-premier"), slots && slots.premier);
-  // ⚠️ 浮动槽**仍然**是「尚未实现」——本批只做了系统块那一半，如实写，别跟着上面那句一起改。
-  $("floating-body").textContent = slots && slots.floating && slots.floating.length
-    ? slotText(slots.floating)
-    : "（核心侧装配器尚未实现）";
+  // ⚠️ 浮动槽与上面两格**走同一个助手、同一个判空形状**——三格是同一类东西，
+  // 各写一套的话「哪一格忘了判空」会变成一个只在空槽下才出现的 TypeError。
+  put($("floating-body"), slots && slots.floating);
 }
 
 function setStatus(status, turn) {
