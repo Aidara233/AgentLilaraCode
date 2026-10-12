@@ -102,21 +102,31 @@ public class InterruptionTests : IDisposable
     }
 
     /// <summary>
-    /// ⚠️ **收尾补出来的那种结果不算配对**——否则规则自己把自己关掉：
-    /// 第二次收尾会把第一次的补丁当成「正常配对」，而真正悬着的那条照样悬着。
+    /// ⚠️ **收尾补出来的那条<b>就是</b>配对**——判据**认不出**它是补丁。
     ///
-    /// <para>两条**只差 id 的前缀**，产出的结论必须相反——这就是那条判据的全部。</para>
+    /// <para>⚠️ <b>这不是漏了，是刻意的</b>（2026-10-12 改）：我原先给它加过一条
+    /// 「带前缀的结果不算配对」的规则，理由是要让「这次执行被作废了」在记录里读得出来。
+    /// 而**那个标记没有做**（未与用户对齐，且它要落盘 = 单向门）⇒ 那条规则成了
+    /// **一条认不出自己的判据**：补丁看起来仍然悬空 ⇒ **每一次恢复都再补一条**
+    /// （实测：同一条调用被补两次、三次）。</para>
+    ///
+    /// <para>⚠️ 代价如实说：**「这一次没跑成」在记录里读不出来**，只能靠结果里那句话。
+    /// 换来的是**收敛**——收尾跑完之后判据一定答「不是断裂」。</para>
     /// </summary>
     [Fact]
-    public void OurOwnRepairResult_IsNotACounterpart()
+    public void OurOwnRepairResult_CountsAsACounterpart_SoTheRuleConverges()
     {
         var prefix = Interruption.NoteIdPrefix;
+        var patched = Result("c1", prefix + Ids.New());
 
-        // 带前缀 ⇒ 不算配对 ⇒ 仍然断裂
-        Assert.True(Interruption.WasInterrupted(
-            [Model("c1"), Result("c1", prefix + Ids.New())], "c1", prefix));
+        // 补过之后 ⇒ 不是断裂（**这就是收敛**：下一趟不会再补一条）
+        Assert.False(Interruption.WasInterrupted([Model("c1"), patched], "c1", prefix));
 
-        // 不带前缀 ⇒ 算配对 ⇒ 不是断裂
+        // ⚠️ 而**真正**没有配对的那条照样判真——上面那条不能宽到把「没配对」也放过去。
+        Assert.True(Interruption.WasInterrupted([Model("c1")], "c1", prefix));
+
+        // ⚠️ 前缀只是**id 的形状**（它仍然要留着：`Recovery` 拿它当「这条是我补的」的痕迹），
+        // 判定本身**不再看它**——所以一条**没有前缀**的普通结果当然也算配对。
         Assert.False(Interruption.WasInterrupted(
             [Model("c1"), Result("c1", Ids.New())], "c1", prefix));
     }
@@ -222,14 +232,15 @@ public class InterruptionTests : IDisposable
     [Fact]
     public async Task TheRepairIsNotAppliedTwice()
     {
-        var turn = _handle.State.Turn;
-        _handle.UpdateStateAndPersist(_store, s => s with { Turn = turn + 1 }, diskStatus: SessionStatus.Idle);
+        // ⚠️ **摆痕迹时**不动 `Turn`：`Stepper` 结尾会把「这一步跑完之后的步数」写下去
+        //（`Turn = s.Turn + 1`），而记录里已经多了一条用户 + 一条模型 ⇒ 再写一个更小的数
+        // 只会让两者**继续**错位，于是**每一条消息都要补一次**（实测栽过）。
+        // ⇒ 判据那一半靠**记录与 `Turn` 的自然差额**（这里就是那笔提前落下的追加）。
         _store.AppendEvent(_handle.ProjectKey, _handle.SessionId, User());
         _store.AppendEvent(_handle.ProjectKey, _handle.SessionId, Model("c1"));
         _handle.UpdateStateAndPersist(_store, s => s with
         {
-            Turn = turn,
-            PendingIntent = new PendingIntent(turn + 1, "c1"),
+            PendingIntent = new PendingIntent(s.Turn + 1, "c1"),
         }, diskStatus: SessionStatus.Idle);
 
         _adapter.Reply("第一次。");

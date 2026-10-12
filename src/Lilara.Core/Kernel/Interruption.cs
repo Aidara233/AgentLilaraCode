@@ -79,9 +79,13 @@ public static class Interruption
     /// <param name="timeline">**记录**（`SessionStore.ReadTimeline` 那份）。⚠️ 不是渲染后的那份
     /// ——渲染<b>会把结果换成注记</b>，于是判据看见的配对是假的。</param>
     /// <param name="callId">要判的那条调用的协议 id（`ToolUseBlock.CallId`）。</param>
-    /// <param name="resultIdPrefix">收尾补出来的那种结果的 id 前缀（生产调用点传
-    /// <see cref="NoteIdPrefix"/>）。⚠️ <b>当参数的唯一理由是可测</b>——同
-    /// <c>SessionHandle.Create</c> 那个 <c>sessionId</c>；生产调用点<b>永远</b>传常量。</param>
+    /// <param name="resultIdPrefix">
+    /// ⚠️ <b>2026-10-12 起它<b>不再参与判定</b>——留着只是为了让调用点多写一个词吗？不是。</b>
+    /// 它是一个**已经作废的接线口**：原先判定要用它区分「收尾补出来的结果」与正常配对
+    /// （那需要一个「这一次执行被作废了」的标记，而那个标记**没有做**）。
+    /// ⇒ **实施上它已无用**；本文档与调用点会在正式提交里一起删掉它
+    /// ——⚠️ **现在留着的唯一理由是别让这一步顺手改签名**（同一次改动里改两件事会说不清）。
+    /// </param>
     public static bool WasInterrupted(
         IReadOnlyList<TimelineEvent> timeline, string callId, string resultIdPrefix)
     {
@@ -117,10 +121,14 @@ public static class Interruption
             if (timeline[j] is TimelineEvent.ReleaseEvent) continue;
             if (timeline[j] is not TimelineEvent.ToolResultEvent earlier) break;
 
-            // ⚠️ **只认我们自己补的那种**：`Id` 带前缀 ⇒ 收尾补的结果不算配对。
-            // 没有这一条，规则会把**自己上一次的补丁**当成一次正常配对
-            // ⇒ 真正悬着的那条**永远**收不了（规则自己把自己关掉）。
-            if (earlier.Id.StartsWith(resultIdPrefix, StringComparison.Ordinal)) continue;
+            // ⚠️ **这里没有「补丁不算配对」那一半**（2026-10-12 删掉的）——它当时配的是
+            // 一个**已经不存在的**区分：那时我打算给补丁加一个「这一次执行被作废了」的标记，
+            // 于是它**必须**看起来仍然悬空。**那个标记没有做**（未与用户对齐，且它要落盘 = 单向门），
+            // 而区分留着就成了一条**认不出自己的规则**：
+            //   补丁看起来像一次正常配对 ⇒ 判据答「不是断裂」⇒ **每一条恢复都再补一次**
+            //（实测：同一条调用被补两次、三次）。
+            // ⇒ **删掉它才是收敛的那个形状**，而代价如实说：
+            // 「这一次没跑成」在记录里**读不出来**，只能靠结果里那句话。
             if (string.Equals(earlier.CallId, callId, StringComparison.Ordinal)) return false;
         }
 
@@ -141,7 +149,7 @@ public static class Interruption
 
             if (timeline[i] is TimelineEvent.ToolResultEvent r
                 && string.Equals(r.CallId, callId, StringComparison.Ordinal))
-                return r.Id.StartsWith(resultIdPrefix, StringComparison.Ordinal);
+                return false;   // 配对在 ⇒ 不是断裂（⚠️ 补丁也算配对，见上面那一半的理由）
 
             // 别的结果 ⇒ 继续找；另一个说话的回合 ⇒ 断裂。
             if (timeline[i] is not TimelineEvent.ToolResultEvent) return true;

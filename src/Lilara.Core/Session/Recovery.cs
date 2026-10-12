@@ -80,39 +80,50 @@ public static class Recovery
         // 而 `Turn` 与条数的比对是**独立**的第二重判据——两者都真才动手。
         var timeline = store.ReadTimeline(handle.ProjectKey, handle.SessionId);
         var steps = timeline.Count(e => e is not TimelineEvent.ToolResultEvent);
-        var lastCall = timeline
-            .OfType<TimelineEvent.MessageEvent>()
-            .SelectMany(m => m.Blocks.OfType<Block.ToolUseBlock>())
-            .LastOrDefault();
+        // ⚠️ **`lastCall` 那个「取最后一条」的写法在 2026-10-12 被删掉了**——它是我在
+        // 第一版里对「一次调用只发一条 `tool_use`」的假设，而那**是错的**
+        //（`StepperToolTests` 断的就是「一条消息里两条」）⇒ 见下面 `dangling` 那一段。
 
         // ⚠️ **只认「正好落后一格」**：差两格以上说明那是别的东西（手改过的记录、
         // 或更老的格式），不替它编一个解释、也不动 `Turn`。
         //
-        // ⚠️ **判据是「记录里比 `Turn` 多走的**那一格**里真的悬着一条调用**」
-        // （`Interruption` 那条规则，用的是**同一个谓词**）——`lastCall` 只是候选。
-        // ⚠️ 而**`Turn` 要补到「记录里的步数」**（不是 `+1`）：收尾之后两者的差应当是 0，
-        // 否则**下一步又会看见同一个错位**，于是每步补一条（实测：每步一条，累积）。
-        var dangling = lastCall is not null
-            && Interruption.WasInterrupted(timeline, lastCall.CallId, Interruption.NoteIdPrefix)
-            ? lastCall.CallId : null;
+        // ⚠️ <b>要补的是**每一条**真的悬空的调用，不是「最后那一条」</b>
+        // （2026-10-12 打断批，E2E 实测抓到）：一次模型调用**发得出多条 `tool_use`**
+        // ⇒ 只补最后一条的后果是：**下一条请求里仍有一条没有配对的 `tool_use`**，
+        // 上游照样拒（实测：网关回 5xx，界面上是「上游 5xx。这是临时的，重试即可。」——
+        // **一句指向错方向的话**，真因是配对）。
+        //
+        // ⚠️ <b>补**一条**就要把 `PendingIntent` 也一起清掉——它是判据的另一半</b>
+        // （2026-10-12，同一批测试抓到）：不变量是
+        //   `未配对的调用数 > 0  ∧  PendingIntent 存在  ∧  steps > Turn  ⟺  「上一次没写完」`
+        // 补完之后第一项**仍然为真**（补丁不是真的配对，见 `Interruption`）⇒
+        // 留着痕迹会让**下一条消息**再补一次。⇒ 「补」这个动作本身就该把痕迹兑现掉，
+        // 而清掉是安全的：那些补丁**在记录里**（永久），重启之后照样看得见。
+        var dangling = timeline
+            .OfType<TimelineEvent.MessageEvent>()
+            .SelectMany(m => m.Blocks.OfType<Block.ToolUseBlock>())
+            .Select(u => u.CallId)
+            .Distinct(StringComparer.Ordinal)
+            .Where(id => Interruption.WasInterrupted(timeline, id, Interruption.NoteIdPrefix))
+            .ToList();
 
         if (hasNewInput && handle.State.PendingIntent is not null
-            && dangling is not null && steps > handle.State.Turn)
+            && dangling.Count > 0 && steps > handle.State.Turn)
         {
             behind = true;
-            lines.Add(new TimelineEvent.ToolResultEvent
-            {
-                // ⚠️ **id 带前缀**：它是「这条是我补的」的唯一判据（见 `Interruption.NoteIdPrefix`）。
-                // 用一个普通 id 会让这一步看起来**真的跑完了**——那是 §3.6 ①之二
-                // 警告的「多了一条假信息」。
-                Id = Interruption.NoteIdPrefix + Ids.New(),
-                At = now,
-                // ⚠️ **配对键取那条**真的悬空**的调用**（由 `WasInterrupted` 判出来），
-                // 不是「最后一条 `tool_use`」——两者在「一条消息里两条调用」时**不是同一条**
-                // （`StepperToolTests` 断的就是那个形状）。
-                CallId = dangling,
-                Content = [new Block.TextBlock(Interruption.AbortText())],
-            });
+            foreach (var callId in dangling)
+                lines.Add(new TimelineEvent.ToolResultEvent
+                {
+                    // ⚠️ **id 带前缀**：它是「这条是我补的」的唯一判据（见 `Interruption.NoteIdPrefix`）。
+                    // 用一个普通 id 会让这一步看起来**真的跑完了**——那是 §3.6 ①之二
+                    // 警告的「多了一条假信息」。
+                    Id = Interruption.NoteIdPrefix + Ids.New(),
+                    At = now,
+                    // ⚠️ **配对键是那条调用自己的 `CallId`**（从记录里解出来的那一个），
+                    // 不是「最后一条 `tool_use`」——两者在多条调用时**不是同一条**。
+                    CallId = callId,
+                    Content = [new Block.TextBlock(Interruption.AbortText())],
+                });
         }
         else
         {

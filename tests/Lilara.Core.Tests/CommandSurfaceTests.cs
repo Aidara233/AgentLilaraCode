@@ -38,7 +38,12 @@ public class CommandSurfaceTests
         (typeof(CoreCommand.SessionCreate),    "session.create",    "session create"),
         (typeof(CoreCommand.SessionActivate),  "session.activate",  "session activate s1"),
         (typeof(CoreCommand.SessionSend),      "session.send",      null),
-        (typeof(CoreCommand.SessionStart),     "session.start",     null),
+        // ⚠️ **2026-10-12 打断批补上文本形态**：原先这里是 `null`，而后果不是
+        // 「少一条命令」——敲 `session start s1` 会**掉进 `Repl.AsMessage`**，
+        // 被当成一条**消息发给模型**（用户以为在启动，实际是让模型读了一句话）。
+        // ⚠️ 而它正是**唯一能在「崩在步中」之后把那个会话收回来**的命令
+        //（那时队列是空的，`session.send` 用不上）⇒ 缺了它那个洞关不上。
+        (typeof(CoreCommand.SessionStart),     "session.start",     "session start s1"),
         (typeof(CoreCommand.SessionInterrupt), "session.interrupt", "session interrupt s1"),
         (typeof(CoreCommand.SessionSetAxis),   "session.setAxis",   "axis set s1 safety prod"),
         (typeof(CoreCommand.SessionConfigure), "session.configure", "session configure s1 --model m"),

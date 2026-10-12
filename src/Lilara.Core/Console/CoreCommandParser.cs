@@ -174,6 +174,16 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("session interrupt ", StringComparison.Ordinal))
             return (new CoreCommand.SessionInterrupt(trimmed["session interrupt ".Length..].Trim()), null);
 
+        // ⚠️ **`session start` 之前没有文本形态**（2026-10-12 打断批补），后果不是「少一条命令」：
+        // 敲它会**掉进 `Repl.AsMessage`** ⇒ 被当成一条**消息发给模型**
+        //（用户以为在启动，实际是让模型读了一句「session start xxx」）。
+        // ⚠️ 而且它正是**唯一能在「崩在步中」之后把那个会话收回来**的那条命令
+        //（`session.send` 只有在人真的想说话时才用得上）⇒ 缺了它，那个洞是**关不上的**。
+        // ⚠️ 委派给 `session.activate` 那一行**不用建**：`SessionStart` 本来就在命令集里
+        //（§3 那张表有它），线上也接了——缺的一直只是控制台这半。
+        if (trimmed.StartsWith("session start ", StringComparison.Ordinal))
+            return (new CoreCommand.SessionStart(trimmed["session start ".Length..].Trim()), null);
+
         // `session configure <id> [--provider <pid>] [--model <m>] [--ask-timeout <分钟>]`——改绑供应商 / 换模型。
         // 标志风格与 `provider set` 一致（同为「可空 = 保留」语义，手感该一样）。
         if (trimmed.StartsWith("session configure ", StringComparison.Ordinal))

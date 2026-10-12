@@ -52,7 +52,8 @@ public sealed class Stepper(
     /// `state.json` 最后写——崩在中间只让 turn 偏小，历史不损坏。</para>
     /// </summary>
     public async Task<StepOutcome> StepAsync(
-        SessionHandle handle, IReadOnlyList<Kernel.Block> blocks, CancellationToken ct)
+        SessionHandle handle, IReadOnlyList<Kernel.Block> blocks, CancellationToken ct,
+        bool explicitStart = false)
     {
         // 「now 冻结在步开始」（00 §2.5）——同一步内重复渲染必须逐字节相同
         var at = CoreClock.Now();
@@ -64,7 +65,11 @@ public sealed class Stepper(
         // ⚠️ 排在这里的另一个理由：**用户答复会被下面那把闸挡在外面**
         // （`RunStepAsync` 拿的是会话闸）⇒ 从这一刻到 `TakeResume` 之间，
         // 没有第二条路径能碰 `Ask`，所以在这里合成答复是安全的。
-        Recovery.BeforeStep(_store, handle, at, hasNewInput: blocks.Count > 0);
+        //
+        // ⚠️ <b>`explicitStart` 也算「有人在使用它」</b>（`session.start`）：那条命令
+        // **本身就是**「有人要它动」，与「用户发了话」在 `01` §5 那条判据下是同一件事
+        // ⇒ 它**必须**能收掉一次撕裂的追加，否则那条命令在**唯一需要它的时候**是空的。
+        Recovery.BeforeStep(_store, handle, at, hasNewInput: blocks.Count > 0 || explicitStart);
 
         // ⚠️ **熔断计数从盘上恢复**（`01` §6.2）。不恢复的话，一次重启就把它清零
         // ⇒ 「自上次用户输入以来跑了多少步」这个语义**只在没重启过时成立**，

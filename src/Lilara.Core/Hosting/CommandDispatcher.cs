@@ -88,7 +88,10 @@ public sealed class CommandDispatcher(
     {
         if (!handle.TryEnterStep()) return false;
 
-        _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
+        // ⚠️ **`explicitStart: true`**：这一趟的触发源就是「有人要它动」（§6.1 的启动口）
+        // ⇒ 收尾的 ① 那一支也认它（`Stepper.StepAsync` 的 `explicitStart`）。
+        _ = Task.Run(
+            () => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false, explicitStart: true),
             CancellationToken.None);
 
         return true;
@@ -750,7 +753,8 @@ public sealed class CommandDispatcher(
     /// 取消与失败必须分开——用户按了中断不是失败，不能报 `error`
     /// （否则每次正常中断都变成红色告警，头会开始忽略 `error`，而那正是它最该看的东西）。
     /// </summary>
-    private async Task<ModelReply?> RunStepAsync(SessionHandle handle, CancellationToken ct, bool throwOnFailure)
+    private async Task<ModelReply?> RunStepAsync(
+        SessionHandle handle, CancellationToken ct, bool throwOnFailure, bool explicitStart = false)
     {
         // CTS 每步一个，且登记进宿主（`interrupt` 靠它找到「当前那个步」）——
         // 长命的 CTS 会让空闲期的 interrupt 把下一次的 token 变成已取消。
@@ -806,8 +810,12 @@ public sealed class CommandDispatcher(
             else
             {
                 // 取空队列——合并是队列的副产品。
+                // ⚠️ **第三个参数是「显式启动」**（`session.start`）——它不是一条用户消息
+                // （队列是空的），但它是**有人要它动**这一件事的另一个落点
+                // ⇒ 收尾的 ① 那一支也认它（否则那条命令在**唯一需要它的时候**是空的）。
                 var blocks = handle.DrainQueue();
-                step = await _resolveStepper(handle).StepAsync(handle, blocks, stepCts.Token);
+                step = await _resolveStepper(handle).StepAsync(
+                    handle, blocks, stepCts.Token, explicitStart: explicitStart);
                 reply = step.Reply;
                 replyForLoop = step.Reply;
 
