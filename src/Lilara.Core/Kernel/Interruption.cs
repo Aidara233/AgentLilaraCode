@@ -85,44 +85,69 @@ public static class Interruption
     public static bool WasInterrupted(
         IReadOnlyList<TimelineEvent> timeline, string callId, string resultIdPrefix)
     {
-        // 正向扫到这条调用为止。⚠️ 扫描过程中顺手记下「谁被消费了」——
-        // 结果可能排在调用**前面**（批次顺序无保证），所以不能边走边判。
-        var consumed = new HashSet<string>(StringComparer.Ordinal);
-
-        foreach (var evt in timeline)
+        // ---- ① 先找到那条调用 ----
+        //
+        // ⚠️ **必须在它之后才判配对，不能先把整条记录扫一遍再判**：配对的 `tool_result`
+        // **排在调用之后**（同一个批次、按调用序落盘）⇒ 在「扫到调用」那一刻往回看，
+        // 看见的**永远是空的**。⚠️ 那正是本规则第一版的写法，而它把**每一条**调用
+        // 都判成了「断裂」——成对的测试当场抓出来（`ADanglingToolUseIsInterrupted`）。
+        var from = -1;
+        for (var i = 0; i < timeline.Count; i++)
         {
-            switch (evt)
-            {
-                case TimelineEvent.ToolResultEvent r:
-                    // ⚠️ **只认我们自己补的那种**：`Id` 带前缀 ⇒ 这次收尾的结果不算配对。
-                    // 不带前缀的正常结果当然算——它就是那半配对。
-                    if (!r.Id.StartsWith(resultIdPrefix, StringComparison.Ordinal))
-                        consumed.Add(r.CallId);
-                    break;
+            if (timeline[i] is not TimelineEvent.MessageEvent m) continue;
+            if (!m.Blocks.OfType<Block.ToolUseBlock>().Any(
+                    u => string.Equals(u.CallId, callId, StringComparison.Ordinal))) continue;
 
-                case TimelineEvent.MessageEvent m when m.Blocks.OfType<Block.ToolUseBlock>()
-                    .Any(u => string.Equals(u.CallId, callId, StringComparison.Ordinal)):
-                    // 找到了装着这条调用的那条消息 ⇒ 判配对；之后的回合一律不看。
-                    return !consumed.Contains(callId);
-
-                case TimelineEvent.MessageEvent m when m.Blocks.OfType<Block.ToolUseBlock>().Any():
-                    // ⚠️ **另一条装着 tool_use 的消息**：它要么是**同批兄弟**（配对排在后面
-                    // ⇒ 还没被消费 ⇒ 断裂），要么是**下一个回合**（⇒ 上一个回合缺配对）。
-                    // 两种情况**都判真**，而两个 `return true` 的落点互不重叠、各自可测。
-                    // ⇒ 这就是「按**位置**判、不按块数判」那条要求的落点。
-                    return true;
-
-                case TimelineEvent.MessageEvent:
-                    // 用户消息（或一句纯文本的模型发言）。⚠️ 正常的用户消息里不会有 `tool_use`，
-                    // 但**记录是盘上的字节** ⇒ 一条手改过的、或格式更旧的行可能有。
-                    // 「记录里根本没有这条调用」必须落到末尾那个 `return false`，
-                    // 不能在这里被判成「断裂」——那会凭空补一条结果。
-                    return true;
-            }
+            from = i;
+            break;
         }
 
-        // 走到这里 = 记录里根本没有这条调用（还没落盘，或 id 写错了）。
+        // 记录里根本没有这条调用（还没落盘，或 id 写错了）。
         // ⚠️ 「找不到」与「悬着」是两件事：这里返回假，**不替它编一条结果**。
-        return false;
+        if (from < 0) return false;
+
+        // ⚠️ **查到这里，`consumed` 那一半才算数**：配对**可能**排在这条消息的
+        // **另一侧**——`HistoryLog.AppendMany` 明写批次的落盘顺序**没有保证**
+        // ⇒ 一条 `tool_result` 可以落在**它那条调用之前**（成对的测试是
+        // `AResultThatLandedBeforeItsCall_StillCounts`）。
+        // ⚠️ **往回扫不能越过「上一个回合」**：越过的话，前面整个更早的回合里的
+        // 同名 `callId`（它在一次会话里会**重复出现**）会变成假证据。
+        for (var j = from - 1; j >= 0; j--)
+        {
+            if (timeline[j] is TimelineEvent.ReleaseEvent) continue;
+            if (timeline[j] is not TimelineEvent.ToolResultEvent earlier) break;
+
+            // ⚠️ **只认我们自己补的那种**：`Id` 带前缀 ⇒ 收尾补的结果不算配对。
+            // 没有这一条，规则会把**自己上一次的补丁**当成一次正常配对
+            // ⇒ 真正悬着的那条**永远**收不了（规则自己把自己关掉）。
+            if (earlier.Id.StartsWith(resultIdPrefix, StringComparison.Ordinal)) continue;
+            if (string.Equals(earlier.CallId, callId, StringComparison.Ordinal)) return false;
+        }
+
+        // ---- ② 从**它**往后扫，扫到「另一个说话的回合」为止 ----
+        //
+        // ⚠️ 判据是**位置**，不是「整条记录里有没有配对」：一旦走到下一条**消息**，
+        // 这条调用就再也没有配对的机会了。⚠️ 而**扫到那里就停**正是
+        // 「前一次断裂的解析不再算第二次」的全部机制：收尾补上去的结果排在**后面**，
+        // 而它一律不看（成对的测试是 `TheRepairIsNotAppliedTwice`）。
+        //
+        // ⚠️ **哪些算「另一个回合」**：`MessageEvent`（模型或用户）都算。
+        // ⚠️ **`ReleaseEvent` 不算**（`01` §12.4）：它是**给我们自己**看的锚
+        // （`TimelineRender` 会把它挡在模型之外），模型的语言里根本没有它
+        // ⇒ 它落在 `tool_use` 与它的结果**中间**是**正常**的（`release` 就是与别的调用同批发生的）。
+        for (var i = from + 1; i < timeline.Count; i++)
+        {
+            if (timeline[i] is TimelineEvent.ReleaseEvent) continue;
+
+            if (timeline[i] is TimelineEvent.ToolResultEvent r
+                && string.Equals(r.CallId, callId, StringComparison.Ordinal))
+                return r.Id.StartsWith(resultIdPrefix, StringComparison.Ordinal);
+
+            // 别的结果 ⇒ 继续找；另一个说话的回合 ⇒ 断裂。
+            if (timeline[i] is not TimelineEvent.ToolResultEvent) return true;
+        }
+
+        // 走到记录末尾 ⇒ **末尾那一条永远是断裂**（那正是「重启之后接着跑」要用的钩子）。
+        return true;
     }
 }

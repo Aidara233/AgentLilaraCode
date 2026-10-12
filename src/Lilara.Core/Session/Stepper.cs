@@ -293,6 +293,11 @@ public sealed class Stepper(
         // ⚠️ **`PendingIntent` 要在这里清掉**：这一步的两个产物都落成了（记录 + 它自己的结果）
         // ⇒ 那个「我可能欠一条」的痕迹**已经被兑现**。不清的后果是**下一步开始时会再补一条**
         // ——那会给模型一条重复的结果（多了一条假信息）。
+        // ⚠️ **`Turn` 原样 `+1`**（那是既有的语义：这一步跑完了，所以 +1）。
+        // ⚠️ **一次「只见消息、不见结果」的错位要在别处修**：崩在模型调用期间时，
+        // 记录里会多出**一整步**（用户 + 模型两条消息），而没有任何 `tool_result` 供 `Recovery`
+        // 拿它当锚 ⇒ `steps` 与 `Turn` 会**永远差一格**，而每发一条消息都会再触发一次收尾。
+        // 判据在 `Recovery.BeforeStep` 里：那一格只在**末尾真的悬着一条工具调用**时才算数。
         handle.UpdateStateAndPersist(_store, s => s with
         {
             Status = SessionStatus.Idle,

@@ -87,8 +87,17 @@ public static class Recovery
 
         // ⚠️ **只认「正好落后一格」**：差两格以上说明那是别的东西（手改过的记录、
         // 或更老的格式），不替它编一个解释、也不动 `Turn`。
-        if (hasNewInput && handle.State.PendingIntent is not null && lastCall is not null
-            && steps == handle.State.Turn + 1)
+        //
+        // ⚠️ **判据是「记录里比 `Turn` 多走的**那一格**里真的悬着一条调用**」
+        // （`Interruption` 那条规则，用的是**同一个谓词**）——`lastCall` 只是候选。
+        // ⚠️ 而**`Turn` 要补到「记录里的步数」**（不是 `+1`）：收尾之后两者的差应当是 0，
+        // 否则**下一步又会看见同一个错位**，于是每步补一条（实测：每步一条，累积）。
+        var dangling = lastCall is not null
+            && Interruption.WasInterrupted(timeline, lastCall.CallId, Interruption.NoteIdPrefix)
+            ? lastCall.CallId : null;
+
+        if (hasNewInput && handle.State.PendingIntent is not null
+            && dangling is not null && steps > handle.State.Turn)
         {
             behind = true;
             lines.Add(new TimelineEvent.ToolResultEvent
@@ -98,16 +107,23 @@ public static class Recovery
                 // 警告的「多了一条假信息」。
                 Id = Interruption.NoteIdPrefix + Ids.New(),
                 At = now,
-                CallId = lastCall.CallId,
+                // ⚠️ **配对键取那条**真的悬空**的调用**（由 `WasInterrupted` 判出来），
+                // 不是「最后一条 `tool_use`」——两者在「一条消息里两条调用」时**不是同一条**
+                // （`StepperToolTests` 断的就是那个形状）。
+                CallId = dangling,
                 Content = [new Block.TextBlock(Interruption.AbortText())],
             });
+        }
+        else
+        {
+            behind = false;
         }
 
         // ---- ② 询问到期（`01` §5 / §3.8）----
         //
-        // ⚠️ **它排在上面之后**：两者可能同时成立（挂起时崩过、而 deadline 也刚过）。
-        // 那种情形下**只走这一支**——一次断裂补两条结果没有意义，而这条更完整
-        // （它落的是「答复」那句话，且会把那批调用全部配对）。
+        // ⚠️ **它排在①之后，而两者可能同时成立**（挂起时崩过、而 `deadline` 也刚过）。
+        // 那种情形下**两件都要做**：①把那条断裂补上、②把这次询问合成答复——
+        // 少了任何一件，那条悬空的 `tool_use` 都还在，下一条请求照样 400。
         if (handle.State.Status == SessionStatus.WaitingForInput
             && handle.State.Ask is { } ask
             && ask.DeadlineAt is { } deadline && now >= deadline)
@@ -133,22 +149,22 @@ public static class Recovery
                 Status = SessionStatus.Idle,
                 Ask = null,
                 PendingIntent = null,
-                Turn = behind ? s.Turn + 1 : s.Turn,
+                Turn = behind ? steps : s.Turn,
             }, diskStatus: SessionStatus.Idle);
 
-            return calls.Count > 1 ? calls.Count : 1;
+            return lines.Count + (calls.Count > 1 ? calls.Count : 1);
         }
 
         if (lines.Count == 0) return 0;
 
         store.AppendEvents(handle.ProjectKey, handle.SessionId, lines);
 
-        // ⚠️ **两处都在锁内换**（`UpdateStateAndPersist`）：崩在「已清痕迹、未落记录」
-        // 之间会让下一次收尾**看不见**这条欠账（痕迹没了），而那正是它存在的理由。
-        // ⇒ 记录**先**落（上面那行），痕迹**后**清（这一行）——顺序不能反。
+        // ⚠️ **记录先落、痕迹后清**（顺序不能反）：崩在中间会让下一次收尾**看不见**这条欠账
+        // （痕迹没了）——而那正是它存在的理由。⚠️ 而**那条记录在盘上** ⇒ 下一次
+        // 走的是「记录比 `Turn` 多一格」那一半，照样收得掉。
         handle.UpdateStateAndPersist(store, s => s with
         {
-            Turn = behind ? s.Turn + 1 : s.Turn,
+            Turn = behind ? steps : s.Turn,
             PendingIntent = null,
         }, diskStatus: handle.State.Status);
 
