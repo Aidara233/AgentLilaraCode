@@ -44,6 +44,12 @@ public static class Interruption
     ///
     /// <para>⚠️ <b>它<b>不</b>说「你可以重发」</b>：对 <c>write</c> / <c>update</c> 这类调用，
     /// 重发可能是**第二次副作用**。模型的下一步归模型判断，核心只负责让「缺失」变得可见。</para>
+    ///
+    /// <para>⚠️ <b>它<b>是纯文本、不挂框架</b>，而这是查过才定的</b>：`ToolFraming`
+    /// 的渲染只在 `TimelineRender.WithFraming` 里发生（那是 **Hosting 之上**的一层），
+    /// 而这里产的是一条**记录** ⇒ 挂 `Framing` 那一格会让 Kernel 层的这个文件
+    /// 依赖上面那层的语义（分层守卫钉着 Kernel 对别层的 `using` 为零）。
+    /// 代价如实说：模型分辨这两类结果要靠**读那句话**，不能靠框架的形状。</para>
     /// </summary>
     public static string AbortText() =>
         "[lilara 框架] 上一次这一步在这里被打断了——这条调用没有执行，也没有返回任何内容。"
