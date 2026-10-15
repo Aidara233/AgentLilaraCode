@@ -342,6 +342,61 @@ public sealed class ControlServer(
             return Results.Json(new { handle.IsRunning, handle.QueueDepth }, WireJson.Options);
         });
 
+        // 统计是核心事实的只读投影；这些端点不激活会话、不触发模型或插件。
+        app.MapGet("/usage/calls", (int? skip, int? limit) =>
+        {
+            var all = host.Usage.ReadAll();
+            var offset = Math.Max(0, skip ?? 0);
+            var pageSize = Math.Clamp(limit ?? 100, 1, 1000);
+            return Results.Json(new
+            {
+                AsOf = CoreClock.Now(),
+                Skip = offset,
+                Limit = pageSize,
+                Total = all.Count,
+                Calls = all.Skip(offset).Take(pageSize).ToList(),
+            }, WireJson.Options);
+        });
+
+        app.MapGet("/usage/summary", () => Results.Json(
+            host.Usage.Summarize(), WireJson.Options));
+
+        app.MapGet("/sessions/{id}/usage", (string id) =>
+        {
+            if (host.Store.FindSession(id) is not { } found) return Results.NotFound();
+            var calls = host.Usage.ForSession(id);
+            return Results.Json(new
+            {
+                SessionId = id,
+                ProjectKey = found.ProjectKey,
+                Summary = host.Usage.Summarize(new UsageFilter { SessionId = id }),
+                Calls = calls,
+            }, WireJson.Options);
+        });
+
+        app.MapGet("/sessions/{id}/context", (string id) =>
+        {
+            if (host.Store.FindSession(id) is not { } found) return Results.NotFound();
+            var latest = host.Usage.ForSession(id).LastOrDefault(c => c.Usage is not null);
+            return Results.Json(new
+            {
+                SessionId = id,
+                ProjectKey = found.ProjectKey,
+                Latest = latest is null ? null : new
+                {
+                    latest.CallId,
+                    latest.StartedAt,
+                    latest.EndedAt,
+                    latest.ModelId,
+                    latest.Protocol,
+                    InputTokens = latest.Usage?.InputTokens,
+                    Source = latest.Usage is null ? "unknown" : "reported",
+                    RequestFingerprint = latest.RequestFingerprint,
+                },
+                Preview = (object?)null,
+            }, WireJson.Options);
+        });
+
         // 头唯一的轴来源（不许手抄轴表）：标签与告警的两端都从核心交出去，头里写字面量会静默失效。
         // alertFrom 是「起始档」，头的判据要按 values.indexOf 的档位序比（权限是单调阶梯）。
         // ⇒ values 的顺序（= 档位序）也是契约的一部分，别排序。

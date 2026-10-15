@@ -12,7 +12,7 @@ namespace Lilara.Core.Session;
 ///
 /// <list type="table">
 ///   <item><description><b>系统块</b>（<see cref="System"/>）：核心提供的恒定单文件。
-///     文件不在 ⇒ 回落内置模板；文件空 ⇒ 无块。</description></item>
+///     文件不在 ⇒ 回落内置模板；非空预设附加机制说明；文件空且无插件系统贡献 ⇒ 无块。</description></item>
 ///   <item><description><b>首要块</b>（<see cref="Premier"/>）：用户 / 项目 / 插件。**没有兜底内容**
 ///     ⇒ 文件不在 = 无块，不是「用回内置模板」。</description></item>
 ///   <item><description><b>尾块</b>（<see cref="Tail"/>）：核心每步现算（轴表）。
@@ -47,9 +47,7 @@ public sealed record PromptSlots(
 /// （文件在不在 / 空不空 ⇒ 有没有块），拆成两个类等于把同一条三值判定抄两遍——
 /// 而它们迟早会漂成两个版本。**判据只有一份**，这就是它现在住在这里的理由。</para>
 ///
-/// <para>⚠️ <b>别在这里做「装配器」</b>：今天只有三块、且没有插件贡献者，
-/// 所以这里是三段直白的逻辑。<b>插件宿主落地时</b>（贡献可以是任意多段、任意顺序、
-/// 要收集 + 排序 + 拼合）才配一个 `PromptAssembler`。在那之前建它是空壳。</para>
+/// <para>插件宿主先校验、冻结并排序贡献；这里仅合并三个槽位并附加框架说明。</para>
 /// </summary>
 public static class SystemBlock
 {
@@ -77,12 +75,19 @@ public static class SystemBlock
         IReadOnlyDictionary<string, string> axes,
         PromptContributionSnapshot? pluginPrompt = null) =>
         new(
-            System: Text(Join(Load(presets, systemPresetId) ?? CorePrompts.SystemFallback,
-                pluginPrompt?.Text(PromptSlot.System)) ?? ""),
+            System: Text(SystemBody(Load(presets, systemPresetId), pluginPrompt?.Text(PromptSlot.System))),
             Premier: Wrap(CorePrompts.PremierOpen,
                 Join(Load(premiers, premierId), pluginPrompt?.Text(PromptSlot.Primary)), CorePrompts.PremierClose),
             Tail: Wrap(CorePrompts.TailOpen,
-                Join(TailBody(axes), pluginPrompt?.Text(PromptSlot.Floating)), CorePrompts.TailClose));
+                TailBody(axes, pluginPrompt?.Text(PromptSlot.Floating)), CorePrompts.TailClose));
+
+    // 非空自定义预设也需要机制说明；显式空预设且无系统贡献时仍不产生系统块。
+    private static string SystemBody(string? preset, string? plugin)
+    {
+        var body = Join(preset ?? CorePrompts.SystemFallback, plugin);
+        if (body is null) return "";
+        return preset is null ? body : Join(body, CorePrompts.FloatingContextExplanation)!;
+    }
 
     private static string? Join(params string?[] values)
     {
@@ -120,16 +125,23 @@ public static class SystemBlock
         string.IsNullOrEmpty(body) ? [] : [new Block.TextBlock($"{open}\n{body}\n{close}")];
 
     /// <summary>
-    /// 尾块的正文——**自述那一句 + 轴表那一行**。
+    /// 尾块的正文——框架自述、当前轴表与等级解释、插件浮动字段。
     ///
     /// <para>⚠️ <b>自述是恒定的，所以它不参与「有没有内容」的判定</b>：判据是
-    /// <b>有没有轴表</b>。若把自述也算进去，一个没有轴的会话会得到一个只有自述的尾块
+    /// <b>有没有轴表或插件浮动字段</b>。若把自述也算进去，一个没有内容的会话会得到一个只有自述的尾块
     /// ——而那正是 <see cref="Wrap"/> 那条「空的不能长得像有内容」要防的。</para>
     /// </summary>
-    private static string? TailBody(IReadOnlyDictionary<string, string> axes) =>
-        AxisTable(axes) is { } table
-            ? $"{CorePrompts.TailDeclaration}\n{CorePrompts.TailAxesPrefix}{table}"
-            : null;
+    private static string? TailBody(IReadOnlyDictionary<string, string> axes, string? plugin)
+    {
+        var table = AxisTable(axes);
+        var descriptions = Axes.RenderOrder.Where(Axes.InContext)
+            .Where(axes.ContainsKey)
+            .Select(axis => Axes.DescriptionOf(axis, axes[axis]) is { } explanation
+                ? $"{Axes.LabelOf(axis)} {axes[axis]}：{explanation}" : null);
+        var body = Join(table is null ? null : CorePrompts.TailAxesPrefix + table,
+            Join(descriptions.ToArray()), plugin);
+        return body is null ? null : $"{CorePrompts.TailDeclaration}\n{body}";
+    }
 
     /// <summary>
     /// 轴表——**哪些轴进上下文由 <see cref="Axes.InContext"/> 一处判定**（`01` §3.5）。

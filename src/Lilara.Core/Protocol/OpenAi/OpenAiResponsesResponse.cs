@@ -15,6 +15,12 @@ public static class OpenAiResponsesResponse
         if (root.ValueKind != JsonValueKind.Object)
             return new ModelReply { Blocks = [], StopReason = "unknown", Refused = false };
 
+        var usage = UsageJson.Parse(root);
+        var reportedModel = root.TryGetProperty("model", out var model)
+            && model.ValueKind == JsonValueKind.String ? model.GetString() : null;
+        var responseId = root.TryGetProperty("id", out var id)
+            && id.ValueKind == JsonValueKind.String ? id.GetString() : null;
+
         var status = root.TryGetProperty("status", out var s) && s.ValueKind == JsonValueKind.String
             ? s.GetString() ?? "unknown"
             : "unknown";
@@ -48,7 +54,15 @@ public static class OpenAiResponsesResponse
         // 拒答信号不在 status 里（incomplete 是「没生成完」不是拒答）：没有可观测信号，故恒 false。
         // 原版另有 incomplete_details.reason，实测正常与截断两种响应都不含它，截断仍是 "completed"。
         // status 原样透传。
-        return new ModelReply { Blocks = blocks, StopReason = status, Refused = false };
+        return new ModelReply
+        {
+            Blocks = blocks,
+            StopReason = status,
+            Refused = false,
+            Usage = usage,
+            ReportedModel = reportedModel,
+            ResponseId = responseId,
+        };
     }
 
     private static List<Block> TextsOf(JsonElement message)

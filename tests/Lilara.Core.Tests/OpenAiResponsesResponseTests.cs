@@ -21,6 +21,10 @@ public class OpenAiResponsesResponseTests
 
         Assert.Equal("READY", ((Block.TextBlock)reply.Blocks[0]).Text);
         Assert.False(reply.Refused);
+        Assert.Equal(1, reply.Usage?.InputTokens);
+        Assert.Equal(1, reply.Usage?.OutputTokens);
+        Assert.Equal("deepseek-flash", reply.ReportedModel);
+        Assert.Equal("resp_1", reply.ResponseId);
     }
 
     [Fact]

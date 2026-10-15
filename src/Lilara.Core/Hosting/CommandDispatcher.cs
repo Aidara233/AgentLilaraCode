@@ -542,10 +542,13 @@ public sealed class CommandDispatcher(
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        var probeCallId = Ids.New();
+        var probeStarted = CoreClock.Now();
 
         try
         {
             var reply = await adapter.CallAsync(probe, timeout.Token);
+            RecordProbeUsage(provider, adapter, probeCallId, probeStarted, reply, "completed");
             return new DispatchResult(new Ack.Accepted
             {
                 CommandId = id,
@@ -555,11 +558,39 @@ public sealed class CommandDispatcher(
         }
         catch (Exception ex)
         {
+            RecordProbeUsage(provider, adapter, probeCallId, probeStarted, null, "failed");
             // 超时与真失败分开说：前者是「端点在，但没在 10 秒内答」，后者是「根本连不上 / 被拒」。
             var why = timeout.IsCancellationRequested && !ct.IsCancellationRequested
                 ? "10 秒内没有响应（端点没起，或上游太慢）"
                 : ex.Message;
             return new DispatchResult(new Ack.Accepted { CommandId = id, Note = $"✗ 不通（{where}）：{why}" });
+        }
+    }
+
+    private void RecordProbeUsage(
+        ProviderDefinition provider, IModelAdapter adapter, string callId,
+        DateTimeOffset startedAt, ModelReply? reply, string status)
+    {
+        try
+        {
+            _host.Usage.Append(new Storage.UsageCall
+            {
+                CallId = callId,
+                Purpose = "probe",
+                ProviderId = provider.Id,
+                ModelId = provider.DefaultModel,
+                Protocol = adapter.Protocol,
+                StartedAt = startedAt,
+                EndedAt = CoreClock.Now(),
+                Status = status,
+                Usage = reply?.Usage,
+                ReportedModel = reply?.ReportedModel,
+                ResponseId = reply?.ResponseId,
+            });
+        }
+        catch
+        {
+            // 探针已经完成时不能因账本故障再次发起网络调用。
         }
     }
 
@@ -828,6 +859,7 @@ public sealed class CommandDispatcher(
 
             ModelReply replyForLoop;
             Stepper.StepOutcome step;
+            var usageCountBefore = _host.Usage.ForSession(handle.SessionId).Count;
 
             if (pending is not null)
             {
@@ -874,6 +906,17 @@ public sealed class CommandDispatcher(
 
                 _bus.Publish(EventBus.ApprovalsTopic, requested);
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId), requested);
+            }
+
+            var usageCalls = _host.Usage.ForSession(handle.SessionId);
+            if (usageCalls.Count > usageCountBefore)
+            {
+                var call = usageCalls[^1];
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.UsageUpdated(
+                        handle.SessionId,
+                        call,
+                        _host.Usage.Summarize(new Storage.UsageFilter { SessionId = handle.SessionId })));
             }
 
             PublishStepEnd(handle, replyForLoop);

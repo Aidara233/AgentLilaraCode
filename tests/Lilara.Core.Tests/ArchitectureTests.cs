@@ -24,7 +24,8 @@ public class ArchitectureTests
         // 16 → 17（2026-10-07 预设批）：加了 `CorePrompts.cs`（核心自带的那份系统提示词模板）。
         // 17 → 18（2026-10-08 询问批）：加了 `Ask.cs`（问用户的词汇层：Kind/Shape/AskRequest）。
         // 18 → 19（2026-10-12 打断批）：加了 `Interruption.cs`（打断的识别：配对规则）。
-        Assert.Equal(19, files.Length);
+        // 19 → 20（2026-10-15 统计批）：加了 `TokenUsage.cs`（跨层共享的 token 事实）。
+        Assert.Equal(20, files.Length);
 
         var offenders = files
             .SelectMany(f => ExternalUsings(f).Select(u => $"{Path.GetFileName(f)}:{u.Line}  {u.Text}"))

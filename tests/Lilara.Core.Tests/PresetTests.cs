@@ -95,15 +95,15 @@ public sealed class PresetTests : IDisposable
         Assert.Empty(Slots(null).System);
     }
 
-    /// <summary>文件有内容 ⇒ 那一块就是它，逐字。</summary>
+    /// <summary>非空预设保留原文，并附加固定的框架机制说明。</summary>
     [Fact]
-    public void FileContent_IsUsedVerbatim()
+    public void FileContent_IsPreservedWithFrameworkExplanation()
     {
         const string mine = "你是测试用的。\n\n第二段。";
         Store.Save("default", mine);
 
         var text = Assert.IsType<Block.TextBlock>(Assert.Single(Slots(null).System));
-        Assert.Equal(mine, text.Text);
+        Assert.Equal(mine + "\n" + CorePrompts.FloatingContextExplanation, text.Text);
     }
 
     /// <summary>会话指定了预设名 ⇒ 用它，**不是**用 default。</summary>
@@ -114,7 +114,7 @@ public sealed class PresetTests : IDisposable
         Store.Save("task", "任务那份");
 
         var text = Assert.IsType<Block.TextBlock>(Assert.Single(Slots("task").System));
-        Assert.Equal("任务那份", text.Text);
+        Assert.Equal("任务那份\n" + CorePrompts.FloatingContextExplanation, text.Text);
     }
 
     /// <summary>指定的预设不存在 ⇒ 仍然回落内置模板（「没配过」那一条，与名字无关）。</summary>
@@ -159,11 +159,11 @@ public sealed class PresetTests : IDisposable
     public void EditingTheFile_TakesEffectOnTheNextRender()
     {
         Store.Save("default", "第一版");
-        Assert.Equal("第一版",
+        Assert.Equal("第一版\n" + CorePrompts.FloatingContextExplanation,
             Assert.IsType<Block.TextBlock>(Assert.Single(Slots(null).System)).Text);
 
         Store.Save("default", "第二版");
-        Assert.Equal("第二版",
+        Assert.Equal("第二版\n" + CorePrompts.FloatingContextExplanation,
             Assert.IsType<Block.TextBlock>(Assert.Single(Slots(null).System)).Text);
     }
 
@@ -382,7 +382,7 @@ public sealed class PresetTests : IDisposable
             new CoreCommand.SessionSend(sid, [new Block.TextBlock("在吗")]), "s1", true, CancellationToken.None);
 
         var sent = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[^1].Slots.System));
-        Assert.Equal("你是被测试的那一份。", sent.Text);
+        Assert.Equal("你是被测试的那一份。\n" + CorePrompts.FloatingContextExplanation, sent.Text);
     }
 
     /// <summary>没配过任何预设 ⇒ 出站请求里带的是**内置模板**（那句话必须真的发得出去）。</summary>
@@ -433,6 +433,6 @@ public sealed class PresetTests : IDisposable
         Store.Save("mine", "第二版");
 
         var sent = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[^1].Slots.System));
-        Assert.Equal("第一版", sent.Text);
+        Assert.Equal("第一版\n" + CorePrompts.FloatingContextExplanation, sent.Text);
     }
 }

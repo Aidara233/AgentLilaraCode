@@ -143,6 +143,75 @@ public sealed class PluginHostTests
     private static PromptContribution Field() => new()
         { PluginId = "demo", Key = "field", Slot = PromptSlot.Floating, Text = "content" };
 
+    private static AxisDefinition DescribedAxis(IReadOnlyDictionary<string, string> descriptions) => new()
+    {
+        Id = "demo.mode", Label = "Mode", Values = ["low", "high"], DefaultValue = "low",
+        LevelDescriptions = descriptions,
+    };
+
+    [Fact]
+    public void SelectedDescriptionIsCanonicalFrozenAndProjectedOnlyForVisibleAxes()
+    {
+        var descriptions = new Dictionary<string, string> { ["LOW"] = "brief explanation", ["high"] = "full explanation" };
+        var host = new PluginHost();
+        host.Register(new FlexiblePlugin { Axes = [DescribedAxis(descriptions),
+            DescribedAxis(new Dictionary<string, string> { ["low"] = "hidden explanation" }) with
+                { Id = "demo.hidden", InContext = false }] });
+        descriptions["high"] = "changed after registration";
+        var snapshot = host.Freeze(new Dictionary<string, string> { ["demo.mode"] = "HIGH" }, DateTimeOffset.UnixEpoch);
+        var prompt = host.Collect(snapshot);
+        Assert.Equal("[demo/axis-level.mode]\nMode (demo.mode) high：full explanation", prompt.Text(PromptSlot.Floating));
+        Assert.Empty(prompt.System);
+        Assert.Empty(prompt.Primary);
+        var frozen = host.Plugins.Single().Axes.Single(a => a.Id == "demo.mode").LevelDescriptions;
+        Assert.Equal("brief explanation", frozen["low"]);
+        Assert.Throws<NotSupportedException>(() => ((IDictionary<string, string>)frozen).Clear());
+        var defaults = host.Collect(host.Freeze(new Dictionary<string, string>(), DateTimeOffset.UnixEpoch));
+        Assert.Contains("brief explanation", defaults.Text(PromptSlot.Floating));
+        Assert.DoesNotContain("full explanation", defaults.Text(PromptSlot.Floating));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void InvalidLevelDescriptionsAreRejectedAtomically(int scenario)
+    {
+        var descriptions = scenario switch
+        {
+            0 => new Dictionary<string, string> { ["unknown"] = "explanation" },
+            1 => new Dictionary<string, string> { ["low"] = " " },
+            2 => new Dictionary<string, string> { ["low"] = "one", ["LOW"] = "two" },
+            _ => new Dictionary<string, string> { ["low"] = new string('中', PluginHost.MaxFieldBytes / 3) },
+        };
+        var host = new PluginHost();
+        Assert.Throws<ArgumentException>(() => host.Register(new FlexiblePlugin { Axes = [DescribedAxis(descriptions)] }));
+        Assert.Empty(host.Plugins);
+        host.Register(new FlexiblePlugin());
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void AutomaticDescriptionsUseSharedLimitsAndReservedKeys(int scenario)
+    {
+        var host = new PluginHost();
+        host.Register(new FlexiblePlugin
+        {
+            Axes = [DescribedAxis(new Dictionary<string, string> { ["low"] = "level explanation" })],
+            Render = _ => scenario switch
+            {
+                0 => [Field() with { Key = "axis-level.mode" }],
+                1 => Enumerable.Range(0, PluginHost.MaxFieldsPerPlugin).Select(i => Field() with { Key = "field-" + i }).ToArray(),
+                _ => Enumerable.Range(0, 4).Select(i => Field() with
+                    { Key = "field-" + i, Text = new string('x', PluginHost.MaxFieldBytes - 32) }).ToArray(),
+            },
+        });
+        Assert.Throws<InvalidOperationException>(() => host.Collect(host.Freeze(new Dictionary<string, string>(), DateTimeOffset.UnixEpoch)));
+    }
+
     private sealed class FlexiblePlugin : IAxisPlugin
     {
         public PluginIdentity Identity => new("demo", "1");

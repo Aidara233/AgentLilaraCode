@@ -16,6 +16,7 @@ public sealed class PluginHost
     public const int MaxFieldsPerPlugin = 64;
     public const int MaxFieldBytes = 16 * 1024;
     public const int MaxPromptBytes = 64 * 1024;
+    private const string LevelFieldPrefix = "axis-level.";
 
     public IReadOnlyList<PluginAxisSnapshot> Plugins
     {
@@ -51,8 +52,19 @@ public sealed class PluginHost
                 throw new ArgumentException($"Axis '{axis.Id}' has an invalid schema or default.", nameof(plugin));
             if (_axes.ContainsKey(axis.Id) || candidate.Any(x => x.Definition.Id == axis.Id))
                 throw new InvalidOperationException($"Axis '{axis.Id}' is already registered.");
+            var descriptions = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var pair in axis.LevelDescriptions)
+            {
+                if (!axis.Accepts(pair.Key) || string.IsNullOrWhiteSpace(pair.Value))
+                    throw new ArgumentException($"Axis '{axis.Id}' has an invalid level description.", nameof(plugin));
+                var value = axis.Canonical(pair.Key);
+                if (!descriptions.TryAdd(value, pair.Value) ||
+                    Encoding.UTF8.GetByteCount(LevelText(axis, value, pair.Value)) > MaxFieldBytes)
+                    throw new ArgumentException($"Axis '{axis.Id}' has duplicate or oversized level descriptions.", nameof(plugin));
+            }
             candidate.Add((id, axis with { Values = Array.AsReadOnly(axis.Values.ToArray()),
-                DefaultValue = axis.Canonical(axis.DefaultValue) }));
+                DefaultValue = axis.Canonical(axis.DefaultValue),
+                LevelDescriptions = new ReadOnlyDictionary<string, string>(descriptions) }));
         }
 
         var capabilities = plugin.Capabilities.Distinct().Order().ToArray();
@@ -132,8 +144,21 @@ public sealed class PluginHost
             {
                 throw new InvalidOperationException($"Plugin '{binding.Id}' prompt collection failed: {ex.Message}", ex);
             }
-            if (contributions.Count > MaxFieldsPerPlugin) throw new InvalidOperationException("Too many plugin prompt fields.");
-            foreach (var contribution in contributions)
+            // 自动等级字段使用注册时冻结的定义和同一步快照，参与同一套字段数量与字节限制。
+            if (contributions.Any(c => c is not null && c.Key is not null &&
+                c.Key.StartsWith(LevelFieldPrefix, StringComparison.Ordinal)))
+                throw new InvalidOperationException($"Plugin '{binding.Id}' uses reserved prompt key prefix '{LevelFieldPrefix}'.");
+            var fields = contributions.ToList();
+            foreach (var axis in schema.Axes.Where(a => a.InContext))
+                if (visible.TryGetValue(axis.Id, out var value) &&
+                    axis.LevelDescriptions.TryGetValue(value, out var explanation))
+                    fields.Add(new PromptContribution
+                    {
+                        PluginId = binding.Id, Key = LevelFieldPrefix + axis.Id[(binding.Id.Length + 1)..],
+                        Slot = PromptSlot.Floating, Text = LevelText(axis, value, explanation),
+                    });
+            if (fields.Count > MaxFieldsPerPlugin) throw new InvalidOperationException("Too many plugin prompt fields.");
+            foreach (var contribution in fields)
             {
                 if (contribution is null || contribution.PluginId != binding.Id ||
                     !IsFieldKey(contribution.Key) || string.IsNullOrWhiteSpace(contribution.Text) ||
@@ -187,6 +212,9 @@ public sealed class PluginHost
 
     private static bool IsFieldKey(string value) => !string.IsNullOrWhiteSpace(value) &&
         value.Length <= 128 && value.Split('.').All(IsPluginId);
+
+    private static string LevelText(AxisDefinition axis, string value, string explanation) =>
+        $"{axis.Label} ({axis.Id}) {value}：{explanation}";
 
     private static bool IsPluginId(string value) =>
         !string.IsNullOrWhiteSpace(value) &&

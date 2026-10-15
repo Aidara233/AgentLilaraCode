@@ -22,6 +22,14 @@ public static class OpenAiChatResponse
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
 
+        var usage = UsageJson.Parse(root);
+        var reportedModel = root.ValueKind == JsonValueKind.Object
+            && root.TryGetProperty("model", out var model)
+            && model.ValueKind == JsonValueKind.String ? model.GetString() : null;
+        var responseId = root.ValueKind == JsonValueKind.Object
+            && root.TryGetProperty("id", out var id)
+            && id.ValueKind == JsonValueKind.String ? id.GetString() : null;
+
         string? text = null;
         var finish = UnknownFinish;
         List<Block> calls = [];
@@ -63,6 +71,9 @@ public static class OpenAiChatResponse
             Blocks = blocks,
             StopReason = finish,
             Refused = finish == ContentFilterFinish,
+            Usage = usage,
+            ReportedModel = reportedModel,
+            ResponseId = responseId,
         };
     }
 

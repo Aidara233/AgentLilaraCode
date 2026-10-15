@@ -32,6 +32,11 @@ public class OpenAiChatResponseTests
         Assert.Equal("你好！", ((Block.TextBlock)reply.Blocks[0]).Text);
         Assert.Equal("stop", reply.StopReason);
         Assert.False(reply.Refused);
+        Assert.Equal(1, reply.Usage?.InputTokens);
+        Assert.Equal(1, reply.Usage?.OutputTokens);
+        Assert.Equal(2, reply.Usage?.TotalTokens);
+        Assert.Equal("deepseek-flash", reply.ReportedModel);
+        Assert.Equal("chatcmpl-1", reply.ResponseId);
     }
 
     [Fact]

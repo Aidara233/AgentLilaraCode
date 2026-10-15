@@ -70,6 +70,35 @@ public class WireFormatTests
         Assert.DoesNotContain("Permission", json);
     }
 
+    [Fact]
+    public void WireEvent_UsageUpdatedHasStableDiscriminator()
+    {
+        var call = new Lilara.Core.Storage.UsageCall
+        {
+            CallId = "c1",
+            ProviderId = "p",
+            ModelId = "m",
+            Protocol = "chat",
+            StartedAt = DateTimeOffset.UnixEpoch,
+            Status = "completed",
+            Usage = new Lilara.Core.Kernel.TokenUsage { InputTokens = 3, OutputTokens = 2 },
+        };
+
+        var json = WireEvent.StableSerialize(new WireEvent.UsageUpdated(
+            "s1", call, new Lilara.Core.Storage.UsageSummary
+            {
+                Calls = 1,
+                CallsWithKnownInput = 1,
+                CallsWithKnownOutput = 1,
+                CallsWithUnknownUsage = 0,
+                InputTokens = 3,
+                OutputTokens = 2,
+            }));
+
+        Assert.Contains("\"kind\":\"usage.updated\"", json);
+        Assert.Contains("\"inputTokens\":3", json);
+    }
+
     // 嵌套 Block 的判别式取自静态声明类型，少了它头收到一串没有类型的块。
     [Fact]
     public void WireEvent_NestedBlocksKeepTheirDiscriminator()
@@ -145,7 +174,8 @@ public class WireFormatTests
         // ⚠️ **加事件类型时按实测改这个数，别按感觉改**（被机械改过的探针等于没有）。
         // 13 → 14：`session.reclaimed`（2026-10-06，回收批）。
         // 14 → 16：`approval.requested` / `.resolved`（2026-10-08，询问批）。
-        Assert.Equal(16, declared.Length);
+        // 16 → 17：`usage.updated`（2026-10-15，统计批）。
+        Assert.Equal(17, declared.Length);
 
         var dispatcher = File.ReadAllText(Path.Combine(
             RepoRoot(), "src", "Lilara.Core", "Hosting", "CommandDispatcher.cs"));
@@ -161,7 +191,7 @@ public class WireFormatTests
     [Fact]
     public void WireEventTable_HasExactlyTheTypesWeThinkItDoes()
     {
-        Assert.Equal(16, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+        Assert.Equal(17, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
     }
 
     /// <summary>

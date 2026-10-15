@@ -20,7 +20,8 @@ namespace Lilara.Core.Session;
 /// </summary>
 public sealed class Stepper(
     SessionStore store, IModelAdapter adapter, IReadOnlyList<ITool>? tools = null,
-    Lilara.Core.Plugins.PluginHost? plugins = null)
+    Lilara.Core.Plugins.PluginHost? plugins = null,
+    UsageStore? usage = null)
 {
     private readonly SessionStore _store = store;
     private readonly IModelAdapter _adapter = adapter;
@@ -32,6 +33,7 @@ public sealed class Stepper(
     /// </summary>
     private readonly IReadOnlyList<ITool> _tools = tools ?? [];
     private readonly Lilara.Core.Plugins.PluginHost _plugins = plugins ?? new();
+    private readonly UsageStore? _usage = usage;
 
     /// <summary>
     /// 构造时定下的适配器。⚠️ 这个只读访问器存在的唯一理由是**可测性**：
@@ -101,6 +103,8 @@ public sealed class Stepper(
         // 两条交错时不会互相整份盖掉（终审 I2）。下同。
         handle.UpdateState(s => s with { Status = SessionStatus.Running });
 
+        var callId = Ids.New();
+        var callStarted = CoreClock.Now();
         ModelReply reply;
         try
         {
@@ -173,9 +177,11 @@ public sealed class Stepper(
 
             // 调用（抛异常时直接传播——这一步没完成，Turn 不动）
             reply = await _adapter.CallAsync(request, ct);
+            RecordUsage(handle, callId, callStarted, reply, "completed");
         }
         catch
         {
+            RecordUsage(handle, callId, callStarted, reply: null, "failed");
             // 回到落盘的那份。⚠️ 用捕获的引用回放，不去读磁盘：
             // 读盘本身可能失败，那会把原始的失败原因盖掉。
             //
@@ -317,6 +323,39 @@ public sealed class Stepper(
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(reply);
+    }
+
+    private void RecordUsage(
+        SessionHandle handle, string callId, DateTimeOffset startedAt,
+        ModelReply? reply, string status)
+    {
+        if (_usage is null) return;
+
+        // 统计属于观察面：账本不可写时不能把一次已经完成的模型调用重跑一遍。
+        try
+        {
+            _usage.Append(new UsageCall
+            {
+                CallId = callId,
+                ProjectKey = handle.ProjectKey,
+                SessionId = handle.SessionId,
+                Step = handle.State.Turn + 1,
+                Purpose = "session",
+                ProviderId = handle.Spec.Model.ProviderId,
+                ModelId = handle.Spec.Model.ModelId,
+                Protocol = _adapter.Protocol,
+                StartedAt = startedAt,
+                EndedAt = CoreClock.Now(),
+                Status = status,
+                Usage = reply?.Usage,
+                ReportedModel = reply?.ReportedModel,
+                ResponseId = reply?.ResponseId,
+            });
+        }
+        catch
+        {
+            // 统计故障不改变会话语义；控制面可在后续版本暴露丢账告警。
+        }
     }
 
     /// <summary>

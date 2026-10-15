@@ -39,6 +39,12 @@ let axes = {};                      // 当前会话的轴值
 const projects = new Map();         // pk -> { dir?, count }
 const info = new Map();             // sid -> { spec?, turn, status }
 let providers = [];
+let sessionContext = null;         // 当前会话最近一次核心报告的上下文 token
+let usageSummary = null;           // 统计页缓存；事实仍由核心端点提供
+let usageCalls = [];
+let usageAsOf = null;
+let usageSkip = 0;
+const usagePageSize = 100;
 // 归档的会话默认**折叠**在左栏里（⚠️ 过滤只发生在这里——核心的 `ListSessions`
 // **照列**归档会话，理由见 `SessionSpec.ArchivedAt` 的注释：那是「一个项目下有哪些会话」
 // 的唯一定义，而 `/claims` 也走它）。
@@ -49,6 +55,165 @@ let editingProvider = null;         // 供应商视图里正在编辑的那个 i
 let showNewCard = false;            // 「新建」那张卡要不要展开（默认收起——它不是数据，是入口）
 let SCHEMA = { protocols: [], authSchemes: [] };   // GET /provider-schema（头的合法值来源，**不许手抄**）
 const pendingAcks = new Map();      // 命令 id -> (frame) => void（`commandNow` 的回执关联）
+
+function tokenText(value) {
+  return value === null || value === undefined ? "未报告" : Number(value).toLocaleString();
+}
+
+function renderContextStatus(context) {
+  sessionContext = context || null;
+  const el = $("context-status");
+  if (!el) return;
+  el.classList.toggle("has-value", !!(context && context.latest));
+  if (!context || !context.latest) {
+    el.textContent = "上下文 输入 token 未报告";
+    el.title = "核心尚未报告当前会话的输入 token";
+    return;
+  }
+  const latest = context.latest;
+  el.textContent = `上下文 ${tokenText(latest.inputTokens)}`;
+  el.title = `最近一次输入 token：${tokenText(latest.inputTokens)} · ${latest.source === "reported" ? "模型报告" : "未报告"}${latest.startedAt ? ` · ${shortTime(latest.startedAt)}` : ""}`;
+}
+
+async function loadSessionContext(id) {
+  try {
+    const response = await fetch(`${core}/sessions/${id}/context`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const context = await response.json();
+    if (id === current) renderContextStatus(context);
+    return context;
+  } catch (e) {
+    if (id === current) renderContextStatus(null);
+    return null;
+  }
+}
+
+function usageBucketRow(bucket) {
+  const tr = document.createElement("tr");
+  const key = document.createElement("td");
+  key.className = "key";
+  key.textContent = bucket.key || "（未知）";
+  const calls = document.createElement("td");
+  calls.className = "num";
+  calls.textContent = tokenText(bucket.calls);
+  const input = document.createElement("td");
+  input.className = "num";
+  input.textContent = tokenText(bucket.inputTokens);
+  const output = document.createElement("td");
+  output.className = "num";
+  output.textContent = tokenText(bucket.outputTokens);
+  tr.append(key, calls, input, output);
+  return tr;
+}
+
+function renderUsageTable(id, rows) {
+  const body = $(id);
+  body.replaceChildren();
+  if (!rows || rows.length === 0) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.className = "empty-row";
+    td.colSpan = 4;
+    td.textContent = "暂无调用记录";
+    tr.appendChild(td);
+    body.appendChild(tr);
+    return;
+  }
+  for (const row of rows) body.appendChild(usageBucketRow(row));
+}
+
+function renderUsageCalls() {
+  const body = $("usage-calls");
+  body.replaceChildren();
+  if (!usageCalls.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.className = "empty-row";
+    td.colSpan = 6;
+    td.textContent = "暂无调用记录";
+    tr.appendChild(td);
+    body.appendChild(tr);
+  } else {
+    for (const call of usageCalls) {
+      const tr = document.createElement("tr");
+      const time = document.createElement("td");
+      time.className = "mono";
+      time.textContent = shortTime(call.startedAt) || "未知时间";
+      const purpose = document.createElement("td");
+      purpose.textContent = call.purpose || "session";
+      const target = document.createElement("td");
+      target.className = "key";
+      target.textContent = `${call.providerId || "?"} / ${call.modelId || "?"}`;
+      const status = document.createElement("td");
+      status.textContent = call.status || "未知";
+      const input = document.createElement("td");
+      input.className = "num";
+      input.textContent = tokenText(call.usage?.inputTokens);
+      const output = document.createElement("td");
+      output.className = "num";
+      output.textContent = tokenText(call.usage?.outputTokens);
+      tr.append(time, purpose, target, status, input, output);
+      body.appendChild(tr);
+    }
+  }
+  const total = usageSummary?.calls ?? 0;
+  const first = total === 0 ? 0 : usageSkip + 1;
+  const last = Math.min(usageSkip + usageCalls.length, total);
+  $("usage-page-note").textContent = total ? `${first}-${last} / ${total}` : "0 次调用";
+  $("usage-prev").disabled = usageSkip <= 0;
+  $("usage-next").disabled = usageSkip + usageCalls.length >= total;
+}
+
+function renderUsageView() {
+  const s = usageSummary;
+  const box = $("usage-summary");
+  box.replaceChildren();
+  const stats = [
+    ["调用次数", s?.calls],
+    ["输入 token", s?.inputTokens],
+    ["输出 token", s?.outputTokens],
+    ["缓存读取", s?.cacheReadTokens],
+    ["缓存写入", s?.cacheWriteTokens],
+    ["推理 token", s?.reasoningTokens],
+    ["未知用量", s?.callsWithUnknownUsage],
+  ];
+  for (const [label, value] of stats) {
+    const stat = document.createElement("div");
+    stat.className = "stat";
+    const name = document.createElement("label");
+    name.textContent = label;
+    const number = document.createElement("strong");
+    number.textContent = tokenText(value);
+    stat.append(name, number);
+    box.appendChild(stat);
+  }
+  renderUsageTable("usage-providers", s?.byProvider);
+  renderUsageTable("usage-models", s?.byModel);
+  renderUsageCalls();
+  $("usage-asof").textContent = s ? `更新于 ${shortTime(usageAsOf) || "刚刚"}` : "尚未加载";
+}
+
+async function loadUsageView(resetPage = false) {
+  if (resetPage) usageSkip = 0;
+  try {
+    const [summaryResponse, callsResponse] = await Promise.all([
+      fetch(`${core}/usage/summary`),
+      fetch(`${core}/usage/calls?skip=${usageSkip}&limit=${usagePageSize}`),
+    ]);
+    if (!summaryResponse.ok || !callsResponse.ok) throw new Error("统计端点不可用");
+    usageSummary = await summaryResponse.json();
+    const page = await callsResponse.json();
+    usageAsOf = page.asOf || null;
+    usageCalls = Array.isArray(page.calls) ? page.calls : [];
+    renderUsageView();
+  } catch (e) {
+    usageSummary = null;
+    usageCalls = [];
+    usageAsOf = null;
+    renderUsageView();
+    renderMeta("✗ 统计读取失败：" + (e && e.message ? e.message : e), "error");
+  }
+}
 
 // ---- 引导：核心启动后没有会话与提供商，「配置提供商 → 建初始会话」是头的策略 ----
 // bootstrap() 有两个入口（首屏 IIFE 与 onopen 自恢复）且不可重入 ⇒ 用一次性承诺去重；
@@ -309,6 +474,7 @@ async function openSessionInner(id) {
   await connected();
   if (gen !== epoch) return;
   current = id;
+  if (leaving !== id) renderContextStatus(null);
   $("interrupt").disabled = false;   // 没选中会话时它是死的 —— 别让它看起来可点（点了也没事，只是会骗人）
   $("gc").disabled = false;
   renderSessions();
@@ -364,6 +530,7 @@ async function openSessionInner(id) {
   renderSessionPanel(state);
   renderProjectPanel(state);
   setStatus(state.state.status, state.state.turn);
+  loadSessionContext(id);
   renderSessions();
   // ⚠️ **整体换掉，不是逐条追加**（2026-10-06 改）。这个函数是**重拉**（「把现在这份画出来」），
   // 而重拉期间时间线上可能已经有东西了——`session.reclaimed` 的处理器刚把「回收了 N 条结果」
@@ -541,21 +708,25 @@ function setStatus(status, turn) {
   el.className = "chip " + (status === "Running" ? "running" : "live");
 }
 
-// ---- 视图切换：会话 / 供应商 ----
+// ---- 视图切换：会话 / 供应商 / 统计 ----
 // ⚠️ 只在**页面内**切：共享同一个 WS、同一份 providers 缓存、同一套样式。
 // 另开一个 HTML 文件就得把 WS 那套管线抽成共用 js 或重写一遍，而这两个视图用的
 // 就是同一份数据（会话视图的供应商下拉 = 供应商视图维护的那份清单）。
 
 function showView(which) {
   document.body.classList.toggle("providers", which === "providers");
-  $("nav-sessions").classList.toggle("on", which !== "providers");
+  document.body.classList.toggle("usage", which === "usage");
+  $("nav-sessions").classList.toggle("on", which === "sessions");
   $("nav-providers").classList.toggle("on", which === "providers");
+  $("nav-usage").classList.toggle("on", which === "usage");
   // 视图进 URL 片段：可收藏、可前进后退、刷新后停在原地。
   // ⚠️ 用 `history.replaceState` 而不是改 `location.hash`——后者会**再触发**一次 hashchange，
   // 与我们这里读 hash 的地方来回打架（无限循环）。
-  try { history.replaceState(null, "", which === "providers" ? "#providers" : "#sessions"); } catch { }
+  try { history.replaceState(null, "", which === "providers" ? "#providers" : which === "usage" ? "#usage" : "#sessions"); } catch { }
   if (which === "providers") {
     loadProviders().then(renderProvidersView).catch((e) => renderMeta("✗ " + e.message, "error"));
+  } else if (which === "usage") {
+    loadUsageView(true);
   } else {
     // 切回来时把会话视图的缓存刷一遍——供应商可能在那边被改过。
     renderSessions();
@@ -1545,6 +1716,26 @@ function handleEvent(p) {
       }
       break;
 
+    case "usage.updated":
+      // 账本事件已经带回本次调用的核心事实；会话页即时显示，统计页重新读取
+      // 全局投影，避免把「当前会话汇总」误当成全局汇总。
+      if (p.sessionId === current && p.call) {
+        renderContextStatus({
+          latest: {
+            callId: p.call.callId,
+            startedAt: p.call.startedAt,
+            endedAt: p.call.endedAt,
+            modelId: p.call.modelId,
+            protocol: p.call.protocol,
+            inputTokens: p.call.usage?.inputTokens,
+            source: p.call.usage ? "reported" : "unknown",
+            requestFingerprint: p.call.requestFingerprint,
+          },
+        });
+      }
+      if (document.body.classList.contains("usage")) loadUsageView();
+      break;
+
     case "error":      // 业务失败走这里（不是 rejected：命令本身没写错）。
       if (p.sessionId === current) renderMeta("✗ " + p.message, "error");
       break;
@@ -1573,6 +1764,10 @@ $("send").onclick = send;
 $("text").onkeydown = (e) => { if (e.key === "Enter") send(); };
 $("nav-sessions").onclick = () => showView("sessions");
 $("nav-providers").onclick = () => showView("providers");
+$("nav-usage").onclick = () => showView("usage");
+$("usage-refresh").onclick = () => loadUsageView(true);
+$("usage-prev").onclick = () => { usageSkip = Math.max(0, usageSkip - usagePageSize); loadUsageView(); };
+$("usage-next").onclick = () => { usageSkip += usagePageSize; loadUsageView(); };
 
 // ---- 新建会话：选项目（工作目录）+ 起名 ----
 // ⚠️ 两者**都发 `session.create` 的字段**，不是「先建再改绑」——`create` 本来就定工作目录。
@@ -1688,6 +1883,7 @@ $("gc").onclick = () => {
   try { core = (await (await fetch("/config.json")).json()).core; } catch { }   // 取不到就用默认值
   // 视图先定（片段里写着就直接进那一页，省得闪一下会话视图再跳）。
   if (location.hash === "#providers") showView("providers");
+  else if (location.hash === "#usage") showView("usage");
   connect();
   // 失败必须可见：不接的话是一次未观测拒绝（页面停在空白）；接住并打一行到时间线，
   // 核心起来后由 onopen 的 currentProject === null 分支自动重试。
