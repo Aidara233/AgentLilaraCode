@@ -1,5 +1,6 @@
 using Lilara.Core.Kernel;
 using Lilara.Core.Storage;
+using Lilara.Core.Plugins;
 
 namespace Lilara.Core.Session;
 
@@ -73,11 +74,21 @@ public static class SystemBlock
     public static PromptSlots Render(
         PresetStore presets, PresetStore premiers,
         string? systemPresetId, string? premierId,
-        IReadOnlyDictionary<string, string> axes) =>
+        IReadOnlyDictionary<string, string> axes,
+        PromptContributionSnapshot? pluginPrompt = null) =>
         new(
-            System: Text(Load(presets, systemPresetId) ?? CorePrompts.SystemFallback),
-            Premier: Wrap(CorePrompts.PremierOpen, Load(premiers, premierId), CorePrompts.PremierClose),
-            Tail: Wrap(CorePrompts.TailOpen, TailBody(axes), CorePrompts.TailClose));
+            System: Text(Join(Load(presets, systemPresetId) ?? CorePrompts.SystemFallback,
+                pluginPrompt?.Text(PromptSlot.System)) ?? ""),
+            Premier: Wrap(CorePrompts.PremierOpen,
+                Join(Load(premiers, premierId), pluginPrompt?.Text(PromptSlot.Primary)), CorePrompts.PremierClose),
+            Tail: Wrap(CorePrompts.TailOpen,
+                Join(TailBody(axes), pluginPrompt?.Text(PromptSlot.Floating)), CorePrompts.TailClose));
+
+    private static string? Join(params string?[] values)
+    {
+        var nonEmpty = values.Where(v => !string.IsNullOrEmpty(v)).ToArray();
+        return nonEmpty.Length == 0 ? null : string.Join("\n", nonEmpty);
+    }
 
     /// <summary>
     /// 读一份预设。⚠️ <c>null</c> = **文件不存在**，与「空文件」不是一回事

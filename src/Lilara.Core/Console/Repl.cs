@@ -291,7 +291,9 @@ public sealed class Repl(
         // `!` 与索引器是 Load / Create 的契约（CompleteAxes 保证 Axes 非空且五键齐全）。
         _out.WriteLine($"模型 {Current.Spec.Model.ModelId} · effort {state.Axes![Axes.Effort]}");
         _out.WriteLine("策略 " + string.Join(" · ",
-            Axes.Names.Select(n => $"{n}={state.Axes!.GetValueOrDefault(n, "?")}")));
+            PluginSessionView.Values(state).Select(p => $"{p.Key}={p.Value}")));
+        foreach (var problem in PluginSessionView.Problems(_host.Plugins, Current.Spec))
+            _out.WriteLine($"插件不可用：{problem}");
         _out.WriteLine($"目录 {Current.Spec.WorkingDirectory}");
     }
 

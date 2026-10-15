@@ -10,7 +10,7 @@ public class ArchitectureTests
 {
     // 底 → 顶。数值越大越靠上；一条 using 的目标层必须**严格低于**发出它的那一层。
     private static readonly string[] LayerOrder =
-        ["Kernel", "Storage", "Providers", "Protocol", "Session", "Hosting", "Control", "Console"];
+        ["Kernel", "Storage", "Providers", "Protocol", "Plugins", "Session", "Hosting", "Control", "Console"];
 
     [Fact]
     public void Kernel_DoesNotDependOnAnyOtherLayer()

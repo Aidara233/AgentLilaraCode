@@ -19,7 +19,8 @@ namespace Lilara.Core.Session;
 ///   3. state.json 最后写——崩在 2 和 3 之间只会让 turn 计数偏小，历史不损坏</para>
 /// </summary>
 public sealed class Stepper(
-    SessionStore store, IModelAdapter adapter, IReadOnlyList<ITool>? tools = null)
+    SessionStore store, IModelAdapter adapter, IReadOnlyList<ITool>? tools = null,
+    Lilara.Core.Plugins.PluginHost? plugins = null)
 {
     private readonly SessionStore _store = store;
     private readonly IModelAdapter _adapter = adapter;
@@ -30,6 +31,7 @@ public sealed class Stepper(
     /// **逐字节不变**（工具相位整段跳过）。
     /// </summary>
     private readonly IReadOnlyList<ITool> _tools = tools ?? [];
+    private readonly Lilara.Core.Plugins.PluginHost _plugins = plugins ?? new();
 
     /// <summary>
     /// 构造时定下的适配器。⚠️ 这个只读访问器存在的唯一理由是**可测性**：
@@ -70,6 +72,9 @@ public sealed class Stepper(
         // **本身就是**「有人要它动」，与「用户发了话」在 `01` §5 那条判据下是同一件事
         // ⇒ 它**必须**能收掉一次撕裂的追加，否则那条命令在**唯一需要它的时候**是空的。
         Recovery.BeforeStep(_store, handle, at, hasNewInput: blocks.Count > 0 || explicitStart);
+        var stepState = handle.State;
+        var pluginAxes = _plugins.Freeze(PluginSessionView.Values(stepState), at, handle.Spec.Plugins ?? []);
+        var pluginPrompt = _plugins.Collect(pluginAxes, handle.Spec.Plugins ?? []);
 
         // ⚠️ **熔断计数从盘上恢复**（`01` §6.2）。不恢复的话，一次重启就把它清零
         // ⇒ 「自上次用户输入以来跑了多少步」这个语义**只在没重启过时成立**，
@@ -122,8 +127,8 @@ public sealed class Stepper(
                 // ⚠️ `!` 是 **`Load` / `Create` 的契约**：它们保证 `State.Axes` 非空
                 // （见 `SessionState.Axes` 的注释）；能拿到 null 的只有手工 `new SessionHandle`，
                 // 那不是运行时路径。
-                Effort = handle.State.Axes![Axes.Effort],
-                Temperature = Axes.NumberOrNull(Axes.Temperature, handle.State.Axes![Axes.Temperature]),
+                Effort = pluginAxes.Values[Axes.Effort],
+                Temperature = Axes.NumberOrNull(Axes.Temperature, pluginAxes.Values[Axes.Temperature]),
 
                 // ⚠️ **三块提示词在步开始读一次、冻进这一趟**（与上面那行 `now` 同一个道理）。
                 // 两块文件是**每步都可能变的外部输入**（预设是用户随时能编辑的文件），
@@ -136,11 +141,12 @@ public sealed class Stepper(
                 // 而不是在这里分三次调——「哪一块从哪来」的判据只有 `SystemBlock` 一处。
                 // ⚠️ 轴值从 **handle 的 State** 读（不是从 spec）：轴是活的，
                 // 而 `!` 是 `Load` / `Create` 的契约（见上面 `Effort` 那行）。
+                // 插件提示词来自同一份步开始快照；浮动贡献仍只存在于尾槽位，不进入时间线。
                 Slots = SystemBlock.Render(
                     new PresetStore(_store.DataRoot, PresetStore.SystemDir),
                     new PresetStore(_store.DataRoot, PresetStore.PremierDir),
                     handle.Spec.SystemPromptPreset, handle.Spec.PremierPrompt,
-                    handle.State.Axes!),
+                    pluginAxes.Values, pluginPrompt),
 
                 // ⚠️ 工具表**从工具表投影**，不是从 spec 读的——spec 里没有它，
                 // 而「这一步有哪些工具」是**派生**的（04 §1.3：工具表不是独立实体）。
@@ -184,7 +190,7 @@ public sealed class Stepper(
             // 再下一次成功的步把旧值写回磁盘 ⇒ 用户看到的那个新值**就此消失，且没有报错**。
             // ⚠️ `s.Axes` 是**锁内**读到的那份——用它，不重新读 `handle.State`：
             // 两条交错时「重新读」会拿到别人的写入，把回滚的基准弄歪（终审 I2）。
-            handle.UpdateState(s => persisted with { Axes = s.Axes });
+            handle.UpdateState(s => persisted with { Axes = s.Axes, PluginAxes = s.PluginAxes });
             throw;
         }
 

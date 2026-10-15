@@ -117,6 +117,9 @@ public sealed record SessionState
     /// 老文件缺这个键 ⇒ `WhenWritingNull` 让盘上键不出现 ⇒ <b>逐字节不变</b>。</para>
     /// </summary>
     public PendingIntent? PendingIntent { get; init; }
+
+    /// <summary>插件轴的当前规范值；未知插件的值也保留，避免卸载时静默丢配置。</summary>
+    public IReadOnlyDictionary<string, string>? PluginAxes { get; init; }
 }
 
 /// <summary>

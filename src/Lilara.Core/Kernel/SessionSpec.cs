@@ -126,4 +126,10 @@ public sealed record SessionSpec
     /// 但语义变了照样 **+1 格式版本**：理由不在兼容（本来就兼容），在**标记这是一份按新格式写的文件**。</para>
     /// </summary>
     public TimeSpan? AskTimeout { get; init; }
+
+    /// <summary>建会话时绑定的插件版本与默认值。旧文件缺省为无绑定，不自动启用新插件。</summary>
+    public IReadOnlyList<SessionPluginBinding>? Plugins { get; init; }
 }
+
+public sealed record SessionPluginBinding(
+    string Id, string Version, IReadOnlyDictionary<string, string> Defaults);

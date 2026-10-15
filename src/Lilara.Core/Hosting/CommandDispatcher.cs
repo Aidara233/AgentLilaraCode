@@ -604,7 +604,7 @@ public sealed class CommandDispatcher(
 
         var handle = SessionHandle.Create(
             _host.Store, workingDirectory, model, Trimmed(c.Title), Trimmed(c.Preset),
-            askTimeout: c.AskTimeoutMinutes is { } m ? TimeSpan.FromMinutes(m) : null);
+            askTimeout: c.AskTimeoutMinutes is { } m ? TimeSpan.FromMinutes(m) : null, plugins: _host.Plugins);
 
         // 登记进激活表——快照端点据此避免读到盘上过期的 Idle。
         _host.Register(handle);
@@ -1083,7 +1083,29 @@ public sealed class CommandDispatcher(
         if (!TryFind(x.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
         if (!Axes.IsKnown(x.Axis))
+        {
+            var binding = handle.Spec.Plugins?.FirstOrDefault(p => x.Axis is not null && p.Defaults.ContainsKey(x.Axis));
+            if (binding is not null)
+            {
+                if (_host.Plugins.Problem(binding) is { } problem) return Reject(id, problem);
+                if (!_host.Plugins.TryCanonicalize(x.Axis, x.Value, out var pluginValue))
+                {
+                    _host.Plugins.TryGetAxis(x.Axis, out var definition);
+                    return Reject(id, $"'{x.Axis}' 不取 '{x.Value}'。可用的：{string.Join("|", definition.Values)}");
+                }
+                if (handle.State.PluginAxes?.GetValueOrDefault(x.Axis!) == pluginValue)
+                    return new DispatchResult(new Ack.Accepted { CommandId = id });
+                handle.UpdateStateAndPersist(_host.Store, s =>
+                {
+                    var next = new Dictionary<string, string>(s.PluginAxes ?? new Dictionary<string, string>(), StringComparer.Ordinal)
+                        { [x.Axis!] = pluginValue };
+                    return s with { PluginAxes = new System.Collections.ObjectModel.ReadOnlyDictionary<string, string>(next) };
+                }, diskStatus: SessionStatus.Idle);
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId), new WireEvent.AxisChanged(handle.SessionId, x.Axis!, pluginValue));
+                return new DispatchResult(new Ack.Accepted { CommandId = id });
+            }
             return Reject(id, $"没有 '{x.Axis}' 这条轴。可用的：{string.Join("|", Axes.Names)}");
+        }
 
         // 合法值清单从表里拼——手抄一份会在加档时静默过期，而这条错误信息是用户唯一的线索。
         if (!Axes.TryParse(x.Axis, x.Value, out var canonical))

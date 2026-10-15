@@ -25,6 +25,9 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
     /// </summary>
     public LiveSessions Live { get; } = new();
 
+    /// <summary>进程内插件轴宿主；注册完成后由推进器只读其快照。</summary>
+    public Lilara.Core.Plugins.PluginHost Plugins { get; } = new();
+
     /// <summary>已激活的会话。快照端点先查这里——见 <see cref="TryGetActivated"/>。</summary>
     private readonly ConcurrentDictionary<string, SessionHandle> _activated = new();
 
@@ -192,7 +195,7 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
         {
             if (_steppers.TryGetValue(handle.SessionId, out var cached)) return cached;
 
-            var stepper = StepperResolver.Resolve(_store, _providers, handle.Spec.Model.ProviderId);
+            var stepper = StepperResolver.Resolve(_store, _providers, handle.Spec.Model.ProviderId, Plugins);
             _steppers[handle.SessionId] = stepper;
             return stepper;
         }

@@ -236,7 +236,9 @@ public sealed class ControlServer(
 
                     // 轴必须走顶层这个 axes：axis.changed 只在订阅之后才有，头刚开页面时无事件可等。
                     // 轴只有一份、住在 State 里；handle 必经 Load / Create（都过 CompleteAxes）⇒ 下面的 ! 不是赌。
-                    Axes = handle.State.Axes!,
+                    Axes = PluginSessionView.Values(handle.State),
+                    AxisDefinitions = PluginSessionView.Definitions(host.Plugins, handle.Spec),
+                    PluginProblems = PluginSessionView.Problems(host.Plugins, handle.Spec),
 
                     // 整个 spec 交出去、不做子集裁剪：SessionSpec 里没有 ApiKey，所以天生不泄 key。
                     // 代价：WorkingDirectory 是本机绝对路径，在开放 CORS(*) 下可读。
@@ -349,14 +351,7 @@ public sealed class ControlServer(
         // 这条是刻意的：让核心能先上线，头后跟。
         app.MapGet("/axes", () => Results.Json(new
         {
-            Axes = Kernel.Axes.Names.Select(n => new
-            {
-                Name = n,
-                Label = Kernel.Axes.LabelOf(n),
-                Values = Kernel.Axes.ValuesOf(n),
-                InContext = Kernel.Axes.InContext(n),
-                Range = Kernel.Axes.RangeOf(n),
-            }),
+            Axes = PluginSessionView.Definitions(host.Plugins),
             AlertSafety = Kernel.Axes.AlertSafety,
             AlertFrom = Kernel.Axes.AlertFrom,
         }, WireJson.Options));
@@ -458,15 +453,28 @@ public sealed class ControlServer(
     /// </summary>
     private object SlotsOf(SessionHandle handle)
     {
+        var values = PluginSessionView.Values(handle.State);
+        Lilara.Core.Plugins.PromptContributionSnapshot? contribution = null;
+        string? problem = null;
+        try
+        {
+            var frozen = host.Plugins.Freeze(values, CoreClock.Now(), handle.Spec.Plugins ?? []);
+            contribution = host.Plugins.Collect(frozen, handle.Spec.Plugins ?? []);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+        {
+            problem = ex.Message;
+        }
         var slots = SystemBlock.Render(
             new PresetStore(host.DataRoot, PresetStore.SystemDir),
             new PresetStore(host.DataRoot, PresetStore.PremierDir),
             handle.Spec.SystemPromptPreset,
             handle.Spec.PremierPrompt,
-            handle.State.Axes!);
+            values, contribution);
 
         return new
         {
+            Problem = problem,
             System = slots.System,
             Premier = slots.Premier,
             // ⚠️ **线上那一格叫 `floating`（浮动），代码里叫 Tail（尾槽位）**——

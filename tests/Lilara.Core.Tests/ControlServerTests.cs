@@ -1020,7 +1020,7 @@ public class ControlServerTests : IAsyncLifetime
         var sid = ((Ack.Accepted)created.Ack).SessionId!;
 
         var root = await GetJson($"/sessions/{sid}/state");
-        AssertKeysOf(root, "sessionId", "state", "highWater", "axes", "spec", "slots");
+        AssertKeysOf(root, "sessionId", "state", "highWater", "axes", "spec", "slots", "axisDefinitions", "pluginProblems");
 
         // ⚠️ 嵌套那层也钉：往 `slots` / `model` 里加字段，顶层看不见。
         //（`spec` 自己那层**不在这里钉**——它归 `SessionSpec_HasExactlyTheseProperties` +
@@ -1173,7 +1173,7 @@ public class ControlServerTests : IAsyncLifetime
 
         Assert.Equal(
             ["ArchivedAt:Nullable`1", "AskTimeout:Nullable`1", "CreatedAt:DateTimeOffset",
-             "Model:ModelSelection", "PremierPrompt:String", "ProjectKey:String", "SessionId:String",
+             "Model:ModelSelection", "Plugins:IReadOnlyList`1", "PremierPrompt:String", "ProjectKey:String", "SessionId:String",
              "SystemPromptPreset:String", "Title:String",
              "Version:Int32", "WorkingDirectory:String"],
             Shape(typeof(SessionSpec)));
@@ -1183,6 +1183,7 @@ public class ControlServerTests : IAsyncLifetime
             ["Effort:String", "MaxTokens:Int32", "ModelId:String",
              "Protocol:String", "ProviderId:String"],
             Shape(typeof(ModelSelection)));
+        Assert.Equal(["Defaults:IReadOnlyDictionary`2", "Id:String", "Version:String"], Shape(typeof(SessionPluginBinding)));
     }
 
     // GET /axes 是头唯一的轴来源（头不许手抄）；同时钉住「中文标签归核心」——下拉的中文名头自己画不出来。

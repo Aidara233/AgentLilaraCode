@@ -107,7 +107,7 @@ public sealed class SessionStore(string dataRoot)
 
     public void WriteSpec(string projectKey, SessionSpec spec) =>
         AtomicFile.Write(Path.Combine(SessionDirectory(projectKey, spec.SessionId), "spec.json"),
-            JsonSerializer.Serialize(spec, Json.Options));
+            JsonSerializer.Serialize(spec with { Version = Json.FormatVersion }, Json.Options));
 
     /// <summary>
     /// 读 `spec.json`。**版本不符会抛 <see cref="FileFormatException"/>，不返回 null。**
@@ -127,7 +127,7 @@ public sealed class SessionStore(string dataRoot)
 
     public void WriteState(string projectKey, SessionState state) =>
         AtomicFile.Write(Path.Combine(SessionDirectory(projectKey, state.SessionId), "state.json"),
-            JsonSerializer.Serialize(state, Json.Options));
+            JsonSerializer.Serialize(state with { Version = Json.FormatVersion }, Json.Options));
 
     /// <summary>读 `state.json`。版本不符抛 <see cref="FileFormatException"/>——理由同 <see cref="ReadSpec"/>。</summary>
     public SessionState ReadState(string projectKey, string sessionId) =>

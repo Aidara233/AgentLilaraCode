@@ -1,6 +1,7 @@
 using Lilara.Core.Protocol;
 using Lilara.Core.Storage;
 using Lilara.Core.Providers;
+using Lilara.Core.Plugins;
 
 namespace Lilara.Core.Session;
 
@@ -21,14 +22,15 @@ public static class StepperResolver
     /// 才退回任意一个。
     /// </summary>
     public static Stepper Resolve(
-        SessionStore store, ProviderStore providers, string? preferredProviderId = null)
+        SessionStore store, ProviderStore providers, string? preferredProviderId = null,
+        PluginHost? plugins = null)
     {
         if (preferredProviderId is null)
         {
             var any = providers.List().FirstOrDefault();
             return any is null
-                ? new Stepper(store, new UnconfiguredAdapter(), Tools.BuiltInTools.All)
-                : new Stepper(store, AdapterFactory.Create(any), Tools.BuiltInTools.All);
+                ? new Stepper(store, new UnconfiguredAdapter(), Tools.BuiltInTools.All, plugins)
+                : new Stepper(store, AdapterFactory.Create(any), Tools.BuiltInTools.All, plugins);
         }
 
         var bound = providers.Load(preferredProviderId);
@@ -37,9 +39,9 @@ public static class StepperResolver
             // 点名缺的是哪个——「还没有配置提供商」在这里是句误导人的话，
             // 用户明明配了（别的）提供商，只是这个会话绑的那个没了。
             return new Stepper(store, new UnconfiguredAdapter(
-                $"会话绑定的提供商 '{preferredProviderId}' 已不存在。用 `provider set` 重新配一个。"));
+                $"会话绑定的提供商 '{preferredProviderId}' 已不存在。用 `provider set` 重新配一个。"), plugins: plugins);
         }
 
-        return new Stepper(store, AdapterFactory.Create(bound), Tools.BuiltInTools.All);
+        return new Stepper(store, AdapterFactory.Create(bound), Tools.BuiltInTools.All, plugins);
     }
 }

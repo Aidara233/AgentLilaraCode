@@ -55,7 +55,8 @@ public static class Json
     /// 「缺配对」的请求并拿到 400，且**永远不知道原因**。⇒ 这正是版本号要终结的那种
     /// 「静默地按旧含义解释新数据」。</para>
     /// </summary>
-    public const int FormatVersion = 6;
+    // 7：会话绑定插件版本及默认值，状态保存插件轴；旧核心必须拒绝，避免丢配置。
+    public const int FormatVersion = 7;
 
     public static readonly JsonSerializerOptions Options = new()
     {

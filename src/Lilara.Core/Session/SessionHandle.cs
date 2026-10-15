@@ -1,5 +1,7 @@
 using Lilara.Core.Kernel;
 using Lilara.Core.Storage;
+using Lilara.Core.Plugins;
+using System.Collections.ObjectModel;
 
 namespace Lilara.Core.Session;
 
@@ -215,7 +217,8 @@ public sealed record SessionHandle
     /// </param>
     public static SessionHandle Create(
         SessionStore store, string workingDirectory, ModelSelection model, string? title = null,
-        string? systemPromptPreset = null, string? sessionId = null, TimeSpan? askTimeout = null)
+        string? systemPromptPreset = null, string? sessionId = null, TimeSpan? askTimeout = null,
+        PluginHost? plugins = null)
     {
         // ⚠️ **一次取绝对路径，三处共用同一个值**：算 key、写 spec、定目录。
         // 改之前是**两次独立的** `GetFullPath`（`ProjectKey.FromPath` 内部一次、
@@ -224,6 +227,7 @@ public sealed record SessionHandle
         // 而 `session.create` 现在要接受**任意** cwd ⇒ 把这条隐含依赖收成显式的一行。
         var fullPath = Path.GetFullPath(workingDirectory);
         var projectKey = Kernel.ProjectKey.FromPath(fullPath);
+        var bindings = plugins?.Bind();
         var spec = new SessionSpec
         {
             // ⚠️ 走 `Ids.New()` 而不是就地 `Guid.NewGuid()...`：会话 id 与记录 id 是**同一个形状**，
@@ -243,6 +247,7 @@ public sealed record SessionHandle
             // ⚠️ 合法性的判据住在命令层（`session.create` / `session.configure` 拒 `<= 0`），
             // 这里**不再判一次**——两处判据就是漂的温床（`01` §8.0.2 那条老毛病）。
             AskTimeout = askTimeout,
+            Plugins = bindings is { Count: > 0 } ? bindings : null,
         };
         var state = new SessionState
         {
@@ -263,6 +268,7 @@ public sealed record SessionHandle
             // 顺带的好处：下面那次 `WriteState` 把默认值一并落了盘——磁盘上「没设过」
             // 与「设成了默认值」从此可分辨，将来改默认值不会让老会话**静默改变行为**。
             Axes = CompleteAxes(stored: null, spec.Model.Effort),
+            PluginAxes = CompletePluginAxes(spec.Plugins, null),
         };
 
         // ⚠️ 先 state 后 spec——顺序是刻意的，别调换。
@@ -300,6 +306,16 @@ public sealed record SessionHandle
     /// <para>⚠️ **覆盖顺序（默认 → spec → 磁盘）是有意的**：磁盘上那份排最后，
     /// 所以用户 `setAxis` 改过的值不会被 spec 或默认值盖掉。</para>
     /// </summary>
+    private static IReadOnlyDictionary<string, string>? CompletePluginAxes(
+        IReadOnlyList<SessionPluginBinding>? bindings, IReadOnlyDictionary<string, string>? stored)
+    {
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var binding in bindings ?? [])
+            foreach (var pair in binding.Defaults) values[pair.Key] = pair.Value;
+        if (stored is not null) foreach (var pair in stored) values[pair.Key] = pair.Value;
+        return values.Count == 0 ? null : new ReadOnlyDictionary<string, string>(values);
+    }
+
     private static IReadOnlyDictionary<string, string> CompleteAxes(
         IReadOnlyDictionary<string, string>? stored, string specEffort)
     {
@@ -330,6 +346,9 @@ public sealed record SessionHandle
         // 读两次不只是多一次 IO：两次之间磁盘可能变（这里没有事务），
         // 于是「用来播种的 effort」与「handle 上那份 spec」可以来自**不同的两代文件**。
         var spec = store.ReadSpec(projectKey, sessionId);
+        if (spec.Plugins is { } savedBindings)
+            spec = spec with { Plugins = Array.AsReadOnly(savedBindings.Select(b => b with
+            { Defaults = new ReadOnlyDictionary<string, string>(new Dictionary<string, string>(b.Defaults, StringComparer.Ordinal)) }).ToArray()) };
 
         // ⚠️ **老 state.json 没有 `axes` 键** ⇒ 读出来是 null ⇒ 在这里补成完整的一份，
         // 而且**补进 `State` 本身**：轴只有这一份存储，`SessionHandle` 上不该有第二份
@@ -342,7 +361,8 @@ public sealed record SessionHandle
         // ⚠️ **只补内存、不回写磁盘**：`Load` 是读路径，写盘会让「打开一个老会话」
         // 产生一次它没要求的写。下一次落盘（`Stepper` **成功的那一步**会写 `state.json`；
         // 抛异常与取消的路径不写）自然带上它。
-        state = state with { Axes = CompleteAxes(state.Axes, spec.Model.Effort) };
+        state = state with { Axes = CompleteAxes(state.Axes, spec.Model.Effort),
+            PluginAxes = CompletePluginAxes(spec.Plugins, state.PluginAxes) };
 
         return new SessionHandle
         {

@@ -356,7 +356,9 @@ async function openSessionInner(id) {
   if (p && !p.dir) p.dir = state.spec.workingDirectory;
 
   renderSlots(state.slots);
+  if (state.axisDefinitions) AXES = state.axisDefinitions;
   renderAxes(state.axes);
+  if (state.slots?.problem) renderMeta(state.slots.problem, "error");
   renderAsk(state);
   renderTitle(state.spec);
   renderSessionPanel(state);
@@ -1149,6 +1151,13 @@ function renderAxes(values) {
       }
     }
 
+    ctl.disabled = a.available === false;
+    if (a.problem) ctl.title = a.problem;
+    if (!a.range && axes[a.name] != null && !a.values.includes(axes[a.name])) {
+      const saved = document.createElement("option");
+      saved.value = axes[a.name]; saved.textContent = axes[a.name]; saved.selected = true;
+      ctl.appendChild(saved);
+    }
     const axisName = a.name;   // 闭包捕获，别用循环变量
     const send = () => {
       if (!current) return;
