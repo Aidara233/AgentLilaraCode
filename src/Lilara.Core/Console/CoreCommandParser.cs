@@ -275,6 +275,17 @@ public static class CoreCommandParser
         if (string.Equals(trimmed, "session gc", StringComparison.Ordinal))
             return (null, "用法：session gc <会话 id>");
 
+        if (string.Equals(trimmed, "session compact", StringComparison.Ordinal))
+            return (null, "用法：session compact <会话 id>");
+
+        if (trimmed.StartsWith("session compact ", StringComparison.OrdinalIgnoreCase))
+        {
+            var id = trimmed["session compact ".Length..].Trim();
+            return id.Length == 0
+                ? (null, "用法：session compact <会话 id>")
+                : (new CoreCommand.SessionCompact(id), null);
+        }
+
         if (IsClaimList(trimmed)) return (null, null);
 
         // 询问：挂起的唯一解除入口（`01` §3.8）。

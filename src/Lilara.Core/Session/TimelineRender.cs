@@ -18,6 +18,8 @@ public static class TimelineRender
     public static IReadOnlyList<TimelineEvent> Render(SessionStore store, SessionHandle handle)
     {
         var raw = store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+        var projection = ContextCompaction.Project(store, handle, raw);
+        var visible = projection.Suffix;
         var blobs = new BlobStore(store.DataRoot);
 
         // ⚠️ **次序：先解引用，再按记录的 id 回收，最后加框架。**
@@ -64,9 +66,12 @@ public static class TimelineRender
         // ⚠️ **这里只有「距离 + 可恢复」两条判据**（2026-10-11 补记）：**点杀**要走下面那个
         // 带 `staleProbe` 的重载（它要多读一次文件系统）。两条渲染路径的**次序、判据、
         // 框架那一步都是同一份代码**——差别只有「多不多跑点杀」这一个谓词。
-        var reclaimed = Reclaim.Decide(raw, blobs);
-        var applied = Reclaim.Apply([.. raw.Select(e => Dereference(e, blobs))], reclaimed);
-        return [.. applied.Select(WithFraming).Where(IsRenderable)];
+        var reclaimed = Reclaim.Decide(visible, blobs);
+        var applied = Reclaim.Apply([.. visible.Select(e => Dereference(e, blobs))], reclaimed);
+        var result = applied.Select(WithFraming).Where(IsRenderable).ToList();
+        if (projection.Checkpoint is { } checkpoint)
+            result.Insert(0, ContextCompaction.SummaryEvent(checkpoint));
+        return result;
     }
 
     /// <summary>
@@ -94,13 +99,15 @@ public static class TimelineRender
         if (staleProbe is null) return Render(store, handle);
 
         var raw = store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+        var projection = ContextCompaction.Project(store, handle, raw);
+        var visible = projection.Suffix;
         var blobs = new BlobStore(store.DataRoot);
 
         // ⚠️ **两条判据取<b>并集</b>**（`01` §11.3：「判据轴上三者并列取并集，不是三选一」）：
         // 可恢复那一条管「内容自己就够」，点杀那一条管「这个源后来被动过」。
         // 并集而不是交集，因为两者收的理由不同：一个是不需要了，一个是不对了。
-        var reclaimed = new HashSet<string>(Reclaim.Decide(raw, blobs), StringComparer.Ordinal);
-        foreach (var r in raw.OfType<TimelineEvent.ToolResultEvent>())
+        var reclaimed = new HashSet<string>(Reclaim.Decide(visible, blobs), StringComparer.Ordinal);
+        foreach (var r in visible.OfType<TimelineEvent.ToolResultEvent>())
         {
             // ⚠️ **过时的那一条仍然要过 `Recoverable`**：注记上写着「fetch(id) 取回」，
             // 而取不回的东西换成注记就是**一句假话**（`01` §8.0.2 二那条判据不是可选的）。
@@ -108,8 +115,11 @@ public static class TimelineRender
                 reclaimed.Add(r.Id);
         }
 
-        var applied = Reclaim.Apply([.. raw.Select(e => Dereference(e, blobs))], reclaimed);
-        return [.. applied.Select(WithFraming).Where(IsRenderable)];
+        var applied = Reclaim.Apply([.. visible.Select(e => Dereference(e, blobs))], reclaimed);
+        var result = applied.Select(WithFraming).Where(IsRenderable).ToList();
+        if (projection.Checkpoint is { } checkpoint)
+            result.Insert(0, ContextCompaction.SummaryEvent(checkpoint));
+        return result;
     }
 
     /// <summary>

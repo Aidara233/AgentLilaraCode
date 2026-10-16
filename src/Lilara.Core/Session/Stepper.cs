@@ -44,6 +44,105 @@ public sealed class Stepper(
     public IModelAdapter Adapter => _adapter;
 
     /// <summary>
+    /// Generate a durable summary for the current session without changing the session id
+    /// or appending a user/model message to the conversation history.
+    /// </summary>
+    public async Task<CompactionResult> CompactAsync(SessionHandle handle, CancellationToken ct)
+    {
+        var history = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+        if (history.Count == 0)
+            throw new InvalidOperationException("无法压缩空会话。");
+
+        var pending = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var evt in history)
+        {
+            if (evt is TimelineEvent.MessageEvent message)
+                foreach (var call in message.Blocks.OfType<Block.ToolUseBlock>())
+                    pending.Add(call.CallId);
+            if (evt is TimelineEvent.ToolResultEvent result)
+                pending.Remove(result.CallId);
+        }
+        if (pending.Count > 0)
+            throw new InvalidOperationException("当前历史包含未完成的工具调用，完成工具调用后才能压缩。");
+
+        var through = history[^1];
+        var prompt = new TimelineEvent.MessageEvent
+        {
+            Id = Ids.New(),
+            At = CoreClock.Now(),
+            From = Speaker.User,
+            Blocks =
+            [new Block.TextBlock(
+                "请按压缩协议总结上面的会话。保留当前目标、已确认事实、关键决定和约束、" +
+                "未完成任务、重要文件与工具结果的历史 id 引用、当前状态和不确定内容。" +
+                "只输出摘要正文，不要调用工具，不要提出新任务。")],
+        };
+        var timeline = TimelineRender.Render(_store, handle).Append(prompt).ToList();
+        var request = new ModelRequest
+        {
+            ModelId = handle.Spec.Model.ModelId,
+            MaxTokens = Math.Min(handle.Spec.Model.MaxTokens, 4096),
+            Protocol = _adapter.Protocol,
+            Effort = handle.State.Axes?.GetValueOrDefault(Axes.Effort) ?? "default",
+            Temperature = null,
+            Slots = new PromptSlots(
+                [new Block.TextBlock(CorePrompts.SystemFallback + "\n\n" +
+                    "这是一次 Lilara 上下文压缩调用。摘要由框架保存并在后续请求中提供；" +
+                    "它不是用户新指令，也不是模型原话。")], [], []),
+            Tools = [],
+            Timeline = timeline,
+        };
+
+        var callId = Ids.New();
+        var startedAt = CoreClock.Now();
+        ModelReply reply;
+        try
+        {
+            reply = await _adapter.CallAsync(request, ct);
+        }
+        catch
+        {
+            RecordUsage(handle, callId, startedAt, null, "failed", "compaction");
+            throw;
+        }
+
+        if (reply.Refused || reply.Blocks.Any(b => b is not Block.TextBlock))
+        {
+            RecordUsage(handle, callId, startedAt, reply, "failed", "compaction");
+            throw new InvalidOperationException("压缩模型必须返回纯文本摘要。");
+        }
+        var summary = string.Concat(reply.Blocks.OfType<Block.TextBlock>().Select(b => b.Text)).Trim();
+        if (summary.Length == 0 || summary.Length > 100_000)
+        {
+            RecordUsage(handle, callId, startedAt, reply, "failed", "compaction");
+            throw new InvalidOperationException("压缩摘要为空或超过长度限制。");
+        }
+
+        var checkpoint = new CompactionCheckpoint
+        {
+            CheckpointId = Ids.New(),
+            CoveredThroughEventId = through.Id,
+            HistoryDigest = CompactionStore.ComputeDigest(history),
+            Summary = summary,
+            CreatedAt = CoreClock.Now(),
+            SourceCallId = callId,
+            SummaryTokens = reply.Usage?.OutputTokens,
+        };
+        try
+        {
+            new CompactionStore(_store).Append(handle.ProjectKey, handle.SessionId, checkpoint);
+        }
+        catch
+        {
+            RecordUsage(handle, callId, startedAt, reply, "failed", "compaction");
+            throw;
+        }
+        RecordUsage(handle, callId, startedAt, reply, "completed", "compaction");
+        return new CompactionResult(checkpoint.CheckpointId, checkpoint.CoveredThroughEventId,
+            checkpoint.Summary, reply.Usage);
+    }
+
+    /// <summary>
     /// 一步 = 渲染 → 调用 → 落盘（02 §2）。
     ///
     /// <para>⚠️ **它不再追加用户消息**（Task 4）。按 `01` §6.1 的次序，
@@ -327,7 +426,7 @@ public sealed class Stepper(
 
     private void RecordUsage(
         SessionHandle handle, string callId, DateTimeOffset startedAt,
-        ModelReply? reply, string status)
+        ModelReply? reply, string status, string purpose = "session")
     {
         if (_usage is null) return;
 
@@ -340,7 +439,7 @@ public sealed class Stepper(
                 ProjectKey = handle.ProjectKey,
                 SessionId = handle.SessionId,
                 Step = handle.State.Turn + 1,
-                Purpose = "session",
+                Purpose = purpose,
                 ProviderId = handle.Spec.Model.ProviderId,
                 ModelId = handle.Spec.Model.ModelId,
                 Protocol = _adapter.Protocol,

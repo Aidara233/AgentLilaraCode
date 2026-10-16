@@ -239,6 +239,8 @@ public abstract record CoreCommand
     /// </summary>
     public sealed record SessionGc(string SessionId) : CoreCommand;
 
+    public sealed record SessionCompact(string SessionId) : CoreCommand;
+
     /// <summary>占用一片区域。路径可以是相对的，按会话的工作目录解析。</summary>
     /// <param name="Scope">
     /// **名字与形状都照协议**：release 的形参写作 `scope: [...]` ⇒ 它是**列表**。

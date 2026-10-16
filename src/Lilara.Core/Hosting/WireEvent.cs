@@ -23,6 +23,7 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(ApprovalResolved), "approval.resolved")]
 [JsonDerivedType(typeof(Error), "error")]
 [JsonDerivedType(typeof(UsageUpdated), "usage.updated")]
+[JsonDerivedType(typeof(CompactionCompleted), "session.compaction.completed")]
 public abstract record WireEvent
 {
     public sealed record SessionCreated(string SessionId, string ProjectKey) : WireEvent;
@@ -181,6 +182,9 @@ public abstract record WireEvent
     /// <summary>一次会话模型调用的 token 账本已经更新，头可据此刷新实时统计。</summary>
     public sealed record UsageUpdated(
         string SessionId, Storage.UsageCall Call, Storage.UsageSummary Summary) : WireEvent;
+
+    public sealed record CompactionCompleted(
+        string SessionId, string CheckpointId, string CoveredThroughEventId, long? SummaryTokens) : WireEvent;
 
     // 参数类型必须是 WireEvent（基类）：泛型版在静态类型推断成子类时会静默丢掉判别式。
     public static string StableSerialize(WireEvent value) =>

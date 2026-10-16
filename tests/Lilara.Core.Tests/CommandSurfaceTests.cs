@@ -52,6 +52,7 @@ public class CommandSurfaceTests
         (typeof(CoreCommand.SessionDelete),    "session.delete",    "session delete s1"),
         // 回收：手动触发（`01` §8.0.2）。四条线都在——控制台那句是 `session gc <id>`。
         (typeof(CoreCommand.SessionGc),        "session.gc",        "session gc s1"),
+        (typeof(CoreCommand.SessionCompact),   "session.compact",   "session compact s1"),
 
         (typeof(CoreCommand.ClaimAcquire),     null,                "claim src/foo"),
         (typeof(CoreCommand.ClaimRelease),     "claim.release",     "claim release src/foo"),

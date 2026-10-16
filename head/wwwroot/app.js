@@ -1736,6 +1736,15 @@ function handleEvent(p) {
       if (document.body.classList.contains("usage")) loadUsageView();
       break;
 
+    case "session.compaction.completed":
+      if (p.sessionId === current) {
+        openSession(current).then(() => {
+          if (p.coveredThroughEventId) renderMeta("ℹ 上下文已压缩至 " + p.coveredThroughEventId);
+        });
+      }
+      if (document.body.classList.contains("usage")) loadUsageView();
+      break;
+
     case "error":      // 业务失败走这里（不是 rejected：命令本身没写错）。
       if (p.sessionId === current) renderMeta("✗ " + p.message, "error");
       break;

@@ -200,6 +200,9 @@ public sealed class CommandDispatcher(
                 case CoreCommand.SessionGc g:
                     return HandleSessionGc(g, commandId);
 
+                case CoreCommand.SessionCompact c:
+                    return await HandleSessionCompactAsync(c, commandId, awaitCompletion, ct);
+
                 case CoreCommand.ClaimAcquire a: return HandleClaimAcquire(a, commandId);
                 case CoreCommand.ClaimRelease r: return HandleClaimRelease(r, commandId);
 
@@ -733,6 +736,155 @@ public sealed class CommandDispatcher(
             SessionId = g.SessionId,
             Note = reason,
         });
+    }
+
+    private async Task<DispatchResult> HandleSessionCompactAsync(
+        CoreCommand.SessionCompact c, string id, bool awaitCompletion, CancellationToken ct)
+    {
+        if (!TryFind(c.SessionId, out var handle, out var notFound))
+            return Reject(id, notFound!);
+        if (handle.IsRunning)
+            return Reject(id, "会话正在运行，请等待当前步骤结束后再压缩。");
+        if (handle.State.Status == SessionStatus.WaitingForInput)
+            return Reject(id, "会话正在等待工具审批，完成审批后再压缩。");
+        if (handle.QueueDepth > 0)
+            return Reject(id, "会话还有待处理消息，请先推进队列后再压缩。");
+
+        var gate = _host.GateFor(handle.SessionId);
+        if (!awaitCompletion)
+            return StartBackgroundCompaction(handle, id, gate);
+
+        await gate.WaitAsync(ct);
+        var entered = false;
+        CancellationTokenSource? stepCts = null;
+        try
+        {
+            if (handle.IsRunning || handle.QueueDepth > 0
+                || handle.State.Status == SessionStatus.WaitingForInput
+                || !(entered = handle.TryEnterStep()))
+                return Reject(id, "会话状态已变化，请稍后重试压缩。");
+            _host.Live.Mark(handle.SessionId);
+            stepCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _host.SetCts(handle.SessionId, stepCts);
+            try
+            {
+                var result = await CompactAndPublishAsync(handle, stepCts.Token);
+                return new DispatchResult(new Ack.Accepted
+                {
+                    CommandId = id,
+                    SessionId = handle.SessionId,
+                    Note = $"已压缩至 {result.CoveredThroughEventId}。"
+                });
+            }
+            catch (OperationCanceledException) when (stepCts.IsCancellationRequested)
+            {
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.Error(handle.SessionId, "上下文压缩已中断。"));
+                throw new DispatchException("上下文压缩已中断。");
+            }
+            catch (Exception ex)
+            {
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.Error(handle.SessionId, ex.Message));
+                throw new DispatchException(ex.Message, ex);
+            }
+        }
+        finally
+        {
+            if (entered)
+            {
+                _host.SetCts(handle.SessionId, null);
+                handle.ExitStep();
+                _host.Live.Clear(handle.SessionId);
+            }
+            stepCts?.Dispose();
+            gate.Release();
+            if (handle.QueueDepth > 0 && !handle.IsRunning) Start(handle);
+        }
+    }
+
+    private DispatchResult StartBackgroundCompaction(SessionHandle handle, string id, SemaphoreSlim gate)
+    {
+        if (!gate.Wait(0))
+            return Reject(id, "会话状态已变化，请稍后重试压缩。");
+
+        if (handle.IsRunning || handle.QueueDepth > 0
+            || handle.State.Status == SessionStatus.WaitingForInput
+            || !handle.TryEnterStep())
+        {
+            gate.Release();
+            return Reject(id, "会话状态已变化，请稍后重试压缩。");
+        }
+
+        var stepCts = new CancellationTokenSource();
+        _host.Live.Mark(handle.SessionId);
+        _host.SetCts(handle.SessionId, stepCts);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await CompactAndPublishAsync(handle, stepCts.Token);
+            }
+            catch (OperationCanceledException) when (stepCts.IsCancellationRequested)
+            {
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.Error(handle.SessionId, "上下文压缩已中断。"));
+            }
+            catch (Exception ex)
+            {
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.Error(handle.SessionId, ex.Message));
+            }
+            finally
+            {
+                _host.SetCts(handle.SessionId, null);
+                stepCts.Dispose();
+                handle.ExitStep();
+                _host.Live.Clear(handle.SessionId);
+                gate.Release();
+                if (handle.QueueDepth > 0 && !handle.IsRunning) Start(handle);
+            }
+        }, CancellationToken.None);
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            SessionId = handle.SessionId,
+            Note = "上下文压缩已开始。",
+        });
+    }
+
+    private async Task<CompactionResult> CompactAndPublishAsync(
+        SessionHandle handle, CancellationToken ct)
+    {
+        var usageCountBefore = _host.Usage.ForSession(handle.SessionId).Count;
+        CompactionResult result;
+        try
+        {
+            result = await _resolveStepper(handle).CompactAsync(handle, ct);
+        }
+        catch
+        {
+            PublishLatestUsage(handle, usageCountBefore);
+            throw;
+        }
+        PublishLatestUsage(handle, usageCountBefore);
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.CompactionCompleted(
+                handle.SessionId, result.CheckpointId,
+                result.CoveredThroughEventId, result.Usage?.OutputTokens));
+        return result;
+    }
+
+    private void PublishLatestUsage(SessionHandle handle, int countBefore)
+    {
+        var calls = _host.Usage.ForSession(handle.SessionId);
+        if (calls.Count <= countBefore) return;
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.UsageUpdated(
+                handle.SessionId,
+                calls[^1],
+                _host.Usage.Summarize(new Storage.UsageFilter { SessionId = handle.SessionId })));
     }
 
     private async Task<DispatchResult> HandleSessionSendAsync(
