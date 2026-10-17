@@ -3,6 +3,16 @@ using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Session.Tools;
 
+// ⚠️ **大小写判据只有这一份**：Windows 不敏感、Unix 敏感。`delete` 的 `IsRoot`
+// 原先写死 `OrdinalIgnoreCase`，与 `path` 的 `SamePath` 是两份判据（2026-10-17
+// 发布检查发现）——两层判据漂开的结果在 Unix 上是「工作目录根」被误判，而那条
+// 判据决定要不要拒绝删掉工作目录本身。
+internal static class FileOperationPaths
+{
+    public static StringComparison Comparison =>
+        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+}
+
 internal static class FileOperationArgs
 {
     public static bool? Boolean(string json, string key)
@@ -104,7 +114,7 @@ public sealed class DeleteTool : ITool
 
     private static bool IsRoot(string full, string root) =>
         full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            .Equals(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), StringComparison.OrdinalIgnoreCase);
+            .Equals(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), FileOperationPaths.Comparison);
 }
 
 /// <summary>移动、复制或重命名一个文件；不覆盖目标。</summary>
@@ -161,7 +171,7 @@ public sealed class PathTool : ITool
     private static bool SamePath(string a, string b) => string.Equals(
         Path.TrimEndingDirectorySeparator(Path.GetFullPath(a)),
         Path.TrimEndingDirectorySeparator(Path.GetFullPath(b)),
-        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+        FileOperationPaths.Comparison);
 
     private static bool IsRoot(string full, string root) => SamePath(full, root);
 }
