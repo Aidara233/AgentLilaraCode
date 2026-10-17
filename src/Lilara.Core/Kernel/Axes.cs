@@ -12,7 +12,7 @@ using System.Globalization;
 ///
 /// <para>⚠️ **但那是要去的方向，不是现状**，别照着写：**手抄的第二副本已经有两份**——
 /// `ClaudeRequestBuilder.ToEffort`（已知，计划 G10 那类，见 <see cref="Effort"/> 那条）
-/// 与 `head/wwwroot/app.js` 里的 `"safety"` / `"permission"` 两处字面量。
+/// 与 `src/Lilara.Head/wwwroot/app.js` 里的 `"safety"` / `"permission"` 两处字面量。
 /// 改这里的常量，那两处会**静默**错配（判据恒 false，相应的下拉与告警就不画了）。</para>
 ///
 /// <para>⚠️ **`effort` 在表里，但它不进上下文**（`01` §3.5：纯请求参数）。

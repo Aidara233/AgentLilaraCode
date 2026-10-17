@@ -24,6 +24,7 @@ let ws = null;
 let wsReady = false;                // 唯一的「可以发帧了吗」判据（见 connect()）
 let current = null;                 // 当前会话 id（视图，非真相）
 let epoch = 0;                      // 每次 openSession 自增，用来区分同 id 的并发重入
+const historyState = { id: null, cursor: null, more: false, loading: false };
 let creating = null;                // 刚发出的 session.create 的命令 id
 let currentProject = null;
 const sessions = new Map();         // sessionId -> { projectKey }（派生索引，次序 = 显示次序）
@@ -334,7 +335,7 @@ async function openSessionInner(id) {
   let state, history;
   try {
     state = await (await fetch(`${core}/sessions/${id}/state`)).json();
-    history = await (await fetch(`${core}/sessions/${id}/history`)).json();
+    history = await (await fetch(`${core}/sessions/${id}/history?limit=50`)).json();
   } catch (e) {
     if (gen !== epoch) return;
     // 没东西可画 ⇒ 退回「没选会话」，别留一个空壳。
@@ -371,7 +372,7 @@ async function openSessionInner(id) {
   // **留在上面、叠成两遍**。
   // ⚠️ 用 `replaceChildren`（不是 `innerHTML = ""` 再逐条）：一条语句换完，中间不留空白帧。
   $("timeline").replaceChildren();
-  for (const item of history.rendered) renderHistoryItem(item);
+  renderHistoryPage(history, false);
 
   await loadClaims();
 
@@ -434,58 +435,118 @@ function slotText(blocks) {
   return textOf(blocks);
 }
 
-function bodyOf(blocks) {
-  // ⚠️ **模型消息里可能夹着工具调用块**（`kind:"toolUse"`）——它们不是正文，
-  // 但**不显示的话**，模型那一步看起来像「什么都没干」，而它其实调了工具。
-  // 这个缺口在 2026-10-06 的工具批里才出现（那之前不存在 `toolUse` 块）。
-  const parts = [];
-  for (const b of blocks || []) {
-    if (b.kind === "text") parts.push(b.text);
-    // `arguments` 是**原文 JSON 串**（核心逐字存、逐字发）⇒ 原样显示，不解析。
-    else if (b.kind === "toolUse") parts.push(`⚒ ${b.name} ${b.arguments}`);
+function renderHistoryPage(page, prepend) {
+  historyState.id = current;
+  historyState.cursor = page.nextCursor || null;
+  historyState.more = !!page.hasMore;
+  const items = page.rendered || [];
+  const timeline = $("timeline");
+  const fragment = document.createDocumentFragment();
+  for (const item of items) {
+    if (!item.id || timeline.querySelector(`[data-history-id="${CSS.escape(item.id)}"]`)) continue;
+    fragment.appendChild(createHistoryItem(item));
   }
-  return parts.join("\n") || EMPTY_BODY;
+  if (prepend) {
+    const first = [...timeline.children].find((el) => el.id !== "history-more");
+    if (first) timeline.insertBefore(fragment, first);
+    else timeline.appendChild(fragment);
+  } else timeline.appendChild(fragment);
+  renderHistoryMore();
 }
 
-function renderTurn(from, blocks, cls) {
-  const el = document.createElement("div");
-  el.className = "turn " + (cls || from);
+function renderHistoryMore() {
+  let bar = $("history-more");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "history-more";
+    $("timeline").prepend(bar);
+  }
+  bar.replaceChildren();
+  if (!historyState.more) return;
+  const button = btn("加载更早记录", loadOlderHistory);
+  button.disabled = historyState.loading;
+  bar.appendChild(button);
+}
 
+async function loadOlderHistory() {
+  if (historyState.loading || !historyState.more || !historyState.cursor || !current) return;
+  historyState.loading = true;
+  renderHistoryMore();
+  const id = current;
+  try {
+    const r = await fetch(`${core}/sessions/${id}/history?limit=50&before=${encodeURIComponent(historyState.cursor)}`);
+    const page = await r.json();
+    if (!r.ok) throw new Error(page.error || "历史分页失败");
+    if (id === current) renderHistoryPage(page, true);
+  } catch (e) {
+    if (id === current) renderMeta("✗ 加载更早记录失败：" + (e.message || e), "error");
+  } finally {
+    historyState.loading = false;
+    if (id === current) renderHistoryMore();
+  }
+}
+
+  return (blocks || []).filter((b) => b.kind === "text").map((b) => b.text).join("") || EMPTY_BODY;
+}
+
+function renderTurn(from, blocks, cls, historyId) {
+  const item = { kind: "message", id: historyId || `live-${Date.now()}-${Math.random()}`, from, blocks };
+  renderHistoryItem(item, cls);
+}
+
+function detail(label, text, cls) {
+  const el = document.createElement("details");
+  el.className = "detail " + (cls || "");
+  const summary = document.createElement("summary");
+  summary.textContent = label;
+  const content = document.createElement("div");
+  content.className = "detail-body";
+  content.textContent = text || "（空）";
+  el.append(summary, content);
+  return el;
+}
+
+function blocksText(blocks) {
+  return (blocks || []).map((b) => b.kind === "text" ? b.text
+    : b.kind === "store" ? `（内容在库里 ${(b.sha256 || "").slice(0, 8)}…）`
+      : b.kind === "image" ? `（图片 ${(b.sha256 || "").slice(0, 8)}…）`
+        : b.kind === "reasoning" ? (b.text || "（内容已隐藏）") : `（${b.kind}）`).join("\n");
+}
+
+function createHistoryItem(t, cls) {
+  const wrap = document.createElement("div");
+  if (t.id) wrap.dataset.historyId = t.id;
+  wrap.className = "turn " + (cls || (t.kind === "toolResult" ? "meta" : t.from));
   const who = document.createElement("div");
   who.className = "who";
-  who.textContent = from === "user" ? "你" : "⏺";
-
+  who.textContent = t.kind === "toolResult" ? "·" : (t.from === "user" ? "你" : "⏺");
   const body = document.createElement("div");
   body.className = "body";
-  body.textContent = bodyOf(blocks);
 
-  el.append(who, body);
-  appendTimeline(el);
+  if (t.kind === "toolResult") {
+    body.appendChild(detail(`工具结果${t.callId ? ` · ${t.callId}` : ""}`, blocksText(t.blocks), "result"));
+  } else {
+    const text = (t.blocks || []).filter((b) => b.kind === "text").map((b) => b.text).join("");
+    if (text) body.appendChild(document.createTextNode(text));
+    for (const b of t.blocks || []) {
+      if (b.kind === "reasoning") {
+        body.appendChild(detail(b.reasoningKind === "redacted" ? "思考过程（已隐藏）" : "思考过程",
+          b.reasoningKind === "redacted" ? "内容已隐藏" : b.text, "reasoning"));
+      } else if (b.kind === "toolUse") {
+        body.appendChild(detail(`调用 ${b.name}`, b.arguments, "tool"));
+      } else if (!["text", "reasoning"].includes(b.kind)) {
+        body.appendChild(detail(`内容（${b.kind}）`, blocksText([b]), "tool"));
+      }
+    }
+  }
+  wrap.append(who, body);
+  return wrap;
 }
 
-/// <summary>
-/// `/history` 的每一项 → 一排。⚠️ **必须按 `kind` 分派**（2026-10-06 修）。
-///
-/// <para>原先这里写的是 `for (const t of history.rendered) renderTurn(t.from, t.blocks)`：
-/// 而核心给/工具结果那一项**没有 `from`**（它加了 `kind`/`callId`）⇒ 渲染成
-/// <c>class="turn undefined"</c> 与一个字面的「⏺」——**正是「刷新能看到、平时看不到」
-/// 那类错位**（刷新走这条路、实时走 `message.appended`，两条路画的东西不一样）。</para>
-/// </summary>
-function renderHistoryItem(t) {
-  if (t.kind === "toolResult") {
-    // ⚠️ 工具结果**不是「谁说的话」**（它是 user 角色里的载荷，`01` §3.6）⇒ 单独一类。
-    // ⚠️ 内容可能是**库地址**（`store` 块）而不是文本——那说明它太大、没内联进记录。
-    // 直接给个地址，不假装看到了内容（要真内容得另走 `GET /store/{sha256}`，还没做）。
-    const text = (t.blocks || []).map((b) =>
-      b.kind === "text" ? b.text
-        : b.kind === "store" ? `（内容在库里 ${(b.sha256 || "").slice(0, 8)}…）`
-          : b.kind === "image" ? `（图片 ${(b.sha256 || "").slice(0, 8)}…）`
-            : "").join("");
-    renderTurn("tool", [{ kind: "text", text }], "meta");
-    return;
-  }
-
-  renderTurn(t.from, t.blocks);
+function renderHistoryItem(t, cls) {
+  if (t.id && document.querySelector(`[data-history-id="${CSS.escape(t.id)}"]`)) return;
+  const el = createHistoryItem(t, cls);
+  appendTimeline(el);
 }
 
 function renderMeta(text, cls) {
@@ -1458,7 +1519,8 @@ async function refreshSessionInfo(id) {
 function handleEvent(p) {
   switch (p.kind) {
     case "message.appended":
-      if (p.sessionId === current) renderTurn(p.from, p.blocks);
+      if (p.sessionId === current)
+        renderTurn(p.from, p.blocks, null, p.historyId);
       break;
 
     case "session.step.begin":
@@ -1574,35 +1636,94 @@ $("text").onkeydown = (e) => { if (e.key === "Enter") send(); };
 $("nav-sessions").onclick = () => showView("sessions");
 $("nav-providers").onclick = () => showView("providers");
 
-// ---- 新建会话：选项目（工作目录）+ 起名 ----
-// ⚠️ 两者**都发 `session.create` 的字段**，不是「先建再改绑」——`create` 本来就定工作目录。
-// 工作目录决定落在哪个项目（项目键是它的纯函数），所以「选项目」与「选目录」是同一件事。
+// ---- 新建会话：在 core 设备的工作目录树中逐层选择 + 起名 ----
+// 浏览器只显示 core 返回的路径；不调用浏览器本机目录选择 API。
+let newDirectory = null;
 
-$("new").onclick = () => {
+$("new").onclick = async () => {
   $("new-form").hidden = false;
   $("new-note").textContent = "";
-  renderNewProjectOptions();
+  $("new-note").className = "note";
   $("new-title").value = "";
+  $("new-project").value = "";
+  await loadNewDirectory();
   $("new-project").focus();
 };
 
 $("new-cancel").onclick = () => { $("new-form").hidden = true; };
 
+async function loadNewDirectory(path) {
+  const note = $("new-note");
+  try {
+    const query = path ? `?path=${encodeURIComponent(path)}` : "";
+    const r = await fetch(`${core}/directories${query}`);
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || "目录不可用");
+    newDirectory = data;
+    renderNewDirectory(data);
+  } catch (e) {
+    newDirectory = null;
+    $("new-project").value = path || "";
+    $("new-directory").textContent = "";
+    note.textContent = "✗ 读不到 core 设备目录：" + (e.message || e);
+    note.className = "note-bad";
+  }
+}
+
+function renderNewDirectory(data) {
+  const note = $("new-note");
+  note.textContent = data.error ? "⚠️ " + data.error : "";
+  note.className = data.error ? "note-bad" : "note";
+
+  const bar = $("new-directory");
+  bar.innerHTML = "";
+  const path = document.createElement("span");
+  path.className = "path";
+  path.textContent = data.current || "core 设备文件系统根";
+  path.title = data.current || "core 设备文件系统根";
+  bar.appendChild(path);
+
+  const browseInput = btn("浏览输入路径", () => {
+    const requested = $("new-project").value.trim();
+    if (requested) loadNewDirectory(requested);
+  });
+  bar.appendChild(browseInput);
+
+  if (data.parent) {
+    const up = btn("返回上级", () => loadNewDirectory(data.parent));
+    bar.appendChild(up);
+  }
+
+  if (data.current) {
+    const choose = btn("选择此目录", () => {
+      $("new-project").value = data.current;
+      note.textContent = "已选择 core 设备目录。";
+      note.className = "note-ok";
+    }, "btn-primary");
+    bar.appendChild(choose);
+  }
+
+  const sel = $("new-project");
+  for (const d of data.directories || []) {
+    const enter = btn(`进入 ${d.name}`, () => loadNewDirectory(d.path));
+    bar.appendChild(enter);
+  }
+
+  // 浏览位置和待提交路径分开：浏览目录不应悄悄覆盖用户正在编辑的路径。
+  if (!sel.value && data.current) sel.value = data.current;
+}
+
 $("new-go").onclick = async () => {
   const note = $("new-note");
   const id = crypto.randomUUID().slice(0, 8);
-  const cwd = $("new-project").value;
+  const cwd = $("new-project").value.trim();
   const title = $("new-title").value.trim();
 
-  // 项目下拉给的是**绝对路径**（核心收的就是 cwd）。留空的那个占位项不能发。
-  if (!cwd) { note.textContent = "✗ 先选一个项目目录。"; note.className = "note-bad"; return; }
+  if (!cwd) { note.textContent = "✗ 先从 core 设备选择一个目录。"; note.className = "note-bad"; return; }
 
   const payload = { kind: "session.create", cwd };
-  if (title) payload.title = title;   // ⚠️ 空名字**整个键都不发**（不是发一个空串）
+  if (title) payload.title = title;
 
-  // ⚠️ 走 `commandNow`（要等回执才决定开不开、错了要显示在表单里），
-  // **不设 `creating`**：`onmessage` 里 `pendingAcks` 那条分支**先判且判完就 return**
-  // ⇒ 设了也永远不会被那条 `frame.id === creating` 的分支消费，只会留下一个陈旧的 id。
   const r = await commandNow(id, payload);
   if (!r.accepted) {
     note.textContent = "✗ " + r.reason;
@@ -1612,9 +1733,6 @@ $("new-go").onclick = async () => {
   $("new-form").hidden = true;
 
   try {
-    // ⚠️ **先切 `currentProject` 再打开**：头只订**一个**项目流（`currentProject`）。
-    // 表单允许建到别的项目 ⇒ 不切过去的话，那个会话的实时事件（步、轴、状态）**永远收不到**，
-    // 而且不会自愈——`loadSessions()` 只在 `currentProject === null` 时才认领一个。
     const st = await (await fetch(`${core}/sessions/${r.sessionId}/state`)).json();
     currentProject = st.spec.projectKey;
     await loadSessions();
@@ -1623,33 +1741,6 @@ $("new-go").onclick = async () => {
     renderMeta("✗ 会话建好了但打不开：" + (e && e.message ? e.message : e), "error");
   }
 };
-
-// 项目下拉的选项：**从核心派生**，与左栏分组是同一份数据。
-// ⚠️ **这不是全集**：`GET /projects` 是扫目录派生的，所以**一个会话都没有的项目根本列不出来**
-//    （哪怕那个目录里有 `.lilara/`）。这是核心的现有形状，头这边不假装它是全集——
-//    真要建到一个新目录，去控制台敲 `session create --cwd <目录>`。
-function renderNewProjectOptions() {
-  const sel = $("new-project");
-  sel.innerHTML = "";
-  const seen = new Set();
-
-  for (const [pk, meta] of projects) {
-    if (!meta.dir || seen.has(pk)) continue;
-    seen.add(pk);
-    const o = document.createElement("option");
-    o.value = meta.dir;                       // 核心收的是**目录**，不是项目键
-    o.textContent = `${dirName(meta.dir)}  ${meta.dir}`;
-    sel.appendChild(o);
-  }
-
-  // 没有已知项目时给一个空占位：让「没得选」看得见，而不是发一条空 cwd 出去。
-  if (!sel.options.length) {
-    const o = document.createElement("option");
-    o.value = "";
-    o.textContent = "（还没有已知目录 —— 去控制台敲 session create --cwd <目录>）";
-    sel.appendChild(o);
-  }
-}
 
 $("interrupt").onclick = () => {
   if (current) command(crypto.randomUUID().slice(0, 8), { kind: "session.interrupt", sessionId: current });

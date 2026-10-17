@@ -128,6 +128,9 @@ body {
 .newform-actions { display: flex; gap: 6px; }
 .newform-actions button { padding: 4px 10px; font-size: 11.5px; }
 .newform .note { margin-top: 6px; }
+.new-directory { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; min-height: 22px; }
+.new-directory .path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 10.5px var(--f-mono); color: var(--ink-2); }
+.new-directory button { padding: 2px 6px; font-size: 10.5px; }
 
 /* ---------- 供应商视图：占满工作区 ---------- */
 
@@ -470,6 +473,15 @@ button:disabled:hover { border-color: var(--rule); }
    ⚠️ 用 `:first-child { margin-top: auto }` 而不是 `justify-content: flex-end`——
    后者在内容溢出时会把顶部顶出可滚动区（读不回来）。 */
 #timeline > .turn:first-child { margin-top: auto; }
+#history-more { display: flex; justify-content: center; padding: 0 0 8px; order: -1; }
+#history-more button { padding: 3px 10px; font-size: 11px; }
+.detail { margin: 3px 0 5px; border: 1px solid var(--rule-soft); background: var(--bg); }
+.detail > summary { cursor: pointer; padding: 2px 7px; color: var(--ink-2); font: 11px var(--f-mono); }
+.detail > .detail-body { padding: 5px 8px 7px; white-space: pre-wrap; word-break: break-word; border-top: 1px solid var(--rule-soft); }
+.detail.tool { border-left: 2px solid var(--run); }
+.detail.reasoning { border-left: 2px solid var(--ink-3); }
+.detail.result { margin-left: 12px; border-left: 2px solid var(--accent); }
+.detail-waiting { color: var(--ink-3); font-size: 11px; }
 
 /* 时间线：说话者独立一列，正文一条竖轨。轨让「同一方的连续输出」看得出来。 */
 .turn {
@@ -764,8 +776,9 @@ button:disabled:hover { border-color: var(--rule); }
   <!-- 新建表单：默认收起。「新建」是个入口不是数据——一进页面就摊开一张空表单
        会把「我有哪些会话」这件事淹没掉（同供应商视图那张新建卡）。 -->
   <div id="new-form" class="newform" hidden>
-    <label for="new-project">项目（工作目录）</label>
-    <select id="new-project"></select>
+    <label for="new-project">core 设备目录</label>
+    <div id="new-directory" class="new-directory"></div>
+    <input id="new-project" class="mono" placeholder="输入 core 设备上的目录路径" autocomplete="off">
     <label for="new-title">会话名（可留空）</label>
     <input id="new-title" placeholder="留空就只有 id" autocomplete="off">
     <div class="newform-actions">
@@ -800,7 +813,7 @@ button:disabled:hover { border-color: var(--rule); }
     <span class="hint muted">也可以点上面的「供应商」在这里建（核心终端那条命令仍然管用）。</span>
   </div>
 
-  <div id="timeline"></div>
+  <div id="timeline" aria-live="polite"><div id="history-more"></div></div>
 
   <!-- 义务 1：两个槽位并排，空的也要显示。⚠️ 别改成折叠（05 §7.1）。 -->
   <div id="slots">

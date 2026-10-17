@@ -48,6 +48,8 @@ namespace Lilara.Core.Session.Tools;
 /// （线上的 `claim.release` 只改 `ClaimStore`、**时间线一个字不写** ⇒ 事后没有锚可倒查）。
 /// ⚠️ 与 `update` / `write` 的分工：那两个**动工作目录**，这一个**动上下文**——
 /// 而两者都是「核心的加载 / 渲染机制的入口」，同 `fetch` 给的是「模型能看见自己历史」。</para>
+///
+/// <para><see cref="SystemInfoTool"/> 是只读的按需设备快照：报告 CPU、内存、磁盘和可用时的 NVIDIA GPU 状态，不持续采样。</para>
 /// </summary>
 public static class BuiltInTools
 {
@@ -55,5 +57,6 @@ public static class BuiltInTools
     [
         new ListTool(), new ReadTool(), new FetchTool(), new AskTool(),
         new UpdateTool(), new WriteTool(), new ReleaseTool(),
+        new MakeDirectoryTool(), new DeleteTool(), new PathTool(), new SystemInfoTool(),
     ];
 }

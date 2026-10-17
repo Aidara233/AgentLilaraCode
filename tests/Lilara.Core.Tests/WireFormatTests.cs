@@ -75,9 +75,11 @@ public class WireFormatTests
     public void WireEvent_NestedBlocksKeepTheirDiscriminator()
     {
         var json = WireEvent.StableSerialize(new WireEvent.MessageAppended(
-            "s1", "user", [new Block.TextBlock("你好")], DateTimeOffset.UnixEpoch));
+            "s1", "user", [new Block.TextBlock("你好")], DateTimeOffset.UnixEpoch)
+            { HistoryId = "h1" });
 
         Assert.Contains("\"kind\":\"message.appended\"", json);
+        Assert.Contains("\"historyId\"", json);
         Assert.Contains("\"kind\":\"text\"", json);          // 嵌套块的判别式
         Assert.Contains("\"text\":\"你好\"", json);
     }
@@ -87,7 +89,8 @@ public class WireFormatTests
     public void WireEvent_ReasoningBlockWithoutSignature_OmitsTheKey()
     {
         var json = WireEvent.StableSerialize(new WireEvent.MessageAppended(
-            "s1", "model", [new Block.ReasoningBlock(null, "想")], DateTimeOffset.UnixEpoch));
+            "s1", "model", [new Block.ReasoningBlock(null, "想")], DateTimeOffset.UnixEpoch)
+            { HistoryId = "h1" });
 
         Assert.Contains("\"reasoningKind\":\"text\"", json);
         Assert.DoesNotContain("signature", json);

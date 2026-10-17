@@ -5,7 +5,7 @@ namespace Lilara.Core.Tests;
 /// <summary>
 /// **头的静态资源与它自己保持自洽**——一条不需要浏览器就能跑的检查。
 ///
-/// <para>⚠️ <b>它为什么存在</b>：头是**零构建**的前端，`head/wwwroot/` 就是最终产物，
+/// <para>⚠️ <b>它为什么存在</b>：头是**零构建**的前端，`src/Lilara.Head/wwwroot/` 就是最终产物，
 /// 于是「我改了、你说没效果」可以有四种成因（跑了另一份构建 / 没重建 / 浏览器缓存 /
 /// 改错了副本），而它们在页面上**长得一模一样**。</para>
 ///
@@ -15,14 +15,14 @@ namespace Lilara.Core.Tests;
 /// 且**一声不吭**（`app.js` 里那行赋值根本没执行到）。</para>
 ///
 /// <para>⚠️ <b>这条守卫只能覆盖「同一份源码内部自洽」</b>，覆盖不了「跑的是旧构建」——
-/// 那一半靠 `head.csproj` 的 <c>CopyToOutputDirectory="Always"</c>
+/// 那一半靠 `src/Lilara.Head/head.csproj` 的 <c>CopyToOutputDirectory="Always"</c>
 /// （副本永远被覆盖，残留不下来）与页面底栏那个「页面 …B @…」自述（点开就知道是哪一份）。
 /// 把边界写清楚，免得下一个人以为这条守卫管得更多。</para>
 /// </summary>
 public class HeadAssetsTests
 {
     private static string WebRoot() =>
-        Path.Combine(RepoRoot(), "head", "wwwroot");
+        Path.Combine(RepoRoot(), "src", "Lilara.Head", "wwwroot");
 
     private static string Read(string name) => File.ReadAllText(Path.Combine(WebRoot(), name));
 

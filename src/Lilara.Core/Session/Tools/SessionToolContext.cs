@@ -23,8 +23,10 @@ public sealed class SessionToolContext(
     string workingDirectory, BlobStore blobs, IReadOnlyList<TimelineEvent>? timeline = null)
     : IToolContext
 {
-    private readonly string _root = Path.GetFullPath(workingDirectory)
-        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    private readonly string _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workingDirectory));
+    private static StringComparison PathComparison => OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
 
     public string WorkingDirectory => _root;
 
@@ -44,8 +46,8 @@ public sealed class SessionToolContext(
     /// **那句断言是假的**：摘掉它，<c>ToolTests</c> 882 条全绿。
     /// ⇒ 两句谓词管同一件事就是「两层判据」的漂移温床（本仓栽过），删掉多的那句。</para>
     ///
-    /// <para>⚠️ <b>大小写按不敏感判</b>（Windows 的语义）。⚠️ <b>它拦不住符号链接 / 目录联接</b>
-    /// ——见 <see cref="IToolContext.ResolvePath"/> 的注释，那是**已认下的洞**。</para>
+    /// <para>⚠️ <b>比较规则按平台选择</b>：Windows 大小写不敏感，Unix 大小写敏感。⚠️ <b>它拦不住符号链接 / 目录联接</b>
+    /// ——路径只做词法规范化，链接目标未解析。</para>
     /// </summary>
     public string? ResolvePath(string relativePath)
     {
@@ -64,8 +66,8 @@ public sealed class SessionToolContext(
 
         // 判据：`full` 要么**就是**根，要么在「根 + 分隔符」之下。
         // ⚠️ 后半句那个分隔符不能省：不加的话 `C:\work-evil` 会被判成在 `C:\work` 之下。
-        return full.Equals(_root, StringComparison.OrdinalIgnoreCase)
-               || full.StartsWith(_root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+        return full.Equals(_root, PathComparison)
+               || full.StartsWith(Path.EndsInDirectorySeparator(_root) ? _root : _root + Path.DirectorySeparatorChar, PathComparison)
             ? full
             : null;
     }

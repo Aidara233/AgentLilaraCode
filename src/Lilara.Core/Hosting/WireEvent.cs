@@ -35,7 +35,11 @@ public abstract record WireEvent
     // 会重复：用户消息在 session.send 时发一次，步末若模型有输出再发一次 ⇒ 头必须幂等。
     // 这是当前实现的可观测行为，不是协议承诺（协议只承诺「有序」）。
     public sealed record MessageAppended(
-        string SessionId, string From, IReadOnlyList<Block> Blocks, DateTimeOffset At) : WireEvent;
+        string SessionId, string From, IReadOnlyList<Block> Blocks, DateTimeOffset At) : WireEvent
+    {
+        // 持久消息对应的 TimelineEvent.Id；临时消息可以为空。
+        public string? HistoryId { get; init; }
+    }
 
     public sealed record StateChanged(string SessionId, string Status, int Turn) : WireEvent;
 

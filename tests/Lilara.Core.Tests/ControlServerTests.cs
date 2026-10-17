@@ -113,7 +113,44 @@ public class ControlServerTests : IAsyncLifetime
         Assert.True(r.Headers.Contains("Access-Control-Allow-Origin"));
     }
 
-    // 控制面的核心验收：连上 → 订阅 → 发命令 → 拿到 ack → 事件到达。
+    [Fact]
+    public async Task Directories_StartAtCoreDeviceRootAndBrowseAnyExistingDirectory()
+    {
+        var outside = Path.Combine(Path.GetTempPath(), "lilara-cs-directory-" + Guid.NewGuid().ToString("N"));
+        var nested = Path.Combine(outside, "nested");
+        Directory.CreateDirectory(nested);
+        try
+        {
+            var rootResponse = await Client.GetAsync(Http("/directories"));
+            Assert.Equal(System.Net.HttpStatusCode.OK, rootResponse.StatusCode);
+            using var root = JsonDocument.Parse(await rootResponse.Content.ReadAsStringAsync());
+            Assert.True(root.RootElement.GetProperty("directories").GetArrayLength() > 0);
+            if (OperatingSystem.IsWindows())
+                Assert.False(root.RootElement.TryGetProperty("current", out _));
+            else
+                Assert.Equal(Path.GetPathRoot(_work), root.RootElement.GetProperty("current").GetString());
+            Assert.Empty(_host.Activated);
+
+            var response = await Client.GetAsync(
+                Http("/directories?path=" + Uri.EscapeDataString(outside)));
+            Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+            using var directory = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            Assert.Equal(Path.GetFullPath(outside), directory.RootElement.GetProperty("current").GetString());
+            Assert.Equal("nested", directory.RootElement.GetProperty("directories")[0].GetProperty("name").GetString());
+        }
+        finally { Directory.Delete(outside, recursive: true); }
+    }
+
+    [Fact]
+    public async Task Directories_RejectMissingPaths()
+    {
+        var missing = Path.Combine(Path.GetTempPath(), "lilara-missing-" + Guid.NewGuid().ToString("N"));
+        var response = await Client.GetAsync(Http("/directories?path=" + Uri.EscapeDataString(missing)));
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+
+    // 头端点只列直接子目录；它不应改变项目/会话状态。
     // 一次验掉 WS 握手、帧的序列化形状、命令投递即返回、事件带 seq 且单调。
     [Fact]
     public async Task WebSocket_AcksCommandsAndStreamsEvents()
@@ -964,8 +1001,7 @@ public class ControlServerTests : IAsyncLifetime
         // 嵌套那层也要钉：`endpoints` 里加个字段，顶层键集**看不见**。
         AssertKeysOf(root.GetProperty("endpoints"), "http", "ws");
 
-        // ⚠️ `/info` 交的 origin 必须**来自解析器**（今天的默认），不是端点里内联的第三份字面量。
-        // 这条把「核心放行的 origin」与「核心自述的 origin」钉成同一个值。
+        // ⚠️ `/info` 交的 origin 必须来自 AllowedOriginResolver，供 head 解释 WS 拒绝原因。
         Assert.Equal(AllowedOriginResolver.Resolve().Origin, root.GetProperty("allowedOrigin").GetString());
     }
 
@@ -1040,17 +1076,41 @@ public class ControlServerTests : IAsyncLifetime
             new CoreCommand.SessionSend(sid, [new Block.TextBlock("hi")]), "s", awaitCompletion: true, CancellationToken.None);
 
         var root = await GetJson($"/sessions/{sid}/history");
-        AssertKeysOf(root, "highWater", "rendered");
+        AssertKeysOf(root, "highWater", "rendered", "hasMore", "nextCursor");
 
         // `rendered` 的每一项来自 `ControlServer.Render`（核心渲染、头只显示）——
-        // 在这里钉它的键集，加字段会红。（`blocks` 自己那层归 `BlockTests`，不重复守。）
-        // ⚠️ `kind` 是 2026-10-06 加的：加了工具结果之后，`rendered` 里**不止消息一种**了
-        // ⇒ 头得能分辨（它按 kind 过滤不认识的）。工具结果那一支另给 `callId`、**没有 `from`**。
-        AssertEachItemKeysOf(root.GetProperty("rendered"), "kind", "from", "at", "blocks");
+        // 消息和工具结果都带稳定的记录 id；工具结果另有 callId 用于协议配对。
+        AssertEachItemKeysOf(root.GetProperty("rendered"), "kind", "id", "from", "at", "blocks");
     }
 
-    /// <summary>
-    /// ⚠️ **含工具调用的会话，`/history` 必须照常 200**（2026-10-06 修）。
+    [Fact]
+    public async Task Snapshot_History_PaginatesNewestThenOlder()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        for (var i = 0; i < 3; i++)
+            _host.Store.AppendEvent(Kernel.ProjectKey.FromPath(_work), sid, new TimelineEvent.MessageEvent
+            {
+                Id = $"h{i}", At = DateTimeOffset.UnixEpoch.AddSeconds(i), From = Speaker.User,
+                Blocks = [new Block.TextBlock($"m{i}")],
+            });
+
+        var first = await GetJson($"/sessions/{sid}/history?limit=2");
+        Assert.True(first.GetProperty("hasMore").GetBoolean());
+        Assert.Equal(new[] { "m1", "m2" }, first.GetProperty("rendered").EnumerateArray()
+            .Select(x => x.GetProperty("blocks")[0].GetProperty("text").GetString()).ToArray());
+        var cursor = first.GetProperty("nextCursor").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(cursor));
+
+        var older = await GetJson($"/sessions/{sid}/history?limit=2&before={Uri.EscapeDataString(cursor!)}");
+        Assert.False(older.GetProperty("hasMore").GetBoolean());
+        Assert.Equal("m0", older.GetProperty("rendered")[0].GetProperty("blocks")[0].GetProperty("text").GetString());
+
+        var invalid = await Client.GetAsync(Http($"/sessions/{sid}/history?limit=2&before=bad"));
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, invalid.StatusCode);
+    }
+
+
     ///
     /// <para>原先 `ControlServer.Render` 把每个事件**强转成 `MessageEvent`** ⇒ 遇到
     /// `ToolResultEvent` 直接 `InvalidCastException` ⇒ **端点 HTTP 500**
@@ -1506,7 +1566,6 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Equal(_root, root.GetProperty("dataRoot").GetString());
         Assert.Equal(ControlServer.DefaultAllowedOrigin, root.GetProperty("allowedOrigin").GetString());
         Assert.False(string.IsNullOrWhiteSpace(root.GetProperty("coreVersion").GetString()));
-        // 两个端点的 URL 都要给——头靠它才知道 WS 该连哪。
         Assert.Contains("/ws", root.GetProperty("endpoints").GetProperty("ws").GetString());
     }
 

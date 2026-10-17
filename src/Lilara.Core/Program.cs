@@ -145,21 +145,14 @@ var port = int.TryParse(Environment.GetEnvironmentVariable("LILARA_PORT"), out v
     ? p
     : ControlServer.DefaultPort;
 
-// ⚠️ WS 的 Origin 白名单**必须跟着头的端口走**，否则改头端口 ⇒ 浏览器 origin 变了 ⇒ 核心静默拒绝。
-// 解析器照 `EndpointResolver` 的先例：纯函数 + 返回值带来源，调用方必须印出来。
+// WS 的 Origin 白名单跟随头自己的端口配置。
 var allowedOrigin = AllowedOriginResolver.Resolve();
-
 var controlServer = new ControlServer(host, dispatcher, bus, port, allowedOrigin.Origin);
 WebApplication? api = null;
 try
 {
     api = await controlServer.StartAsync(CancellationToken.None);
     Console.WriteLine($"  控制面 {controlServer.Url}（头连这个；只监听本机）");
-    // ⚠️ **WS 只接受这个 origin 的页面**（见 `ControlServer.MapWebSocket` 的注释）。
-    // 印出来是为了**失败能自解释**：WS 握手被拒时浏览器**不把响应体交给页面 JS**，
-    // 页面只会「已断开·重连中」地无限重试 ⇒ 用户唯一能看到原因的渠道就是**这行横幅**。
-    // ⚠️ 这里读的是**实例值**（`AllowedOrigin`），不是默认常量——否则 origin 可配时，
-    // 横幅会印一个闸其实**拒绝**的 origin，而用户恰好靠横幅自解释失败原因。
     Console.WriteLine($"  WS 只接受来自 {controlServer.AllowedOrigin} 的页面（{AllowedOriginResolver.Describe(allowedOrigin.Source)}）。");
 }
 catch (Exception ex)

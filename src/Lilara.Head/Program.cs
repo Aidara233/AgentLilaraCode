@@ -32,7 +32,7 @@ app.UseDefaultFiles();
 // ⚠️ **静态文件不许被浏览器缓存**（2026-10-06 加，原因是同一类事故栽了三次）。
 //
 // 页面是 `index.html` + `app.js`，而 `app.js` 从来不换名字 ⇒ 浏览器完全有理由一直用旧的。
-// 更要命的是**同一次改动有多份副本**：`head/wwwroot/` 是源，`bin/Debug/.../wwwroot` 与
+// 更要命的是**同一次改动有多份副本**：`src/Lilara.Head/wwwroot/` 是源，`bin/Debug/.../wwwroot` 与
 // `bin/Release/.../wwwroot` 是**构建时复制**过去的，而**跑哪个构建就看哪一份**。
 // 于是「我改了、你却说没效果」可以有四种成因（跑了另一份构建 / 没重建 / 浏览器缓存 /
 // 改错了副本），而它们**在页面上长得一模一样**。
@@ -49,7 +49,7 @@ app.MapGet("/config.json", () => Results.Json(new { core }));
 
 // **页面自述**：它是由哪个构建的 `wwwroot` 提供的、那份 `app.js` 有多大。
 // ⚠️ 这一条是为了终结「我改了、你说没效果」那类对话：底栏显示的那两个数就是
-// **你现在看的这一份**，与 `head/wwwroot/app.js` 的属性一比对，答案立刻出来。
+// **你现在看的这一份**，与 `src/Lilara.Head/wwwroot/app.js` 的属性一比对，答案立刻出来。
 // ⚠️ 读的是 `AppContext.BaseDirectory`（= 静态文件的真实来源），不是源码目录。
 app.MapGet("/build.json", () =>
 {

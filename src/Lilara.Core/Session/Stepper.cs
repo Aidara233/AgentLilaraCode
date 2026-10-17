@@ -285,7 +285,8 @@ public sealed class Stepper(
                 Turn = s.Turn + 1,
             }, diskStatus: SessionStatus.WaitingForInput);
 
-            return new StepOutcome(reply, pending, handle.State.Ask?.DeadlineAt);
+            return new StepOutcome(reply, pending, handle.State.Ask?.DeadlineAt,
+                events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id);
         }
         // 一次落盘 = 一个原子。⚠️ 空批次**不写**（拒答且没有工具的那一步就是空的），
         // 而 `AppendEvents` 对空批次是 no-op、不抛——见它的注释。
@@ -316,7 +317,7 @@ public sealed class Stepper(
             PendingIntent = null,
         }, diskStatus: SessionStatus.Idle);
 
-        return new StepOutcome(reply);
+        return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id);
     }
 
     /// <summary>
@@ -541,7 +542,11 @@ public sealed class Stepper(
     /// 不重算的理由是「工具是纯的」这条契约不该在核心内部被当成可有可无
     /// （重算一遍会得到同一个答案，但那是**假设**，而不是这里能证明的事）。
     /// </param>
-    public sealed record StepOutcome(ModelReply Reply, AskRequest? Refused = null, DateTimeOffset? DeadlineAt = null);
+    public sealed record StepOutcome(
+        ModelReply Reply,
+        AskRequest? Refused = null,
+        DateTimeOffset? DeadlineAt = null,
+        string? HistoryId = null);
 
     /// <summary>
     /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。

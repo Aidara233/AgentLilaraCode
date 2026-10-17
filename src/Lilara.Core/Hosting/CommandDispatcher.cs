@@ -744,10 +744,11 @@ public sealed class CommandDispatcher(
         // 这两步刻意不拿闸：合并是队列的副产品，而 no-op 的前提是后来的 send 先进得来。
         // 并发安全靠各自那层的锁：`HistoryLog.Append` 自带按路径的锁，`SessionHandle.Enqueue` 自带队列锁。
         var at = CoreClock.Now();
+        var historyId = Ids.New();
 
         _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
         {
-            Id = Ids.New(),
+            Id = historyId,
             At = at,
             From = Speaker.User,
             Blocks = s.Blocks,
@@ -762,7 +763,10 @@ public sealed class CommandDispatcher(
         // 事件从 dispatcher 发，不从 `Stepper` 发——否则控制台敲的那句话在头上看不见
         // （控制台不订阅，但它的命令照样产生事件；缺了它头的视图会静默少一步）。
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-            new WireEvent.MessageAppended(handle.SessionId, "user", s.Blocks, at));
+            new WireEvent.MessageAppended(handle.SessionId, "user", s.Blocks, at)
+            {
+                HistoryId = historyId,
+            });
 
         // 启动去重：已有推进在飞时，本次只入队、不再安排一次推进。
         if (!handle.TryEnterStep())
@@ -859,7 +863,10 @@ public sealed class CommandDispatcher(
                 // 模型消息由这里发（`Stepper` 不碰事件总线）；判据与它落盘时一致：拒答 / 空块不产生模型消息。
                 if (!reply.Refused && reply.Blocks.Count > 0)
                     _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                        new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, CoreClock.Now()));
+                        new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, CoreClock.Now())
+                        {
+                            HistoryId = step.HistoryId,
+                        });
             }
 
             // ⚠️ **挂起也要发事件**（`01` §3.8）：一条头收不到的问题 = 会话被**静默挂起**。
