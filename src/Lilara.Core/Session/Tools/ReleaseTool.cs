@@ -88,14 +88,25 @@ public sealed class ReleaseTool : ITool
         // 或 `"src,lib"`（一段逗号分隔的话）。两种都不解析 ⇒ 这里回一句说得清的话，
         // **而不是悄悄当成一个路径**——那会让一次「释放 src 和 lib」变成「释放一个叫
         // `src,lib` 的路径」，**一条也收不掉**，而两边都以为说清了。
-        if (ToolArgs.StringArray(call.ArgumentsJson, "scope") is null)
+        // ⚠️ **非空也是约定的一半**：JSON Schema 里 `scope` 只写 `type: array`
+        // （这个字符串原样发给 provider，保持最保守的形状）——空数组由上面那句显式拒绝。
+        // ⚠️ **空数组也要回一句**：`ToolArgs.StringArray` 对 `[]` 返回**空列表**
+        // （不是 `null`——`[]` 是模型明确说的「没有」，见那里的注释），而推进器
+        // （`Stepper.RecordRelease`）对空 scope **不画线**。⇒ 这里只判 `null` 的话，
+        // 一次「释放了个寂寞」会回一句「已释放。」，而记录里一条线都没有——
+        // 模型以为收掉了，上下文一个字没变。两处判据必须是同一个。
+        if (ToolArgs.StringArray(call.ArgumentsJson, "scope") is not { Count: > 0 })
         {
             return Task.FromResult(ToolText.Of(
-                "`scope` 要给一个**路径的数组**，比如 [\"src\", \"docs\"]。"
-                + "给单个字符串、或一串逗号分隔的话，我都读不出来。"));
+                "`scope` 要给一个**非空**的路径数组，比如 [\"src\", \"docs\"]。"
+                + "给单个字符串、一串逗号分隔的话、或者空数组，我都读不出来。"));
         }
 
         // 工具本身**什么都不做**：线的落点在推进器（它要写进记录）。
+        // ⚠️ **两条执行路径各画一次**（2026-10-17）：`Stepper.StepAsync` 与本批挂起后
+        // 用户批准的恢复路径 `Stepper.ResumeAsync`——两处都只给执行器交回的
+        // 「真正执行过」的调用画线（`ToolExecutor.Batch.ExecutedCallIds`）。
+        // ⇒ 这一句「已释放。」是**两个判据都成立之后**才说得出的话。
         // ⇒ 这条结果是一句确认，篇幅压到最短——它进上下文，而它没有信息量。
         return Task.FromResult(ToolText.Of("已释放。"));
     }

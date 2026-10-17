@@ -250,8 +250,15 @@ public sealed class Stepper(
             //
             // ⚠️ **配对不受影响**：它照样返回一条（空的）结果、照样配那条 `tool_use`——
             // 「一对不能拆」那条不变量一个字没动，所以这里不新增任何特例。
-            foreach (var release in toolCalls.Where(c => c.Name == ReleaseTool.NameOf))
-                if (RecordRelease(release, at) is { } line) events.Add(line);
+            //
+            // ⚠️ **只给真正执行过的那些画线**（2026-10-17）：闸门硬拒（`off` 档）的调用
+            // 也在这一批里、名字也叫 `release`，但它**一次都没跑**——为它画线等于让
+            // 一次被拒绝的操作改变上下文。判据由执行器交回（`Batch.ExecutedCallIds`），
+            // 因为「跑没跑」只有它知道。
+            foreach (var callId in batch.ExecutedCallIds)
+                if (toolCalls.FirstOrDefault(c => string.Equals(c.CallId, callId, StringComparison.Ordinal)) is { Name: ReleaseTool.NameOf } release
+                    && RecordRelease(release, at) is { } line)
+                    events.Add(line);
         }
 
         // ⚠️ **有问 ⇒ 中止这一步的「执行」，但那条模型消息照样落盘**（`01` §3.8）。
@@ -480,6 +487,20 @@ public sealed class Stepper(
 
             var batch = await executor.ExecuteAsync(calls, context, ct, reply);
             events.AddRange(batch.Results);
+
+            // ⚠️ **`release` 的线在这里也要落**（2026-10-17）——原先只在 `StepAsync` 有一半：
+            // 一批里只要有一条要问，整批就挂起；用户批准之后全部执行（`ToolExecutor` 的
+            // `Reply.Covers`），`release` 照样返回「已释放。」，而这里若不画线，
+            // **记录里一条线都没有**，上下文也不会回收——两边都看着正常。
+            // ⇒ 与 `StepAsync` 走**同一个 `RecordRelease`、同一份执行名单**，
+            // 不另写一份判据。
+            //
+            // ⚠️ **时刻用 `CoreClock.Now()`，不用「步开始」**：这一步没有模型调用，
+            // 它是**用户答复**那一刻发生的执行——与 `Answer` / `Blocked` 里的 `At` 同源。
+            foreach (var callId in batch.ExecutedCallIds)
+                if (calls.FirstOrDefault(c => string.Equals(c.CallId, callId, StringComparison.Ordinal)) is { Name: ReleaseTool.NameOf } release
+                    && RecordRelease(release, CoreClock.Now()) is { } line)
+                    events.Add(line);
 
             // ⚠️ **还有没答到的**（一张卡只答了一部分）⇒ 重新挂起，那些 `tool_use` 继续悬着
             // ——而这次悬着是**对的**：它们确实还没被回答。
