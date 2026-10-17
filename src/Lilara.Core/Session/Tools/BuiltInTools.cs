@@ -50,6 +50,12 @@ namespace Lilara.Core.Session.Tools;
 /// 而两者都是「核心的加载 / 渲染机制的入口」，同 `fetch` 给的是「模型能看见自己历史」。</para>
 ///
 /// <para><see cref="SystemInfoTool"/> 是只读的按需设备快照：报告 CPU、内存、磁盘和可用时的 NVIDIA GPU 状态，不持续采样。</para>
+///
+/// <para>⚠️ <b><see cref="FloatingContextTool"/>（2026-10-17）是这一列里唯一一个「核心自己每步都会合成调用它」的工具</b>：
+/// 浮动块不再拼进 user 消息，而是由 <c>Stepper.FloatingContextPair</c> 在时间线末尾
+/// 合成一对 <c>tool_use</c> + <c>tool_result</c>——那条合成的调用引用的就是这个**声明过的名字**。
+/// ⚠️ 合成本身**不经过执行器**；本表里的实例只在模型**自己**真调一次时执行（兜底）。
+/// 它仍然算「机制」：开的是「模型能看见核心每步注入的那块状态」这扇门。</para>
 /// </summary>
 public static class BuiltInTools
 {
@@ -58,5 +64,6 @@ public static class BuiltInTools
         new ListTool(), new ReadTool(), new FetchTool(), new AskTool(),
         new UpdateTool(), new WriteTool(), new ReleaseTool(),
         new MakeDirectoryTool(), new DeleteTool(), new PathTool(), new SystemInfoTool(), new GitReadTool(), new GitWriteTool(),
+        new DotnetBuildTool(), new DotnetTestTool(), new FloatingContextTool(),
     ];
 }

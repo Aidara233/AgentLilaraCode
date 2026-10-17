@@ -6,7 +6,9 @@ namespace Lilara.Core.Session.Tools;
 
 public sealed class GitReadTool : ITool
 {
-    private const int MaxOutputBytes = ToolLimits.MaxResultBytes - 8192;
+    // ⚠️ 采集上限 = **保存**上限（`01` §9.3，2026-10-17）：大结果全量入档，
+    // 喂给模型的截断由 `TimelineRender.RenderForModel` 一处做。工具这里只防「一次调用撑爆内存 / 盘」。
+    private const int MaxOutputBytes = ToolLimits.MaxToolOutputBytes;
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(8);
     private readonly string _gitExecutable;
 
@@ -322,17 +324,22 @@ public sealed class GitReadTool : ITool
 
     private static string Format(string command, string stdout, int exitCode, string stderr, bool truncated)
     {
+        // ⚠️ 这里的 `truncated` 只可能来自**保存上限**（4 MiB），不再是投递预算：
+        // 一般的「输出长」应当**完整入档**，由渲染层投递给模型打开头一段 + `fetch` 接续。
+        // 走到这里说明单次调用真的到了保存上限——那是一条**罕见且明确**的失败形态，要说清楚。
         var result = new StringBuilder($"git {command}：\n");
-        var marker = truncated ? "\n[输出已截断；请缩小路径或分页范围后重试。]\n" : "";
-        var bodyLimit = ToolLimits.MaxResultBytes - marker.Length;
+        var marker = truncated
+            ? $"\n[输出超过单次保存上限 {ToolLimits.MaxToolOutputBytes} 字节，余下部分未采集；请缩小查询范围重试。]\n"
+            : "";
+        var bodyLimit = ToolLimits.MaxToolOutputBytes - marker.Length;
         result.Append(stdout.Length <= bodyLimit ? stdout : stdout[..bodyLimit]);
         if (stdout.Length == 0) result.Append("(无输出)\n");
         if (truncated) result.Append(marker);
-        if (!string.IsNullOrWhiteSpace(stderr) && result.Length < ToolLimits.MaxResultBytes - 256)
+        if (!string.IsNullOrWhiteSpace(stderr) && result.Length < ToolLimits.MaxToolOutputBytes - 256)
             result.AppendLine($"\nstderr: {stderr.Trim()}");
-        if (exitCode != 0 && result.Length < ToolLimits.MaxResultBytes - 64)
+        if (exitCode != 0 && result.Length < ToolLimits.MaxToolOutputBytes - 64)
             result.AppendLine($"\n退出码：{exitCode}");
-        if (result.Length > ToolLimits.MaxResultBytes) result.Length = ToolLimits.MaxResultBytes;
+        if (result.Length > ToolLimits.MaxToolOutputBytes) result.Length = ToolLimits.MaxToolOutputBytes;
         return result.ToString();
     }
 

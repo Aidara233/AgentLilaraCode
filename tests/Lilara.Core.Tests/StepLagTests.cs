@@ -104,7 +104,8 @@ public class StepLagTests : IDisposable
 
         // ⚠️ 断言落在**第 2 步的请求**上：那是模型实际拿到的字节。
         // 拿盘面断言是不够的——盘面**永远不会**有回收的痕迹（回收只换渲染，§8.0.2 一/八）。
-        var sent = _adapter.Calls[1].Timeline.OfType<TimelineEvent.ToolResultEvent>().Single();
+        var sent = _adapter.Calls[1].Timeline.OfType<TimelineEvent.ToolResultEvent>()
+            .Single(r => r.CallId == "c1");
         Assert.Contains(original, TextOf(sent), StringComparison.Ordinal);
     }
 

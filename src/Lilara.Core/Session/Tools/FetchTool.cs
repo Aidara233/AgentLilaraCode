@@ -35,9 +35,10 @@ public sealed class FetchTool : ITool
 
 
     public string Description =>
-        "取回一条**旧工具结果**当时的内容（被回收之后你只看到一条 [已回收] 注记，"
-        + "注记里有它的 id）。给的是**当时那份字节**，不是现在的值——"
-        + "想要现在的值，自己重调一次那个工具。";
+        "取回一条**旧工具结果**当时的原文。被回收的注记写着 `fetch(id=…)`；"
+        + "被**截断**的注记写着 `fetch(id=…, offset=…)`——照它给的位置接着读即可，不必重跑工具。"
+        + "给的是**当时那份字节**，不是现在的值。"
+        + "`offset` 是字节位置（0 基），`length` 最多取多少字节；都不给 = 从头取（单次仍有上限）。";
 
     public string ParametersSchemaJson => """
         {
@@ -45,7 +46,15 @@ public sealed class FetchTool : ITool
           "properties": {
             "id": {
               "type": "string",
-              "description": "[已回收] 注记里给出的那个 id。"
+              "description": "注记里给出的那个稳定 id。"
+            },
+            "offset": {
+              "type": "integer",
+              "description": "从这个字节开始取（0 基）。截断注记里给的就是这个位置。省略 = 0。"
+            },
+            "length": {
+              "type": "integer",
+              "description": "最多取多少字节（正整数）。省略 = 取到结果尾（但单次仍有上限）。"
             }
           },
           "required": ["id"]
@@ -63,27 +72,108 @@ public sealed class FetchTool : ITool
         // 一条结果可以是「这是那张图」+ 图那样一串块，也可以是纯图、一个字都没有
         // （`01` §3.6 ①之一）。⇒ 原样交回，**不折成一段文本**：
         // 折了之后图没了而描述还在 ⇒ 多一条**假信息**（图上写着 42，图已经不在了）。
-        if (context.SnapshotOf(id) is not { } blocks)
+        if (!ToolPaths.HasKey(call.ArgumentsJson, "offset") && !ToolPaths.HasKey(call.ArgumentsJson, "length"))
         {
-            // ⚠️ 取不到要合成**一句人话**，而不是一个空结果：空结果会让模型
-            // 以为「那次调用没有输出」，而它其实只是**找不到了**（`01` §8.0.2 六末）。
-            return Task.FromResult(ToolText.Of(
-                $"取不回 id 为 {id} 的那条结果：没有这一条（可能写错了 id，"
-                + "或者它所在的那段历史已经被截断）。"));
+            if (context.SnapshotOf(id) is not { } blocks)
+                return Task.FromResult(NotFound(id));
+
+            // ⚠️ **取回的永远是「一串块」，不是一条 `Ref`**（`01` §8.0.2 六「解到最底」）：
+            // 句柄走的是**库地址**那条路（`SnapshotOf` → `TimelineRender.Dereference`），
+            // 取回来的是**当时的字节**，所以 `fetch(fetch(x) 的 id)` 天然不会串成链。
+            //
+            // ⚠️ **不包信封、不注入 `tool_use`**（§8.0.2 六那两条硬理由）：
+            // 身份信息（id 在参数里、是什么工具在注记里）不需要塞进结果，再包一层是同一件事说两遍；
+            // 而伪造一条 `tool_use` 会让**记录谎报「模型看到过什么」**。
+            return Task.FromResult(new ToolOutcome { Content = blocks });
         }
 
-        // ⚠️ **取回的永远是「一串块」，不是一条 `Ref`**（`01` §8.0.2 六「解到最底」）：
-        // 句柄走的是**库地址**那条路（`SnapshotOf` → `TimelineRender.Dereference`），
-        // 取回来的是**当时的字节**，所以 `fetch(fetch(x) 的 id)` 天然不会串成链。
-        //
-        // ⚠️ 而这条性质**不是可有可无的**：`TimelineRender` 解 `Ref` 时**不递归**
-        // （它只解一层）。⇒ 若哪天 `SnapshotOf` 改成返回引用而不是内容，
-        // 一条指向 `fetch` 自己的引用会在渲染时解出一串空内容——**静默地少一段**。
-        // 那条测试（`FetchTests` 里钉形状的那条）就是为此存在的。
-        //
-        // ⚠️ **不包信封、不注入 `tool_use`**（§8.0.2 六那两条硬理由）：
-        // 身份信息（id 在参数里、是什么工具在注记里）不需要塞进结果，再包一层是同一件事说两遍；
-        // 而伪造一条 `tool_use` 会让**记录谎报「模型看到过什么」**，还顺手砸掉头存在的理由。
-        return Task.FromResult(new ToolOutcome { Content = blocks });
+        // ---- 窗口取回：只对「单文本块」的结果成立 ----
+        var offset = ToolArgs.Number(call.ArgumentsJson, "offset") ?? 0;
+        if (offset < 0) return Task.FromResult(ToolText.Of($"`offset` 不能是负数（给的是 {offset}）。"));
+
+        long? length = null;
+        if (ToolPaths.HasKey(call.ArgumentsJson, "length"))
+        {
+            length = ToolArgs.Number(call.ArgumentsJson, "length");
+            if (length is not { } l || l <= 0)
+                return Task.FromResult(ToolText.Of("`length` 要是正整数（最多取多少字节）。"));
+        }
+
+        if (context.RawBytesOf(id) is not { } bytes)
+        {
+            // ⚠️ 两种「按字节取不了」要分开说：**没有这条**（id 错 / 被截断的历史）
+            // 与**形状不对**（混排 / 图片）。用户的下一步动作不同。
+            return Task.FromResult(context.SnapshotOf(id) is null
+                ? NotFound(id)
+                : ToolText.Of(
+                    $"id {id} 的那条结果不是单文本内容（可能含图片或多个块），不能按字节偏移取回；"
+                    + "去掉 `offset` / `length` 可以取回它的全部内容。"));
+        }
+
+        if (offset >= bytes.Length)
+        {
+            // ⚠️ **不是空结果**：空结果会让模型以为「那次调用没有输出」，
+            // 而它其实只是**取过头了**（同 `read` 那条判据）。
+            return Task.FromResult(ToolText.Of(
+                $"这条结果一共 {bytes.Length} 字节，从第 {offset} 字节之后就没有内容了。"));
+        }
+
+        // ⚠️ 窗口上限 = **保存上限**，不是 `MaxResultBytes`：取回是模型点名要的一段，
+        // 而投递预算对 `fetch` 也是保存上限（`ToolLimits.DeliveryBudgetOf`）——
+        // 两边共用一个数，取回来的东西才不会在渲染时又被砍掉。
+        var count = Math.Min(Math.Min(length ?? ToolLimits.MaxToolOutputBytes, ToolLimits.MaxToolOutputBytes),
+            bytes.Length - offset);
+        var window = bytes.AsSpan((int)offset, (int)count);
+        var text = DecodeFixed(window, offset > 0, offset + count < bytes.Length);
+
+        return Task.FromResult(new ToolOutcome
+        {
+            Content = [new Block.TextBlock(text)],
+            // ⚠️ 范围写进框架（`01` §3.7）：被截断这件事必须**明说**，
+            // 否则模型会把「前一段」当成全文——那是「多了一条假信息」。
+            Framing = new ToolFraming("fetch", [
+                new ToolFramingField("id", id),
+                new ToolFramingField("第", $"{offset}–{offset + count}"),
+                new ToolFramingField("共", bytes.Length.ToString()),
+            ]),
+        });
+    }
+
+    private static ToolOutcome NotFound(string id) => ToolText.Of(
+        $"取不回 id 为 {id} 的那条结果：没有这一条（可能写错了 id，"
+        + "或者它所在的那段历史已经被截断）。");
+
+    /// <summary>
+    /// 把一段**可能是半截字符**的字节解成文本，必要时往两侧对齐到字符边界。
+    /// ⚠️ 与 `read` 的 `Decode` 同一判据（剥掉首尾不完整的序列，而不是换成 U+FFFD）：
+    /// 边界处的半个字符**根本不是内容**——它是我们切出来的。
+    /// </summary>
+    private static string DecodeFixed(ReadOnlySpan<byte> bytes, bool trimHead, bool trimTail)
+    {
+        var start = 0;
+        var end = bytes.Length;
+
+        if (trimHead)
+            while (start < end && (bytes[start] & 0xC0) == 0x80) start++;
+
+        if (trimTail)
+        {
+            var i = end - 1;
+            while (i >= start && (bytes[i] & 0xC0) == 0x80) i--;
+            if (i >= start)
+            {
+                var need = bytes[i] switch
+                {
+                    >= 0xF0 => 4,
+                    >= 0xE0 => 3,
+                    >= 0xC0 => 2,
+                    _ => 1,
+                };
+                if (i + need > end) end = i;
+            }
+        }
+
+        return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false)
+            .GetString(bytes[start..end]);
     }
 }

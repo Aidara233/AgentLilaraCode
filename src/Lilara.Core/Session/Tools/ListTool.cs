@@ -352,12 +352,14 @@ public sealed class ReadTool : ITool
         // 上限只能有一个源。`ls` 里那句「这个文件太大」读的是同一个数）。
         //
         // ⚠️ **两层 `Min` 看着冗余，其实不是**——而且删掉外层的那次变异**差点被放过去**：
-        //   · 内层 `limit ?? Max` 管的是**没给 limit** 那一半
-        //   · 外层那个 `Min(…, Max)` 管的是**给了 limit** 那一半
+        //   · 内层 `limit ?? Save` 管的是**没给 limit** 那一半
+        //   · 外层那个 `Min(…, Save)` 管的是**给了 limit** 那一半
         // ⇒ 只留内层时，`{"limit": 786432}` 就**原样读 786432 字节**——
         //   **上限被模型自己的参数绕过去了**，而那正是这个功能存在的全部意义。
-        // ⚠️ 判据：`limit` 是**请求**，`MaxResultBytes` 是**约束**。请求可以小于约束，不能大于。
-        var count = Math.Min(Math.Min(limit ?? ToolLimits.MaxResultBytes, ToolLimits.MaxResultBytes), length - offset);
+        // ⚠️ 判据：`limit` 是**请求**，保存上限是**约束**。请求可以小于约束，不能大于。
+        // ⚠️ 这里的上限是**保存**上限（2026-10-17）：读进来的这一段会完整入档；
+        // 投递给模型时若超预算，由 `TimelineRender.RenderForModel` 打开头一段 + `fetch` 接续。
+        var count = Math.Min(Math.Min(limit ?? ToolLimits.MaxToolOutputBytes, ToolLimits.MaxToolOutputBytes), length - offset);
 
         byte[] bytes;
         try

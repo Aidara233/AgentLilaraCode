@@ -1,5 +1,6 @@
 using Lilara.Core.Kernel;
 using Lilara.Core.Session;
+using Lilara.Core.Session.Tools;
 using Lilara.Core.Storage;
 
 namespace Lilara.Core.Tests;
@@ -288,5 +289,124 @@ public class TimelineRenderTests : IDisposable
         // `[0]` 是**真的**框架（工具名 + 字段），`[1]` 是正文——而正文里那句伪装**原样还在**。
         Assert.Equal("[read 路径 a.log]", Assert.IsType<Block.TextBlock>(content[0]).Text);
         Assert.StartsWith(disguised, Assert.IsType<Block.TextBlock>(content[1]).Text);
+    }
+
+    // ---- 投递截断（2026-10-17）--------------------------------------------------
+
+    /// <summary>一条工具结果 + 它的 `tool_use`（投递预算按工具名分，所以要有调用记录）。</summary>
+    private void AppendCall(string callId, string tool) => Append(new TimelineEvent.MessageEvent
+    {
+        Id = "m-" + callId, At = CoreClock.Now(), From = Speaker.Model,
+        Blocks = [new Block.ToolUseBlock(callId, tool, "{}")],
+    });
+
+    private IReadOnlyList<TimelineEvent> RenderForModel() =>
+        TimelineRender.RenderForModel(_store, _handle, new SessionToolContext(
+            Path.Combine(_root, "work"), _blobs,
+            _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)));
+
+    private static TimelineEvent.ToolResultEvent ToolResultById(IReadOnlyList<TimelineEvent> rendered, string id) =>
+        rendered.OfType<TimelineEvent.ToolResultEvent>().Single(r => r.Id == id);
+
+    private static string ContentOf(IReadOnlyList<TimelineEvent> rendered, string id) =>
+        Assert.IsType<Block.TextBlock>(Assert.Single(ToolResultById(rendered, id).Content)).Text;
+
+    /// <summary>
+    /// ⚠️ **投递截断只保留开头**，尾部换成一条带稳定 id 与下一个偏移的注记
+    /// （用户 2026-10-17 裁定）。
+    ///
+    /// <para>⚠️ 必须钉住的那条性质：`offset` 是**可兑付**的——它等于实际交付的字节数，
+    /// 而不是预算数（注记本身不算、字符边界回退也不算）。否则模型照着它 `fetch`，
+    /// 要么漏字节、要么把注记的一段再喂回来。</para>
+    /// </summary>
+    [Fact]
+    public void ModelView_TruncatesOversizedResultsToTheHeadAndOffersAFetchOffset()
+    {
+        const string head = "HEAD-";
+        const string tail = "-TAIL";
+        var body = head + new string('x', ToolLimits.MaxResultBytes) + tail;
+        AppendCall("c1", "read");
+        Append(Result("r1", "c1", new Block.TextBlock(body)));
+
+        var text = ContentOf(RenderForModel(), "r1");
+
+        Assert.Contains("[已截断]", text);
+        Assert.Contains("fetch(id=\"r1\"", text);
+        Assert.Contains(head, text);
+        Assert.DoesNotContain(tail, text);   // ⚠️ 只保留开头：尾部**不**出现
+
+        // 注记里的偏移 = 实际交付量：取回从那里继续，拼起来恰好是原文。
+        var match = System.Text.RegularExpressions.Regex.Match(text, @"offset=(\d+)");
+        Assert.True(match.Success);
+        var offset = int.Parse(match.Groups[1].Value);
+        Assert.True(offset <= ToolLimits.MaxResultBytes);
+        Assert.Equal(body[..offset], text[..offset]);   // 交付的恰好是原文前缀
+    }
+
+    /// <summary>
+    /// ⚠️ **偏移必须是「实际交付的字节数」，不是预算数**：中文一字 3 字节，
+    /// 预算切在某字中间时会回退 ⇒ 两者不相等。拿预算当偏移，`fetch` 会漏掉或重放字节。
+    /// </summary>
+    [Fact]
+    public void ModelView_TruncationOffsetAccountsForUTF8BoundaryRollback()
+    {
+        // 每字 3 字节；总长不是 3 的整数倍时，预算切点必然落在字符中间。
+        var body = string.Concat(Enumerable.Repeat("中", ToolLimits.MaxResultBytes / 3 + 1)) + "尾";
+        AppendCall("c1", "read");
+        Append(Result("r1", "c1", new Block.TextBlock(body)));
+
+        var text = ContentOf(RenderForModel(), "r1");
+        var offset = int.Parse(System.Text.RegularExpressions.Regex.Match(text, @"offset=(\d+)").Groups[1].Value);
+        var bodyBytes = System.Text.Encoding.UTF8.GetBytes(body);
+
+        Assert.True(offset < ToolLimits.MaxResultBytes, "切点落在字符中间时，偏移必须回退到字符边界。");
+        Assert.Equal(0, offset % 3);                              // 都落在完整字符的起点上
+        Assert.Equal(bodyBytes[..offset], System.Text.Encoding.UTF8.GetBytes(text)[..offset]);
+    }
+
+    /// <summary>
+    /// ⚠️ **只有模型路径截断**：头 / 控制台看的是完整内容（那是查看存档，不是投递）。
+    /// </summary>
+    [Fact]
+    public void HistoryView_DoesNotTruncate()
+    {
+        var body = new string('x', ToolLimits.MaxResultBytes + 100);
+        AppendCall("c1", "read");
+        Append(Result("r1", "c1", new Block.TextBlock(body)));
+
+        var text = ContentOf(Render(), "r1");
+        Assert.Equal(body.Length, text.Length);
+        Assert.DoesNotContain("[已截断]", text);
+    }
+
+    /// <summary>
+    /// ⚠️ **`fetch` 的结果不按普通预算再砍一次**（`ToolLimits.DeliveryBudgetOf`）：
+    /// 否则「取回」等于取回了正好放不下的东西——功能自己抵消自己。
+    /// </summary>
+    [Fact]
+    public void ModelView_DoesNotTruncateFetchResults()
+    {
+        var body = new string('x', ToolLimits.MaxResultBytes + 100);
+        AppendCall("c1", "fetch");
+        Append(Result("r1", "c1", new Block.TextBlock(body)));
+
+        var text = ContentOf(RenderForModel(), "r1");
+        Assert.Equal(body.Length, text.Length);
+        Assert.DoesNotContain("[已截断]", text);
+    }
+
+    /// <summary>
+    /// ⚠️ **已经是回收注记的不再截断**（两层注记叠在一起，模型分不清该照哪句做）。
+    /// </summary>
+    [Fact]
+    public void ModelView_DoesNotTruncateReclaimNotes()
+    {
+        AppendCall("c1", "read");
+        Append(Result("r1", "c1", new Block.TextBlock(new string('x', ToolLimits.MaxResultBytes + 100))));
+        PadPastTheProtectionBand();
+
+        var text = ContentOf(RenderForModel(), "r1");
+        Assert.Contains("[已回收]", text);
+        Assert.DoesNotContain("[已截断]", text);
     }
 }

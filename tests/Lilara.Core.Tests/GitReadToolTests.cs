@@ -101,8 +101,11 @@ public sealed class GitReadToolTests : IDisposable
         Git("add", "--", "large.txt");
         Git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "large file");
         var result = await Run(new GitReadTool(), """{"command":"show","path":"large.txt"}""");
-        Assert.Contains("输出已截断", Text(result));
-        Assert.True(Encoding.UTF8.GetByteCount(Text(result)) <= ToolLimits.MaxResultBytes);
+        // ⚠️ 2026-10-17：这么大的输出应当**完整入档**（远小于 4 MiB 保存上限），
+        // 投递截断由渲染层做。这里钉的是「工具不再在 256 KiB 处自己砍掉」。
+        Assert.Contains("已改变", Text(result));
+        Assert.DoesNotContain("保存上限", Text(result));
+        Assert.True(Encoding.UTF8.GetByteCount(Text(result)) <= ToolLimits.MaxToolOutputBytes);
     }
 
     [Fact]

@@ -19,8 +19,13 @@ namespace Lilara.Core.Session.Tools;
 /// <param name="timeline">**记录**那一份时间线（不是渲染后的形态）。
 /// ⚠️ 取地址必须从**记录**取：回收只换渲染、记录不动（`01` §8.0.2 一 / 八）——
 /// 若拿渲染后的形态去算地址，被回收的那条算出来就是**那段注记**的哈希，`fetch` 当场永久取不回。</param>
+/// <param name="floatingContext">**这一刻的尾块文本**（`01` §3.2，2026-10-17）。
+/// 由建设点（`Stepper` 两处 / 控制台的待答询问探测）交进来，**不是**在这里现渲染：
+/// 现渲染会让 `floating_context` 的返回值与核心合成注入的那份分叉。
+/// 省略 = 空串（没有浮动块，或调用方确实不需要它）。</param>
 public sealed class SessionToolContext(
-    string workingDirectory, BlobStore blobs, IReadOnlyList<TimelineEvent>? timeline = null)
+    string workingDirectory, BlobStore blobs, IReadOnlyList<TimelineEvent>? timeline = null,
+    string? floatingContext = null)
     : IToolContext
 {
     private readonly string _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workingDirectory));
@@ -103,4 +108,28 @@ public sealed class SessionToolContext(
 
         return TimelineRender.Dereference(r, blobs).Content;
     }
+
+    /// <summary>
+    /// 按稳定 id 取回一条结果的**原始字节**——`fetch` 的分页窗口读它。
+    ///
+    /// <para>⚠️ <b>只有「单文本块」的结果有原始字节</b>（`TextBlock` 或指向 `text/plain` 的
+    /// <see cref="Block.StoreBlock"/>）：混排 / 图片不是一个字节序列，给它们编一个偏移语义
+    /// 就是发明第三种形状。⇒ 其余形态返回 <c>null</c>，由工具如实说「这条例结果不能按字节窗口取」。</para>
+    ///
+    /// <para>⚠️ <b>和 <see cref="SnapshotOf"/> 同源</b>：都从**记录**找、都走
+    /// `TimelineRender.Dereference` 那套库对象读法——各写一份就会漂。</para>
+    /// </summary>
+    public byte[]? RawBytesOf(string stableId)
+    {
+        if (timeline?.OfType<TimelineEvent.ToolResultEvent>().FirstOrDefault(r => r.Id == stableId)
+            is not { } r) return null;
+
+        var content = TimelineRender.Dereference(r, blobs).Content;
+        return content is [Block.TextBlock text]
+            ? System.Text.Encoding.UTF8.GetBytes(text.Text)
+            : null;
+    }
+
+    /// <summary>见 <see cref="IToolContext.FloatingContext"/>：建设点冻住的那份，由构造参数交进来。</summary>
+    public string FloatingContext { get; } = floatingContext ?? "";
 }

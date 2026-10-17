@@ -76,6 +76,17 @@ public sealed class Stepper(
         var pluginAxes = _plugins.Freeze(PluginSessionView.Values(stepState), at, handle.Spec.Plugins ?? []);
         var pluginPrompt = _plugins.Collect(pluginAxes, handle.Spec.Plugins ?? []);
 
+        // ⚠️ **三块槽位这一刻冻住**（2026-10-17 起抬到这里，早先内联在下面构造请求处）。
+        // 理由不是整洁：`floating_context` 工具在执行相位要读**同一份**尾块
+        // （`SessionToolContext.FloatingContext`）——若执行时另渲染一遍，
+        // 「核心合成注入的那份」与「模型自己要来的那份」会在同一步里分叉。
+        // ⚠️ 冻结的时点与原来逐字相同（步开始、`at` 已取）；跨步实时、步内逐字节稳定。
+        var slots = SystemBlock.Render(
+            new PresetStore(_store.DataRoot, PresetStore.SystemDir),
+            new PresetStore(_store.DataRoot, PresetStore.PremierDir),
+            handle.Spec.SystemPromptPreset, handle.Spec.PremierPrompt,
+            pluginAxes.Values, pluginPrompt);
+
         // ⚠️ **熔断计数从盘上恢复**（`01` §6.2）。不恢复的话，一次重启就把它清零
         // ⇒ 「自上次用户输入以来跑了多少步」这个语义**只在没重启过时成立**，
         // 而失控的循环只要跨过一次重启就再也停不下来。
@@ -91,7 +102,6 @@ public sealed class Stepper(
         // 不是「进了内存」（`Activate` 太宽，头扫一眼列表就会走），是「**第一步真的要拿它渲染**」。
         var staleProbe = new Tools.SessionToolContext(
             handle.Spec.WorkingDirectory, new BlobStore(_store.DataRoot));
-
         // ⚠️ 先记下落盘的那份，失败了原样放回去。
         // 调用方 catch 之后继续用**同一个把手**：不回滚的话，
         // 用户刚看着一步失败，`status` 却报 Running——而磁盘上从来没写过 Running。
@@ -141,12 +151,14 @@ public sealed class Stepper(
                 // 而不是在这里分三次调——「哪一块从哪来」的判据只有 `SystemBlock` 一处。
                 // ⚠️ 轴值从 **handle 的 State** 读（不是从 spec）：轴是活的，
                 // 而 `!` 是 `Load` / `Create` 的契约（见上面 `Effort` 那行）。
-                // 插件提示词来自同一份步开始快照；浮动贡献仍只存在于尾槽位，不进入时间线。
-                Slots = SystemBlock.Render(
-                    new PresetStore(_store.DataRoot, PresetStore.SystemDir),
-                    new PresetStore(_store.DataRoot, PresetStore.PremierDir),
-                    handle.Spec.SystemPromptPreset, handle.Spec.PremierPrompt,
-                    pluginAxes.Values, pluginPrompt),
+                //
+                // ⚠️ **尾块落在哪由「工具表里有没有 `floating_context`」决定**（2026-10-17）：
+                // 有 ⇒ 末尾合成一对调用 + 结果；没有 ⇒ **退回尾槽位**（不丢内容）。
+                // ⚠️ **纯 chat / 无工具的会话也会走到**（`04` §1.3 推论 1：裸核心是合法的）——
+                // 第一版把那种会话的尾块**整块弄丢**了（只发合成对、又没有工具可声明），
+                // 三条插件集成测试当场变红。这是「下放」与「不丢」之间必须二选一时的正确取舍：
+                // 拿不到声明位置就还放回原位，而不是让内容消失。
+                Slots = HasFloatingContextTool ? slots with { Tail = [] } : slots,
 
                 // ⚠️ 工具表**从工具表投影**，不是从 spec 读的——spec 里没有它，
                 // 而「这一步有哪些工具」是**派生**的（04 §1.3：工具表不是独立实体）。
@@ -168,7 +180,16 @@ public sealed class Stepper(
                 // 以及把 `fetch` 的 `Ref` 解开。三件事都得在这里做完——**适配器只看见普通块**。
                 // ⚠️ 那份渲染**与头 / 控制台读的是同一个函数**（`SessionQueries.HistoryOf` 也走它）：
                 // 各写一份就会出现「模型看到的」与「用户看到的」悄悄分叉。
-                Timeline = TimelineRender.Render(_store, handle, staleProbe),
+                // ⚠️ 那份渲染**与头 / 控制台读的是同一个函数**（`SessionQueries.HistoryOf` 也走它）：
+                // 各写一份就会出现「模型看到的」与「用户看到的」悄悄分叉。
+                // ⚠️ **但喂模型的那一份多一条投递截断**（2026-10-17）：超过
+                // `ToolLimits.MaxResultBytes` 的结果只喂开头，尾部的注记给出稳定 id 与下一个偏移
+                // ⇒ 模型用 `fetch(id, offset)` 接着看，不必重跑那个工具。
+                Timeline = FloatingContextPair(
+                    TimelineRender.RenderForModel(_store, handle, staleProbe), slots.Tail, at,
+                    // ⚠️ **`Turn + 1` 是「这一步的编号」**（与 `PendingIntent` 给「那一步的 Turn」用的
+                    // 同一个约定）：`State.Turn` 数的是**已完成**的步，进行中的这一步是下一号。
+                    handle.State.Turn + 1),
             };
 
             // 调用（抛异常时直接传播——这一步没完成，Turn 不动）
@@ -241,7 +262,11 @@ public sealed class Stepper(
             var executor = new ToolExecutor(
                 _tools, blobs, handle.State.Axes![Axes.Permission],
                 new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId));
-            var context = new SessionToolContext(handle.Spec.WorkingDirectory, blobs, recorded);
+            var context = new SessionToolContext(handle.Spec.WorkingDirectory, blobs, recorded,
+                // ⚠️ **与合成注入同一份字节**（`slots` 就是构造请求时用的那份尾块）：
+                // `floating_context` 若在这里现渲染，同一步里「核心注入的」与「模型自己要来的」
+                // 会分叉，而两边都看起来是对的（本仓栽过的形状）。
+                FloatingTextOf(slots));
 
             var batch = await executor.ExecuteAsync(toolCalls, context, ct);
             pending = batch.Pending;
@@ -549,7 +574,11 @@ public sealed class Stepper(
                 new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId));
             var context = new SessionToolContext(
                 handle.Spec.WorkingDirectory, blobs,
-                _store.ReadTimeline(handle.ProjectKey, handle.SessionId));
+                _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
+                // ⚠️ **答复路径没有步开始的槽位快照**：`floating_context` 要说的话是
+                // 「答复这一刻」的那份（与头的 `/state` 同一个时间轴），所以在这里现装配一次。
+                // ⚠️ 它与上面那次模型调用无关——那条路**不调模型**。
+                FloatingTextAt(handle, CoreClock.Now()));
 
             var batch = await executor.ExecuteAsync(calls, context, ct, reply);
             events.AddRange(batch.Results);
@@ -603,6 +632,99 @@ public sealed class Stepper(
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines);
+    }
+
+    /// <summary>
+    /// **尾块 → 末尾的一对合成调用 + 结果**（`01` §3.2，2026-10-17 用户裁定）。
+    ///
+    /// <para>⚠️ <b>为什么不再拼进末尾那条 user 消息</b>：Claude 链路原先把它拼进
+    /// 「用户的那条话」里 ⇒ ① 用户输入与核心注入在**同一个数组**里，模型靠包边文字才分得开；
+    /// ② 下一条请求里同一条用户消息是按记录重渲染的、**不带尾块** ⇒ 前缀在第一条用户消息处
+    /// 就分叉。合成一对工具调用把移动的部分挪进 tool 位置，用户消息逐字节稳定。</para>
+    ///
+    /// <para>⚠️ <b>为什么是「临时合成、不落盘」</b>（`01` §3.2「浮动 = 状态，不是事件」）：
+    /// 落盘会让它①每步**累积**（浮动槽的整个前提是替换而非追加）②在盘上留下一条
+    /// **模型从未做过的 assistant 消息**（记录是事实）。⇒ 每步现造、只进这一次请求。
+    /// <see cref="TimelineRender"/> 的两条入口因此**都不认识它**：头 / 控制台的
+    /// `Render` 里没有这块，`/history` 也永远不出现——浮动是「此刻是什么」，不是历史。</para>
+    ///
+    /// <para>⚠️ <b>它是纯的</b>：`Id` 与 `At` 都来自步开始冻住的 <paramref name="at"/> /
+    /// <paramref name="turn"/>，同一份输入渲染两次逐字节相同（`00` §5 铁律 1）。
+    /// 两个 id 都带 `floating-` 前缀：**一条只在这一步的请求里存在的合成调用能被认出来**
+    /// （它们从不出现在盘上，也不该被任何「按 id 取回」的路径匹配上）。</para>
+    ///
+    /// <para>⚠️ <b>工具表里没有 `floating_context` 时整对不合成</b>（含纯 chat 会话）：
+    /// 客户端（测试替身、未来的纯 chat 预设）刻意构造的无工具对话**行为逐字节不变**，
+    /// 而「名字没声明就发一条调用」会在部分上游变成 400。</para>
+    /// </summary>
+    /// <param name="timeline">渲染后的时间线——合成对追加在它**之后**（旧内容一个字节不动）。</param>
+    /// <param name="tail">尾槽位的块（<see cref="SystemBlock.Render"/> 的产物）。空 ⇒ 不合成。</param>
+    /// <param name="at">步开始冻结的时刻（`now`）。</param>
+    /// <param name="turn">这一步的 `Turn`——做成 id 的一部分，让不同步的合成对互不相等。</param>
+    ///
+    /// <para>⚠️ <b>工具表里没有 `floating_context` 时整对不合成</b>（含纯 chat 会话）：
+    /// 客户端（测试替身、未来的纯 chat 预设）刻意构造的无工具对话**行为逐字节不变**，
+    /// 而「名字没声明就发一条调用」会在部分上游变成 400。</para>
+    /// </summary>
+    /// <param name="tail">尾槽位的块（<see cref="SystemBlock.Render"/> 的产物）。空 ⇒ 不合成。</param>
+    /// <param name="at">步开始冻结的时刻（`now`）。</param>
+    /// <param name="turn">这一步的 `Turn`——做成 id 的一部分，让不同步的合成对互不相等。</param>
+    /// <summary>工具表里有没有 <see cref="FloatingContextTool.NameOf"/>（`_tools` 构造后不变，逐次查表够用）。</summary>
+    private bool HasFloatingContextTool =>
+        _tools.Any(t => string.Equals(t.Name, FloatingContextTool.NameOf, StringComparison.Ordinal));
+
+    private IReadOnlyList<TimelineEvent> FloatingContextPair(
+        IReadOnlyList<TimelineEvent> timeline, IReadOnlyList<Block> tail, DateTimeOffset at, int turn)
+    {
+        if (tail.Count == 0) return timeline;
+        if (!HasFloatingContextTool) return timeline;
+
+        var text = string.Concat(tail.OfType<Block.TextBlock>().Select(b => b.Text));
+        if (text.Length == 0) return timeline;
+
+        return
+        [
+            .. timeline,
+            new TimelineEvent.MessageEvent
+            {
+                Id = $"floating-{turn}-call",
+                At = at,
+                From = Speaker.Model,
+                Blocks = [new Block.ToolUseBlock($"floating-{turn}-result", FloatingContextTool.NameOf, "{}")],
+            },
+            new TimelineEvent.ToolResultEvent
+            {
+                Id = $"floating-{turn}-result",
+                At = at,
+                CallId = $"floating-{turn}-result",
+                Content = [new Block.TextBlock(text)],
+            },
+        ];
+    }
+
+    /// <summary>
+    /// **这一刻的尾块文本**——答复路径与控制面的探测点用（`01` §3.2）。
+    ///
+    /// <para>⚠️ 它读的是**这一刻**的预设文件与轴值（与头的 `/state` 同一个时间轴），
+    /// 而**不是**某一步冻结的那份——那条时间线只存在于那次请求的字节里。
+    /// 系统 / 首要两块的正文这里用空串：这个入口只要尾块，
+    /// 而为了一句尾块去读两份预设既无必要，也会把「文件在不在」的副作用引进来。
+    /// ⚠️ 装配判据仍然只有 <see cref="SystemBlock"/> 一处。</para>
+    /// </summary>
+    private string? FloatingTextAt(SessionHandle handle, DateTimeOffset now)
+    {
+        var state = handle.State;
+        var axes = _plugins.Freeze(PluginSessionView.Values(state), now, handle.Spec.Plugins ?? []);
+        var prompt = _plugins.Collect(axes, handle.Spec.Plugins ?? []);
+        var slots = SystemBlock.Build(systemText: null, premierText: null, axes.Values, prompt);
+        return FloatingTextOf(slots);
+    }
+
+    /// <summary>尾槽位的块 → 一段文本。<c>null</c> = 没有尾块（`SystemBlock.Wrap` 的「连包边一起不产出」）。</summary>
+    private static string? FloatingTextOf(PromptSlots slots)
+    {
+        var text = string.Concat(slots.Tail.OfType<Block.TextBlock>().Select(b => b.Text));
+        return text.Length == 0 ? null : text;
     }
 
     /// <summary>

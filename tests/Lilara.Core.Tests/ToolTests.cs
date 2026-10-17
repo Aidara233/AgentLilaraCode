@@ -295,13 +295,16 @@ public class ToolTests : IDisposable
     /// ⚠️ **单次上限真的生效**，而且它从 `ToolLimits` 读（不是本文件里另一个数）。
     /// </summary>
     [Fact]
-    public async Task Read_WithoutLimit_IsCappedAtTheLimit()
+    public async Task Read_WithoutLimit_IsCappedAtTheSaveLimit()
     {
-        await File.WriteAllTextAsync(Path.Combine(_root, "big.txt"), new string('x', ToolLimits.MaxResultBytes + 500));
+        // ⚠️ 2026-10-17：工具侧上限是**保存**上限——投递截断在渲染层
+        // （`TimelineRender.RenderForModel`）。这里钉的是「单次调用不会把内存 / 盘撑爆」。
+        await File.WriteAllTextAsync(Path.Combine(_root, "big.txt"),
+            new string('x', ToolLimits.MaxToolOutputBytes + 500));
 
         var outcome = await new ReadTool().RunAsync(Call("read", """{"path":"big.txt"}"""), _ctx, default);
 
-        Assert.Equal(ToolLimits.MaxResultBytes, Body(outcome).Length);
+        Assert.Equal(ToolLimits.MaxToolOutputBytes, Body(outcome).Length);
     }
 
     /// <summary>
@@ -312,13 +315,14 @@ public class ToolTests : IDisposable
     [Fact]
     public async Task Read_ReportsItsRangeInTheFrame()
     {
-        await File.WriteAllTextAsync(Path.Combine(_root, "big.txt"), new string('x', ToolLimits.MaxResultBytes + 500));
+        await File.WriteAllTextAsync(Path.Combine(_root, "big.txt"),
+            new string('x', ToolLimits.MaxToolOutputBytes + 500));
 
         var outcome = await new ReadTool().RunAsync(Call("read", """{"path":"big.txt"}"""), _ctx, default);
 
         var frame = Frame(outcome).Render();
         Assert.Contains("big.txt", frame);
-        Assert.Contains((ToolLimits.MaxResultBytes + 500).ToString(), frame);   // 总长在（模型据此知道还没读完）
+        Assert.Contains((ToolLimits.MaxToolOutputBytes + 500).ToString(), frame);   // 总长在（模型据此知道还没读完）
     }
 
     [Fact]
@@ -422,17 +426,18 @@ public class ToolTests : IDisposable
     }
     /// <summary>
     /// ⚠️ **上限不能被 `limit` 绕过**——那是这个功能存在的**全部意义**：
-    /// 模型（或一次写错的调用）给一个巨大的 `limit`，不该把上下文撑爆。
+    /// 模型（或一次写错的调用）给一个巨大的 `limit`，不该把内存 / 盘撑爆。
+    /// ⚠️ 2026-10-17：这里是**保存**上限；投递截断由渲染层做。
     /// </summary>
     [Fact]
     public async Task Read_WithAHugeLimit_IsStillCapped()
     {
-        await File.WriteAllTextAsync(Path.Combine(_root, "big.txt"), new string('x', ToolLimits.MaxResultBytes * 3));
+        await File.WriteAllTextAsync(Path.Combine(_root, "big.txt"), new string('x', ToolLimits.MaxToolOutputBytes + 500));
 
         var outcome = await new ReadTool().RunAsync(
-            Call("read", $$"""{"path":"big.txt","limit":{{ToolLimits.MaxResultBytes * 3}}}"""), _ctx, default);
+            Call("read", $$"""{"path":"big.txt","limit":{{ToolLimits.MaxToolOutputBytes * 2}}}"""), _ctx, default);
 
-        Assert.Equal(ToolLimits.MaxResultBytes, Body(outcome).Length);
+        Assert.Equal(ToolLimits.MaxToolOutputBytes, Body(outcome).Length);
     }
 
     // ---- ls：元数据（`01` §9.3）------------------------------------------------

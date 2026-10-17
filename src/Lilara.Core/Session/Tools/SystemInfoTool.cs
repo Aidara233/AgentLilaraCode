@@ -35,8 +35,10 @@ public sealed class SystemInfoTool : ITool
         catch (Exception ex) { gpu = new NvidiaStatus("查询失败", ex.Message); }
 
         text.Append("NVIDIA GPU: ").AppendLine(gpu.State + (gpu.Detail is null ? "" : $"（{gpu.Detail}）"));
-        if (text.Length > ToolLimits.MaxResultBytes)
-            text.Length = ToolLimits.MaxResultBytes;
+        // ⚠️ 设备快照本身很小，这一句是**保存**上限那道安全阀（同 `ToolLimits`）：
+        // 投递截断在渲染层，不在这里。
+        if (text.Length > ToolLimits.MaxToolOutputBytes)
+            text.Length = ToolLimits.MaxToolOutputBytes;
 
         return new ToolOutcome { Content = [new Block.TextBlock(text.ToString().TrimEnd())] };
     }

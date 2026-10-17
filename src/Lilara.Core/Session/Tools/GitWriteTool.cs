@@ -8,7 +8,8 @@ namespace Lilara.Core.Session.Tools;
 
 public sealed class GitWriteTool : ITool
 {
-    private const int MaxOutputBytes = ToolLimits.MaxResultBytes - 8192;
+    // ⚠️ 同 `GitReadTool`：这是**保存**上限，投递截断在渲染层。
+    private const int MaxOutputBytes = ToolLimits.MaxToolOutputBytes;
     private const int MaxPaths = 100;
     private const int MaxMessageBytes = 16 * 1024;
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(30);
@@ -146,8 +147,9 @@ public sealed class GitWriteTool : ITool
                 }
                 var output = new StringBuilder(summary);
                 if (!string.IsNullOrWhiteSpace(stdout.Text)) output.AppendLine().Append(stdout.Text.TrimEnd());
-                if (stdout.Truncated) output.AppendLine().Append("[输出已截断。]");
-                if (output.Length > ToolLimits.MaxResultBytes) output.Length = ToolLimits.MaxResultBytes;
+                if (stdout.Truncated)
+                    output.AppendLine().Append($"[输出超过单次保存上限 {ToolLimits.MaxToolOutputBytes} 字节，余下部分未采集。]");
+                if (output.Length > ToolLimits.MaxToolOutputBytes) output.Length = ToolLimits.MaxToolOutputBytes;
                 return Outcome(output.ToString());
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
