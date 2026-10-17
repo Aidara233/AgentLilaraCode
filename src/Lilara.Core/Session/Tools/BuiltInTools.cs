@@ -57,6 +57,6 @@ public static class BuiltInTools
     [
         new ListTool(), new ReadTool(), new FetchTool(), new AskTool(),
         new UpdateTool(), new WriteTool(), new ReleaseTool(),
-        new MakeDirectoryTool(), new DeleteTool(), new PathTool(), new SystemInfoTool(), new GitReadTool(),
+        new MakeDirectoryTool(), new DeleteTool(), new PathTool(), new SystemInfoTool(), new GitReadTool(), new GitWriteTool(),
     ];
 }
