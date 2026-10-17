@@ -26,14 +26,17 @@ namespace Lilara.Core.Session.Tools;
 /// 于是一个**真的**落过的 `tool_use` 会被渲染成「这里本该有内容，但它丢了」——
 /// 那是**一条关于丢失的假信息**，而它只是「本来就没有内容」。</para>
 ///
-/// <para>⚠️ <b>它不释放锁</b>（今天）：§12.4 说 `release` 同时做三件事（解锁 / 触发回收 /
-/// 清理残留），而**解锁那一半今天没有落点**——`ClaimStore` 的写手在
-/// `CommandDispatcher.HandleClaimRelease`（命令层），而工具**够不着**它
-/// （`IToolContext` 只读，见那里的注释）。⇒ 这一半**如实记在 §14**，不假装它做了。</para>
+/// <para>⚠️ <b>解锁那一半现在有了</b>（2026-10-17）：§12.4 说 `release` 同时做三件事
+/// （解锁 / 触发回收 / 清理残留），而解锁原先没有落点——工具够不着 `ClaimStore`
+/// （`IToolContext` 只读）。现在它由**推进器**在同一处补上：画完线之后调
+/// `Stepper.UnlockReleased`，走与 `claim.release` **同一个** `ClaimStore.Release`，
+/// 只摘**本会话自己**的声明。⚠️ 工具本身仍然什么都不改——它还是只说出那句话。</para>
 ///
 /// <para>⚠️ <b>`PermissionClass` = <see cref="PermissionClass.ReadOnly"/>，而这是有理由的</b>：
-/// 它**什么都不改**——不写盘、不动别人的锁、不发外部请求。它做的唯一一件事是
+/// 工具**本身**什么都不改——不写盘、不动别人的锁、不发外部请求。它做的唯一一件事是
 /// **说出一句话**（「我用完了」）。⇒ 它不需要授权。
+/// ⚠️ **而推进器会替它改两样东西**（画线、摘自己的声明）——那是它说出那句话的**后果**，
+/// 不是工具的手在动；与 `update` / `write` 那种「工具自己写盘」不同。
 /// ⚠️ 而它**不是没有后果**的：那句话会让上下文变小。但那**不是**「需要许可的副作用」那一类
 /// （`01` §3.5 那一列问的是「会不会改到世界」），而且**它有审计痕迹**（那条记录它自己）。</para>
 /// </summary>
@@ -49,7 +52,7 @@ public sealed class ReleaseTool : ITool
 
     public string Name => NameOf;
 
-    /// <summary>见类型注释：它什么都不改，只是说一句话。</summary>
+    /// <summary>见类型注释：工具本身什么都不改，只是说一句话（后果由推进器落）。</summary>
     public PermissionClass PermissionClass => PermissionClass.ReadOnly;
 
     public string Description =>

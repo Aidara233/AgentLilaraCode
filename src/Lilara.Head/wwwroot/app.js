@@ -514,6 +514,18 @@ function blocksText(blocks) {
 }
 
 function createHistoryItem(t, cls) {
+  // 线：一条横贯的分隔（与核心的 `ReleaseEvent`、控制台 `history` 同形）。
+  // ⚠️ 它只能来自 `/history` 的分页数据——模型自己的上下文里没有这条记录。
+  if (t.kind === "release") {
+    const line = document.createElement("div");
+    line.className = "turn release-line";
+    if (t.id) line.dataset.historyId = t.id;
+    const scope = (t.scope || []).join("、");
+    const summary = t.summary ? `（${t.summary}）` : "";
+    line.textContent = `── ✂ 释放 ${scope || "（未给范围）"}${summary} ──`;
+    return line;
+  }
+
   const wrap = document.createElement("div");
   if (t.id) wrap.dataset.historyId = t.id;
   wrap.className = "turn " + (cls || (t.kind === "toolResult" ? "meta" : t.from));
@@ -1569,6 +1581,13 @@ function handleEvent(p) {
       if (p.sessionId === current) {
         openSession(current).then(() => { if (p.reason) renderMeta("ℹ " + p.reason); });
       }
+      break;
+
+    case "release.recorded":
+      // ⚠️ **模型画了一条线**（`release`）：线落在 `history.jsonl` 里，而 `/history` 现在
+      // 会把它交出来 ⇒ 重拉一次就能在正确位置画出分隔线。⚠️ **不在这里手动插一行**——
+      // 线的位置由核心的分页给出，手插会让它和重拉后的顺序打架（同 `session.reclaimed`）。
+      if (p.sessionId === current) openSession(current);
       break;
 
     // ⚠️ **询问**（`01` §3.8）。它同时投 `approvals` 与会话流 ⇒ 这里收到的是**一条**

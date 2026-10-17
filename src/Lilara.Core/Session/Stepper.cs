@@ -201,6 +201,13 @@ public sealed class Stepper(
         var toolCalls = reply.Blocks.OfType<Kernel.Block.ToolUseBlock>().ToList();
         var events = new List<TimelineEvent>();
 
+        // ⚠️ **步内摘掉的声明**（`release` 的解锁那一半，2026-10-17）：事件由调用方在落盘之后发，
+        // 因为 `Stepper` 不碰事件总线（同 `StepOutcome` 的注释）。⚠️ 它必须与 `events` 同一处收集——
+        // 否则「线落了、锁摘了、头不知道」，而头会继续显示模型已经说用完了的锁。
+        var releasedClaims = new List<Claim>();
+        // 同理：落下的线（头要据它的 id 画分隔线，而线本身被 `IsRenderable` 挡在模型之外）。
+        var releasedLines = new List<TimelineEvent.ReleaseEvent>();
+
         // ⚠️ **记录那一份**（未经回收、未经解引用）——`fetch` 取地址必须从它算，
         // 理由见 `SessionToolContext` 的构造参数注释。
         var recorded = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
@@ -257,9 +264,22 @@ public sealed class Stepper(
             // 因为「跑没跑」只有它知道。
             foreach (var callId in batch.ExecutedCallIds)
                 if (toolCalls.FirstOrDefault(c => string.Equals(c.CallId, callId, StringComparison.Ordinal)) is { Name: ReleaseTool.NameOf } release
-                    && RecordRelease(release, at) is { } line)
+                    && RecordRelease(release, at) is TimelineEvent.ReleaseEvent line)
+                {
                     events.Add(line);
+                    // ⚠️ **模型侧 `release` 也摘掉自己的声明**（2026-10-17，§12.4 的「解锁」那一半）：
+                    // 工具够不着 `ClaimStore`（`IToolContext` 只读），而这里够得着——
+                    // 摘锁与画线是**同一件事的两半**（「这批资源我用完了」）。
+                    // ⚠️ **只摘自己的**：替别人摘锁是 `claim.release` 的逃生口。
+                    // ⚠️ 失败给空列表 ⇒ 最坏是「锁还在」，**线与回收照常**。
+                    releasedClaims.AddRange(UnlockReleased(handle, line.Scope));
+                    releasedLines.Add(line);
+                }
         }
+
+        // ⚠️ **`claim.released` 由调用方发**（`Stepper` 刻意不碰事件总线，同 `StepOutcome` 的注释）：
+        // 头靠它刷新「谁在动哪些文件」；不发的话，头会继续显示模型已经说用完了的锁。
+        // ⇒ 与 `StepOutcome` 一起交回，由 `CommandDispatcher` 在落盘之后发。
 
         // ⚠️ **有问 ⇒ 中止这一步的「执行」，但那条模型消息照样落盘**（`01` §3.8）。
         //
@@ -293,7 +313,7 @@ public sealed class Stepper(
             }, diskStatus: SessionStatus.WaitingForInput);
 
             return new StepOutcome(reply, pending, handle.State.Ask?.DeadlineAt,
-                events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id);
+                events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id, releasedClaims, releasedLines);
         }
         // 一次落盘 = 一个原子。⚠️ 空批次**不写**（拒答且没有工具的那一步就是空的），
         // 而 `AppendEvents` 对空批次是 no-op、不抛——见它的注释。
@@ -324,7 +344,8 @@ public sealed class Stepper(
             PendingIntent = null,
         }, diskStatus: SessionStatus.Idle);
 
-        return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id);
+        return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id,
+            ReleasedClaims: releasedClaims, ReleasedLines: releasedLines);
     }
 
     /// <summary>
@@ -443,6 +464,49 @@ public sealed class Stepper(
     }
 
     /// <summary>
+    /// **模型侧 `release` 的解锁那一半**（`01` §12.4，2026-10-17）：摘掉**本会话自己**
+    /// 落在释放作用域里的声明。
+    ///
+    /// <para>⚠️ <b>为什么住在这里而不是工具里</b>：`IToolContext` 是只读的
+    /// （`04` §5.1），工具够不着 `ClaimStore`；而推进器本来就拿着 `SessionStore`
+    /// 与工作目录。⚠️ 但**摘锁的实现不在这里**——它走 `ClaimStore.Release`，
+    /// 与用户侧 `claim.release` **同一个函数**（两层判据共用一个谓词）。
+    /// 这里只做**作用域筛选**：`ClaimStore` 用的是规范化后的绝对路径与逐字 `==`，
+    /// 而 `release.Scope` 是模型给的**工作目录相对路径**（可以带反斜杠、尾斜杠）——
+    /// 两边形状不同，必须在这一层用 `Claims.Normalize` 换算，否则一条也摘不掉。</para>
+    ///
+    /// <para>⚠️ <b>只摘自己的</b>：`ownerSessionId` 传本会话；替别人摘锁是
+    /// `claim.release` 的逃生口，不是模型那句话的意思。</para>
+    ///
+    /// <para>⚠️ <b>失败方向</b>：`ClaimStore.Release` 对坏 JSON / IO 失败给空列表
+    /// （同 `All` 那条），⇒ 最坏结果是「锁还在」，而**线与回收照常**。
+    /// 这里不抛：它跑在步的落盘路径上，抛会把一步已经算好的结果整个丢掉。
+    /// ⚠️ 事件由**调用方**发（`Stepper` 刻意不碰事件总线，见 `StepOutcome` 的注释），
+    /// 所以它只交回被摘掉的那些声明。</para>
+    /// </summary>
+    /// <returns>真正被摘掉的声明（调用方为它们发 `claim.released`）。</returns>
+    private static IReadOnlyList<Claim> UnlockReleased(SessionHandle handle, IReadOnlyList<string> scope)
+    {
+        if (scope.Count == 0) return [];
+
+        var paths = scope
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => Claims.Normalize(p, handle.Spec.WorkingDirectory))
+            .ToList();
+        if (paths.Count == 0) return [];
+
+        try
+        {
+            return new ClaimStore(handle.Spec.WorkingDirectory).Release(paths, handle.SessionId);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 摘锁是可见性机制的辅助那半；线是事实。失败不改变后者，也不该让这一步失败。
+            return [];
+        }
+    }
+
+    /// <summary>
     /// **答复之后直接执行**（`01` §3.8）——这一批之前走的是「让模型重新发起」。
     ///
     /// <para>⚠️ <b>为什么不再让模型重发</b>：那条路上批准只是落一句
@@ -474,6 +538,8 @@ public sealed class Stepper(
         ToolExecutor.Reply reply, CancellationToken ct, PausedAsk paused)
     {
         var events = new List<TimelineEvent>();
+        var releasedClaims = new List<Claim>();
+        var releasedLines = new List<TimelineEvent.ReleaseEvent>();
 
         if (calls.Count > 0)
         {
@@ -499,8 +565,12 @@ public sealed class Stepper(
             // 它是**用户答复**那一刻发生的执行——与 `Answer` / `Blocked` 里的 `At` 同源。
             foreach (var callId in batch.ExecutedCallIds)
                 if (calls.FirstOrDefault(c => string.Equals(c.CallId, callId, StringComparison.Ordinal)) is { Name: ReleaseTool.NameOf } release
-                    && RecordRelease(release, CoreClock.Now()) is { } line)
+                    && RecordRelease(release, CoreClock.Now()) is TimelineEvent.ReleaseEvent line)
+                {
                     events.Add(line);
+                    releasedClaims.AddRange(UnlockReleased(handle, line.Scope));
+                    releasedLines.Add(line);
+                }
 
             // ⚠️ **还有没答到的**（一张卡只答了一部分）⇒ 重新挂起，那些 `tool_use` 继续悬着
             // ——而这次悬着是**对的**：它们确实还没被回答。
@@ -519,7 +589,8 @@ public sealed class Stepper(
                     Turn = s.Turn + 1,
                 }, diskStatus: SessionStatus.WaitingForInput);
 
-                return new StepOutcome(NoReply, again, handle.State.Ask?.DeadlineAt);
+                return new StepOutcome(NoReply, again, handle.State.Ask?.DeadlineAt,
+                    ReleasedClaims: releasedClaims, ReleasedLines: releasedLines);
             }
         }
 
@@ -531,7 +602,7 @@ public sealed class Stepper(
             Turn = s.Turn + 1,
         }, diskStatus: SessionStatus.Idle);
 
-        return new StepOutcome(NoReply);
+        return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines);
     }
 
     /// <summary>
@@ -556,6 +627,9 @@ public sealed class Stepper(
     /// 一条头永远收不到的问题，等于把会话静默挂起。⇒ 与那条分工和解的做法是
     /// <b>把它作为<b>返回值的一部分</b>交出去</b>，由 `CommandDispatcher` 发。</para>
     /// </summary>
+    /// <para><paramref name="ReleasedClaims"/> 同理：`release` 摘掉的声明由推进器算好
+    /// （它拿着会话与工作目录），而 `claim.released` 事件由 `CommandDispatcher` 在落盘之后发。</para>
+    /// </summary>
     /// <param name="Reply">原样返回给调用方（控制台要它）。</param>
     /// <param name="Refused">
     /// 这次挂起的**那件事**（要问什么、等多久）。<c>null</c> = 没挂起。
@@ -563,11 +637,21 @@ public sealed class Stepper(
     /// 不重算的理由是「工具是纯的」这条契约不该在核心内部被当成可有可无
     /// （重算一遍会得到同一个答案，但那是**假设**，而不是这里能证明的事）。
     /// </param>
+    /// <param name="ReleasedClaims">
+    /// 这一步的 `release` **真正摘掉**的声明（`01` §12.4 的解锁那一半，2026-10-17）。
+    /// ⚠️ 空列表是绝大多数步的答案；只有 `release` 执行且确实持有那些锁时才有内容。
+    /// </param>
+    /// <param name="ReleasedLines">
+    /// 这一步落下的线（`ReleaseEvent`，2026-10-17）。⚠️ 它给**头**一个出口：
+    /// 线本身被 `TimelineRender.IsRenderable` 挡在模型之外，而人要看得出「模型在这里收过上下文」。
+    /// </param>
     public sealed record StepOutcome(
         ModelReply Reply,
         AskRequest? Refused = null,
         DateTimeOffset? DeadlineAt = null,
-        string? HistoryId = null);
+        string? HistoryId = null,
+        IReadOnlyList<Claim>? ReleasedClaims = null,
+        IReadOnlyList<TimelineEvent.ReleaseEvent>? ReleasedLines = null);
 
     /// <summary>
     /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。

@@ -510,6 +510,16 @@ button:disabled:hover { border-color: var(--rule); }
 .turn.model .body { color: var(--ink); }
 .turn.error .body { border-left-color: var(--danger); color: var(--danger); }
 .turn.error .who { color: var(--danger); }
+/* 线：模型说「这批资源用完了」的那条横线（`release`，01 §12.4）。 */
+.turn.release-line {
+  color: var(--ink-3);
+  font-size: 12px;
+  text-align: center;
+  border-top: 1px dashed var(--ink-3);
+  border-bottom: 1px dashed var(--ink-3);
+  padding: 4px 0;
+  margin: 6px 0;
+}
 .turn.meta .body {
   border-left-color: transparent;
   color: var(--ink-3);

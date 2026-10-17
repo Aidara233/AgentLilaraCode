@@ -102,7 +102,15 @@ public class ReleaseLineTests : IDisposable
         {
             Blocks = [ReleaseOf("c3", "src")], StopReason = "tool_use", Refused = false,
         });
-        await _stepper.StepAsync(_handle, [], default);
+        var releaseStep = await _stepper.StepAsync(_handle, [], default);
+
+        // ⚠️ **线的头出口**：`StepOutcome` 交回这条线，`CommandDispatcher` 据此发
+        // `release.recorded`（头重拉历史、画分隔线）。⚠️ 判据是**同一条线的 id**
+        // ——另起一条会让头画的线和判定读的线对不上。
+        var recorded = Assert.Single(releaseStep.ReleasedLines!);
+        Assert.Equal(["src"], recorded.Scope);
+        Assert.Contains(_store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ReleaseEvent>(), e => e.Id == recorded.Id);
 
         // 第 3 步：纯文本 ⇒ 这一趟的请求就是断言对象。
         _adapter.Reply("好。");
@@ -453,6 +461,56 @@ public class ReleaseLineTests : IDisposable
         var result = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
             .OfType<TimelineEvent.ToolResultEvent>().Single(r => r.CallId == "c2");
         Assert.Contains("拒绝", TextOf(result), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ **模型侧 `release` 摘掉自己的声明**（2026-10-17，§12.4 的解锁那一半）。
+    ///
+    /// <para>⚠️ <b>缺陷的形状</b>：`ClaimStore` 的写手原先只在命令层
+    /// （`claim.release`），而工具够不着它 ⇒ 模型说「我用完了」，锁还在，
+    /// 别的会话照样被挡。</para>
+    ///
+    /// <para>⚠️ <b>这里钉的是逐字路径</b>（`claim.release` 的判据），不是「整棵子树」——
+    /// 文件条目与目录条目是两把不同的声明。⚠️ **「只摘自己的」不在这里测**：
+    /// 它被一个既有事实挡住了——`claims.json` **同一个工作目录只有一份**，
+    /// 第二个会话的第一条声明就会判成冲突、写不进去（`ClaimCommandTests` 钉着）。
+    /// ⇒ 在同一个工作目录里造不出「别人的锁」，而 `ClaimStore.Release` 的
+    /// `ownerSessionId` 筛选今天因此**没有可观测效果**；它的价值是记录意图，
+    /// 等「每个会话独立 workingDirectory」或跨目录声明出现时再补测试。
+    /// **别把这条读成「已经证明只摘自己的」。**</para>
+    /// </summary>
+    [Fact]
+    public async Task ARelease_UnlocksTheSessionsOwnClaimsInScope()
+    {
+        var claims = new ClaimStore(_work);
+        var key = ProjectKey.FromPath(_work);
+        claims.Save(
+        [
+            // ⚠️ `ClaimStore.Release` 与 `claim.release` 同一条判据：**逐字路径**。
+            // 所以这里声明的是目录本身（典型用法），而不是它下面的某个文件。
+            new Claim(_handle.SessionId, key, Claims.Normalize("a.txt", _work), CoreClock.Now()),
+            new Claim(_handle.SessionId, key, Claims.Normalize("src", _work), CoreClock.Now()),
+        ]);
+
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "甲");
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, "看一眼", default);
+
+        var released = new List<Claim>();
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReleaseOf("c2", "a.txt", "src")], StopReason = "tool_use", Refused = false,
+        });
+        var step = await _stepper.StepAsync(_handle, [], default);
+        released.AddRange(step.ReleasedClaims ?? []);
+
+        var remaining = claims.All().Select(c => c.Path).ToList();
+        Assert.DoesNotContain(Claims.Normalize("a.txt", _work), remaining);
+        Assert.DoesNotContain(Claims.Normalize("src", _work), remaining);
+        Assert.Equal(2, released.Count);
     }
 
     private SessionHandle HandleWith(string permission)

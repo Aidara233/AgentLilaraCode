@@ -148,7 +148,8 @@ public class WireFormatTests
         // ⚠️ **加事件类型时按实测改这个数，别按感觉改**（被机械改过的探针等于没有）。
         // 13 → 14：`session.reclaimed`（2026-10-06，回收批）。
         // 14 → 16：`approval.requested` / `.resolved`（2026-10-08，询问批）。
-        Assert.Equal(16, declared.Length);
+        // 16 → 17：`release.recorded`（2026-10-17，线的头出口）。
+        Assert.Equal(17, declared.Length);
 
         var dispatcher = File.ReadAllText(Path.Combine(
             RepoRoot(), "src", "Lilara.Core", "Hosting", "CommandDispatcher.cs"));
@@ -164,7 +165,7 @@ public class WireFormatTests
     [Fact]
     public void WireEventTable_HasExactlyTheTypesWeThinkItDoes()
     {
-        Assert.Equal(16, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+        Assert.Equal(17, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
     }
 
     /// <summary>

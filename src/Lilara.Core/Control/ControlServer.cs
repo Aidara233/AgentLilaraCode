@@ -391,9 +391,11 @@ public sealed class ControlServer(
 
             // 分页必须作用在核心渲染后的事件上：ReleaseEvent、库解引用、回收注记和 framing
             // 都先确定，不能直接按 history.jsonl 行切，否则 head 看到的页会和模型看到的形态分叉。
-            var events = SessionQueries.HistoryOf(host, handle)
-                .Where(e => e is not Kernel.TimelineEvent.ReleaseEvent)
-                .ToList();
+            //
+            // ⚠️ **线不再被丢掉**（2026-10-17）：它**不进模型上下文**（`TimelineRender` 照样挡），
+            // 但它是给**人**的锚——头要画一条分隔线（`01` §14 #32）。
+            // ⇒ 在这里显式渲染成 `kind: "release"`，模型侧那份不经过这个函数。
+            var events = SessionQueries.HistoryOf(host, handle).ToList();
 
             var end = events.Count;
             if (before is not null)
@@ -619,6 +621,18 @@ public sealed class ControlServer(
             // ⚠️ 交的是**库里那个地址**，不是内容——`StoreBlock` 的大小可能远超一屏，
             // 而这个端点是给浏览器渲染的。要内容得另走（`03` §9.4 的 `GET /store/{sha256}`，还没做）。
             Blocks = r.Content,
+        },
+
+        // ⚠️ **线是给人看的**（2026-10-17）：模型那份渲染会把它挡掉
+        // （`TimelineRender.IsRenderable`），而 `/history` 是头的入口——
+        // 它必须交出去，否则「模型收过上下文」这件事对用户不存在（`01` §14 #32）。
+        Kernel.TimelineEvent.ReleaseEvent line => new
+        {
+            Kind = "release",
+            Id = line.Id,
+            At = line.At,
+            Scope = line.Scope,
+            Summary = line.Summary,
         },
 
         _ => throw new ArgumentException($"控制面不认识这个事件类型（{evt.GetType().Name}）", nameof(evt)),

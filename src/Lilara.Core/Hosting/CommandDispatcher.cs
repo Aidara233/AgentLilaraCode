@@ -883,6 +883,21 @@ public sealed class CommandDispatcher(
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId), requested);
             }
 
+            // ⚠️ **模型侧 `release` 摘掉的锁要告诉头**（2026-10-17）：摘锁只改 `claims.json`，
+            // 而头右栏的「谁在动哪些文件」靠 `claim.released` 刷新——不发的话，
+            // 头会继续显示模型已经说「我用完了」的锁，与核心状态静默分叉。
+            // ⚠️ `Stepper` 不碰事件总线（同 `StepOutcome` 的注释）⇒ 它交回、这里发。
+            foreach (var claim in step.ReleasedClaims ?? [])
+                _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
+                    new WireEvent.ClaimReleased(handle.SessionId, claim.Path));
+
+            // ⚠️ **线也要告诉头**（2026-10-17）：`/history` 把 `ReleaseEvent` 挡在外面
+            // （`TimelineRender.IsRenderable`），而人要看得出「模型在这里收过上下文」。
+            // ⇒ 头收到就重拉历史、在对应位置画一条分隔线；线本身仍然不进模型上下文。
+            foreach (var line in step.ReleasedLines ?? [])
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.ReleaseRecorded(handle.SessionId, line.Id, line.Scope, line.Summary, line.At));
+
             PublishStepEnd(handle, replyForLoop);
 
             // ⚠️ **这里刻意不 `return`**：要让 `finally` 先跑（它 `ExitStep()` 放掉那把标志，
@@ -1498,21 +1513,9 @@ public sealed class CommandDispatcher(
     {
         if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
-        var store = new ClaimStore(handle.Spec.WorkingDirectory);
         var paths = c.Scope.Select(p => Claims.Normalize(p, handle.Spec.WorkingDirectory)).ToList();
-
-        // 逃生口：不检查占用者是不是自己——模型失控时，用户要能从**别的**会话里把锁摘掉。
-        // 同样在 `Update` 的锁里（读-改-写不可分）。
-        var updated = store.Update(current =>
-        {
-            var list = current.ToList();
-            foreach (var path in paths) list.RemoveAll(x => x.Path == path);
-            return list;
-        });
-
-        // 只为真正被删掉的（`updated.Removed`）发事件——为 scope 里每条都发，
-        // 会给根本没被删的路径也发（它本来就不在）。
-        foreach (var claim in updated.Removed)
+        var released = new ClaimStore(handle.Spec.WorkingDirectory).Release(paths);
+        foreach (var claim in released)
             _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
                 new WireEvent.ClaimReleased(c.SessionId, claim.Path));
 
