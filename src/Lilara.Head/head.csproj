@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>Lilara.Head</RootNamespace>
-    <AssemblyName>lilara-head</AssemblyName>
+    <AssemblyName>Lilara.Head</AssemblyName>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>

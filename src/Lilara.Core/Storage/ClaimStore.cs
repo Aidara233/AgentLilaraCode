@@ -34,6 +34,30 @@ public sealed class ClaimStore(string workingDirectory)
     public void Save(IEnumerable<Claim> claims) =>
         AtomicFile.Write(Path_, System.Text.Json.JsonSerializer.Serialize(claims.ToList(), Kernel.Json.Options));
 
+    /// <summary>
+    /// **摘掉一批声明**（`claim.release` 与模型侧 `release` 共用的唯一实现）。
+    ///
+    /// <para>⚠️ <b>路径必须已经 <see cref="Lilara.Core.Kernel.Claims.Normalize"/> 过</b>——
+    /// 这里的比较是逐字 <c>==</c>。调用方各自规范化一次等于两份判据，
+    /// 而漂了的表现是「摘了但没摘掉」，静默。</para>
+    ///
+    /// <para>⚠️ <b><paramref name="ownerSessionId"/> 为 <c>null</c> 是逃生口</b>：
+    /// `claim.release` 不检查占用者是谁（模型失控时用户要能从别的会话摘锁）；
+    /// 模型侧 `release` **只摘自己的**——那是「我用完了」，不是「我替别人说完了」。</para>
+    /// </summary>
+    /// <returns>真正被删掉的声明（调用方只为这些发事件）。</returns>
+    public IReadOnlyList<Claim> Release(IReadOnlyCollection<string> normalizedPaths, string? ownerSessionId = null) =>
+        Update(current =>
+        {
+            var list = current.ToList();
+            foreach (var path in normalizedPaths)
+            {
+                list.RemoveAll(x => x.Path == path
+                    && (ownerSessionId is null || string.Equals(x.SessionId, ownerSessionId, StringComparison.Ordinal)));
+            }
+            return list;
+        }).Removed;
+
     // 按路径的锁。键必须规范化到小写——Windows 大小写不敏感，两个只差大小写的
     // 工作目录必须拿到同一把锁，否则丢更新。
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Lock> PathLocks = new();

@@ -3,7 +3,7 @@ using System.Text.RegularExpressions;
 namespace Lilara.Core.Tests;
 
 /// <summary>
-/// <b>`head/wwwroot/app.js` 的守卫。</b>
+/// <b>`src/Lilara.Head/wwwroot/app.js` 的守卫。</b>
 ///
 /// <para>⚠️ 为什么这个文件存在（2026-10-07）：头那 74KB 的 `app.js` **一条测试都没有**，
 /// 而它在同一天里栽了**两次同一形状**的错——「<b>把不是一串块的东西喂给收一串块的函数</b>」，
@@ -23,9 +23,7 @@ namespace Lilara.Core.Tests;
 /// <para>⚠️ <b>边界要说清：它读的是源码文本，不是运行行为。</b>它拦得住「谁又用错了」，
 /// 拦不住「渲染出来长什么样」。真正的 E2E 在浏览器里。</para>
 ///
-/// <para>⚠️ <b>它只读 `head/wwwroot/app.js` 那一份</b>——`head/bin/{Debug,Release}/…/wwwroot/`
-/// 是构建时复制过去的副本，按名字遍历时**排在源码前面**（写这些守卫时踩到过：
-/// 读的是 Release 那份旧拷贝，于是「变异落上却不红」，白查了三轮）。</para>
+/// <para>⚠️ <b>它只读 `src/Lilara.Head/wwwroot/app.js` 源码</b>——输出目录的副本由 head 项目每次构建强制覆盖。</para>
 /// </summary>
 public sealed class HeadScriptTests
 {
@@ -36,7 +34,7 @@ public sealed class HeadScriptTests
             dir = dir.Parent;
 
         Assert.NotNull(dir);
-        var path = Path.Combine(dir!.FullName, "head", "wwwroot", "app.js");
+        var path = Path.Combine(dir!.FullName, "src", "Lilara.Head", "wwwroot", "app.js");
         Assert.True(File.Exists(path), $"找不到 {path}");
         return File.ReadAllText(path);
     }
@@ -140,5 +138,39 @@ public sealed class HeadScriptTests
         Assert.False(body.Contains("b.kind", StringComparison.Ordinal),
             "slotText 里又自己判块了——块级逻辑只有 textOf 一份实现，这里只该判「空」。\n"
             + body);
+    }
+
+    [Fact]
+    public void HistoryDetails_AndPagination_AreStructuredAndShared()
+    {
+        var js = AppJs();
+
+        Assert.Contains("reasoning", js, StringComparison.Ordinal);
+        Assert.Contains("toolUse", js, StringComparison.Ordinal);
+        Assert.Contains("toolResult", js, StringComparison.Ordinal);
+        Assert.Contains("callId", js, StringComparison.Ordinal);
+        Assert.Contains("historyId", js, StringComparison.Ordinal);
+        Assert.Contains("nextCursor", js, StringComparison.Ordinal);
+        Assert.Contains("before=", js, StringComparison.Ordinal);
+        Assert.Contains("dataset.historyId", js, StringComparison.Ordinal);
+        Assert.Contains("createElement(\"details\")", js, StringComparison.Ordinal);
+        Assert.DoesNotContain("signature)", js, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NewSessionDirectorySelection_ComesFromCoreAndSubmitsCwd()
+    {
+        var js = AppJs();
+
+        Assert.Contains("/directories", js, StringComparison.Ordinal);
+        Assert.Contains("session.create", js, StringComparison.Ordinal);
+        Assert.Contains("cwd", js, StringComparison.Ordinal);
+        Assert.Contains("d.path", js, StringComparison.Ordinal);
+        Assert.Contains("进入 ${d.name}", js, StringComparison.Ordinal);
+        Assert.Contains("$(\"new-project\").value.trim()", js, StringComparison.Ordinal);
+        Assert.DoesNotContain("$(\"new-project\").innerHTML", js, StringComparison.Ordinal);
+        Assert.DoesNotContain("showDirectoryPicker", js, StringComparison.Ordinal);
+        Assert.DoesNotContain("webkitdirectory", js, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("File System Access", js, StringComparison.OrdinalIgnoreCase);
     }
 }

@@ -182,6 +182,89 @@ public class FetchTests : IDisposable
         Assert.NotEmpty(outcome.Content);
     }
 
+    // ---- 窗口取回（2026-10-17 投递截断的退路）----------------------------------
+
+    /// <summary>
+    /// ⚠️ **被截断的结果必须能按偏移取回**（2026-10-17 用户裁定）：截断注记给出
+    /// `fetch(id, offset=…)`，而这里的 `offset` 必须与那边**同一个单位**（字节）、
+    /// 同一条字符边界规则——否则「接着看」会漏字节或把注记再喂回来。
+    /// </summary>
+    [Fact]
+    public async Task Fetch_WithOffsetAndLength_ReturnsThatByteWindow()
+    {
+        var result = StoredResult("r1", "0123456789");
+        var outcome = await _tool.RunAsync(
+            new ToolCall("c1", "fetch", """{"id":"r1","offset":4,"length":3}"""), ContextWith(result), default);
+
+        Assert.Equal("456", Assert.IsType<Block.TextBlock>(Assert.Single(outcome.Content)).Text);
+
+        // ⚠️ 范围与总量进框架：缺了它们，模型会把「这一段」当成「全部」。
+        var frame = Assert.IsType<ToolFraming>(outcome.Framing).Render();
+        Assert.Contains("4–7", frame);
+        Assert.Contains("10", frame);
+    }
+
+    /// <summary>
+    /// ⚠️ 大结果（记录里是库地址）也要能按窗口取——那正是投递截断最常落在的一档。
+    /// </summary>
+    [Fact]
+    public async Task Fetch_WindowWorksForContentThatWentToTheStore()
+    {
+        var big = new string('x', BlobStore.InlineThresholdBytes + 100) + "TAIL";
+        var result = StoredResult("r1", big);
+        Assert.IsType<Block.StoreBlock>(Assert.Single(result.Content));
+
+        var outcome = await _tool.RunAsync(
+            new ToolCall("c1", "fetch", """{"id":"r1","offset":1000,"length":4}"""), ContextWith(result), default);
+
+        Assert.Equal("xxxx", Assert.IsType<Block.TextBlock>(Assert.Single(outcome.Content)).Text);
+    }
+
+    [Fact]
+    public async Task Fetch_NextOffsetFromTheTruncationNote_ContinuesWithoutGapOrOverlap()
+    {
+        // 中文每字 3 字节，偏移落在字符中间时应当往后对齐到完整的字——与渲染层同一条规则。
+        var text = "你好世界";
+        var result = StoredResult("r1", text);
+        var bytes = Encoding.UTF8.GetBytes(text);
+
+        var outcome = await _tool.RunAsync(
+            new ToolCall("c1", "fetch", $$"""{"id":"r1","offset":{{2}},"length":{{bytes.Length}}}"""),
+            ContextWith(result), default);
+
+        var body = Assert.IsType<Block.TextBlock>(Assert.Single(outcome.Content)).Text;
+        Assert.DoesNotContain('�', body);
+        Assert.Equal("好世界", body);
+    }
+
+    [Fact]
+    public async Task Fetch_WithOffsetPastTheEnd_SaysSoInsteadOfReturningEmpty()
+    {
+        var result = StoredResult("r1", "short");
+        var outcome = await _tool.RunAsync(
+            new ToolCall("c1", "fetch", """{"id":"r1","offset":99}"""), ContextWith(result), default);
+
+        var text = Assert.IsType<Block.TextBlock>(Assert.Single(outcome.Content)).Text;
+        Assert.Contains("99", text);
+        Assert.Contains("5", text);
+    }
+
+    [Fact]
+    public async Task Fetch_WindowOnANonTextResult_SaysItCannotBePaged()
+    {
+        var mixed = new TimelineEvent.ToolResultEvent
+        {
+            Id = "r1", At = CoreClock.Now(), CallId = "c1",
+            Content = [new Block.TextBlock("说明"), new Block.ImageBlock(new string('i', 64), "image/png")],
+        };
+
+        var outcome = await _tool.RunAsync(
+            new ToolCall("c1", "fetch", """{"id":"r1","offset":0,"length":10}"""), ContextWith(mixed), default);
+
+        var text = Assert.IsType<Block.TextBlock>(Assert.Single(outcome.Content)).Text;
+        Assert.Contains("不能按字节偏移", text);
+    }
+
     // ---- 常驻 ----------------------------------------------------------------
 
     /// <summary>

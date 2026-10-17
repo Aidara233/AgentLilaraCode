@@ -193,6 +193,10 @@ public sealed class ToolExecutor(
         if (asks.Count > 0) return new Batch([], Merge(asks));
 
         var results = new List<TimelineEvent.ToolResultEvent>(calls.Count);
+
+        // ⚠️ **只有走到下面那个 `RunAsync` 的调用才进来**——「名字在批里」不足以说明
+        // 「它执行过」（见 `Batch.ExecutedCallIds`）。`release` 的线按这份名单画。
+        var executed = new List<string>(calls.Count);
         foreach (var plan in plans)
         {
             // ⚠️ **问意见（`Question`）那条：用户答复过的不跑**（`01` §3.8）。
@@ -220,8 +224,13 @@ public sealed class ToolExecutor(
             }
 
             // ⚠️ **被拒的调用绝不 `RunAsync`**——否则就是「拒了，但还是删了库」。
-            var outcome = plan.Tool is not null && plan.Verdict is Verdict.Allow
-                ? await plan.Tool.RunAsync(
+            // ⚠️ 这一格也是 `ExecutedCallIds` 的唯一写入点：名单在**执行前**记下，
+            // 与 `RunAsync` 同一支，不会出现「结果落了、名单没有」或反过来。
+            var willRun = plan.Tool is not null && plan.Verdict is Verdict.Allow;
+            if (willRun) executed.Add(plan.Call.CallId);
+
+            var outcome = willRun
+                ? await plan.Tool!.RunAsync(
                     new ToolCall(plan.Call.CallId, plan.Call.Name, plan.Call.Arguments), context, ct)
                 : new ToolOutcome { Content = [new Block.TextBlock(plan.Says!)] };
 
@@ -241,17 +250,36 @@ public sealed class ToolExecutor(
             });
         }
 
-        return new Batch(results, null);
+        return new Batch(results, null) { ExecutedCallIds = executed };
     }
 
     /// <summary>
     /// 一趟执行的两个产出（`01` §3.8）。⚠️ <b>两者互斥</b>：
     /// <see cref="Pending"/> 非 null ⇒ <see cref="Results"/> 必然是空的（一条都没跑）。
+    /// <para>⚠️ 挂起时 <see cref="Batch.ExecutedCallIds"/> 也是空的：那一趟**一条都没跑**。</para>
     /// </summary>
     /// <param name="Results">按调用序的结果。⚠️ 有问时恒空——见类型注释。</param>
     /// <param name="Pending">要问用户的那件事。⚠️ <c>null</c> = 没问。</param>
     public sealed record Batch(
-        IReadOnlyList<TimelineEvent.ToolResultEvent> Results, AskRequest? Pending);
+        IReadOnlyList<TimelineEvent.ToolResultEvent> Results, AskRequest? Pending)
+    {
+        /// <summary>
+        /// 真正跑过 <see cref="ITool.RunAsync"/> 的调用 id（`01` §12.4 的线要它）。
+        ///
+        /// <para>⚠️ <b>它存在，是因为「名字相同」与「真的执行了」不是一回事</b>：
+        /// 一条 `release` 可能被闸门硬拒、可能落在挂起的那批里、也可能只配了
+        /// 一条「这批不跑了」的补丁结果——那三种情况下**都没有画过线**。
+        /// 若推进器只看「本批里有没有叫 release 的调用」就画，那么一次被拒绝的
+        /// `off` 档调用、一次从未执行的恢复批次，会各留下一条线
+        /// （而线是**单调的判据**：它会把那些结果永久收掉）。</para>
+        ///
+        /// <para>⚠️ <b>它是执行器唯一知道、而调用方无法重建的事实</b>：拒绝理由与补丁正文
+        /// 都是内容，但「这条到底跑没跑」只有这一步知道。⇒ 由执行器交回，而不是让
+        /// 推进器拿结果去猜。⚠️ 只有真正执行的分支会填它；拒绝 / 不存在 / 挂起 / 提问答复
+        /// （答案由核心拼，工具没跑）**一律为空**。</para>
+        /// </summary>
+        public IReadOnlyList<string> ExecutedCallIds { get; init; } = [];
+    }
 
     /// <summary>
     /// 把同一批里**多条**询问并成**一次**（`01` §3.8：「一次询问要能够扔出来好几个问题」）。

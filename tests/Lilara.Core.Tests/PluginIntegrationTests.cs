@@ -3,6 +3,7 @@ using Lilara.Core.Control;
 using Lilara.Core.Hosting;
 using Lilara.Core.Kernel;
 using Lilara.Core.Plugins;
+using Lilara.Core.Protocol;
 using Lilara.Core.Protocol.Claude;
 using Lilara.Core.Protocol.OpenAi;
 using Lilara.Core.Session;
@@ -45,6 +46,23 @@ public sealed class PluginIntegrationTests : IDisposable
         d.DispatchAsync(new CoreCommand.SessionSetAxis(h.SessionId, axis, value), "set", false, CancellationToken.None);
     private static string Text(IEnumerable<Block> blocks) => string.Join("\n", blocks.OfType<Block.TextBlock>().Select(b => b.Text));
 
+    /// <summary>
+    /// 请求里**模型看得见的全部文本**——包括末尾那对合成的 `floating_context` 调用 + 结果
+    /// （2026-10-17：工具表里有 `floating_context` 时，浮动块不再走 `Slots.Tail`，
+    /// 它住在时间线末尾的合成对里）。
+    /// ⚠️ 只读 `Slots.Tail` 的断言在本批之后**只在带工具表的会话里**恒为空——
+    /// 这里的推进器刻意不带工具表，所以它实际读的是尾槽位（回退路径）。
+    /// 两条都读：这个助手钉的是「模型看得见」，不是「它从哪条路来」。
+    /// </summary>
+    private static string RequestText(ModelRequest request) => string.Join("\n",
+        Text(request.Slots.System), Text(request.Slots.Premier), Text(request.Slots.Tail),
+        string.Join("\n", request.Timeline.Select(e => e switch
+        {
+            TimelineEvent.ToolResultEvent r => Text(r.Content),
+            TimelineEvent.MessageEvent m => Text(m.Blocks),
+            _ => "",
+        })));
+
     [Fact]
     public async Task Change_Save_Restart_NextStep_ChangesFloatingOnly_AndAllProtocolsCarryIt()
     {
@@ -70,12 +88,14 @@ public sealed class PluginIntegrationTests : IDisposable
         nextAdapter.Reply("two");
         await new Stepper(fresh.Store, nextAdapter, plugins: fresh.Plugins).StepAsync(loaded, "again", CancellationToken.None);
         var after = nextAdapter.Calls.Single();
-        Assert.Contains("style=brief", Text(before.Slots.Tail));
-        Assert.Contains("style=detailed", Text(after.Slots.Tail));
-        Assert.Contains("Keep the answer concise.", Text(before.Slots.Tail));
-        Assert.Contains("Explain the reasoning with concrete examples.", Text(after.Slots.Tail));
-        Assert.DoesNotContain("Keep the answer concise.", Text(after.Slots.Tail));
-        Assert.Contains("验证未通过时不得声称完成", Text(after.Slots.Tail));
+        // ⚠️ 读 **RequestText**（槽位 + 时间线），不读 `Slots.Tail`：这里的推进器不带工具表，
+        // 尾块退回槽位；若哪天它带上工具表，尾块会搬到末尾合成对里，那样断言仍然成立。
+        Assert.Contains("style=brief", RequestText(before));
+        Assert.Contains("style=detailed", RequestText(after));
+        Assert.Contains("Keep the answer concise.", RequestText(before));
+        Assert.Contains("Explain the reasoning with concrete examples.", RequestText(after));
+        Assert.DoesNotContain("Keep the answer concise.", RequestText(after));
+        Assert.Contains("验证未通过时不得声称完成", RequestText(after));
         Assert.Contains("浮动上下文", Text(after.Slots.System));
         Assert.Equal(Text(before.Slots.System), Text(after.Slots.System));
         Assert.Equal(Text(before.Slots.Premier), Text(after.Slots.Premier));
@@ -146,11 +166,11 @@ public sealed class PluginIntegrationTests : IDisposable
         adapter.ReplyWith(request =>
         {
             Assert.Equal("high", request.Effort);
-            Assert.Contains("style=brief", Text(request.Slots.Tail));
-            Assert.Contains("Keep the answer concise.", Text(request.Slots.Tail));
-            Assert.DoesNotContain("Explain the reasoning with concrete examples.", Text(request.Slots.Tail));
-            Assert.Contains("相关编译、测试或检查", Text(request.Slots.Tail));
-            Assert.DoesNotContain("验证未通过时不得声称完成", Text(request.Slots.Tail));
+            Assert.Contains("style=brief", RequestText(request));
+            Assert.Contains("Keep the answer concise.", RequestText(request));
+            Assert.DoesNotContain("Explain the reasoning with concrete examples.", RequestText(request));
+            Assert.Contains("相关编译、测试或检查", RequestText(request));
+            Assert.DoesNotContain("验证未通过时不得声称完成", RequestText(request));
             Set(commands, h, "demo.style", "brief").GetAwaiter().GetResult();
             throw new InvalidOperationException("upstream failed");
         });

@@ -38,11 +38,8 @@ public sealed class ControlServer(
     /// <summary>
     /// 默认只放行头自己的 origin。
     ///
-    /// <para>⚠️ <b>它必须与 <c>head/Program.cs</c> 的默认头端口是同一个数</b>——
-    /// 两份副本，而 `AllowedOriginResolver` 会在环境变量缺席时用这里兜底。
-    /// 头默认端口从 7790 改到 17990 时这里**跟着改**（7790 同样落在保留段里）。
-    /// ⚠️ <c>localhost:17990</c> 与 <c>127.0.0.1:17990</c> **不是同一个 origin**（浏览器这么判），
-    /// 且 <c>localhost</c> 是任何本机程序都能抢占的名字（hosts / DNS）⇒ 拒 localhost 是刻意的。</para>
+    /// <para>⚠️ <b>它必须与 <c>src/Lilara.Head/Program.cs</c> 的默认头端口是同一个数</b>——
+    /// 两份副本，而 `AllowedOriginResolver` 会在环境变量缺席时用这里兜底。</para>
     /// </summary>
     internal const string DefaultAllowedOrigin = "http://127.0.0.1:17990";
 
@@ -123,6 +120,73 @@ public sealed class ControlServer(
         // 每个快照都带该 topic 的 seq 高水位：头拿它去 subscribe(since:)，
         // 「拉快照 → 订阅」之间落的事件才不漏不重。
         app.MapGet("/projects", () => Results.Json(ProjectKeys(), WireJson.Options));
+
+        // 目录浏览只在 core 设备上发生：head 只提交 core 看到的路径，不调用浏览器本机选择器。
+        // 缺省返回文件系统根（Windows 盘符 / Unix 根目录），可浏览任意可读目录；不创建目录、不激活会话。
+        app.MapGet("/directories", (string? path) =>
+        {
+            if (string.IsNullOrWhiteSpace(path) && OperatingSystem.IsWindows())
+            {
+                var drives = DriveInfo.GetDrives()
+                    .Where(d => d.IsReady)
+                    .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase)
+                    .Select(d => new { Name = d.Name, Path = d.RootDirectory.FullName })
+                    .ToList();
+                return Results.Json(new
+                {
+                    Root = (string?)null,
+                    Current = (string?)null,
+                    Parent = (string?)null,
+                    Directories = drives,
+                    Error = (string?)null,
+                }, WireJson.Options);
+            }
+
+            string current;
+            try
+            {
+                current = string.IsNullOrWhiteSpace(path)
+                    ? Path.GetPathRoot(Path.GetFullPath(host.WorkingDirectory))!
+                    : Path.GetFullPath(path);
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or System.Security.SecurityException)
+            {
+                return Results.BadRequest(new { error = $"路径不合法：{ex.Message}" });
+            }
+
+            var currentInfo = new DirectoryInfo(current);
+            if (!currentInfo.Exists)
+                return Results.BadRequest(new { error = "目录不存在或不可访问。" });
+
+            DirectoryInfo[] children;
+            try { children = currentInfo.EnumerateDirectories().ToArray(); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return Results.Json(new
+                {
+                    Root = Path.GetPathRoot(current),
+                    Current = current,
+                    Parent = currentInfo.Parent?.FullName,
+                    Directories = Array.Empty<object>(),
+                    Error = $"目录不可读：{ex.Message}",
+                }, WireJson.Options);
+            }
+
+            var directories = children
+                .Where(d => (d.Attributes & FileAttributes.ReparsePoint) == 0)
+                .OrderBy(d => d.Name, StringComparer.Ordinal)
+                .Select(d => new { Name = d.Name, Path = d.FullName })
+                .ToList();
+
+            return Results.Json(new
+            {
+                Root = Path.GetPathRoot(current),
+                Current = current,
+                Parent = currentInfo.Parent?.FullName,
+                Directories = directories,
+                Error = (string?)null,
+            }, WireJson.Options);
+        });
 
         app.MapGet("/projects/{pk}/sessions", (string pk) =>
             Results.Json(host.Store.ListSessions(pk), WireJson.Options));
@@ -312,27 +376,50 @@ public sealed class ControlServer(
             Session.Tools.AskTool.ItemsOf(host.Store, handle.ProjectKey, handle.SessionId, paused.CallId,
                 handle.State.Axes?.GetValueOrDefault(Axes.Permission));
 
-        app.MapGet("/sessions/{id}/history", (string id) =>
+        app.MapGet("/sessions/{id}/history", (string id, int? limit, string? before) =>
         {
             if (!TryFind(id, out var handle)) return Results.NotFound();
 
-            // 同 /state：先高水位、后内容。
+            const int defaultLimit = 50;
+            const int maxLimit = 200;
+            var pageSize = limit ?? defaultLimit;
+            if (pageSize is < 1 or > maxLimit)
+                return Results.BadRequest(new { error = $"limit 必须在 1 到 {maxLimit} 之间。" });
+
+            // 同 /state：先高水位、后内容。它是 WS 游标，不是历史分页游标。
             var highWater = bus.HighWaterMark(EventBus.SessionTopic(id));
 
-            // 返回的是当前可渲染的形态（核心渲染，头只显示）；简化机制还没有，这一步是恒等的。
-            // ⚠️ **线的事件不进这里**（`01` §12.4）：它是给我们自己看的锚（倒查 / 线的判据），
-            // 不是一条要给人看的对话。它照样落盘、照样是判定的输入，而**渲染出来的形态里没有它**
-            // ——与 `TimelineRender.IsRenderable` 同一份判据。
-            // ⚠️ 不挡的话这里会**抛**（下面那个 `_ =>` 分支）：一个会话只要释放过一次，
-            // 头拉历史就当场 500。
-            var events = SessionQueries.HistoryOf(host, handle)
-                .Where(e => e is not Kernel.TimelineEvent.ReleaseEvent)
-                .ToList();
+            // 分页必须作用在核心渲染后的事件上：ReleaseEvent、库解引用、回收注记和 framing
+            // 都先确定，不能直接按 history.jsonl 行切，否则 head 看到的页会和模型看到的形态分叉。
+            //
+            // ⚠️ **线不再被丢掉**（2026-10-17）：它**不进模型上下文**（`TimelineRender` 照样挡），
+            // 但它是给**人**的锚——头要画一条分隔线（`01` §14 #32）。
+            // ⇒ 在这里显式渲染成 `kind: "release"`，模型侧那份不经过这个函数。
+            var events = SessionQueries.HistoryOf(host, handle).ToList();
+
+            var end = events.Count;
+            if (before is not null)
+            {
+                if (!TryDecodeHistoryCursor(before, out var cursorSession, out var beforeId)
+                    || !string.Equals(cursorSession, id, StringComparison.Ordinal))
+                    return Results.BadRequest(new { error = "历史游标无效或不属于此会话。" });
+
+                end = events.FindIndex(e => string.Equals(e.Id, beforeId, StringComparison.Ordinal));
+                if (end < 0)
+                    return Results.BadRequest(new { error = "历史游标已失效，请重新加载会话。" });
+            }
+
+            var start = Math.Max(0, end - pageSize);
+            var page = events.GetRange(start, end - start);
+            var hasMore = start > 0;
+            var nextCursor = hasMore ? EncodeHistoryCursor(id, page[0].Id) : null;
 
             return Results.Json(new
             {
                 highWater,
-                rendered = events.Select(Render).ToList(),
+                rendered = page.Select(Render).ToList(),
+                hasMore,
+                NextCursor = nextCursor ?? "",
             }, WireJson.Options);
         });
 
@@ -540,11 +627,40 @@ public sealed class ControlServer(
         };
     }
 
+    private static string EncodeHistoryCursor(string sessionId, string beforeId) =>
+        Convert.ToBase64String(Encoding.UTF8.GetBytes($"1\n{sessionId}\n{beforeId}"))
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
+
+    private static bool TryDecodeHistoryCursor(
+        string cursor, out string sessionId, out string beforeId)
+    {
+        sessionId = "";
+        beforeId = "";
+        try
+        {
+            var padded = cursor.Replace('-', '+').Replace('_', '/');
+            padded += new string('=', (4 - padded.Length % 4) % 4);
+            var parts = Encoding.UTF8.GetString(Convert.FromBase64String(padded)).Split('\n');
+            if (parts is not ["1", var sid, var bid] || sid.Length == 0 || bid.Length == 0)
+                return false;
+            sessionId = sid;
+            beforeId = bid;
+            return true;
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
+
     private static object Render(Kernel.TimelineEvent evt) => evt switch
     {
         Kernel.TimelineEvent.MessageEvent m => new
         {
             Kind = "message",
+            Id = m.Id,
             From = m.From == Kernel.Speaker.User ? "user" : "model",
             At = m.At,
             Blocks = m.Blocks,
@@ -553,12 +669,25 @@ public sealed class ControlServer(
         Kernel.TimelineEvent.ToolResultEvent r => new
         {
             Kind = "toolResult",
+            Id = r.Id,
             // ⚠️ 配对 id 交出去：头要拿它跟前一条的 `toolUse` 块对起来。
             CallId = r.CallId,
             At = r.At,
             // ⚠️ 交的是**库里那个地址**，不是内容——`StoreBlock` 的大小可能远超一屏，
             // 而这个端点是给浏览器渲染的。要内容得另走（`03` §9.4 的 `GET /store/{sha256}`，还没做）。
             Blocks = r.Content,
+        },
+
+        // ⚠️ **线是给人看的**（2026-10-17）：模型那份渲染会把它挡掉
+        // （`TimelineRender.IsRenderable`），而 `/history` 是头的入口——
+        // 它必须交出去，否则「模型收过上下文」这件事对用户不存在（`01` §14 #32）。
+        Kernel.TimelineEvent.ReleaseEvent line => new
+        {
+            Kind = "release",
+            Id = line.Id,
+            At = line.At,
+            Scope = line.Scope,
+            Summary = line.Summary,
         },
 
         _ => throw new ArgumentException($"控制面不认识这个事件类型（{evt.GetType().Name}）", nameof(evt)),
@@ -944,6 +1073,29 @@ public sealed class ControlServer(
         if (host.Store.FindSession(sessionId) is not { } found) return false;
 
         handle = host.Activate(found.ProjectKey, sessionId);
+        return true;
+    }
+
+    private static readonly StringComparison PathComparison =
+        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    private static bool IsWithinDirectory(string root, string path)
+    {
+        var normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        var normalizedPath = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        return string.Equals(path, root, PathComparison)
+            || normalizedPath.StartsWith(normalizedRoot, PathComparison);
+    }
+
+    private static bool HasReparsePointBetween(DirectoryInfo current, DirectoryInfo root)
+    {
+        for (var dir = current; dir is not null; dir = dir.Parent)
+        {
+            if ((dir.Attributes & FileAttributes.ReparsePoint) != 0) return true;
+            if (string.Equals(dir.FullName, root.FullName, PathComparison)) return false;
+        }
         return true;
     }
 

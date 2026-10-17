@@ -74,10 +74,34 @@ public static class SystemBlock
         string? systemPresetId, string? premierId,
         IReadOnlyDictionary<string, string> axes,
         PromptContributionSnapshot? pluginPrompt = null) =>
+        Build(
+            // ⚠️ 传**可空**的预设正文，不在这里折成 `SystemFallback`：那一折会抹掉
+            // 「文件不在」与「文件在」的区分，而 `SystemBody` 的判据正是它
+            // （文件不在时兜底里已含机制说明；文件在时补一句）。
+            Load(presets, systemPresetId),
+            Load(premiers, premierId),
+            axes, pluginPrompt);
+
+    /// <summary>
+    /// 三块槽位的**纯装配**——输入是已经读好的两份正文 + 轴 + 插件贡献，不碰任何存储。
+    ///
+    /// <para>⚠️ <b>它必须有，是因为 <see cref="Render"/> 够不到「答复路径」与控制面</b>
+    /// （2026-10-17，`floating_context` 批）：<c>Stepper.ResumeAsync</c> 没有步开始的槽位快照，
+    /// 而待答询问的探测点也不该为了拿一句尾块去读两份预设。⇒ 两份正文由调用点自己取
+    /// （各取各的：步开始取预设、答复/探测用空串），**装配判据仍然只有这一处**。</para>
+    ///
+    /// <para>⚠️ <b>两格正文的语义与 <see cref="Render"/> 的「文件不在 / 空」那三种状态同一套</b>：
+    /// <c>null</c> = 没有这一块，<c>""</c> = 有但为空（系统块那一格甚至会产出空串块——
+    /// 那是「用户明说纯聊天」的声明，见 <see cref="Text"/>）。</para>
+    /// </summary>
+    internal static PromptSlots Build(
+        string? systemText, string? premierText,
+        IReadOnlyDictionary<string, string> axes,
+        PromptContributionSnapshot? pluginPrompt = null) =>
         new(
-            System: Text(SystemBody(Load(presets, systemPresetId), pluginPrompt?.Text(PromptSlot.System))),
+            System: Text(SystemBody(systemText, pluginPrompt?.Text(PromptSlot.System))),
             Premier: Wrap(CorePrompts.PremierOpen,
-                Join(Load(premiers, premierId), pluginPrompt?.Text(PromptSlot.Primary)), CorePrompts.PremierClose),
+                Join(premierText, pluginPrompt?.Text(PromptSlot.Primary)), CorePrompts.PremierClose),
             Tail: Wrap(CorePrompts.TailOpen,
                 TailBody(axes, pluginPrompt?.Text(PromptSlot.Floating)), CorePrompts.TailClose));
 

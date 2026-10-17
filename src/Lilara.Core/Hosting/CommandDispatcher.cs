@@ -927,10 +927,11 @@ public sealed class CommandDispatcher(
         // 这两步刻意不拿闸：合并是队列的副产品，而 no-op 的前提是后来的 send 先进得来。
         // 并发安全靠各自那层的锁：`HistoryLog.Append` 自带按路径的锁，`SessionHandle.Enqueue` 自带队列锁。
         var at = CoreClock.Now();
+        var historyId = Ids.New();
 
         _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
         {
-            Id = Ids.New(),
+            Id = historyId,
             At = at,
             From = Speaker.User,
             Blocks = s.Blocks,
@@ -945,7 +946,10 @@ public sealed class CommandDispatcher(
         // 事件从 dispatcher 发，不从 `Stepper` 发——否则控制台敲的那句话在头上看不见
         // （控制台不订阅，但它的命令照样产生事件；缺了它头的视图会静默少一步）。
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-            new WireEvent.MessageAppended(handle.SessionId, "user", s.Blocks, at));
+            new WireEvent.MessageAppended(handle.SessionId, "user", s.Blocks, at)
+            {
+                HistoryId = historyId,
+            });
 
         // 启动去重：已有推进在飞时，本次只入队、不再安排一次推进。
         if (!handle.TryEnterStep())
@@ -1043,7 +1047,10 @@ public sealed class CommandDispatcher(
                 // 模型消息由这里发（`Stepper` 不碰事件总线）；判据与它落盘时一致：拒答 / 空块不产生模型消息。
                 if (!reply.Refused && reply.Blocks.Count > 0)
                     _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                        new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, CoreClock.Now()));
+                        new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, CoreClock.Now())
+                        {
+                            HistoryId = step.HistoryId,
+                        });
             }
 
             // ⚠️ **挂起也要发事件**（`01` §3.8）：一条头收不到的问题 = 会话被**静默挂起**。
@@ -1059,6 +1066,21 @@ public sealed class CommandDispatcher(
                 _bus.Publish(EventBus.ApprovalsTopic, requested);
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId), requested);
             }
+
+            // ⚠️ **模型侧 `release` 摘掉的锁要告诉头**（2026-10-17）：摘锁只改 `claims.json`，
+            // 而头右栏的「谁在动哪些文件」靠 `claim.released` 刷新——不发的话，
+            // 头会继续显示模型已经说「我用完了」的锁，与核心状态静默分叉。
+            // ⚠️ `Stepper` 不碰事件总线（同 `StepOutcome` 的注释）⇒ 它交回、这里发。
+            foreach (var claim in step.ReleasedClaims ?? [])
+                _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
+                    new WireEvent.ClaimReleased(handle.SessionId, claim.Path));
+
+            // ⚠️ **线也要告诉头**（2026-10-17）：`/history` 把 `ReleaseEvent` 挡在外面
+            // （`TimelineRender.IsRenderable`），而人要看得出「模型在这里收过上下文」。
+            // ⇒ 头收到就重拉历史、在对应位置画一条分隔线；线本身仍然不进模型上下文。
+            foreach (var line in step.ReleasedLines ?? [])
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.ReleaseRecorded(handle.SessionId, line.Id, line.Scope, line.Summary, line.At));
 
             var usageCalls = _host.Usage.ForSession(handle.SessionId);
             if (usageCalls.Count > usageCountBefore)
@@ -1686,21 +1708,9 @@ public sealed class CommandDispatcher(
     {
         if (!TryFind(c.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
-        var store = new ClaimStore(handle.Spec.WorkingDirectory);
         var paths = c.Scope.Select(p => Claims.Normalize(p, handle.Spec.WorkingDirectory)).ToList();
-
-        // 逃生口：不检查占用者是不是自己——模型失控时，用户要能从**别的**会话里把锁摘掉。
-        // 同样在 `Update` 的锁里（读-改-写不可分）。
-        var updated = store.Update(current =>
-        {
-            var list = current.ToList();
-            foreach (var path in paths) list.RemoveAll(x => x.Path == path);
-            return list;
-        });
-
-        // 只为真正被删掉的（`updated.Removed`）发事件——为 scope 里每条都发，
-        // 会给根本没被删的路径也发（它本来就不在）。
-        foreach (var claim in updated.Removed)
+        var released = new ClaimStore(handle.Spec.WorkingDirectory).Release(paths);
+        foreach (var claim in released)
             _bus.Publish(EventBus.ProjectTopic(handle.ProjectKey),
                 new WireEvent.ClaimReleased(c.SessionId, claim.Path));
 

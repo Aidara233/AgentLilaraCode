@@ -104,9 +104,11 @@ public class WireFormatTests
     public void WireEvent_NestedBlocksKeepTheirDiscriminator()
     {
         var json = WireEvent.StableSerialize(new WireEvent.MessageAppended(
-            "s1", "user", [new Block.TextBlock("你好")], DateTimeOffset.UnixEpoch));
+            "s1", "user", [new Block.TextBlock("你好")], DateTimeOffset.UnixEpoch)
+            { HistoryId = "h1" });
 
         Assert.Contains("\"kind\":\"message.appended\"", json);
+        Assert.Contains("\"historyId\"", json);
         Assert.Contains("\"kind\":\"text\"", json);          // 嵌套块的判别式
         Assert.Contains("\"text\":\"你好\"", json);
     }
@@ -116,7 +118,8 @@ public class WireFormatTests
     public void WireEvent_ReasoningBlockWithoutSignature_OmitsTheKey()
     {
         var json = WireEvent.StableSerialize(new WireEvent.MessageAppended(
-            "s1", "model", [new Block.ReasoningBlock(null, "想")], DateTimeOffset.UnixEpoch));
+            "s1", "model", [new Block.ReasoningBlock(null, "想")], DateTimeOffset.UnixEpoch)
+            { HistoryId = "h1" });
 
         Assert.Contains("\"reasoningKind\":\"text\"", json);
         Assert.DoesNotContain("signature", json);
@@ -174,8 +177,10 @@ public class WireFormatTests
         // ⚠️ **加事件类型时按实测改这个数，别按感觉改**（被机械改过的探针等于没有）。
         // 13 → 14：`session.reclaimed`（2026-10-06，回收批）。
         // 14 → 16：`approval.requested` / `.resolved`（2026-10-08，询问批）。
-        // 16 → 17：`usage.updated`（2026-10-15，统计批）。
-        Assert.Equal(18, declared.Length);
+        // 16 → 17：`usage.updated`（2026-10-15，统计批）与 `release.recorded`（2026-10-17，线的头出口）
+        // 是两条分支各自加的 ⇒ 合并后是 16 + 2。
+        // 17 → 18：`session.compaction.completed`（2026-10-16，压缩批）。
+        Assert.Equal(19, declared.Length);
 
         var dispatcher = File.ReadAllText(Path.Combine(
             RepoRoot(), "src", "Lilara.Core", "Hosting", "CommandDispatcher.cs"));
@@ -191,7 +196,7 @@ public class WireFormatTests
     [Fact]
     public void WireEventTable_HasExactlyTheTypesWeThinkItDoes()
     {
-        Assert.Equal(18, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+        Assert.Equal(19, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
     }
 
     /// <summary>

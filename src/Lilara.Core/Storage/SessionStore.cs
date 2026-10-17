@@ -35,7 +35,7 @@ public sealed class SessionStore(string dataRoot)
     ///
     /// <para>⚠️ <b>排序不是装饰，是「顺序必须确定」这条既有裁定的一部分。</b>
     /// `Directory.GetDirectories` 的返回顺序**由文件系统决定、不由我们决定**——
-    /// 而调用方会取 <c>[0]</c>：`head/wwwroot/app.js` 在 `currentProject === null` 时
+    /// 而调用方会取 <c>[0]</c>：`src/Lilara.Head/wwwroot/app.js` 在 `currentProject === null` 时
     /// 就取第一个当默认订阅的项目流。<b>把它交给文件系统，等于把头默认订哪个项目交给文件系统。</b></para>
     ///
     /// <para>⚠️ <b>严重性别夸大</b>：Windows/NTFS 恰按文件名序枚举，而项目键是路径规范化后的小写串

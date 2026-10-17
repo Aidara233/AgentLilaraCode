@@ -239,7 +239,8 @@ public class StepperToolTests : IDisposable
         await _stepper.StepAsync(handle, [], default);
 
         var sent = Assert.Single(
-            _adapter.Calls[1].Timeline.OfType<TimelineEvent.ToolResultEvent>());
+            _adapter.Calls[1].Timeline.OfType<TimelineEvent.ToolResultEvent>(),
+            r => r.CallId == "c1");
         // ⚠️ 请求侧是**两块**：框架 + 内容（`01` §3.7）。框架是渲染期加的独立一块。
         Assert.Equal(big, Assert.IsType<Block.TextBlock>(sent.Content[1]).Text);
         Assert.Contains("big.txt", Assert.IsType<Block.TextBlock>(sent.Content[0]).Text);
@@ -263,7 +264,8 @@ public class StepperToolTests : IDisposable
         await _stepper.StepAsync(handle, [], default);   // 不抛
 
         var sent = Assert.Single(
-            _adapter.Calls[1].Timeline.OfType<TimelineEvent.ToolResultEvent>());
+            _adapter.Calls[1].Timeline.OfType<TimelineEvent.ToolResultEvent>(),
+            r => r.CallId == "c1");
         // ⚠️ 内容在 `[1]`；`[0]` 是框架（它**不受**库对象丢失影响 —— 它是事实，不是内容）。
         Assert.Contains("找不到", Assert.IsType<Block.TextBlock>(sent.Content[1]).Text);
     }

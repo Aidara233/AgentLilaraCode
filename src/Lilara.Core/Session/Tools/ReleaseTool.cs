@@ -26,14 +26,17 @@ namespace Lilara.Core.Session.Tools;
 /// 于是一个**真的**落过的 `tool_use` 会被渲染成「这里本该有内容，但它丢了」——
 /// 那是**一条关于丢失的假信息**，而它只是「本来就没有内容」。</para>
 ///
-/// <para>⚠️ <b>它不释放锁</b>（今天）：§12.4 说 `release` 同时做三件事（解锁 / 触发回收 /
-/// 清理残留），而**解锁那一半今天没有落点**——`ClaimStore` 的写手在
-/// `CommandDispatcher.HandleClaimRelease`（命令层），而工具**够不着**它
-/// （`IToolContext` 只读，见那里的注释）。⇒ 这一半**如实记在 §14**，不假装它做了。</para>
+/// <para>⚠️ <b>解锁那一半现在有了</b>（2026-10-17）：§12.4 说 `release` 同时做三件事
+/// （解锁 / 触发回收 / 清理残留），而解锁原先没有落点——工具够不着 `ClaimStore`
+/// （`IToolContext` 只读）。现在它由**推进器**在同一处补上：画完线之后调
+/// `Stepper.UnlockReleased`，走与 `claim.release` **同一个** `ClaimStore.Release`，
+/// 只摘**本会话自己**的声明。⚠️ 工具本身仍然什么都不改——它还是只说出那句话。</para>
 ///
 /// <para>⚠️ <b>`PermissionClass` = <see cref="PermissionClass.ReadOnly"/>，而这是有理由的</b>：
-/// 它**什么都不改**——不写盘、不动别人的锁、不发外部请求。它做的唯一一件事是
+/// 工具**本身**什么都不改——不写盘、不动别人的锁、不发外部请求。它做的唯一一件事是
 /// **说出一句话**（「我用完了」）。⇒ 它不需要授权。
+/// ⚠️ **而推进器会替它改两样东西**（画线、摘自己的声明）——那是它说出那句话的**后果**，
+/// 不是工具的手在动；与 `update` / `write` 那种「工具自己写盘」不同。
 /// ⚠️ 而它**不是没有后果**的：那句话会让上下文变小。但那**不是**「需要许可的副作用」那一类
 /// （`01` §3.5 那一列问的是「会不会改到世界」），而且**它有审计痕迹**（那条记录它自己）。</para>
 /// </summary>
@@ -49,7 +52,7 @@ public sealed class ReleaseTool : ITool
 
     public string Name => NameOf;
 
-    /// <summary>见类型注释：它什么都不改，只是说一句话。</summary>
+    /// <summary>见类型注释：工具本身什么都不改，只是说一句话（后果由推进器落）。</summary>
     public PermissionClass PermissionClass => PermissionClass.ReadOnly;
 
     public string Description =>
@@ -88,14 +91,25 @@ public sealed class ReleaseTool : ITool
         // 或 `"src,lib"`（一段逗号分隔的话）。两种都不解析 ⇒ 这里回一句说得清的话，
         // **而不是悄悄当成一个路径**——那会让一次「释放 src 和 lib」变成「释放一个叫
         // `src,lib` 的路径」，**一条也收不掉**，而两边都以为说清了。
-        if (ToolArgs.StringArray(call.ArgumentsJson, "scope") is null)
+        // ⚠️ **非空也是约定的一半**：JSON Schema 里 `scope` 只写 `type: array`
+        // （这个字符串原样发给 provider，保持最保守的形状）——空数组由上面那句显式拒绝。
+        // ⚠️ **空数组也要回一句**：`ToolArgs.StringArray` 对 `[]` 返回**空列表**
+        // （不是 `null`——`[]` 是模型明确说的「没有」，见那里的注释），而推进器
+        // （`Stepper.RecordRelease`）对空 scope **不画线**。⇒ 这里只判 `null` 的话，
+        // 一次「释放了个寂寞」会回一句「已释放。」，而记录里一条线都没有——
+        // 模型以为收掉了，上下文一个字没变。两处判据必须是同一个。
+        if (ToolArgs.StringArray(call.ArgumentsJson, "scope") is not { Count: > 0 })
         {
             return Task.FromResult(ToolText.Of(
-                "`scope` 要给一个**路径的数组**，比如 [\"src\", \"docs\"]。"
-                + "给单个字符串、或一串逗号分隔的话，我都读不出来。"));
+                "`scope` 要给一个**非空**的路径数组，比如 [\"src\", \"docs\"]。"
+                + "给单个字符串、一串逗号分隔的话、或者空数组，我都读不出来。"));
         }
 
         // 工具本身**什么都不做**：线的落点在推进器（它要写进记录）。
+        // ⚠️ **两条执行路径各画一次**（2026-10-17）：`Stepper.StepAsync` 与本批挂起后
+        // 用户批准的恢复路径 `Stepper.ResumeAsync`——两处都只给执行器交回的
+        // 「真正执行过」的调用画线（`ToolExecutor.Batch.ExecutedCallIds`）。
+        // ⇒ 这一句「已释放。」是**两个判据都成立之后**才说得出的话。
         // ⇒ 这条结果是一句确认，篇幅压到最短——它进上下文，而它没有信息量。
         return Task.FromResult(ToolText.Of("已释放。"));
     }

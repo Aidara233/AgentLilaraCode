@@ -102,7 +102,15 @@ public class ReleaseLineTests : IDisposable
         {
             Blocks = [ReleaseOf("c3", "src")], StopReason = "tool_use", Refused = false,
         });
-        await _stepper.StepAsync(_handle, [], default);
+        var releaseStep = await _stepper.StepAsync(_handle, [], default);
+
+        // ⚠️ **线的头出口**：`StepOutcome` 交回这条线，`CommandDispatcher` 据此发
+        // `release.recorded`（头重拉历史、画分隔线）。⚠️ 判据是**同一条线的 id**
+        // ——另起一条会让头画的线和判定读的线对不上。
+        var recorded = Assert.Single(releaseStep.ReleasedLines!);
+        Assert.Equal(["src"], recorded.Scope);
+        Assert.Contains(_store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ReleaseEvent>(), e => e.Id == recorded.Id);
 
         // 第 3 步：纯文本 ⇒ 这一趟的请求就是断言对象。
         _adapter.Reply("好。");
@@ -313,5 +321,220 @@ public class ReleaseLineTests : IDisposable
 
         Assert.Empty(_store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
             .OfType<TimelineEvent.ReleaseEvent>());
+    }
+
+    /// <summary>
+    /// ⚠️ **空 `<c>scope</c> 数组同样不画线，而且工具那侧也必须这么说**
+    /// （2026-10-17）——两层判据必须共用一个谓词。
+    ///
+    /// <para>⚠️ <b>它钉的是一个具体的分叉</b>：`ToolArgs.StringArray` 对 `[]` 返回**空列表**
+    /// （不是 `null`），而 `ReleaseTool` 原先只判 `null` ⇒ 回一句「已释放。」，
+    /// 而 `Stepper.RecordRelease` 看到 `Count == 0` 不画线。⇒ 模型以为收掉了，
+    /// 上下文一个字没变，而两边都看着正常。</para>
+    /// </summary>
+    [Fact]
+    public async Task AnEmptyScope_IsRejectedByTheToolAndDrawsNoLine()
+    {
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "甲");
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, "看一眼", default);
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [new Block.ToolUseBlock("c2", "release", """{"scope":[]}""")],
+            StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, [], default);
+
+        Assert.Empty(_store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ReleaseEvent>());
+
+        var result = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => r.CallId == "c2");
+        var text = string.Concat(result.Content.OfType<Block.TextBlock>().Select(b => b.Text));
+        Assert.DoesNotContain("已释放", text, StringComparison.Ordinal);
+        Assert.Contains("非空", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ **恢复批次里的 `release` 也要画线**（2026-10-17，缺口 A）。
+    ///
+    /// <para>⚠️ <b>缺陷的形状</b>：一批里只要有一条要问（这里那条 `write_thing` 在
+    /// `standard` 档是写入 ⇒ 问），整批挂起；用户批准后 `ToolExecutor` **全部执行**，
+    /// `release` 照样返回「已释放。」——而 `RecordRelease` 原先只在 `StepAsync` 里调，
+    /// `ResumeAsync` 一个字都不写 ⇒ 工具说释放了、记录里没有线、上下文也不回收。</para>
+    ///
+    /// <para>⚠️ <b>判据分两层</b>：① 记录里有 `ReleaseEvent`；② 下一次渲染真的把
+    /// 释放点之前的结果换成了注记（线的**效果**，不只是那条记录）。</para>
+    /// </summary>
+    [Fact]
+    public async Task ARelease_InAResumedBatch_DrawsTheLineAndReclaims()
+    {
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "甲");
+        var handle = HandleWith("standard");
+        var tools = new ITool[] { new ReleaseTool(), new ReadTool(), new AskingWriter() };
+        var stepper = new Stepper(_store, _adapter, tools);
+
+        // 第 1 步：读一个文件（一条有效的结果，等着被线覆盖）。
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await stepper.StepAsync(handle, "看一眼", default);
+
+        var readId = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => r.CallId == "c1").Id;
+
+        // 第 2 步：release + 一条会触发询问的写入调用 ⇒ 整批挂起，一条都没跑。
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks =
+            [
+                ReleaseOf("c2", "a.txt"),
+                new Block.ToolUseBlock("c3", "write_thing", """{"a":1}"""),
+            ],
+            StopReason = "tool_use", Refused = false,
+        });
+        var step = await stepper.StepAsync(handle, [], default);
+        Assert.NotNull(step.Refused);
+        Assert.Empty(_store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ReleaseEvent>());
+
+        // 用户批准 ⇒ 整批执行（`ResumeAsync` 那条路）。
+        var calls = handle.AwaitingInput!.Calls;
+        var reply = new ToolExecutor.Reply(
+            AskKind.Permission,
+            [.. calls.Select(c => c.CallId)],
+            [],
+            new Dictionary<string, string>());
+        await stepper.ResumeAsync(
+            handle, calls, reply, default,
+            _store.ReadState(handle.ProjectKey, handle.SessionId).Ask!);
+
+        var line = Assert.Single(_store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ReleaseEvent>());
+        Assert.Equal(["a.txt"], line.Scope);
+
+        // 线的效果：下一次请求里那条读结果已经换成注记。
+        _adapter.Reply("好。");
+        await stepper.StepAsync(handle, [], default);
+        var sent = _adapter.Calls[^1].Timeline.OfType<TimelineEvent.ToolResultEvent>()
+            .Single(r => r.CallId == "c1");
+        Assert.Contains("[已回收]", TextOf(sent), StringComparison.Ordinal);
+        Assert.NotNull(readId);
+    }
+
+    /// <summary>
+    /// ⚠️ **被闸门硬拒的 `release` 不画线**（2026-10-17，缺口 C）。
+    ///
+    /// <para>⚠️ `off` 档会拒绝只读类，而那条调用**一次都没跑**。原先的写法只看
+    /// 「本批里有没有叫 `release` 的调用」⇒ 一次被拒绝的操作照样留下一条线，
+    /// 而线是**单调的判据**：它会把那些结果永久收掉。⇒ 判据改为执行器的执行名单。</para>
+    /// </summary>
+    [Fact]
+    public async Task ARelease_DeniedByTheGate_DrawsNoLine()
+    {
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "甲");
+        var handle = HandleWith("off");
+        var stepper = new Stepper(_store, _adapter, BuiltInTools.All);
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await stepper.StepAsync(handle, "看一眼", default);
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReleaseOf("c2", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await stepper.StepAsync(handle, [], default);
+
+        Assert.Empty(_store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ReleaseEvent>());
+
+        // ⚠️ 配对不能因此破：拒绝**也是一条结果**（`01` §3.6 ①）。
+        var result = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => r.CallId == "c2");
+        Assert.Contains("拒绝", TextOf(result), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ **模型侧 `release` 摘掉自己的声明**（2026-10-17，§12.4 的解锁那一半）。
+    ///
+    /// <para>⚠️ <b>缺陷的形状</b>：`ClaimStore` 的写手原先只在命令层
+    /// （`claim.release`），而工具够不着它 ⇒ 模型说「我用完了」，锁还在，
+    /// 别的会话照样被挡。</para>
+    ///
+    /// <para>⚠️ <b>这里钉的是逐字路径</b>（`claim.release` 的判据），不是「整棵子树」——
+    /// 文件条目与目录条目是两把不同的声明。⚠️ **「只摘自己的」不在这里测**：
+    /// 它被一个既有事实挡住了——`claims.json` **同一个工作目录只有一份**，
+    /// 第二个会话的第一条声明就会判成冲突、写不进去（`ClaimCommandTests` 钉着）。
+    /// ⇒ 在同一个工作目录里造不出「别人的锁」，而 `ClaimStore.Release` 的
+    /// `ownerSessionId` 筛选今天因此**没有可观测效果**；它的价值是记录意图，
+    /// 等「每个会话独立 workingDirectory」或跨目录声明出现时再补测试。
+    /// **别把这条读成「已经证明只摘自己的」。**</para>
+    /// </summary>
+    [Fact]
+    public async Task ARelease_UnlocksTheSessionsOwnClaimsInScope()
+    {
+        var claims = new ClaimStore(_work);
+        var key = ProjectKey.FromPath(_work);
+        claims.Save(
+        [
+            // ⚠️ `ClaimStore.Release` 与 `claim.release` 同一条判据：**逐字路径**。
+            // 所以这里声明的是目录本身（典型用法），而不是它下面的某个文件。
+            new Claim(_handle.SessionId, key, Claims.Normalize("a.txt", _work), CoreClock.Now()),
+            new Claim(_handle.SessionId, key, Claims.Normalize("src", _work), CoreClock.Now()),
+        ]);
+
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "甲");
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, "看一眼", default);
+
+        var released = new List<Claim>();
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReleaseOf("c2", "a.txt", "src")], StopReason = "tool_use", Refused = false,
+        });
+        var step = await _stepper.StepAsync(_handle, [], default);
+        released.AddRange(step.ReleasedClaims ?? []);
+
+        var remaining = claims.All().Select(c => c.Path).ToList();
+        Assert.DoesNotContain(Claims.Normalize("a.txt", _work), remaining);
+        Assert.DoesNotContain(Claims.Normalize("src", _work), remaining);
+        Assert.Equal(2, released.Count);
+    }
+
+    private SessionHandle HandleWith(string permission)
+    {
+        var handle = SessionHandle.Create(_store, _work, Model());
+        handle.UpdateStateAndPersist(_store, s => s with
+        {
+            Axes = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal)
+            {
+                [Axes.Permission] = permission,
+            },
+        }, diskStatus: SessionStatus.Idle);
+        return handle;
+    }
+
+    /// <summary>一个声明为写入的测试替身——`standard` 档会让它触发询问，从而挂起整批。</summary>
+    private sealed class AskingWriter : ITool
+    {
+        public string Name => "write_thing";
+        public PermissionClass PermissionClass => PermissionClass.Writing;
+        public string Description => "测试替身";
+        public string ParametersSchemaJson => """{"type":"object","properties":{}}""";
+
+        public Task<ToolOutcome> RunAsync(ToolCall call, IToolContext context, CancellationToken ct) =>
+            Task.FromResult(new ToolOutcome { Content = [new Block.TextBlock("写了")] });
     }
 }

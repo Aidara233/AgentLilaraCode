@@ -19,6 +19,7 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(SessionArchived), "session.archived")]
 [JsonDerivedType(typeof(SessionDeleted), "session.deleted")]
 [JsonDerivedType(typeof(SessionReclaimed), "session.reclaimed")]
+[JsonDerivedType(typeof(ReleaseRecorded), "release.recorded")]
 [JsonDerivedType(typeof(ApprovalRequested), "approval.requested")]
 [JsonDerivedType(typeof(ApprovalResolved), "approval.resolved")]
 [JsonDerivedType(typeof(Error), "error")]
@@ -37,7 +38,11 @@ public abstract record WireEvent
     // 会重复：用户消息在 session.send 时发一次，步末若模型有输出再发一次 ⇒ 头必须幂等。
     // 这是当前实现的可观测行为，不是协议承诺（协议只承诺「有序」）。
     public sealed record MessageAppended(
-        string SessionId, string From, IReadOnlyList<Block> Blocks, DateTimeOffset At) : WireEvent;
+        string SessionId, string From, IReadOnlyList<Block> Blocks, DateTimeOffset At) : WireEvent
+    {
+        // 持久消息对应的 TimelineEvent.Id；临时消息可以为空。
+        public string? HistoryId { get; init; }
+    }
 
     public sealed record StateChanged(string SessionId, string Status, int Turn) : WireEvent;
 
@@ -137,6 +142,22 @@ public abstract record WireEvent
     /// </remarks>
     /// </summary>
     public sealed record SessionReclaimed(string SessionId, string Reason) : WireEvent;
+
+    /// <summary>
+    /// **模型画了一条线**（`release`，`01` §12.4）——头据此重拉历史并画一条分隔线。
+    ///
+    /// <para>⚠️ <b>为什么不复用 <see cref="SessionReclaimed"/></b>：那条讲的是「回收算完了」
+    /// （`session.gc` 的观察口），而线是**另一件事**——线落下时回收还没发生，
+    /// 发生的是「接下来会收」。把两者并成一个事件，头就分不清「为什么重拉」，
+    /// 而两者的载荷与措辞本来就不同（那条带一句回执）。</para>
+    ///
+    /// <para>⚠️ <b>线本身仍然不进模型上下文</b>：`TimelineRender.IsRenderable` 照样挡它。
+    /// 这条事件只是给**人**的出口（`01` §14 #32）。</para>
+    /// <para>⚠️ <b>载荷是线的作用域与可选摘要</b>，不是整条 `ReleaseEvent`——
+    /// 头的渲染只需要这两样，交整条记录会把落盘格式泄漏到线上。</para>
+    /// </summary>
+    public sealed record ReleaseRecorded(
+        string SessionId, string Id, IReadOnlyList<string> Scope, string? Summary, DateTimeOffset At) : WireEvent;
 
     /// <summary>
     /// **核心在问用户**（`01` §3.8）。⚠️ <b>它同时投两条流</b>：
