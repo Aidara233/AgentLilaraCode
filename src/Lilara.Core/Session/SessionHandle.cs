@@ -203,12 +203,12 @@ public sealed record SessionHandle
     // ⚠️ **这里曾经有一个 `Reclaimed` 字段（+ `SetReclaimed`）——已经删掉**（2026-10-11）。
     //
     // 它是一份**内存账**：由 `session.gc` 命令写、由 `TimelineRender` 读。删它的理由是
-    // **判定属于渲染，不属于 handle**：判据是「这一刻该喂给模型什么」，而记录一步一变
-    // ⇒ 任何存在这里的缓存都只在「某个维护点跑过」之后才新鲜，而**没人能保证那个维护点
-    // 覆盖了所有请求路径**。实测抓到的两处：答复那条路（`ResumeAsync`）落下结果后直接推
-    // 下一步、不经过推进器里的重算点；而 `Load` 出来的 handle 更是**恒为空集**。
-    // ⇒ `TimelineRender.Render` 现在每次现算（`Reclaim.Decide(raw, blobs)`）。
-    // 完整推理与「为什么它不违反 §11.7 那两档」见那里的注释。
+    // **判定属于记录，不属于 handle**：判据是「这一刻该喂给模型什么」，
+    // 而任何存在这里的缓存都只在「某个维护点跑过」之后才新鲜，而**没人能保证那个维护点
+    // 覆盖了所有请求路径**（实测抓到的两处：答复那条路 `ResumeAsync` 不经过推进器里的重算点；
+    // `Load` 出来的 handle 恒为空集）。
+    // ⇒ 2026-10-17 起它落成一条**记录**（`TimelineEvent.ReclaimEvent`，由 `session.gc` /
+    // 压缩在开窗那一刻写入），`TimelineRender` 只读它。handle 仍然不持有任何回收状态。
 
     /// <param name="sessionId">
     /// ⚠️ <b>可空，而且正常路径**必须**不传</b>：给它的唯一用途是**可测性**

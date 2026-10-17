@@ -24,7 +24,7 @@ public static class TimelineRender
     public static IReadOnlyList<TimelineEvent> Render(SessionStore store, SessionHandle handle)
     {
         var raw = store.ReadTimeline(handle.ProjectKey, handle.SessionId);
-        return Render(store, handle, raw, staleProbe: null, truncateForDelivery: false);
+        return Render(store, handle, raw, truncateForDelivery: false);
     }
 
     /// <summary>
@@ -46,10 +46,10 @@ public static class TimelineRender
     /// 同一步里渲染两次必须逐字节相同（`00` §5 铁律 1）。</para>
     /// </summary>
     public static IReadOnlyList<TimelineEvent> RenderForModel(
-        SessionStore store, SessionHandle handle, Kernel.IToolContext staleProbe)
+        SessionStore store, SessionHandle handle)
     {
         var raw = store.ReadTimeline(handle.ProjectKey, handle.SessionId);
-        return Render(store, handle, raw, staleProbe, truncateForDelivery: true);
+        return Render(store, handle, raw, truncateForDelivery: true);
     }
 
     /// <summary>
@@ -59,38 +59,29 @@ public static class TimelineRender
     /// <para>⚠️ <b>压缩投影在<b>最前</b>，而这是 2026-10-17 合并两个独立实现时的关键一条</b>
     /// （`75efa1a` 的持久压缩 × 本批的投递截断，两者都改过这个类）：投影换的是**看哪一段历史**，
     /// 回收/截断/框架换的是**怎么渲染那一段** ⇒ 后者必须以投影后的 `visible` 为输入。
-    /// 反过来（在完整 `raw` 上回收再切）会让判定看到压缩窗口之外的记录，
-    /// 而 `Reclaim.Decide` 的距离判据（「最近 N 条」）数的就会是**已经被压缩掉的条数**。</para>
+    /// 反过来（在完整 `raw` 上回收再切）会让判定看到压缩窗口之外的记录。</para>
     ///
     /// <para>⚠️ <b>摘要事件必须插在<b>最前</b>、且在框架之前</b>：摘要不是工具结果
     /// （`WithFraming` 不会碰它），而它代表的是被压缩掉的那一整段历史，位置就是它所在的位置。</para>
+    ///
+    /// <para>⚠️ <b>渲染<b>不</b>决定回收，只读已经落盘的窗口</b>（2026-10-17 更正）：
+    /// `Reclaim.Decide` 只看 `ReclaimEvent` / `ReleaseEvent` 这两种记录——前者由
+    /// `session.gc` / 压缩在开窗那一刻解析好，后者由模型画线。渲染<b>不带</b> `staleProbe`、
+    /// 也不数保护带：那些判据会在每一步重新解析，而回收改的是前缀中段
+    /// ⇒ 每步破一次缓存，且模型刚读到的内容在下一步就消失（`00` §3：热路径不做事后清理）。</para>
     /// </summary>
     private static IReadOnlyList<TimelineEvent> Render(
         SessionStore store, SessionHandle handle, IReadOnlyList<TimelineEvent> raw,
-        Kernel.IToolContext? staleProbe, bool truncateForDelivery)
+        bool truncateForDelivery)
     {
         // ⚠️ **压缩投影**（`75efa1a`）：换的是「看哪一段历史」，不是「怎么渲染」。
         var projection = ContextCompaction.Project(store, handle, raw);
         var visible = projection.Suffix;
         var blobs = new BlobStore(store.DataRoot);
 
-        // ⚠️ **判定在<b>这里</b>做，而且只在这里**（2026-10-11）——它**不是**一个后台维护的
-        // 集合，而是一次渲染的**纯函数输入**：判定的输入必须是这一刻的记录。
-        // 任何缓存的集合都会在某个时刻**陈旧**，而陈旧的表现不是「晚一步」，是**取不回**。
+        // ⚠️ **判定只读记录里的窗口**（2026-10-17）：窗口在什么地方被写下来，
+        // 回收就只在什么地方发生。渲染本身是纯的、不碰文件系统、不做时间判定。
         var reclaimed = new HashSet<string>(Reclaim.Decide(visible, blobs), StringComparer.Ordinal);
-
-        if (staleProbe is not null)
-        {
-            // ⚠️ **两条判据取<b>并集</b>**（`01` §11.3）：可恢复那一条管「内容自己就够」，
-            // 点杀那一条管「这个源后来被动过」。并集而不是交集，因为两者收的理由不同。
-            foreach (var r in visible.OfType<TimelineEvent.ToolResultEvent>())
-            {
-                // ⚠️ **过时的那一条仍然要过 `Recoverable`**：注记上写着「fetch(id) 取回」，
-                // 而取不回的东西换成注记就是**一句假话**。
-                if (Reclaim.Stale(r, staleProbe) && Reclaim.Recoverable(r.Content, blobs))
-                    reclaimed.Add(r.Id);
-            }
-        }
 
         var applied = Reclaim.Apply([.. visible.Select(e => Dereference(e, blobs))], reclaimed);
 
@@ -173,18 +164,18 @@ public static class TimelineRender
         return cut;
     }
 
-    /// <summary>同上，但**多一条判据**：被判定为**过时**的结果也换成注记（`01` §11.3 判据轴上的**点杀**）。
-
     /// <summary>
     /// ⚠️ <b>「这条记录要不要进「现在要用的那串事件」」</b>。
     ///
-    /// <para>今天只有一种被挡在外面：<see cref="TimelineEvent.ReleaseEvent"/>——
-    /// 它是**给我们自己看的锚**（倒查 / 线的判据），而不是要喂给模型的东西。</para>
+    /// <para>今天有两种被挡在外面：<see cref="TimelineEvent.ReleaseEvent"/>（线）与
+    /// <see cref="ReclaimEvent"/>（窗口记录）——它们都是**给我们自己看的锚**
+    /// （倒查 / 回收的判据），而不是要喂给模型的东西。</para>
     ///
-    /// <para>⚠️ <b>它挡的是「渲染」，不是「记录」</b>：释放事件照样落盘、照样是判定的输入
+    /// <para>⚠️ <b>它挡的是「渲染」，不是「记录」</b>：两种记录照样落盘、照样是判定的输入
     /// （`Reclaim.Decide` 从**记录**读它）。</para>
     /// </summary>
-    private static bool IsRenderable(TimelineEvent evt) => evt is not TimelineEvent.ReleaseEvent;
+    private static bool IsRenderable(TimelineEvent evt) =>
+        evt is not TimelineEvent.ReleaseEvent and not ReclaimEvent;
 
     /// <summary>
     /// 把框架渲染成**一个独立的文本块**，恒定在<span>内容之前</span>（`01` §3.7）。

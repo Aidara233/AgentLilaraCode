@@ -1,6 +1,7 @@
 using System.Text;
 using Lilara.Core.Kernel;
 using Lilara.Core.Session;
+using Lilara.Core.Session.Tools;
 using Lilara.Core.Storage;
 
 namespace Lilara.Core.Tests;
@@ -35,6 +36,18 @@ public class ReclaimTests : IDisposable
     /// <summary>把一条结果**按写入侧的规则**落一遍（含进库）。</summary>
     private TimelineEvent.ToolResultEvent Materialized(string id, params Block[] content) =>
         Result(id, [.. Reclaim.Materialize(content, _blobs)]);
+
+    /// <summary>一条「点名了时间线里全部结果」的窗口记录（测试用；真实窗口由 `session.gc` 解析）。</summary>
+    private ReclaimEvent Window() => new()
+    {
+        Id = Ids.New(),
+        At = CoreClock.Now(),
+        Trigger = "test",
+        Ids = ["small", "missing", .. Enumerable.Range(0, Reclaim.ProtectedRecentResults).Select(i => $"f{i}")],
+    };
+
+    /// <summary>点杀用的上下文：工作目录是本例的临时根（这里的测试没有依赖文件，源都读不到 ⇒ 不点杀）。</summary>
+    private SessionToolContext Probe() => new(_root, _blobs);
 
     // ---- 判据 ----------------------------------------------------------------
 
@@ -91,7 +104,7 @@ public class ReclaimTests : IDisposable
         var filler = Enumerable.Range(0, Reclaim.ProtectedRecentResults)
             .Select(i => Materialized($"f{i}", new Block.TextBlock("填充"))).ToArray();
 
-        Assert.Contains(small.Id, Reclaim.Decide([small, .. filler], _blobs));
+        Assert.Contains(small.Id, Reclaim.Decide([small, .. filler, Window()], _blobs));
     }
 
     /// <summary>库对象真的没了 ⇒ 不收（收掉的后果是模型收到一句「可 fetch」而取不回）。</summary>
@@ -102,21 +115,24 @@ public class ReclaimTests : IDisposable
         var filler = Enumerable.Range(0, Reclaim.ProtectedRecentResults)
             .Select(i => Materialized($"f{i}", new Block.TextBlock("填充"))).ToArray();
 
-        Assert.DoesNotContain(missing.Id, Reclaim.Decide([missing, .. filler], _blobs));
+        Assert.DoesNotContain(missing.Id, Reclaim.Decide([missing, .. filler, Window()], _blobs));
     }
 
     /// <summary>
     /// **保护带**：最近 <see cref="Reclaim.ProtectedRecentResults"/> 条**不动**
     /// ——哪怕它们完全可回收（`01` §11.3：保护的是**动作链**，不是内容预算）。
+    ///
+    /// <para>⚠️ **保护带在「开窗那一刻」解析**（2026-10-17）：<see cref="Reclaim.Resolve"/>
+    /// 算出来，调用方落成窗口记录；<see cref="Reclaim.Decide"/> 只读记录。</para>
     /// </summary>
     [Fact]
-    public void Decide_NeverTouchesTheProtectiveBand()
+    public void Resolve_HonoursTheProtectiveBand()
     {
         var all = Enumerable.Range(0, Reclaim.ProtectedRecentResults + 2)
             .Select(i => Materialized($"r{i}", new Block.TextBlock("都在记录里")))
             .ToList();
 
-        var decided = Reclaim.Decide(all, _blobs);
+        var decided = Reclaim.Resolve(all, _blobs, Probe());
 
         // 最前面两条在保护带之外 ⇒ 收；末尾 ProtectedRecentResults 条 ⇒ 一条都不动。
         Assert.Contains("r0", decided);
@@ -127,7 +143,7 @@ public class ReclaimTests : IDisposable
 
     // 非工具结果的事件（用户/模型的消息）永远不在候选里。
     [Fact]
-    public void Decide_IgnoresNonToolEvents()
+    public void Resolve_IgnoresNonToolEvents()
     {
         var message = new TimelineEvent.MessageEvent
         {
@@ -140,7 +156,45 @@ public class ReclaimTests : IDisposable
         var filler = Enumerable.Range(0, Reclaim.ProtectedRecentResults + 1)
             .Select(i => Materialized($"r{i}", new Block.TextBlock("x"))).ToList();
 
-        Assert.DoesNotContain("m1", Reclaim.Decide([message, .. filler], _blobs));
+        Assert.DoesNotContain("m1", Reclaim.Resolve([message, .. filler], _blobs, Probe()));
+    }
+
+    /// <summary>
+    /// ⚠️ **没有窗口 ⇒ 一条都不收**（2026-10-17 的核心性质）：渲染发生在每一步，
+    /// 而回收改的是前缀中段 ⇒ 它只许在「失效窗口」里发生。这条钉的是「热路径绝不事后清理」。
+    ///
+    /// <para>⚠️ 它同时是「每步破缓存」那个缺陷的守卫：若有人把距离 / 点杀搬回 `Decide`，
+    /// 这条会红——因为这里<b>没有</b> `session.gc`、<b>没有</b> release、<b>没有</b>压缩。</para>
+    /// </summary>
+    [Fact]
+    public void Decide_WithNoWindow_ReclaimsNothing_EvenPastTheBand()
+    {
+        var all = Enumerable.Range(0, Reclaim.ProtectedRecentResults + 3)
+            .Select(i => Materialized($"r{i}", new Block.TextBlock("都在记录里")))
+            .ToList();
+
+        Assert.Empty(Reclaim.Decide(all, _blobs));
+    }
+
+    /// <summary>窗口记录里列出的那些 id 才被收——而且仍要过「可恢复」。</summary>
+    [Fact]
+    public void Decide_ReclaimsOnlyWhatTheWindowLists()
+    {
+        var r0 = Materialized("r0", new Block.TextBlock("被点名"));
+        var r1 = Materialized("r1", new Block.TextBlock("没点名"));
+        var gone = Result("gone", new Block.StoreBlock(new string('a', 64), "text/plain"));
+
+        var decided = Reclaim.Decide(
+            [r0, r1, gone, new ReclaimEvent
+            {
+                Id = "w1", At = CoreClock.Now(), Trigger = "session.gc",
+                Ids = ["r0", "gone"],   // `gone` 的库对象不在 ⇒ 不许收（注记会是一句假话）
+            }],
+            _blobs);
+
+        Assert.Contains("r0", decided);
+        Assert.DoesNotContain("r1", decided);
+        Assert.DoesNotContain("gone", decided);
     }
 
     // ---- 注记 ----------------------------------------------------------------

@@ -1640,6 +1640,66 @@ public class ControlServerTests : IAsyncLifetime
     // ---- 回收的线上那一线（回收批）----
 
     /// <summary>
+    /// ⚠️ **回收只在开窗时发生（`session.gc`），不在每一步**（2026-10-17 的形状）：
+    /// 这是「未期望的时机」那次事故在**线上端点**上的守卫——`/history` 是头与控制台
+    /// 读的那一份，若渲染自己回收，模型刚读到的结果会在**下一次重拉**时变成注记
+    /// （而下一步的请求里也已经是注记）。这里用真实的 `session.gc` 命令开窗，
+    /// 前后各拉一次 `/history`：开窗前必须是原文，开窗后必须变成注记。
+    /// </summary>
+    [Fact]
+    public async Task History_ReclaimsOnlyAfterSessionGc_NotOnEveryRender()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        // 一条内联结果 + 垫够保护带（与 `session.gc` 的解析判据一致：末尾 N 条不动）。
+        var events = new List<TimelineEvent>
+        {
+            new TimelineEvent.ToolResultEvent
+            {
+                Id = "r1", At = DateTimeOffset.UnixEpoch, CallId = "c1",
+                Content = [new Block.TextBlock("原文")],
+            },
+        };
+        events.AddRange(Enumerable.Range(0, Session.Reclaim.ProtectedRecentResults).Select(i =>
+            (TimelineEvent)new TimelineEvent.ToolResultEvent
+            {
+                Id = $"pad{i}", At = DateTimeOffset.UnixEpoch, CallId = $"padcall{i}",
+                Content = [new Block.TextBlock("垫")],
+            }));
+        _host.Store.AppendEvents(Kernel.ProjectKey.FromPath(_work), sid, events);
+
+        // 开窗前：渲染（两次）都是原文——反复渲染不改变结论。
+        for (var i = 0; i < 2; i++)
+        {
+            var root = await GetJson($"/sessions/{sid}/history");
+            var r1 = root.GetProperty("rendered").EnumerateArray()
+                .Single(e => e.GetProperty("id").GetString() == "r1");
+            var text = string.Concat(r1.GetProperty("blocks").EnumerateArray()
+                .Select(b => b.GetProperty("text").GetString()));
+            Assert.Contains("原文", text);
+            Assert.DoesNotContain("[已回收]", text);
+        }
+
+        // 开窗（真实命令路径：解析 → 落窗口记录）。
+        var gc = await _dispatcher.DispatchAsync(new CoreCommand.SessionGc(sid), "g", false, CancellationToken.None);
+        Assert.IsType<Ack.Accepted>(gc.Ack);
+
+        // 开窗后：同一条变成注记，而注记给的 id 就是记录 id。
+        var after = await GetJson($"/sessions/{sid}/history");
+        var reclaimed = after.GetProperty("rendered").EnumerateArray()
+            .Single(e => e.GetProperty("id").GetString() == "r1");
+        var note = string.Concat(reclaimed.GetProperty("blocks").EnumerateArray()
+            .Select(b => b.GetProperty("text").GetString()));
+        Assert.Contains("[已回收]", note);
+        Assert.Contains("fetch(id=\"r1\")", note);
+
+        // ⚠️ 窗口记录本身**不进渲染**（它是给我们自己的锚，不是对话）。
+        Assert.DoesNotContain("reclaim", after.GetProperty("rendered").EnumerateArray()
+            .Select(e => e.GetProperty("kind").GetString()));
+    }
+
+    /// <summary>
     /// ⚠️ **`session.gc` 是同步跑完才回执的，而头在等回执的整个窗口里 `current` 还是旧会话。**
     /// 连续点两次（或切完会话立刻点）时，第二条命令会带着**上一个会话的 id** 发出去。
     ///

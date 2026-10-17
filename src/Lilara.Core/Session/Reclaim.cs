@@ -131,40 +131,37 @@ public static class Reclaim
     /// <summary>
     /// 这一批该回收哪些（按 <see cref="TimelineEvent.ToolResultEvent.Id"/>）。
     ///
-    /// <para>判据是<b>事实</b>，不是声明（`01` §8.0.2 二）：
+    /// <para>⚠️ <b>2026-10-17 重定形状：它只读「已落盘的窗口」，不自己解析判据。</b>
+    /// 窗口有两个来源：①<b>显式的</b> <see cref="ReclaimEvent"/>
+    /// （`session.gc` / 压缩落检查点时，由 <see cref="Resolve"/> 当场解析好并写下 id）；
+    /// ②<b>语义的</b> <see cref="TimelineEvent.ReleaseEvent"/>（模型画的线，作用域见
+    /// <see cref="LineCovers"/>）。两者取<b>并集</b>。</para>
+    ///
+    /// <para>⚠️ <b>为什么距离与点杀不在这里现算</b>：渲染发生在<b>每一步</b>，而回收改的是
+    /// 前缀<b>中段</b> ⇒ 只有失效窗口（前缀反正要重建）里才许动手（`00` §3）。
+    /// 若在渲染里现算，模型每读一个新文件保护带就挪一格 ⇒ 上一步的产出在下一步变成注记
+    /// ⇒ <b>每步破一次前缀</b>，回收省下的全赔进去，而且模型刚读到的内容当场消失。
+    /// ⇒ 判据只许在<b>开窗那一刻</b>解析一次（<see cref="Resolve"/>），结果落盘；渲染只读它。</para>
+    ///
+    /// <para>⚠️ <b>判据是事实，不是声明</b>（`01` §8.0.2 二，这条没变）：
     /// <b>可回收 ⟺ `fetch` 取得回 ⟺ 内容自己就够</b>（见 <see cref="Recoverable"/>）。
-    /// ⇒ 把「靠工具自觉声明类别」整条换掉了，也因此不需要任何新字段。</para>
-    ///
-    /// <para>⚠️ <b>大小、形状都不进这个判据</b>（用户 2026-10-06 裁定）：
-    /// 小文件内联、大文件留地址、混排存块数组——<b>三条一律可回收</b>。
-    /// 区分只在「持久化到哪」，<b>模型视角不分大小</b>。
-    /// ⇒ 判据也不区分类别（§8.0.2 三已经按类别分那件事整条摘掉了）。</para>
-    ///
-    /// <para>⚠️ <b>没有「本应进库却没进」这一档</b>（用户裁定「不留历史包袱，不加额外兜底」）：
-    /// 内容够就够了，不够就**不算可回收**，<b>不抛也不补</b>。
-    /// 老记录里那些指向缺失对象的行正落在这里。</para>
-    ///
-    /// <para>⚠️ <b>2026-10-11：这里有<b>两条</b>判据了</b>（`01` §11.3 判据轴）——
-    /// ①**距离**（末尾 N 条之外的，上面那个循环）；②**线**（落在已释放作用域里的，
-    /// 见 <see cref="LineCovers"/>）。⚠️ 取**并集**，不是二选一。
-    /// **点杀**（`Reclaim.Stale`）**不在这里**——它要碰文件系统，由
-    /// `TimelineRender.Render` 那条带 `staleProbe` 的重载并进来（这个方法是纯的）。</para>
+    /// 窗口里记下的 id 在渲染时仍要过这一条——库对象后来没了的结果不许换成注记，
+    /// 那会是一句「fetch 取回」的假话。</para>
     /// </summary>
     public static IReadOnlySet<string> Decide(IReadOnlyList<TimelineEvent> timeline, BlobStore blobs)
     {
-        // 保护带按「最近的工具结果」数，所以先只挑出工具结果这一类。
-        var candidates = timeline.OfType<TimelineEvent.ToolResultEvent>().ToList();
+        var byId = timeline.OfType<TimelineEvent.ToolResultEvent>()
+            .ToDictionary(r => r.Id, StringComparer.Ordinal);
 
         var result = new HashSet<string>(StringComparer.Ordinal);
 
-        // 从后往前数：末尾 ProtectedRecentResults 条是保护带，不动。
-        for (var i = 0; i < candidates.Count - ProtectedRecentResults; i++)
-        {
-            var r = candidates[i];
-            if (Recoverable(r.Content, blobs)) result.Add(r.Id);
-        }
+        // ---- 显式窗口：`session.gc` / 压缩在开窗那一刻解析好的那批 id ----
+        foreach (var window in timeline.OfType<ReclaimEvent>())
+            foreach (var id in window.Ids)
+                if (byId.TryGetValue(id, out var r) && Recoverable(r.Content, blobs))
+                    result.Add(id);
 
-        // ---- 第二条判据：线（`01` §12.4）----
+        // ---- 语义窗口：线（`01` §12.4）----
         //
         // ⚠️ **判据是「这个源被释放过吗」，不是「它在线的哪一侧」。**
         // 位置那一读法（「最后一条线以下全收」）**不够用，而且会抖**：放第二次线之后，
@@ -176,6 +173,57 @@ public static class Reclaim
 
         return result;
     }
+
+    /// <summary>
+    /// **开窗那一刻解析判据**——距离（保护带之外）与点杀（这个源后来被改过）在这里算，
+    /// 算完的结果由调用方落成一条 <see cref="ReclaimEvent"/>。
+    ///
+    /// <para>⚠️ <b>它是纯的</b>（除 <paramref name="staleProbe"/> 的重读之外）：同一份记录、
+    /// 同一刻的文件系统，得到同一个集合。⚠️ 但它<b>碰文件系统</b>（点杀要重读源、重算指纹），
+    /// 所以<b>不许</b>放在渲染那条路上——渲染必须是纯的（`00` §5 铁律 1）。</para>
+    ///
+    /// <para>⚠️ <b>点杀与距离取并集</b>（`01` §11.3）：两者收的理由不同，
+    /// 而「可恢复」是共同前提（见 <see cref="Decide"/> 的注释）。点杀出来的那些
+    /// **不受保护带限制**——它收的是「这一条不对了」，不是「这一段远了」。</para>
+    /// </summary>
+    public static IReadOnlyList<string> Resolve(
+        IReadOnlyList<TimelineEvent> timeline, BlobStore blobs, IToolContext staleProbe)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+
+        // ---- 距离：末尾 ProtectedRecentResults 条是保护带，不动 ----
+        var candidates = timeline.OfType<TimelineEvent.ToolResultEvent>().ToList();
+        for (var i = 0; i < candidates.Count - ProtectedRecentResults; i++)
+        {
+            var r = candidates[i];
+            if (Recoverable(r.Content, blobs)) result.Add(r.Id);
+        }
+
+        // ---- 点杀：这个源后来被动过（`00` §5 三态判定的第三格）----
+        foreach (var r in candidates)
+            if (Stale(r, staleProbe) && Recoverable(r.Content, blobs))
+                result.Add(r.Id);
+
+        // ⚠️ 顺序必须确定：落盘的那条记录要逐字节可复现（同 `Json.StableSerialize` 的纪律）。
+        return [.. result.OrderBy(id => id, StringComparer.Ordinal)];
+    }
+
+    /// <summary>
+    /// 把一次解析落成记录。**调用方负责追加**（`Stepper` 不碰存储的写路径之外的时机，
+    /// 而 `session.gc` 的落点在命令层——两处各追加一次，而不是在这里偷偷写盘）。
+    ///
+    /// <para>⚠️ <b>`Ids` 可以为空</b>：窗口开了而一条都收不了是正常结果（全在保护带里 /
+    /// 库对象没了）——它照样要落，因为「这一刻判过」是事实，
+    /// 且它让 `session.gc` 的回执与事件说的是同一件事（同一条记录的 id）。</para>
+    /// </summary>
+    public static ReclaimEvent Window(string trigger, IReadOnlyList<string> ids, string? note) => new()
+    {
+        Id = Ids.New(),
+        At = CoreClock.Now(),
+        Trigger = trigger,
+        Ids = ids,
+        Note = note,
+    };
 
     /// <summary>
     /// **线以下、且落在释放集里的那些结果**（`01` §12.4）。

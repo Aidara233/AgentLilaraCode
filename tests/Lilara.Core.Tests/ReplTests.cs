@@ -6,6 +6,7 @@ using Lilara.Core.Console;
 using Lilara.Core.Storage;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
+using Lilara.Core.Session.Tools;
 using Lilara.Core.Tests.Fakes;
 
 namespace Lilara.Core.Tests;
@@ -715,7 +716,7 @@ public class ReplTests : IDisposable
                 CallId = "call-1",
                 Content = [new Block.TextBlock(original)],
             },
-            // ⚠️ 垫够保护带，否则 `r1` 落在窗口内 ⇒ 渲染成原文、这条测试就测不到注记那一半。
+            // ⚠️ 垫够保护带，否则 `r1` 落在窗口内 ⇒ 开窗也收不到它。
             // 用**常量**算，不写死 4——那个数是占位值，写死了它一改这条就静默失效。
             .. Enumerable.Range(0, Reclaim.ProtectedRecentResults).Select(i =>
                 new TimelineEvent.ToolResultEvent
@@ -725,6 +726,22 @@ public class ReplTests : IDisposable
                     CallId = $"padcall{i}",
                     Content = [new Block.TextBlock("垫")],
                 }),
+        ]);
+
+        // ⚠️ 回收只发生在窗口里（2026-10-17）⇒ 开窗那一刻解析（同 `session.gc`）。
+        // ⚠️ **必须在 r1 落盘之后**解析——窗口解析的是「这一刻的记录」。
+        _store.AppendEvents(session.ProjectKey, session.SessionId,
+        [
+            new ReclaimEvent
+            {
+                Id = "w1",
+                At = CoreClock.Now(),
+                Trigger = "test",
+                Ids = Reclaim.Resolve(
+                    _store.ReadTimeline(session.ProjectKey, session.SessionId), new BlobStore(_root),
+                    new SessionToolContext(_work, new BlobStore(_root),
+                        _store.ReadTimeline(session.ProjectKey, session.SessionId))),
+            },
         ]);
 
         await repl.ExecuteAsync("history", CancellationToken.None);

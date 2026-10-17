@@ -24,9 +24,16 @@ public static class ContextCompaction
         if (checkpoint is null) return new(null, history);
 
         var index = history.ToList().FindIndex(e => e.Id == checkpoint.CoveredThroughEventId);
-        return index < 0
-            ? new(null, history)
-            : new(checkpoint, history.Skip(index + 1).ToList());
+        if (index < 0) return new(null, history);
+
+        // ⚠️ **本框架自己的记账事件不算「历史」**（2026-10-17）：压缩检查点覆盖到某条用户消息
+        // 之后，`Stepper.CompactAsync` 会紧接着追一条 `ReclaimEvent`（窗口记录）。
+        // 它是**记账**、不是对话，并且<b>不在摘要里</b>（摘要只总结到 `CoveredThroughEventId`）。
+        // 若把它当作「检查点之后的正文」，它会被渲染成一个空的用户消息——而那是错的。
+        // ⇒ 投影时把它们滤掉；它们照样落盘、照样在记录里（回滚 / 排查要看得见）。
+        return new(checkpoint, history.Skip(index + 1)
+            .Where(e => e is not ReclaimEvent)
+            .ToList());
     }
 
     public static TimelineEvent SummaryEvent(CompactionCheckpoint checkpoint) =>

@@ -136,8 +136,9 @@ public abstract record WireEvent
     /// 不为它单开一条显示路径。⇒ 那句话的<b>唯一出处仍是核心</b>（<see cref="Ack.Accepted.Note"/> 的既定用途，
     /// `provider.test` 就是这么用的），头只是换了个落点。</para>
     ///
-    /// <para>⚠️ <b>它不是「重算的请求」</b>：头收到的只是「该重拉了」这个信号，判定仍在核心
-    /// （<c>Reclaim.Decide</c> 一处）。</para>
+    /// <para>⚠️ <b>它不是「重算的请求」</b>：头收到的只是「该重拉了」这个信号；
+    /// 窗口记录已经由核心落盘（`Reclaim.Resolve` + `TimelineEvent.ReclaimEvent`），
+    /// 头重拉 /history 时读到的是它。</para>
     ///
     /// <para>⚠️ <b>投递范围与会话内的事件一视同仁</b>（会话流）：它讲的是「这个会话的形态变了」。</para>
     /// </remarks>
@@ -147,9 +148,9 @@ public abstract record WireEvent
     /// <summary>
     /// **模型画了一条线**（`release`，`01` §12.4）——头据此重拉历史并画一条分隔线。
     ///
-    /// <para>⚠️ <b>为什么不复用 <see cref="SessionReclaimed"/></b>：那条讲的是「回收算完了」
-    /// （`session.gc` 的观察口），而线是**另一件事**——线落下时回收还没发生，
-    /// 发生的是「接下来会收」。把两者并成一个事件，头就分不清「为什么重拉」，
+    /// <para>⚠️ <b>为什么不复用 <see cref="SessionReclaimed"/></b>：那条讲的是「回收窗口开过了」，
+    /// 而线是**另一件事**——线落下时**没有**窗口记录，收的是「作用域里、且到现在还被读过的结果」。
+    /// 把两者并成一个事件，头就分不清「为什么重拉」，
     /// 而两者的载荷与措辞本来就不同（那条带一句回执）。</para>
     ///
     /// <para>⚠️ <b>线本身仍然不进模型上下文</b>：`TimelineRender.IsRenderable` 照样挡它。

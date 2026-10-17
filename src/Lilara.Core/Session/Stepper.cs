@@ -137,6 +137,19 @@ public sealed class Stepper(
             RecordUsage(handle, callId, startedAt, reply, "failed", "compaction");
             throw;
         }
+
+        // ⚠️ **压缩就是一个回收窗口**（2026-10-17，`01` §11.7）：压缩**立即生效**
+        // ⇒ 下一步的前缀反正要重建；既然要重建，就把距离与点杀一并解析一次、落成窗口记录。
+        // 这不是「压力触发」——压力触发是前缀好好的、主动破它；压缩的破是它自己的语义。
+        // ⚠️ 只解析**这次压缩之后仍然可见**的记录：被压掉的那段本来就由摘要代表，
+        // 收它不再省任何字节（而 `Reclaim.Decide` 也只看到投影后的那段）。
+        var visible = ContextCompaction.Project(_store, handle, history).Suffix;
+        var blobs = new BlobStore(_store.DataRoot);
+        var ids = Reclaim.Resolve(visible, blobs,
+            new Tools.SessionToolContext(handle.Spec.WorkingDirectory, blobs, history));
+        _store.AppendEvents(handle.ProjectKey, handle.SessionId,
+            [Reclaim.Window("compaction", ids, null)]);
+
         RecordUsage(handle, callId, startedAt, reply, "completed", "compaction");
         return new CompactionResult(checkpoint.CheckpointId, checkpoint.CoveredThroughEventId,
             checkpoint.Summary, reply.Usage);
@@ -195,14 +208,8 @@ public sealed class Stepper(
         // 而链长只在**用户消息到达时**归零（`HandleSessionSend`）——重启不改变这一点。
         if (handle.ConsecutiveToolSteps < handle.State.Turn) handle.RestoreToolSteps(handle.State.Turn);
 
-        // ⚠️ **过时判定（点杀）这一刻冻住**（2026-10-11）：`Reclaim.Stale` 要**碰文件系统**
-        // （重读那个源、重算指纹），而渲染必须是纯的 ⇒ 判定在渲染**外**算。
-        // 冻在这一刻的理由与上面那行 `now` 逐字相同：这一步里无论如何重复渲染，
-        // 拿到的都是**同一批字节、同一个判定** ⇒ 步内逐字节稳定。
-        // ⚠️ **它就是那个「更窄的那一刻」**（`01` §11.7 找了三轮的东西）：
-        // 不是「进了内存」（`Activate` 太宽，头扫一眼列表就会走），是「**第一步真的要拿它渲染**」。
-        var staleProbe = new Tools.SessionToolContext(
-            handle.Spec.WorkingDirectory, new BlobStore(_store.DataRoot));
+        // ⚠️ **引擎租约**：所有 `StepAsync` 调用都在 **_stepper 的会话内串行** 之内
+        // （`CommandDispatcher` 的会话闸），所以这里不需要再同步。
         // ⚠️ 先记下落盘的那份，失败了原样放回去。
         // 调用方 catch 之后继续用**同一个把手**：不回滚的话，
         // 用户刚看着一步失败，`status` 却报 Running——而磁盘上从来没写过 Running。
@@ -289,7 +296,7 @@ public sealed class Stepper(
                 // `ToolLimits.MaxResultBytes` 的结果只喂开头，尾部的注记给出稳定 id 与下一个偏移
                 // ⇒ 模型用 `fetch(id, offset)` 接着看，不必重跑那个工具。
                 Timeline = FloatingContextPair(
-                    TimelineRender.RenderForModel(_store, handle, staleProbe), slots.Tail, at,
+                    TimelineRender.RenderForModel(_store, handle), slots.Tail, at,
                     // ⚠️ **`Turn + 1` 是「这一步的编号」**（与 `PendingIntent` 给「那一步的 Turn」用的
                     // 同一个约定）：`State.Turn` 数的是**已完成**的步，进行中的这一步是下一号。
                     handle.State.Turn + 1),
@@ -385,9 +392,8 @@ public sealed class Stepper(
             // ⇒ 它的输出去处与时间点都在这一句上。
             //
             // ⚠️ **顺序无关紧要，因为它是判据的输入而不是判据**：真正读它的是
-            // `Reclaim.Decide`，而那个判定发生在**下一次渲染**（`RecordRelease` 先落、
+            // `Reclaim.Decide`，而那个判定只读**已经落盘**的线（`RecordRelease` 先落、
             // 下一步开始才渲染）。⇒ 把 `release` 调在最后一条也照样收得掉它前面的东西。
-            //
             // ⚠️ **配对不受影响**：它照样返回一条（空的）结果、照样配那条 `tool_use`——
             // 「一对不能拆」那条不变量一个字没动，所以这里不新增任何特例。
             //
@@ -687,7 +693,7 @@ public sealed class Stepper(
     /// 仍然只有一个答案。</para>
     ///
     /// <para>⚠️ <b>它<b>不</b>重新渲染</b>（2026-10-11 明确下来）：<see cref="StepAsync"/>
-    /// 里那份渲染与 <c>staleProbe</c> 是**为「调模型」冻的**，而这一步**不调模型**
+    /// 里那份渲染是**为「调模型」冻的**，而这一步**不调模型**
     /// （答复是用户给的，结果由核心自己拼）。⇒ 这里不读时间线、也不跑点杀。
     /// ⚠️ 这不是省事：若这里也跑一次点杀，冻结的那一刻就**不是**「步开始」而是
     /// 「用户按下答应的那一刻」——同一步里就会有两个判定，而那正是要躲的每步破前缀。</para>

@@ -1,6 +1,7 @@
 using Lilara.Core.Kernel;
 using Lilara.Core.Protocol;
 using Lilara.Core.Session;
+using Lilara.Core.Session.Tools;
 using Lilara.Core.Storage;
 using Lilara.Core.Tests.Fakes;
 
@@ -47,7 +48,12 @@ public sealed class CompactionTests : IDisposable
 
         Assert.Equal("目标：完成压缩闭环", result.Summary);
         Assert.Single(new CompactionStore(_store).ReadAll(_handle.ProjectKey, _handle.SessionId));
-        Assert.Single(_store.ReadTimeline(_handle.ProjectKey, _handle.SessionId));
+        // ⚠️ 压缩会追一条窗口记录（2026-10-17）：压缩立即生效 ⇒ 这个窗口里解析一次回收。
+        // 时间线因此是「用户消息 + 窗口记录」两条——记录本身一字未动。
+        var timeline = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId);
+        Assert.Equal(2, timeline.Count);
+        Assert.IsType<TimelineEvent.MessageEvent>(timeline[0]);
+        Assert.Equal("compaction", Assert.IsType<ReclaimEvent>(timeline[1]).Trigger);
         Assert.Equal("compaction", Assert.Single(usage.ForSession(_handle.SessionId)).Purpose);
 
         var restarted = new SessionHandle
@@ -57,6 +63,8 @@ public sealed class CompactionTests : IDisposable
         };
         var projection = ContextCompaction.Project(_store, restarted);
         Assert.Equal("目标：完成压缩闭环", projection.Checkpoint?.Summary);
+        // ⚠️ 压缩自己落的窗口记录是**记账**、不是被压掉的历史的一部分
+        // （摘要只总结到 `CoveredThroughEventId`）⇒ 投影把它滤掉，正文为空。
         Assert.Empty(projection.Suffix);
     }
 
