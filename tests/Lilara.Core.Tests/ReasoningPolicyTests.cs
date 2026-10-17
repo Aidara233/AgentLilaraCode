@@ -142,4 +142,60 @@ public class ReasoningPolicyTests
 
         Assert.Empty(ReasoningPolicy.FilterFor(blocks, "openai-chat"));
     }
+
+    // ---- reasoning_content：**字段**回不回传，与上面的「块进不进 content」是两回事 ----
+    //
+    // 把这两个问题并在一个判据里，就是 DeepSeek 那条 400 的来源（2026-10-17 用户实测）。
+
+    [Theory]
+    [InlineData("openai-chat", true, true)]    // 带工具的 Chat：必须回传
+    [InlineData("openai-chat", false, false)]  // 纯聊天的 Chat：不需要
+    [InlineData("openai-responses", true, false)]   // Responses 走 reasoning 项，没这个字段
+    [InlineData("claude-messages", true, false)]    // Claude 走 thinking 块
+    [InlineData("definitely-not-a-protocol", true, false)]
+    public void CanReplayAsReasoningContent_IsKeyedOnChatPlusTools(
+        string protocol, bool carriesTools, bool expected)
+    {
+        Assert.Equal(expected, ReasoningPolicy.CanReplayAsReasoningContent(protocol, carriesTools));
+    }
+
+    [Fact]
+    public void ReasoningContentOf_ConcatenatesTheReasoningBlocksInOrder()
+    {
+        var blocks = new List<Block>
+        {
+            new Block.ReasoningBlock(null, "先想"),
+            new Block.TextBlock("答"),
+            new Block.ReasoningBlock(null, "再想"),
+        };
+
+        Assert.Equal("先想再想", ReasoningPolicy.ReasoningContentOf(blocks, "openai-chat", carriesTools: true));
+    }
+
+    [Fact]
+    public void ReasoningContentOf_ReturnsAnEmptyStringWhenTheHistoryHasNoReasoning()
+    {
+        // 兜底那一半：不是 null（null = 不写这个键），而是空串（=「这一轮没留下思考」）。
+        var blocks = new List<Block> { new Block.TextBlock("答") };
+
+        Assert.Equal("", ReasoningPolicy.ReasoningContentOf(blocks, "openai-chat", carriesTools: true));
+    }
+
+    [Fact]
+    public void ReasoningContentOf_SkipsRedactedPayloads()
+    {
+        // redacted 是加密载荷，不能当正文回传——与 Claude 的 redacted_thinking 同理。
+        var blocks = new List<Block> { new Block.ReasoningBlock(null, "ZW5j", ReasoningKind.Redacted) };
+
+        Assert.Equal("", ReasoningPolicy.ReasoningContentOf(blocks, "openai-chat", carriesTools: true));
+    }
+
+    [Fact]
+    public void ReasoningContentOf_ReturnsNullWhenTheFieldMustNotBeWritten()
+    {
+        Assert.Null(ReasoningPolicy.ReasoningContentOf(
+            [new Block.ReasoningBlock(null, "想")], "openai-chat", carriesTools: false));
+        Assert.Null(ReasoningPolicy.ReasoningContentOf(
+            [new Block.ReasoningBlock(null, "想")], "claude-messages", carriesTools: true));
+    }
 }

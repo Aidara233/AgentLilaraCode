@@ -31,6 +31,7 @@ public static class OpenAiChatResponse
             && id.ValueKind == JsonValueKind.String ? id.GetString() : null;
 
         string? text = null;
+        string? reasoning = null;
         var finish = UnknownFinish;
         List<Block> calls = [];
 
@@ -55,12 +56,25 @@ public static class OpenAiChatResponse
                     text = c.GetString();
 
                 calls = ToolCalls(msg);
+
+                // ⚠️ **DeepSeek 思考模式的 `reasoning_content`**（2026-10-17）：
+                // 不在 content 里，而是 message 上的一个平级字段。不读它 ⇒ 下一步根本没东西可回传
+                // ⇒ 请求带工具时 400 `must be passed back`。**空串也留**——它的语义是
+                // 「这一轮思考了但没有正文」，与「没有这个字段」在回传时不同（见 ReasoningPolicy）。
+                // ⚠️ 只认明文推理（ReasoningKind.Text）：redacted 是加密载荷，不能当正文回传，
+                // 与 Claude 的 `redacted_thinking` 同理。
+                if (msg.TryGetProperty("reasoning_content", out var rc) && rc.ValueKind == JsonValueKind.String)
+                    reasoning = rc.GetString()!;
             }
         }
 
         // 判据是 Length > 0，不是 is not null：截断响应给的是空串（max_tokens=4 → content:""），
         // is not null 会造出一个空的 TextBlock 并写进时间线。
         var blocks = new List<Block>();
+        // ⚠️ 推理块在前、正文在后（与 Claude 那条链路同序）：`reasoning_content` 是「我打算这么做」，
+        // `content` 是说完的话。⚠️ 空串**不造块**——与下面正文同一条判据（Length > 0）：
+        // 造一个空文本块会让记录里多一条不存在的思考。
+        if (reasoning is { Length: > 0 }) blocks.Add(new Block.ReasoningBlock(null, reasoning));
         if (text is { Length: > 0 }) blocks.Add(new Block.TextBlock(text));
         // ⚠️ 文本在前、调用在后：与响应里两者同时出现时的**自然次序**一致
         //（`content` 是「我打算这么做」，`tool_calls` 是「于是这么调」）。

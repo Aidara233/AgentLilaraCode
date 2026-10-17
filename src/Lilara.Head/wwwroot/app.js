@@ -653,9 +653,6 @@ async function loadOlderHistory() {
   }
 }
 
-  return (blocks || []).filter((b) => b.kind === "text").map((b) => b.text).join("") || EMPTY_BODY;
-}
-
 function renderTurn(from, blocks, cls, historyId) {
   const item = { kind: "message", id: historyId || `live-${Date.now()}-${Math.random()}`, from, blocks };
   renderHistoryItem(item, cls);
@@ -703,29 +700,82 @@ function createHistoryItem(t, cls) {
   body.className = "body";
 
   if (t.kind === "toolResult") {
+    // ⚠️ 独立一行时**不要 `white-space: pre-wrap`**：`body.plain` 让折叠项自己撑开
+    // （折叠项内部那份已经设了 pre-wrap），否则外层会把缩进也画出来。
+    body.classList.add("plain");
     body.appendChild(detail(`工具结果${t.callId ? ` · ${t.callId}` : ""}`, blocksText(t.blocks), "result"));
   } else {
+    // ⚠️ **顺序是 思考 → 正文 → 其余块**（2026-10-17 用户裁定）。原先按块的原序输出，
+    // 于是「思考、正文、调用」里的思考落在正文**上面**、而「正文、思考」里落在下面——
+    // 记录里的块序是模型给的原样（不改），但**人读的那一栏**统一成「先想、再说、再调」。
+    // 正文用 textContent 原样渲染；思考 / 调用 / 其他块各是一个折叠项。
+    //
+    // ⚠️ **工具结果按 `callId` 配到对应的调用下面**，不再各自单列一行
+    // （2026-10-17）：实时事件与 `/history` 都按「模型消息之后跟它的结果」到达，
+    // 配对由这里做——`createHistoryItem` 是纯函数，配对表由调用方传进来。
+    const reasoning = (t.blocks || []).filter((b) => b.kind === "reasoning");
     const text = (t.blocks || []).filter((b) => b.kind === "text").map((b) => b.text).join("");
-    if (text) body.appendChild(document.createTextNode(text));
-    for (const b of t.blocks || []) {
-      if (b.kind === "reasoning") {
-        body.appendChild(detail(b.reasoningKind === "redacted" ? "思考过程（已隐藏）" : "思考过程",
-          b.reasoningKind === "redacted" ? "内容已隐藏" : b.text, "reasoning"));
-      } else if (b.kind === "toolUse") {
-        body.appendChild(detail(`调用 ${b.name}`, b.arguments, "tool"));
-      } else if (!["text", "reasoning"].includes(b.kind)) {
-        body.appendChild(detail(`内容（${b.kind}）`, blocksText([b]), "tool"));
-      }
-    }
+    const others = (t.blocks || []).filter((b) => !["text", "reasoning"].includes(b.kind));
+
+    for (const b of reasoning) body.appendChild(reasoningDetail(b));
+
+    const textEl = document.createElement("div");
+    textEl.className = "msg-text";
+    // ⚠️ 占位与 `EMPTY_BODY` 同一句话（`05` §4：空正文必须显式可见）。
+    // 只有推理、没有正文时也显示占位——「这一步没有正文输出」仍然是事实。
+    textEl.textContent = text || (others.length ? "" : EMPTY_BODY);
+    if (textEl.textContent) body.appendChild(textEl);
+
+    for (const b of others) installToolRow(body, t, b);
   }
   wrap.append(who, body);
   return wrap;
+}
+
+function reasoningDetail(b) {
+  const redacted = b.reasoningKind === "redacted";
+  return detail(redacted ? "思考过程（已隐藏）" : "思考过程",
+    redacted ? "内容已隐藏" : b.text, "reasoning");
+}
+
+
+/// **一个非文本、非推理的块 → 一行**。今天的「其余块」里只有 `toolUse` 是活的；
+/// 别的（`image` / `store`）照旧给一个地址式的折叠项，并**保留调用行的 id**，
+/// 好让结果配得上来（`data-call-id`）。
+function installToolRow(body, t, b) {
+  if (b.kind === "toolUse") {
+    const row = detail(`调用 ${b.name}`, b.arguments, "tool");
+    // ⚠️ 结果配对的锚——`t` 的 `callId` 由 `message.appended` / `/history` 原样带出。
+    if (b.callId) row.dataset.callId = b.callId;
+    body.appendChild(row);
+    return;
+  }
+  body.appendChild(detail(`内容（${b.kind}）`, blocksText([b]), "tool"));
 }
 
 function renderHistoryItem(t, cls) {
   if (t.id && document.querySelector(`[data-history-id="${CSS.escape(t.id)}"]`)) return;
   const el = createHistoryItem(t, cls);
   appendTimeline(el);
+}
+
+function appendToolResult(t) {
+  const row = detail(`工具结果${t.callId ? ` · ${t.callId}` : ""}`, blocksText(t.blocks), "result");
+  if (t.id) row.dataset.historyId = t.id;
+  if (t.callId) row.dataset.resultCallId = t.callId;
+
+  // 配到对应的调用下面（`[data-call-id]` 是 `installToolRow` 留的锚）。
+  // ⚠️ 找不到就不硬塞：它可能属于更早的一条模型消息，而那条**还没被加载**
+  //（分页）——这时独立显示，重拉后自然归位（`renderHistoryPage` 会整段重画）。
+  const anchor = t.callId
+    ? document.querySelector(`[data-call-id="${CSS.escape(t.callId)}"]`)
+    : null;
+  if (anchor) {
+    anchor.after(row);
+    // ⚠️ 调用项自己也是 `<details>`：结果跟在它**同级**时，折叠 / 展开互不牵连。
+  } else {
+    appendTimeline(row);
+  }
 }
 
 function renderMeta(text, cls) {
@@ -1706,6 +1756,15 @@ function handleEvent(p) {
         renderTurn(p.from, p.blocks, null, p.historyId);
       break;
 
+    // ⚠️ **工具结果的实时出口**（2026-10-17）。此前核心只在步末发模型消息，
+    // 结果一条事件都没有 ⇒ 头要把页面重拉一遍才看得见（用户实测）。
+    // ⇒ 与 `message.appended` 对称：带 `historyId`，`appendToolResult` 负责按 `callId`
+    // 配到前面那条调用下面；重拉时同一批结果会以相同 id 出现，去重由 id 完成。
+    case "tool.result.appended":
+      if (p.sessionId === current)
+        appendToolResult({ kind: "toolResult", id: p.id, callId: p.callId, blocks: p.blocks });
+      break;
+
     case "session.step.begin":
       // 「在跑」的信号源是它：session.state 是磁盘的镜像，而磁盘从不存 Running。
       if (p.sessionId === current) setStatus("Running", p.turn - 1);
@@ -1859,9 +1918,20 @@ $("usage-refresh").onclick = () => loadUsageView(true);
 $("usage-prev").onclick = () => { usageSkip = Math.max(0, usageSkip - usagePageSize); loadUsageView(); };
 $("usage-next").onclick = () => { usageSkip += usagePageSize; loadUsageView(); };
 
-// ---- 新建会话：在 core 设备的工作目录树中逐层选择 + 起名 ----
-// 浏览器只显示 core 返回的路径；不调用浏览器本机目录选择 API。
-let newDirectory = null;
+// ---- 新建会话：目录输入即过滤 + 起名 ----
+//
+// ⚠️ 分工（用户裁定 2026-10-17）：**补全逻辑在头**，core 侧只需要一个 ls——
+// `GET /directories?path=` 给什么列什么（空路径列盘符/根，路径列直接子目录），
+// **不认前缀、不做匹配**。头把输入切成「父目录 + 名字前缀」，问 core 要父目录的
+// 子目录，再在本地按前缀过滤并画成候选。
+//
+// ⚠️ 两条容易写错的地方（都是「静态看图看不出来」）：
+//   ① **请求次序**：先发的慢响应不能盖掉后发的快响应（`dirBrowseSeq`）；
+//      否则打字打快一点，候选就停在某一个中间状态，而且不报错。
+//   ② **父目录的枚举**：`E:/Worksp` 的父目录是 `E:/`，**不是** `E:/` 本身——
+//      「列出 `E:/Worksp` 的子目录」会被 core 判成「目录不存在」而报错，而用户
+//      想要的是「`E:/` 下以 `Worksp` 开头的那些」。
+let dirBrowse = { seq: 0, items: [], active: -1, prefix: "" };
 
 $("new").onclick = async () => {
   $("new-form").hidden = false;
@@ -1869,72 +1939,168 @@ $("new").onclick = async () => {
   $("new-note").className = "note";
   $("new-title").value = "";
   $("new-project").value = "";
-  await loadNewDirectory();
+  await dirSuggest("");
   $("new-project").focus();
 };
 
-$("new-cancel").onclick = () => { $("new-form").hidden = true; };
+$("new-cancel").onclick = () => {
+  $("new-form").hidden = true;
+  hideDirList();
+};
 
-async function loadNewDirectory(path) {
-  const note = $("new-note");
+// 输入 → 请求（防抖 120ms：连续打字只发最后一次）；打开表单时主动拉一次盘符。
+let dirTimer = null;
+$("new-project").addEventListener("input", () => {
+  clearTimeout(dirTimer);
+  dirTimer = setTimeout(() => dirSuggest($("new-project").value), 120);
+});
+
+// 把 `E:/Worksp` 拆成「父目录 E:/」＋「前缀 Worksp」。
+//
+// ⚠️ 分隔符必须**两种都认**：core 在 Windows 上回的是 `\`，而用户在框里打的是 `/`。
+// 只认一种的话 `E:\Workspace\` 会被当成一个名字，前缀过滤永远匹配不上。
+function dirSplit(input) {
+  const text = String(input ?? "");
+  const cut = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"));
+  if (cut < 0) return { dir: "", prefix: text };
+  // `E:/` 与 `/` 的 cut 落在最后一位：父目录就是它自己，前缀为空。
+  if (cut === text.length - 1) return { dir: text, prefix: "" };
+  return { dir: text.slice(0, cut + 1), prefix: text.slice(cut + 1) };
+}
+
+async function dirSuggest(input) {
+  const { dir, prefix } = dirSplit(input);
+  const seq = ++dirBrowse.seq;
+  dirBrowse.prefix = prefix;
+
   try {
-    const query = path ? `?path=${encodeURIComponent(path)}` : "";
+    const query = dir ? `?path=${encodeURIComponent(dir)}` : "";
     const r = await fetch(`${core}/directories${query}`);
     const data = await r.json();
-    if (!r.ok) throw new Error(data.error || "目录不可用");
-    newDirectory = data;
-    renderNewDirectory(data);
+    if (seq !== dirBrowse.seq) return;      // 过期的响应：丢掉，不画
+
+    if (!r.ok) {
+      dirBrowse.items = [];
+      renderDirItems([], data.error || "目录不可用", prefix);
+      return;
+    }
+
+    const p = prefix.toLowerCase();
+    const items = (data.directories || []).filter((d) => d.name.toLowerCase().startsWith(p));
+    // 输入的父目录本身就是待选路径时（如 `E:/Workspace/`），第一项放它自己，
+    // 否则「进入子目录后想停在这里」只能靠手删——那是这一版要消掉的来回。
+    const here = dir && prefix === "" ? [{ name: "此目录", path: dir, up: false, here: true }] : [];
+    dirBrowse.items = here.concat(items);
+    renderDirItems(dirBrowse.items, data.error, prefix);
   } catch (e) {
-    newDirectory = null;
-    $("new-project").value = path || "";
-    $("new-directory").textContent = "";
-    note.textContent = "✗ 读不到 core 设备目录：" + (e.message || e);
-    note.className = "note-bad";
+    if (seq !== dirBrowse.seq) return;
+    dirBrowse.items = [];
+    renderDirItems([], "读不到 core 设备目录：" + (e && e.message ? e.message : e), prefix);
   }
 }
 
-function renderNewDirectory(data) {
-  const note = $("new-note");
-  note.textContent = data.error ? "⚠️ " + data.error : "";
-  note.className = data.error ? "note-bad" : "note";
+function renderDirItems(items, error, prefix) {
+  const list = $("new-project-list");
+  list.innerHTML = "";
+  dirBrowse.active = -1;
 
-  const bar = $("new-directory");
-  bar.innerHTML = "";
-  const path = document.createElement("span");
-  path.className = "path";
-  path.textContent = data.current || "core 设备文件系统根";
-  path.title = data.current || "core 设备文件系统根";
-  bar.appendChild(path);
+  if (error) {
+    const err = document.createElement("div");
+    err.className = "dir-error";
+    err.textContent = "⚠️ " + error;
+    list.appendChild(err);
+    showDirList();
+    return;
+  }
 
-  const browseInput = btn("浏览输入路径", () => {
-    const requested = $("new-project").value.trim();
-    if (requested) loadNewDirectory(requested);
+  if (items.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "dir-empty";
+    empty.textContent = prefix ? `没有以「${prefix}」开头的子目录` : "没有子目录";
+    list.appendChild(empty);
+    showDirList();
+    return;
+  }
+
+  items.forEach((d, i) => {
+    const row = document.createElement("div");
+    row.className = "dir-item";
+    row.setAttribute("role", "option");
+    // ⚠️ 用 dataset 存路径，不把路径拼进 onclick——`innerHTML` 拼路径会让 `'` 和
+    // 模型/用户能碰到的一切文本变成代码；目录名里出现引号不是假设，是输入。
+    row.dataset.path = d.path;
+    row.dataset.index = String(i);
+
+    const name = document.createElement("span");
+    name.className = "name" + (d.here ? " up" : "");
+    name.textContent = d.here ? "↳ 选择当前目录" : d.name + (prefix && d.name.length === prefix.length ? "/" : "");
+    name.title = d.path;
+
+    const full = document.createElement("span");
+    full.className = "full";
+    full.textContent = d.path;
+    full.title = d.path;
+
+    row.append(name, full);
+    row.addEventListener("mousedown", (e) => {
+      // mousedown 而不是 click：click 之前 input 会先 blur，列表已经被隐藏。
+      e.preventDefault();
+      pickDir(d);
+    });
+    list.appendChild(row);
   });
-  bar.appendChild(browseInput);
 
-  if (data.parent) {
-    const up = btn("返回上级", () => loadNewDirectory(data.parent));
-    bar.appendChild(up);
-  }
-
-  if (data.current) {
-    const choose = btn("选择此目录", () => {
-      $("new-project").value = data.current;
-      note.textContent = "已选择 core 设备目录。";
-      note.className = "note-ok";
-    }, "btn-primary");
-    bar.appendChild(choose);
-  }
-
-  const sel = $("new-project");
-  for (const d of data.directories || []) {
-    const enter = btn(`进入 ${d.name}`, () => loadNewDirectory(d.path));
-    bar.appendChild(enter);
-  }
-
-  // 浏览位置和待提交路径分开：浏览目录不应悄悄覆盖用户正在编辑的路径。
-  if (!sel.value && data.current) sel.value = data.current;
+  showDirList();
 }
+
+function showDirList() {
+  const list = $("new-project-list");
+  list.hidden = false;
+  $("new-project").setAttribute("aria-expanded", "true");
+}
+
+function hideDirList() {
+  const list = $("new-project-list");
+  if (!list) return;
+  list.hidden = true;
+  list.innerHTML = "";
+  dirBrowse.active = -1;
+  $("new-project").setAttribute("aria-expanded", "false");
+}
+
+// 选中一个候选：
+//  - 「当前目录」项直接落成值；
+//  - 子目录**不直接落成值**，而是补全到「子目录/」并继续列下一层——这样
+//    `E:/` → `E:/Worksp` → `E:/Workspace/` 一路是「打字 + 回车」，不用再点「进入」。
+function pickDir(d) {
+  const input = $("new-project");
+  if (d.here) { input.value = d.path; hideDirList(); return; }
+  input.value = d.path.endsWith("/") || d.path.endsWith("\\") ? d.path : d.path + (d.path.includes("\\") ? "\\" : "/");
+  dirSuggest(input.value);
+  input.focus();
+}
+
+function moveDirActive(step) {
+  const rows = [...$("new-project-list").querySelectorAll(".dir-item")];
+  if (rows.length === 0) return;
+  dirBrowse.active = (dirBrowse.active + step + rows.length) % rows.length;
+  rows.forEach((r, i) => r.classList.toggle("on", i === dirBrowse.active));
+  rows[dirBrowse.active].scrollIntoView({ block: "nearest" });
+}
+
+$("new-project").addEventListener("keydown", (e) => {
+  const open = !$("new-project-list").hidden;
+  if (e.key === "ArrowDown") { e.preventDefault(); open ? moveDirActive(1) : dirSuggest($("new-project").value); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); if (open) moveDirActive(-1); }
+  else if (e.key === "Enter") {
+    // 有高亮就选它；没有高亮且候选恰好一条就选那一条（常见路径不用按 ↓）。
+    const row = open && (dirBrowse.active >= 0 ? dirBrowse.items[dirBrowse.active]
+      : dirBrowse.items.length === 1 ? dirBrowse.items[0] : null);
+    if (row) { e.preventDefault(); pickDir(row); }
+  } else if (e.key === "Escape") { e.preventDefault(); hideDirList(); }
+});
+
+$("new-project").addEventListener("blur", () => hideDirList());
 
 $("new-go").onclick = async () => {
   const note = $("new-note");
@@ -1943,13 +2109,21 @@ $("new-go").onclick = async () => {
   const title = $("new-title").value.trim();
 
   if (!cwd) { note.textContent = "✗ 先从 core 设备选择一个目录。"; note.className = "note-bad"; return; }
+  hideDirList();
 
   const payload = { kind: "session.create", cwd };
   if (title) payload.title = title;
 
   const r = await commandNow(id, payload);
   if (!r.accepted) {
-    note.textContent = "✗ " + r.reason;
+    // 名字没打完（`E:/Worksp`）就点创建是最常见的一步：把 core 的拒绝换成可操作的提示，
+    // 并顺手补全到「候选唯一」的那一层——别的失败原样照转。
+    if (r.reason && r.reason.startsWith("目录不存在")) {
+      note.textContent = "✗ " + r.reason + "（输入框里的路径可能还没补全：先用 ↓ 选候选或补上结尾的 /）";
+      dirSuggest(cwd);
+    } else {
+      note.textContent = "✗ " + r.reason;
+    }
     note.className = "note-bad";
     return;
   }

@@ -1145,6 +1145,60 @@ public class ControlServerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Snapshot_History_KeepsEachToolResultBesideItsModelMessage()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        // ⚠️ 造**记录里真实的次序**：模型消息（调用）→ 它的结果 → 紧接着下一条用户消息。
+        // 2026-10-17：结果必须**紧跟**在它的模型消息之后，否则头只能画成「调用都在上、
+        // 结果都在下」——而那是用户点名的那个形状。
+        _host.Store.AppendEvents(
+            Kernel.ProjectKey.FromPath(_work), sid,
+            [
+                new TimelineEvent.MessageEvent
+                {
+                    Id = "m1", At = DateTimeOffset.UnixEpoch, From = Speaker.Model,
+                    Blocks =
+                    [
+                        new Block.TextBlock("我查一下"),
+                        new Block.ToolUseBlock("c1", "demo", "{}"),
+                        new Block.ToolUseBlock("c2", "demo", "{}"),
+                    ],
+                },
+                new TimelineEvent.ToolResultEvent
+                {
+                    Id = "r1", At = DateTimeOffset.UnixEpoch, CallId = "c1",
+                    Content = [new Block.TextBlock("结果一")],
+                },
+                new TimelineEvent.ToolResultEvent
+                {
+                    Id = "r2", At = DateTimeOffset.UnixEpoch, CallId = "c2",
+                    Content = [new Block.TextBlock("结果二")],
+                },
+                new TimelineEvent.MessageEvent
+                {
+                    Id = "m2", At = DateTimeOffset.UnixEpoch, From = Speaker.User,
+                    Blocks = [new Block.TextBlock("下一句")],
+                },
+            ]);
+
+        var root = await GetJson($"/sessions/{sid}/history");
+        var ids = root.GetProperty("rendered").EnumerateArray()
+            .Select(i => i.GetProperty("id").GetString()!).ToArray();
+
+        // 组内次序：模型消息 → 两条结果（按记录序）→ 下一条消息。
+        Assert.Equal(["m1", "r1", "r2", "m2"], ids);
+
+        // ⚠️ 探针：这两个结果**确实是** `callId` 配得上 m1 的两条调用——
+        // 否则「紧跟」只是碰巧，而不是配对判据在起作用。
+        var calls = root.GetProperty("rendered")[0].GetProperty("blocks").EnumerateArray()
+            .Where(b => b.GetProperty("kind").GetString() == "toolUse")
+            .Select(b => b.GetProperty("callId").GetString()!).ToArray();
+        Assert.Equal(["c1", "c2"], calls);
+    }
+
+    [Fact]
     public async Task Snapshot_Queue_CarriesExactlyTheseKeys()
     {
         var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);

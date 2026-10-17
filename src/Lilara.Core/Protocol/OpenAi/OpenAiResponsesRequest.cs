@@ -133,12 +133,12 @@ public static class OpenAiResponsesRequest
     }
 
     // 一条 canonical 消息 → 协议 input 项（有工具调用时是多项，见 ToItems）。
-    // Responses 不暴露推理（返回体无推理字段）→ 丢且不伪造。
+    // Responses 的 content **不暴露推理块**（它们进的是并列的 reasoning 项，见 ReasoningItem）。
     private static List<JsonObject> MessageToItems(TimelineEvent.MessageEvent message, string protocol)
     {
         var role = message.From == Speaker.User ? "user" : "assistant";
 
-        // 先按协议能力过滤推理块——Responses 不承载，丢且不伪造。
+        // 先按协议能力过滤推理块——Responses 的 content 不承载它们（它们走 reasoning 项，见上）。
         var blocks = ReasoningPolicy.FilterFor(message.Blocks, protocol);
         var texts = blocks.OfType<Block.TextBlock>().Select(b => b.Text).ToList();
 
@@ -147,11 +147,22 @@ public static class OpenAiResponsesRequest
         var calls = blocks.OfType<Block.ToolUseBlock>().ToList();
 
         // 过滤掉推理块后可能一条不剩（推理模型只思考不落笔），必须早失败。
-        if (texts.Count == 0 && calls.Count == 0)
+        // ⚠️ 2026-10-17：推理块在 Responses 里**不丢**——它们是独立的 `type:"reasoning"` 项
+        // （见下面 `ReasoningItem`）。⚠️ 取自**原始** `message.Blocks`，不是过滤后的 `blocks`：
+        // `FilterFor` 的职责正是把推理块挡在 content 之外，从它身上取会被自己挡掉。
+        var reasoning = message.Blocks.OfType<Block.ReasoningBlock>()
+            .Where(r => r.Kind == ReasoningKind.Text)
+            .Select(r => r.Text)
+            .ToList();
+        if (texts.Count == 0 && calls.Count == 0 && reasoning.Count == 0)
             throw new ArgumentException(
                 $"时间线里有空消息（speaker={message.From}），无法构造请求", nameof(message));
 
         var items = new List<JsonObject>();
+
+        // ⚠️ **推理项在整条消息的项之前**（与响应里的次序一致：先思考，再说话 / 调工具）。
+        foreach (var r in reasoning)
+            items.Add(ReasoningItem(r));
 
         // ⚠️ **没有正文时不发那条 message 项**（`content: []` 是另一回事，而且多半非法）。
         // 一条「只调工具」的 assistant 消息在 Responses 下**就是**若干 function_call 项，没有消息项。
@@ -183,4 +194,26 @@ public static class OpenAiResponsesRequest
 
         return items;
     }
+
+    /// <summary>
+    /// 推理块 → `{"type":"reasoning","summary":[{type:"summary_text",text:…}]}`。
+    ///
+    /// <para>⚠️ <b>为什么响应那条路会丢它、而这里要发</b>（2026-10-17）：推理项的价值在
+    /// **回传**——不是所有上游都强求（DeepSeek 的 Responses 有没有硬要求尚未实测），
+    /// 但「有就发」与「有就不发」的差别只在一条注释之外：另一条 OpenAI 协议（Chat）
+    /// **已经因为不发吃到了 400**（`reasoning_content must be passed back`）。
+    /// 推理块是**不可优化**的（`00` §7 判据 5），能在链路上原样保住就保住。</para>
+    ///
+    /// <para>⚠️ <b>摘要形状是照 DeepSeek 的用例写的</b>（`type:"reasoning"` + `summary` 里的
+    /// `summary_text`），不是凭记忆拼的字段名。若上游文档后来换了形状，改的是**这一处**。</para>
+    /// </summary>
+    private static JsonObject ReasoningItem(string text) => new()
+    {
+        ["type"] = "reasoning",
+        ["summary"] = new JsonArray(new JsonObject
+        {
+            ["type"] = "summary_text",
+            ["text"] = text,
+        }),
+    };
 }

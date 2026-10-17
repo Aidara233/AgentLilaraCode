@@ -180,7 +180,9 @@ public class WireFormatTests
         // 16 → 17：`usage.updated`（2026-10-15，统计批）与 `release.recorded`（2026-10-17，线的头出口）
         // 是两条分支各自加的 ⇒ 合并后是 16 + 2。
         // 17 → 18：`session.compaction.completed`（2026-10-16，压缩批）。
-        Assert.Equal(19, declared.Length);
+        // 18 → 19：`session.compaction.completed` 之外，`tool.result.appended`（2026-10-17，
+        //          工具结果的实时出口——此前结果只有重拉 `/history` 才看得见）。
+        Assert.Equal(20, declared.Length);
 
         var dispatcher = File.ReadAllText(Path.Combine(
             RepoRoot(), "src", "Lilara.Core", "Hosting", "CommandDispatcher.cs"));
@@ -196,7 +198,7 @@ public class WireFormatTests
     [Fact]
     public void WireEventTable_HasExactlyTheTypesWeThinkItDoes()
     {
-        Assert.Equal(19, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+        Assert.Equal(20, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
     }
 
     /// <summary>

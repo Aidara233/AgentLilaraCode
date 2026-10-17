@@ -354,6 +354,8 @@ public sealed class Stepper(
         // 有问 ⇒ 事件列表**空**（模型消息也不落——见下），状态转 `WaitingForInput`，
         // 那次暂停冻进 handle，等用户答完由 `CommandDispatcher` 续跑。
         AskRequest? pending = null;
+        // 这一批工具结果——**给头的活事件**（`StepOutcome.ToolResults`）。有问时恒空。
+        IReadOnlyList<TimelineEvent.ToolResultEvent> toolResults = [];
 
         // ⚠️ 工具调用是**模型消息的一部分** ⇒ 有调用就一定有那条模型消息（上面那个 if 通过）。
         // `events.Count > 0` 不是多余的守卫，它挡的是「凭空落一堆悬空结果」——而悬空的
@@ -376,6 +378,7 @@ public sealed class Stepper(
             var batch = await executor.ExecuteAsync(toolCalls, context, ct);
             pending = batch.Pending;
             events.AddRange(batch.Results);
+            toolResults = batch.Results;
 
             // ⚠️ **`release` 的线在这里落盘**（`01` §12.4，2026-10-11）：
             // 它和别的事件**不一样**——工具只跑出一次「成功」，而**记录上要留的那条不是结果**。
@@ -475,7 +478,7 @@ public sealed class Stepper(
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id,
-            ReleasedClaims: releasedClaims, ReleasedLines: releasedLines);
+            ReleasedClaims: releasedClaims, ReleasedLines: releasedLines, ToolResults: toolResults);
     }
 
     private void RecordUsage(
@@ -703,6 +706,8 @@ public sealed class Stepper(
         var events = new List<TimelineEvent>();
         var releasedClaims = new List<Claim>();
         var releasedLines = new List<TimelineEvent.ReleaseEvent>();
+        // 答复之后真正跑掉的那批结果——**给头的活事件**（与 `StepAsync` 同一个出口）。
+        IReadOnlyList<TimelineEvent.ToolResultEvent> toolResults = [];
 
         if (calls.Count > 0)
         {
@@ -720,6 +725,7 @@ public sealed class Stepper(
 
             var batch = await executor.ExecuteAsync(calls, context, ct, reply);
             events.AddRange(batch.Results);
+            toolResults = batch.Results;
 
             // ⚠️ **`release` 的线在这里也要落**（2026-10-17）——原先只在 `StepAsync` 有一半：
             // 一批里只要有一条要问，整批就挂起；用户批准之后全部执行（`ToolExecutor` 的
@@ -769,7 +775,8 @@ public sealed class Stepper(
             Turn = s.Turn + 1,
         }, diskStatus: SessionStatus.Idle);
 
-        return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines);
+        return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
+            ToolResults: toolResults);
     }
 
     /// <summary>
@@ -911,7 +918,19 @@ public sealed class Stepper(
         DateTimeOffset? DeadlineAt = null,
         string? HistoryId = null,
         IReadOnlyList<Claim>? ReleasedClaims = null,
-        IReadOnlyList<TimelineEvent.ReleaseEvent>? ReleasedLines = null);
+        IReadOnlyList<TimelineEvent.ReleaseEvent>? ReleasedLines = null,
+        /// <summary>
+        /// 这一批工具结果——**给头的活事件**用的，不是落盘的另一份。
+        ///
+        /// <para>⚠️ 它们已经随 `events` 落盘了；这里交回去只是为了 `CommandDispatcher`
+        /// 能发 `tool.result.appended`（2026-10-17：此前没有这个出口，头的「工具结果」
+        /// 只在重拉 `/history` 时出现，正常对话流程里看不见）。</para>
+        ///
+        /// <para>⚠️ 交的是**记录那一份**（未回收、未解引用、未加框架）——与 `TimelineEvent`
+        /// 落盘的内容逐字相同。回收/截断是**渲染期**的事，头收到活事件时那条记录刚写，
+        /// 还没轮到任何判定；重拉时 `/history` 会给同一批结果套上最新形态。</para>
+        /// </summary>
+        IReadOnlyList<TimelineEvent.ToolResultEvent>? ToolResults = null);
 
     /// <summary>
     /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。

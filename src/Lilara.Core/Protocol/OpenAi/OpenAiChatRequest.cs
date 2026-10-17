@@ -32,17 +32,20 @@ public static class OpenAiChatRequest
             messages.Add(new JsonObject { ["role"] = "system", ["content"] = systemText });
 
         foreach (var evt in request.Timeline)
-            messages.Add(ToMessage(evt, request.Protocol));
+            messages.Add(ToMessage(evt, request.Protocol, request.Tools.Count > 0));
 
         // ---- 尾槽位：**拼进末尾那条 user 消息**（`01` §3.2 / §3.3）----
         //
         // ⚠️ **判据只有一条：末尾是不是 user。** 是 ⇒ 拼进去；不是 ⇒ 补一条 user 消息。
-        // ⚠️ **但 Chat 这一条多一格**：工具结果在 Chat 下是**独立的 `role:"tool"` 消息**
-        // （不像 Claude 那样塞进 user 消息的块）⇒ 时间线的末尾**通常是 `tool`**。
+        // ⚠️ 但 Chat 这一条多一格：工具结果在 Chat 下是独立的 `role:"tool"` 消息，
         // 往 `role:"tool"` 里拼正文是**非法的**（那条消息的 `content` 是工具输出），
         // 所以这里补一条 user 消息——而 Claude 那边走的是「拼进去」。
         // ⚠️ **两条链路的形状差异是协议给的**，不是这里偷懒：同一个尾块在两条链路上
         // 落点不同，而模型看到的内容**逐字相同**（这是判据，「落在同一个位置」不是）。
+        //
+        // ⚠️ 2026-10-17：模块合成对（`floating_context` 的 tool_use + tool_result）之后，
+        // 时间线末尾**通常**是那条 `role:"tool"` 的合成结果 ⇒ 这里给尾块另起一条 user 消息。
+        // 这不改变判据，只是让「末尾不是 user」从例外变成常态。
         if (TailText(request.Slots.Tail) is { Length: > 0 } tail)
             messages.Add(new JsonObject { ["role"] = "user", ["content"] = tail });
 
@@ -107,10 +110,10 @@ public static class OpenAiChatRequest
     /// 消息是 role/content，工具结果是 role/**tool** + `tool_call_id`（Chat 把结果
     /// 做成一个**独立消息**，而不是 Claude 那种塞进 user 消息的块）。
     /// </summary>
-    private static JsonObject ToMessage(TimelineEvent evt, string protocol) => evt switch
+    private static JsonObject ToMessage(TimelineEvent evt, string protocol, bool carriesTools) => evt switch
     {
-        TimelineEvent.MessageEvent m => MessageToJson(m, protocol),
-        TimelineEvent.ToolResultEvent r => ResultToJson(r, protocol),
+        TimelineEvent.MessageEvent m => MessageToJson(m, protocol, carriesTools),
+        TimelineEvent.ToolResultEvent r => ResultToJson(r),
         _ => throw new ArgumentException($"时间线里有无法翻译的事件（{evt.GetType().Name}）", nameof(evt)),
     };
 
@@ -123,7 +126,7 @@ public static class OpenAiChatRequest
     /// 与 Claude 那条链路**保持同一种行为**——同一个工具结果在两条链路上应当让模型看到
     /// 同样的东西，否则「换个 provider」会静默改变模型对同一条历史的理解。</para>
     /// </summary>
-    private static JsonObject ResultToJson(TimelineEvent.ToolResultEvent r, string protocol)
+    private static JsonObject ResultToJson(TimelineEvent.ToolResultEvent r)
     {
         // ⚠️ **`Ref` 到不了这里**（2026-10-06）：`fetch` 的结果今天带的是**内容**，
         // 而引用（若哪天真有）由 `TimelineRender` 在**进适配器之前**解掉
@@ -147,9 +150,9 @@ public static class OpenAiChatRequest
         };
     }
 
-    // 一条 canonical 消息 → 协议消息。Chat 不暴露推理（返回体无推理字段）→ 丢且不伪造；
-    // protocol 参数在这里对输出无可观测影响（过滤结果只被 OfType<TextBlock>() 消费）。
-    private static JsonObject MessageToJson(TimelineEvent.MessageEvent message, string protocol)
+    // 一条 canonical 消息 → 协议消息。Chat 的 content **不暴露推理**（推理块不进 content，丢且不伪造）；
+    // ⚠️ 但 `reasoning_content` 这个**字段**在带工具的请求里必须回传——见下面那段注释。
+    private static JsonObject MessageToJson(TimelineEvent.MessageEvent message, string protocol, bool carriesTools)
     {
         var role = message.From == Speaker.User ? "user" : "assistant";
 
@@ -160,13 +163,23 @@ public static class OpenAiChatRequest
         // 模型的工具调用走 `tool_calls`（Chat 把它挂在 assistant 消息上）。
         var calls = blocks.OfType<Block.ToolUseBlock>().ToList();
 
+        // ⚠️ **`reasoning_content` 走的是另一条路**（2026-10-17）：上面过滤掉的是
+        // **content 里的推理块**，而 DeepSeek 要回来的是那个**字段**。两者看着像同一件事，
+        // 把这一条也按 CanCarry 丢掉就会得到
+        // `The reasoning_content in the thinking mode must be passed back to the API.`（实测）。
+        // 值是「原样回传」；记录里没有推理块时给空串（见 `ReasoningContentOf` 的注释）。
+        var reasoning = ReasoningPolicy.ReasoningContentOf(message.Blocks, protocol, carriesTools);
+
         // ⚠️ 判据要**连调用一起看**：一个只调工具、不说话的 assistant 消息 content 是空的，
         // 而那是**常态**（模型先调再说）。只看 texts 会把它当成「空消息」拒掉。
-        if (texts.Count == 0 && calls.Count == 0)
+        // ⚠️ 只带推理的 assistant 消息也放行——`reasoning_content` 就是它的内容。
+        if (texts.Count == 0 && calls.Count == 0 && reasoning is null)
             throw new ArgumentException(
                 $"时间线里有空消息（speaker={message.From}），无法构造请求", nameof(message));
 
         var obj = new JsonObject { ["role"] = role };
+
+        if (reasoning is not null) obj["reasoning_content"] = reasoning;
 
         // ⚠️ 有 tool_calls 而 content 为空时，**发 `null` 而不是空串或省略**：
         // 省略 content 字段会被上游当成格式错误（它要求这个键存在）。

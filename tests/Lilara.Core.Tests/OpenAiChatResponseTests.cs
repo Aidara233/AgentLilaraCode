@@ -209,4 +209,32 @@ public class OpenAiChatResponseTests
         Assert.Single(reply.Blocks);
         Assert.IsType<Block.TextBlock>(reply.Blocks[0]);
     }
+
+    // Chat 不把推理放进 content 块的位置——但 DeepSeek 的 `reasoning_content` 是**另一个字段**，
+    // 必须原样读进记录，否则下一步回传不了（400 `must be passed back`，2026-10-17）。
+    [Fact]
+    public void Map_ReadsReasoningContentAsAReasoningBlock()
+    {
+        var reply = OpenAiChatResponse.Map(
+            """{"choices":[{"message":{"role":"assistant","content":"答","reasoning_content":"想了"},"finish_reason":"stop"}]}""");
+
+        Assert.Equal(2, reply.Blocks.Count);
+        var reasoning = Assert.IsType<Block.ReasoningBlock>(reply.Blocks[0]);
+        Assert.Equal("想了", reasoning.Text);
+        Assert.Null(reasoning.Signature);          // Chat 没有签名这回事
+        Assert.Equal(ReasoningKind.Text, reasoning.Kind);
+        Assert.Equal("答", Assert.IsType<Block.TextBlock>(reply.Blocks[1]).Text);
+    }
+
+    [Fact]
+    public void Map_KeepsAnEmptyReasoningContentAsNoBlock()
+    {
+        // 空串 = 「思考了但没有正文」⇒ 不造块（与 content 的 Length > 0 同一条判据）。
+        // 它的回传兜底由请求侧给空串（ReasoningPolicy），不需要记录里有一个空块。
+        var reply = OpenAiChatResponse.Map(
+            """{"choices":[{"message":{"role":"assistant","content":"答","reasoning_content":""},"finish_reason":"stop"}]}""");
+
+        Assert.Single(reply.Blocks);
+        Assert.IsType<Block.TextBlock>(reply.Blocks[0]);
+    }
 }

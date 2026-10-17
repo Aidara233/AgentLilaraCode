@@ -1067,6 +1067,15 @@ public sealed class CommandDispatcher(
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId), requested);
             }
 
+            // ⚠️ **工具结果也要告诉头**（2026-10-17，用户实测）：此前只有 `message.appended`
+            // ⇒ 实时流里那批调用看起来「没有下文」，结果只有重拉 `/history` 才出现。
+            // ⚠️ 在模型消息**之后**发：头按到达次序画，而记录里的次序就是「模型消息、
+            // 然后它那批结果」。⚠️ 一条结果一条事件（见 `ToolResultAppended` 的注释）。
+            foreach (var result in step.ToolResults ?? [])
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.ToolResultAppended(
+                        handle.SessionId, result.Id, result.CallId, result.Content, result.At));
+
             // ⚠️ **模型侧 `release` 摘掉的锁要告诉头**（2026-10-17）：摘锁只改 `claims.json`，
             // 而头右栏的「谁在动哪些文件」靠 `claim.released` 刷新——不发的话，
             // 头会继续显示模型已经说「我用完了」的锁，与核心状态静默分叉。

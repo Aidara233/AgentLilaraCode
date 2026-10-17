@@ -20,6 +20,7 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(SessionDeleted), "session.deleted")]
 [JsonDerivedType(typeof(SessionReclaimed), "session.reclaimed")]
 [JsonDerivedType(typeof(ReleaseRecorded), "release.recorded")]
+[JsonDerivedType(typeof(ToolResultAppended), "tool.result.appended")]
 [JsonDerivedType(typeof(ApprovalRequested), "approval.requested")]
 [JsonDerivedType(typeof(ApprovalResolved), "approval.resolved")]
 [JsonDerivedType(typeof(Error), "error")]
@@ -158,6 +159,27 @@ public abstract record WireEvent
     /// </summary>
     public sealed record ReleaseRecorded(
         string SessionId, string Id, IReadOnlyList<string> Scope, string? Summary, DateTimeOffset At) : WireEvent;
+
+    /// <summary>
+    /// **工具结果落盘了**——头的「工具结果」在正常对话流程里可见的唯一出口。
+    ///
+    /// <para>⚠️ <b>为什么加它</b>（2026-10-17，用户实测）：此前步末只发
+    /// <see cref="MessageAppended"/>（模型消息），而 <c>ToolResultEvent</c> **一条都不发**
+    /// ⇒ 头只有 `openSession` 重拉 `/history` 时才看得见结果，实时流里那批调用看起来
+    /// 「没有下文」。这不是渲染问题，是**没有生产者**。</para>
+    ///
+    /// <para>⚠️ <b>载荷是结果本身的三样</b>：<see cref="CallId"/> 供头与前面那条
+    /// `toolUse` 块配对；<see cref="Id"/> 是记录内身份（与 `/history` 里的同一条一致，
+    /// 头靠它去重）；<see cref="Blocks"/> 是内容。⚠️ 交的是**记录那一份**
+    /// （未回收 / 未截断 / 未加框架）——头收到时那条刚写，回收判定还没发生。
+    /// 重拉时 `/history` 会给出同一批结果的最新形态（可能是回收注记），两边靠
+    /// <see cref="Id"/> 对上。</para>
+    ///
+    /// <para>⚠️ <b>一条事件一条结果</b>，不打包：头按 `callId` 配对的位置是逐条的，
+    /// 打包只会让「其中一个要展开、另一个不要」变成一件要拆包的事。</para>
+    /// </summary>
+    public sealed record ToolResultAppended(
+        string SessionId, string Id, string CallId, IReadOnlyList<Block> Blocks, DateTimeOffset At) : WireEvent;
 
     /// <summary>
     /// **核心在问用户**（`01` §3.8）。⚠️ <b>它同时投两条流</b>：

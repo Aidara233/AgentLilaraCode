@@ -22,7 +22,12 @@ public abstract record Block
     public sealed record TextBlock(string Text) : Block;
 
     // 模型的推理块。
-    // 铁律：能回传的协议必须逐字回传，不能回传的（Chat / Responses）必须不伪造。
+    // 铁律：能回传的协议必须逐字回传，不能回传的必须不伪造。
+    //   ⚠️ 2026-10-17 改口：「不能回传的（Chat / Responses）」那句话**是错的**。
+    //   Chat 的 `reasoning_content` 与 Responses 的 reasoning 项都是回传通道——
+    //   Chat 带工具时上游还**强制要求**回传（DeepSeek 的 400）。差别只在**放在哪**：
+    //   Claude 是 content 里的块（要 signature），Chat 是消息上的字段，Responses 是并列项。
+    //   判据见 `ReasoningPolicy`（块进不进 content 与字段回不回传是**两个问题**）。
     // Signature：不透明凭据，原样存原样传、绝不修改；可以为 null——本机网关的
     //   deepseek-flash 返回的 thinking 块就没有 signature。
     // Text：可读推理文本；Kind = Redacted 时是加密载荷的 base64。

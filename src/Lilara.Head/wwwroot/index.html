@@ -128,9 +128,51 @@ body {
 .newform-actions { display: flex; gap: 6px; }
 .newform-actions button { padding: 4px 10px; font-size: 11.5px; }
 .newform .note { margin-top: 6px; }
-.new-directory { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; min-height: 22px; }
-.new-directory .path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 10.5px var(--f-mono); color: var(--ink-2); }
-.new-directory button { padding: 2px 6px; font-size: 10.5px; }
+
+/* 目录输入：候选来自 core 的 GET /directories（输入即过滤；↑/↓ 选，回车进入）。
+   ⚠️ 列表绝对定位、z-index 压过下面的会话列表——否则候选会被 .newform 之后的
+   兄弟节点盖住，看起来像「没有候选」。 */
+.new-directory { position: relative; margin-bottom: 8px; }
+.new-directory input { margin-bottom: 0; }
+.dir-list {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  max-height: 232px;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgba(16, 20, 24, 0.10);
+}
+.dir-list[hidden] { display: none; }
+.dir-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 7px;
+  cursor: pointer;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.dir-item + .dir-item { border-top: 1px solid var(--rule-soft); }
+.dir-item.on { background: var(--accent-wash); }
+.dir-item .name { color: var(--ink); white-space: nowrap; }
+.dir-item .name.up { color: var(--ink-2); }
+.dir-item .full {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 10px var(--f-mono);
+  color: var(--ink-3);
+  text-align: right;
+}
+.dir-empty, .dir-error { padding: 5px 7px; font-size: 11px; color: var(--ink-3); }
+.dir-error { color: var(--danger); }
 
 /* ---------- 供应商视图：占满工作区 ---------- */
 
@@ -536,7 +578,13 @@ button:disabled:hover { border-color: var(--rule); }
 .detail > .detail-body { padding: 5px 8px 7px; white-space: pre-wrap; word-break: break-word; border-top: 1px solid var(--rule-soft); }
 .detail.tool { border-left: 2px solid var(--run); }
 .detail.reasoning { border-left: 2px solid var(--ink-3); }
-.detail.result { margin-left: 12px; border-left: 2px solid var(--accent); }
+.detail.result { margin-left: 0; border-left: 2px solid var(--accent); }
+/* ⚠️ 独立成一行的工具结果（还没配到调用上）：正文容器不要再套一层 pre-wrap，
+   否则折叠项的外层缩进会被原样画出来（2026-10-17）。 */
+.turn .body.plain { white-space: normal; padding-bottom: 4px; }
+/* 正文与折叠项之间的次序由 `createHistoryItem` 决定（思考 → 正文 → 调用），
+   这里只给正文一行留出与折叠项不同的字号（正文不是元数据）。 */
+.turn .body .msg-text { white-space: pre-wrap; }
 .detail-waiting { color: var(--ink-3); font-size: 11px; }
 
 /* 时间线：说话者独立一列，正文一条竖轨。轨让「同一方的连续输出」看得出来。 */
@@ -871,8 +919,14 @@ button:disabled:hover { border-color: var(--rule); }
        会把「我有哪些会话」这件事淹没掉（同供应商视图那张新建卡）。 -->
   <div id="new-form" class="newform" hidden>
     <label for="new-project">core 设备目录</label>
-    <div id="new-directory" class="new-directory"></div>
-    <input id="new-project" class="mono" placeholder="输入 core 设备上的目录路径" autocomplete="off">
+    <!-- 输入即过滤：头的逻辑只把输入切成「父目录 + 前缀」问 core 要子目录，再过滤；
+         core 侧只需要一个 ls（GET /directories?path=），不认前缀、不做补全。 -->
+    <div id="new-directory" class="new-directory">
+      <input id="new-project" class="mono" placeholder="输入路径，候选来自 core 设备（如 E:/Worksp）"
+             autocomplete="off" spellcheck="false"
+             role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="new-project-list">
+      <div id="new-project-list" class="dir-list" role="listbox" aria-label="core 设备子目录" hidden></div>
+    </div>
     <label for="new-title">会话名（可留空）</label>
     <input id="new-title" placeholder="留空就只有 id" autocomplete="off">
     <div class="newform-actions">

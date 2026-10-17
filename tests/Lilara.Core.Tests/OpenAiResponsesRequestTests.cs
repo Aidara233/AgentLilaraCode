@@ -66,12 +66,15 @@ public class OpenAiResponsesRequestTests
     }
 
     [Fact]
-    public void Build_DropsReasoningBecauseResponsesCannotCarryIt()
+    public void Build_KeepsReasoningOutOfMessageContent()
     {
+        // ⚠️ 2026-10-17 改判据：推理**不再丢**（它走 reasoning 项），但它仍然**不许**进 content。
         var root = Parse(OpenAiResponsesRequest.Build(Req(Msg(Speaker.Model,
             new Block.ReasoningBlock("sig", "想想"), new Block.TextBlock("答案")))));
 
-        var content = root.GetProperty("input")[0].GetProperty("content");
+        var input = root.GetProperty("input");
+        Assert.Equal("reasoning", input[0].GetProperty("type").GetString());
+        var content = input[1].GetProperty("content");
         Assert.Equal(1, content.GetArrayLength());
         Assert.Equal("答案", content[0].GetProperty("text").GetString());
     }
@@ -104,10 +107,44 @@ public class OpenAiResponsesRequestTests
     }
 
     [Fact]
-    public void Build_ThrowsWhenAMessageHasNoReplayableBlocks()
+    public void Build_ThrowsOnAnAssistantTurnWithNoContentAtAll()
     {
+        // ⚠️ 2026-10-17 改形状：推理块**不再**被丢（它走 reasoning 项），所以「只有推理块」
+        // 不再是空消息。真正空的是**一条块都没有**的消息。
         Assert.Contains("空消息", Assert.Throws<ArgumentException>(() =>
-            OpenAiResponsesRequest.Build(Req(Msg(Speaker.Model, new Block.ReasoningBlock(null, "只想不说"))))).Message);
+            OpenAiResponsesRequest.Build(Req(Msg(Speaker.User, new Block.TextBlock("hi")),
+                Msg(Speaker.Model)))).Message);
+    }
+
+    [Fact]
+    public void Build_EmitsReasoningAsItsOwnItem_NotAsMessageContent()
+    {
+        // 推理项排在消息项之前（先思考、再说话），并且正文那条 content 里没有它。
+        var root = Parse(OpenAiResponsesRequest.Build(Req(
+            Msg(Speaker.User, new Block.TextBlock("hi")),
+            Msg(Speaker.Model, new Block.ReasoningBlock(null, "想想"), new Block.TextBlock("答")))));
+
+        var input = root.GetProperty("input");
+        Assert.Equal("reasoning", input[1].GetProperty("type").GetString());
+        Assert.Equal("想想", input[1].GetProperty("summary")[0].GetProperty("text").GetString());
+        Assert.Equal("message", input[2].GetProperty("type").GetString());
+        Assert.Equal("答", input[2].GetProperty("content")[0].GetProperty("text").GetString());
+
+        // ⚠️ 探针：正文项里不能夹推理——那条消息的 content 只有一个 part。
+        Assert.Equal(1, input[2].GetProperty("content").GetArrayLength());
+    }
+
+    [Fact]
+    public void Build_ReasoningOnlyAssistantMessageEmitsOnlyTheReasoningItem()
+    {
+        // 过滤掉推理块之后没有正文也没有调用 ⇒ 不造空 message 项（与「只调工具」那条同一条判据）。
+        var root = Parse(OpenAiResponsesRequest.Build(Req(
+            Msg(Speaker.User, new Block.TextBlock("hi")),
+            Msg(Speaker.Model, new Block.ReasoningBlock(null, "只想不说")))));
+
+        var input = root.GetProperty("input");
+        Assert.Equal(2, input.GetArrayLength());
+        Assert.Equal("reasoning", input[1].GetProperty("type").GetString());
     }
 
     // 两边是同一个表达式（自比），对「形状对不对」零信息量，只能抓不确定性（字典枚举序、时钟、随机数）。
@@ -164,15 +201,16 @@ public class OpenAiResponsesRequestTests
     }
 
     [Fact]
-    public void Build_KeepsTextOrderAroundADroppedReasoningBlock()
+    public void Build_KeepsTextOrderWithAReasoningItemAroundThem()
     {
-        // 丢掉中间那块推理后，剩下的两块不能合并、顺序也不能乱。
+        // 推理块变成独立项后，两段正文仍然留在**同一条**消息里、顺序不变（与改动之前同一条判据）。
         var json = OpenAiResponsesRequest.Build(Req(Msg(Speaker.Model,
             new Block.TextBlock("前"), new Block.ReasoningBlock("s", "中"), new Block.TextBlock("后"))));
 
         Assert.Equal(
             "{\"model\":\"deepseek-flash\",\"max_output_tokens\":16000,\"input\":" +
-            "[{\"type\":\"message\",\"role\":\"assistant\",\"content\":" +
+            "[{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"中\"}]}," +
+            "{\"type\":\"message\",\"role\":\"assistant\",\"content\":" +
             "[{\"type\":\"output_text\",\"text\":\"前\"},{\"type\":\"output_text\",\"text\":\"后\"}]}]}",
             json);
     }
@@ -180,11 +218,21 @@ public class OpenAiResponsesRequestTests
     [Fact]
     public void Build_NeverFabricatesReasoningIntoTheBody()
     {
-        // 只断言第一个 text 块活下来不够，这条直接查整段 JSON 里没有推理痕迹。
+        // ⚠️ 2026-10-17 改判据：推理文本现在**可以**出现在线上（reasoning 项里，原样回传），
+        // 但**绝不许**冒充正文——「原样回传」与「伪造」的差别就在它待在哪个项里。
         var json = OpenAiResponsesRequest.Build(Req(Msg(Speaker.Model,
             new Block.ReasoningBlock("sig-==", "想想"), new Block.TextBlock("答案"))));
 
-        Assert.DoesNotContain("想想", json);
+        Assert.Contains("\"type\":\"reasoning\"", json);
+        Assert.Contains("\"text\":\"想想\"", json);
+
+        // 正文项里只有「答案」——推理一个字都不在里面。
+        var root = Parse(json);
+        var messageContent = root.GetProperty("input")[1].GetProperty("content");
+        Assert.Equal(1, messageContent.GetArrayLength());
+        Assert.Equal("答案", messageContent[0].GetProperty("text").GetString());
+
+        // 签名（Claude 的凭据）不属于 Responses 的 reasoning 项——不发。
         Assert.DoesNotContain("sig-==", json);
     }
 
@@ -212,7 +260,8 @@ public class OpenAiResponsesRequestTests
 
         var root = Parse(OpenAiResponsesRequest.Build(request));
 
-        Assert.Equal("答案", root.GetProperty("input")[0].GetProperty("content")[0].GetProperty("text").GetString());
+        // 推理项在前、正文项在后（2026-10-17：推理不再被丢）。
+        Assert.Equal("答案", root.GetProperty("input")[1].GetProperty("content")[0].GetProperty("text").GetString());
     }
 
     [Fact]
