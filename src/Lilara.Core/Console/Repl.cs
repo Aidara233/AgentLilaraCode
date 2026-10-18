@@ -164,6 +164,10 @@ public sealed class Repl(
                     _out.WriteLine(accepted.Note ?? "✓");
                     break;
 
+                case CoreCommand.SessionCompact compact:
+                    _out.WriteLine($"✓ {compact.SessionId} 的上下文已压缩（{accepted.Note}）。");
+                    break;
+
                 default:
                     PrintReply(result.Reply);
                     break;

@@ -20,9 +20,12 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(SessionDeleted), "session.deleted")]
 [JsonDerivedType(typeof(SessionReclaimed), "session.reclaimed")]
 [JsonDerivedType(typeof(ReleaseRecorded), "release.recorded")]
+[JsonDerivedType(typeof(ToolResultAppended), "tool.result.appended")]
 [JsonDerivedType(typeof(ApprovalRequested), "approval.requested")]
 [JsonDerivedType(typeof(ApprovalResolved), "approval.resolved")]
 [JsonDerivedType(typeof(Error), "error")]
+[JsonDerivedType(typeof(UsageUpdated), "usage.updated")]
+[JsonDerivedType(typeof(CompactionCompleted), "session.compaction.completed")]
 public abstract record WireEvent
 {
     public sealed record SessionCreated(string SessionId, string ProjectKey) : WireEvent;
@@ -133,8 +136,9 @@ public abstract record WireEvent
     /// 不为它单开一条显示路径。⇒ 那句话的<b>唯一出处仍是核心</b>（<see cref="Ack.Accepted.Note"/> 的既定用途，
     /// `provider.test` 就是这么用的），头只是换了个落点。</para>
     ///
-    /// <para>⚠️ <b>它不是「重算的请求」</b>：头收到的只是「该重拉了」这个信号，判定仍在核心
-    /// （<c>Reclaim.Decide</c> 一处）。</para>
+    /// <para>⚠️ <b>它不是「重算的请求」</b>：头收到的只是「该重拉了」这个信号；
+    /// 窗口记录已经由核心落盘（`Reclaim.Resolve` + `TimelineEvent.ReclaimEvent`），
+    /// 头重拉 /history 时读到的是它。</para>
     ///
     /// <para>⚠️ <b>投递范围与会话内的事件一视同仁</b>（会话流）：它讲的是「这个会话的形态变了」。</para>
     /// </remarks>
@@ -144,9 +148,9 @@ public abstract record WireEvent
     /// <summary>
     /// **模型画了一条线**（`release`，`01` §12.4）——头据此重拉历史并画一条分隔线。
     ///
-    /// <para>⚠️ <b>为什么不复用 <see cref="SessionReclaimed"/></b>：那条讲的是「回收算完了」
-    /// （`session.gc` 的观察口），而线是**另一件事**——线落下时回收还没发生，
-    /// 发生的是「接下来会收」。把两者并成一个事件，头就分不清「为什么重拉」，
+    /// <para>⚠️ <b>为什么不复用 <see cref="SessionReclaimed"/></b>：那条讲的是「回收窗口开过了」，
+    /// 而线是**另一件事**——线落下时**没有**窗口记录，收的是「作用域里、且到现在还被读过的结果」。
+    /// 把两者并成一个事件，头就分不清「为什么重拉」，
     /// 而两者的载荷与措辞本来就不同（那条带一句回执）。</para>
     ///
     /// <para>⚠️ <b>线本身仍然不进模型上下文</b>：`TimelineRender.IsRenderable` 照样挡它。
@@ -156,6 +160,27 @@ public abstract record WireEvent
     /// </summary>
     public sealed record ReleaseRecorded(
         string SessionId, string Id, IReadOnlyList<string> Scope, string? Summary, DateTimeOffset At) : WireEvent;
+
+    /// <summary>
+    /// **工具结果落盘了**——头的「工具结果」在正常对话流程里可见的唯一出口。
+    ///
+    /// <para>⚠️ <b>为什么加它</b>（2026-10-17，用户实测）：此前步末只发
+    /// <see cref="MessageAppended"/>（模型消息），而 <c>ToolResultEvent</c> **一条都不发**
+    /// ⇒ 头只有 `openSession` 重拉 `/history` 时才看得见结果，实时流里那批调用看起来
+    /// 「没有下文」。这不是渲染问题，是**没有生产者**。</para>
+    ///
+    /// <para>⚠️ <b>载荷是结果本身的三样</b>：<see cref="CallId"/> 供头与前面那条
+    /// `toolUse` 块配对；<see cref="Id"/> 是记录内身份（与 `/history` 里的同一条一致，
+    /// 头靠它去重）；<see cref="Blocks"/> 是内容。⚠️ 交的是**记录那一份**
+    /// （未回收 / 未截断 / 未加框架）——头收到时那条刚写，回收判定还没发生。
+    /// 重拉时 `/history` 会给出同一批结果的最新形态（可能是回收注记），两边靠
+    /// <see cref="Id"/> 对上。</para>
+    ///
+    /// <para>⚠️ <b>一条事件一条结果</b>，不打包：头按 `callId` 配对的位置是逐条的，
+    /// 打包只会让「其中一个要展开、另一个不要」变成一件要拆包的事。</para>
+    /// </summary>
+    public sealed record ToolResultAppended(
+        string SessionId, string Id, string CallId, IReadOnlyList<Block> Blocks, DateTimeOffset At) : WireEvent;
 
     /// <summary>
     /// **核心在问用户**（`01` §3.8）。⚠️ <b>它同时投两条流</b>：
@@ -197,6 +222,13 @@ public abstract record WireEvent
     /// <summary>**那次询问结束了**（答了 / 作废了 / 超时了）。同投两条流。</summary>
     /// <param name="Outcome">`submit` / `cancel` / `expired`。</param>
     public sealed record ApprovalResolved(string SessionId, string AskId, string Outcome) : WireEvent;
+
+    /// <summary>一次会话模型调用的 token 账本已经更新，头可据此刷新实时统计。</summary>
+    public sealed record UsageUpdated(
+        string SessionId, Storage.UsageCall Call, Storage.UsageSummary Summary) : WireEvent;
+
+    public sealed record CompactionCompleted(
+        string SessionId, string CheckpointId, string CoveredThroughEventId, long? SummaryTokens) : WireEvent;
 
     // 参数类型必须是 WireEvent（基类）：泛型版在静态类型推断成子类时会静默丢掉判别式。
     public static string StableSerialize(WireEvent value) =>

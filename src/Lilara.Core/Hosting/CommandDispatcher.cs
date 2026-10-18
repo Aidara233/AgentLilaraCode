@@ -3,6 +3,7 @@ using Lilara.Core.Kernel;
 using Lilara.Core.Storage;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
+using Lilara.Core.Session.Tools;
 
 namespace Lilara.Core.Hosting;
 
@@ -199,6 +200,9 @@ public sealed class CommandDispatcher(
                 // ---- 回收（触发源是手动；`01` §8.0.2）----
                 case CoreCommand.SessionGc g:
                     return HandleSessionGc(g, commandId);
+
+                case CoreCommand.SessionCompact c:
+                    return await HandleSessionCompactAsync(c, commandId, awaitCompletion, ct);
 
                 case CoreCommand.ClaimAcquire a: return HandleClaimAcquire(a, commandId);
                 case CoreCommand.ClaimRelease r: return HandleClaimRelease(r, commandId);
@@ -542,10 +546,13 @@ public sealed class CommandDispatcher(
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        var probeCallId = Ids.New();
+        var probeStarted = CoreClock.Now();
 
         try
         {
             var reply = await adapter.CallAsync(probe, timeout.Token);
+            RecordProbeUsage(provider, adapter, probeCallId, probeStarted, reply, "completed");
             return new DispatchResult(new Ack.Accepted
             {
                 CommandId = id,
@@ -555,11 +562,39 @@ public sealed class CommandDispatcher(
         }
         catch (Exception ex)
         {
+            RecordProbeUsage(provider, adapter, probeCallId, probeStarted, null, "failed");
             // 超时与真失败分开说：前者是「端点在，但没在 10 秒内答」，后者是「根本连不上 / 被拒」。
             var why = timeout.IsCancellationRequested && !ct.IsCancellationRequested
                 ? "10 秒内没有响应（端点没起，或上游太慢）"
                 : ex.Message;
             return new DispatchResult(new Ack.Accepted { CommandId = id, Note = $"✗ 不通（{where}）：{why}" });
+        }
+    }
+
+    private void RecordProbeUsage(
+        ProviderDefinition provider, IModelAdapter adapter, string callId,
+        DateTimeOffset startedAt, ModelReply? reply, string status)
+    {
+        try
+        {
+            _host.Usage.Append(new Storage.UsageCall
+            {
+                CallId = callId,
+                Purpose = "probe",
+                ProviderId = provider.Id,
+                ModelId = provider.DefaultModel,
+                Protocol = adapter.Protocol,
+                StartedAt = startedAt,
+                EndedAt = CoreClock.Now(),
+                Status = status,
+                Usage = reply?.Usage,
+                ReportedModel = reply?.ReportedModel,
+                ResponseId = reply?.ResponseId,
+            });
+        }
+        catch
+        {
+            // 探针已经完成时不能因账本故障再次发起网络调用。
         }
     }
 
@@ -643,56 +678,54 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
-    /// **回收一次**（`01` §8.0.2）：重算集合 → 换渲染 → 发事件。磁盘一字不动。
+    /// **开一次回收窗口**（`01` §8.0.2 / §11.7）：解析判据 → 落一条
+    /// <see cref="ReclaimEvent"/>（窗口记录）→ 发事件。
     ///
-    /// <para>⚠️ <b>它拿会话闸</b>（与退订 / 归档那三条同一个理由）：回收改的是
+    /// <para>⚠️ <b>2026-10-17 重定形状：它是<b>窗口的生产者</b>，不再是观察口。</b>
+    /// 上一版把判定搬进渲染（每次现算），本意是修「注记上的 id 取不回」；
+    /// 但渲染发生在**每一步**，而那让回收从中段改历史 ⇒ 每步破一次缓存
+    /// （`00` §3：热路径「绝不事后清理」）。⇒ 判据回到「开窗那一刻解析一次」：
+    /// 距离（保护带之外）与点杀（源被动过）在这里算，结果落盘；
+    /// 渲染只读这条记录（<see cref="Reclaim.Decide"/>）。</para>
+    ///
+    /// <para>⚠️ <b>它拿会话闸</b>（与退订 / 归档那三条同一个理由）：窗口改的是
     /// **要发给模型的字节**。若与在跑的步交错，那个步可能一半用旧形态、一半用新形态——
     /// 而前缀的一致性正是整套经济学的地基（`00` §0）。⇒ 要么整个步在旧的形态下跑完，
     /// 要么整个在旧的形态下跑完之后才换。</para>
     ///
     /// <para>⚠️ <b>成果那句话只说一次</b>（2026-10-06 改）：它<b>既进回执的 <c>Note</c>、
     /// 又随 <see cref="WireEvent.SessionReclaimed"/> 发出去</b>。两个去处不是冗余——
-    /// 回执给「发命令的那个客户端」（控制台、脚本），事件给「盯着这条流的每个头」。
-    /// 原先事件只带条数，而<b>条数到不了用户眼前</b>：回执先到、事件后到，
-    /// 头处理事件时要重拉历史，那一步会清空时间线，把回执刚画上的那行一起抹掉
-    /// ⇒ 页面一个字都不说。⇒ 现在头把这句话画在<b>重拉之后</b>，位置就不重要了。</para>
+    /// 回执给「发命令的那个客户端」（控制台、脚本），事件给「盯着这条流的每个头」。</para>
     ///
-    /// <para>⚠️ <b>它<b>不</b>搬动磁盘、也<b>不</b>碰库</b>：`Decide` 只读。
-    /// ⚠️ <b>而 2026-10-11 起它也不再改任何内存</b>——判定搬进了渲染
-    /// （`TimelineRender.Render` 每次现算，见那里的注释）⇒ 这条命令的全部效果
-    /// 是「**算一遍、把结果说出去**」。它因此**可逆、无副作用**，随时可以再触发一次。</para>
+    /// <para>⚠️ <b>它不改任何已有记录</b>：只<b>追一条</b>新的窗口记录（只追加）。
+    /// ⇒ 回滚 = 追一条不含那些 id 的新窗口（或删掉这一条），而不是改写历史。
+    /// 「窗口开了而一条都没收」是合法结果，同样要落——「这一刻判过」本身是事实，
+    /// 而且它让回执与事件说的是同一个 id。</para>
     /// </summary>
     private DispatchResult HandleSessionGc(CoreCommand.SessionGc g, string id)
     {
         if (!TryFind(g.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
-        // ⚠️ **它不再持闸**（2026-10-11）：它原先要在 `gate` 里写一份内存账（`SetReclaimed`），
-        // 所以必须与推进互斥。现在它**只观察**——读一遍记录、算一遍判定、说个数
-        // ⇒ 与 `Stepper` 的 `ReadTimeline` 同级，不碰任何可变状态。
-        //
-        // ⚠️ **判定不再由它落进任何地方**：它原先写到 `handle` 上那份**内存账**里，
-        // 而那份账**只在有人喊的时候才更新** ⇒ 陈旧的那份会让注记上给出的 id
-        // **在下一个渲染窗口里取不回**（判据与后果见 `TimelineRender.Render` 的注释）。
-        // ⇒ 判定现在住在渲染里（每次现算），这条命令因此只是个**观察口**：
-        // 它的独有价值是「立刻算一次并把结果说出去」，**不是任何东西的前提**。
-        // ⚠️ **它算的是「可恢复」那一档**（`Reclaim.Decide`），**不含点杀**——
-        // 点杀要一个 `IToolContext`，而这条命令的用途是「看一眼收了多少」，
-        // 不是「冻结这一步的世界」（那件事归 `Stepper`）。
-        var count = Reclaim.Decide(
-            _host.Store.ReadTimeline(handle.ProjectKey, handle.SessionId),
-            new Storage.BlobStore(_host.Store.DataRoot)).Count;
+        var timeline = _host.Store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+        var blobs = new Storage.BlobStore(_host.Store.DataRoot);
+        var probe = new SessionToolContext(handle.Spec.WorkingDirectory, blobs, timeline);
+
+        // ⚠️ **点杀要碰文件系统**（重读源、重算指纹），所以它只能在这里解析，
+        // 不许搬回渲染那条路（渲染必须是纯的，`00` §5 铁律 1）。
+        var ids = Reclaim.Resolve(timeline, blobs, probe);
 
         // ⚠️ **回执里必须说结果**，不能只回一个「收到了」：回收常常**一条都收不了**
         // （都在保护带里 / 内容指向的对象不在库里）——那时渲染一字未变，
         // 而用户看到的就是「**按了没反应**」，与「坏了」长得一模一样。
-        // `Note` 正是给「业务结果」用的（`provider.test` 就是这么用的），把条数说了就分得开。
-        var reason = count == 0
-            ? "没有可回收的结果（都在保护带里，或者内容已经不在库里）"
-            : $"回收了 {count} 条结果";
+        var reason = ids.Count == 0
+            ? "没有可回收的结果（都在保护带里，或者源已经不在库里）"
+            : $"回收了 {ids.Count} 条结果";
 
-        // ⚠️ **没有它头就看不见**：回收不改盘，头看的是核心渲染的那份形态 ⇒
+        var window = Reclaim.Window("session.gc", ids, reason);
+        _host.Store.AppendEvents(handle.ProjectKey, handle.SessionId, [window]);
+
+        // ⚠️ **没有它头就看不见**：回收不改已有记录，头看的是核心渲染的那份形态 ⇒
         // 不告诉它一声，它会一直显示回收之前的（而且完全看不出来）。
-        // ⚠️ 只是**换个落点**，话还是上面那一句——不在这里另写一份（同一件事只说一次）。
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
             new WireEvent.SessionReclaimed(handle.SessionId, reason));
 
@@ -702,6 +735,155 @@ public sealed class CommandDispatcher(
             SessionId = g.SessionId,
             Note = reason,
         });
+    }
+
+    private async Task<DispatchResult> HandleSessionCompactAsync(
+        CoreCommand.SessionCompact c, string id, bool awaitCompletion, CancellationToken ct)
+    {
+        if (!TryFind(c.SessionId, out var handle, out var notFound))
+            return Reject(id, notFound!);
+        if (handle.IsRunning)
+            return Reject(id, "会话正在运行，请等待当前步骤结束后再压缩。");
+        if (handle.State.Status == SessionStatus.WaitingForInput)
+            return Reject(id, "会话正在等待工具审批，完成审批后再压缩。");
+        if (handle.QueueDepth > 0)
+            return Reject(id, "会话还有待处理消息，请先推进队列后再压缩。");
+
+        var gate = _host.GateFor(handle.SessionId);
+        if (!awaitCompletion)
+            return StartBackgroundCompaction(handle, id, gate);
+
+        await gate.WaitAsync(ct);
+        var entered = false;
+        CancellationTokenSource? stepCts = null;
+        try
+        {
+            if (handle.IsRunning || handle.QueueDepth > 0
+                || handle.State.Status == SessionStatus.WaitingForInput
+                || !(entered = handle.TryEnterStep()))
+                return Reject(id, "会话状态已变化，请稍后重试压缩。");
+            _host.Live.Mark(handle.SessionId);
+            stepCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _host.SetCts(handle.SessionId, stepCts);
+            try
+            {
+                var result = await CompactAndPublishAsync(handle, stepCts.Token);
+                return new DispatchResult(new Ack.Accepted
+                {
+                    CommandId = id,
+                    SessionId = handle.SessionId,
+                    Note = $"已压缩至 {result.CoveredThroughEventId}。"
+                });
+            }
+            catch (OperationCanceledException) when (stepCts.IsCancellationRequested)
+            {
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.Error(handle.SessionId, "上下文压缩已中断。"));
+                throw new DispatchException("上下文压缩已中断。");
+            }
+            catch (Exception ex)
+            {
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.Error(handle.SessionId, ex.Message));
+                throw new DispatchException(ex.Message, ex);
+            }
+        }
+        finally
+        {
+            if (entered)
+            {
+                _host.SetCts(handle.SessionId, null);
+                handle.ExitStep();
+                _host.Live.Clear(handle.SessionId);
+            }
+            stepCts?.Dispose();
+            gate.Release();
+            if (handle.QueueDepth > 0 && !handle.IsRunning) Start(handle);
+        }
+    }
+
+    private DispatchResult StartBackgroundCompaction(SessionHandle handle, string id, SemaphoreSlim gate)
+    {
+        if (!gate.Wait(0))
+            return Reject(id, "会话状态已变化，请稍后重试压缩。");
+
+        if (handle.IsRunning || handle.QueueDepth > 0
+            || handle.State.Status == SessionStatus.WaitingForInput
+            || !handle.TryEnterStep())
+        {
+            gate.Release();
+            return Reject(id, "会话状态已变化，请稍后重试压缩。");
+        }
+
+        var stepCts = new CancellationTokenSource();
+        _host.Live.Mark(handle.SessionId);
+        _host.SetCts(handle.SessionId, stepCts);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await CompactAndPublishAsync(handle, stepCts.Token);
+            }
+            catch (OperationCanceledException) when (stepCts.IsCancellationRequested)
+            {
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.Error(handle.SessionId, "上下文压缩已中断。"));
+            }
+            catch (Exception ex)
+            {
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.Error(handle.SessionId, ex.Message));
+            }
+            finally
+            {
+                _host.SetCts(handle.SessionId, null);
+                stepCts.Dispose();
+                handle.ExitStep();
+                _host.Live.Clear(handle.SessionId);
+                gate.Release();
+                if (handle.QueueDepth > 0 && !handle.IsRunning) Start(handle);
+            }
+        }, CancellationToken.None);
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            SessionId = handle.SessionId,
+            Note = "上下文压缩已开始。",
+        });
+    }
+
+    private async Task<CompactionResult> CompactAndPublishAsync(
+        SessionHandle handle, CancellationToken ct)
+    {
+        var usageCountBefore = _host.Usage.ForSession(handle.SessionId).Count;
+        CompactionResult result;
+        try
+        {
+            result = await _resolveStepper(handle).CompactAsync(handle, ct);
+        }
+        catch
+        {
+            PublishLatestUsage(handle, usageCountBefore);
+            throw;
+        }
+        PublishLatestUsage(handle, usageCountBefore);
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.CompactionCompleted(
+                handle.SessionId, result.CheckpointId,
+                result.CoveredThroughEventId, result.Usage?.OutputTokens));
+        return result;
+    }
+
+    private void PublishLatestUsage(SessionHandle handle, int countBefore)
+    {
+        var calls = _host.Usage.ForSession(handle.SessionId);
+        if (calls.Count <= countBefore) return;
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.UsageUpdated(
+                handle.SessionId,
+                calls[^1],
+                _host.Usage.Summarize(new Storage.UsageFilter { SessionId = handle.SessionId })));
     }
 
     private async Task<DispatchResult> HandleSessionSendAsync(
@@ -832,6 +1014,7 @@ public sealed class CommandDispatcher(
 
             ModelReply replyForLoop;
             Stepper.StepOutcome step;
+            var usageCountBefore = _host.Usage.ForSession(handle.SessionId).Count;
 
             if (pending is not null)
             {
@@ -883,6 +1066,15 @@ public sealed class CommandDispatcher(
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId), requested);
             }
 
+            // ⚠️ **工具结果也要告诉头**（2026-10-17，用户实测）：此前只有 `message.appended`
+            // ⇒ 实时流里那批调用看起来「没有下文」，结果只有重拉 `/history` 才出现。
+            // ⚠️ 在模型消息**之后**发：头按到达次序画，而记录里的次序就是「模型消息、
+            // 然后它那批结果」。⚠️ 一条结果一条事件（见 `ToolResultAppended` 的注释）。
+            foreach (var result in step.ToolResults ?? [])
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.ToolResultAppended(
+                        handle.SessionId, result.Id, result.CallId, result.Content, result.At));
+
             // ⚠️ **模型侧 `release` 摘掉的锁要告诉头**（2026-10-17）：摘锁只改 `claims.json`，
             // 而头右栏的「谁在动哪些文件」靠 `claim.released` 刷新——不发的话，
             // 头会继续显示模型已经说「我用完了」的锁，与核心状态静默分叉。
@@ -897,6 +1089,17 @@ public sealed class CommandDispatcher(
             foreach (var line in step.ReleasedLines ?? [])
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                     new WireEvent.ReleaseRecorded(handle.SessionId, line.Id, line.Scope, line.Summary, line.At));
+
+            var usageCalls = _host.Usage.ForSession(handle.SessionId);
+            if (usageCalls.Count > usageCountBefore)
+            {
+                var call = usageCalls[^1];
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.UsageUpdated(
+                        handle.SessionId,
+                        call,
+                        _host.Usage.Summarize(new Storage.UsageFilter { SessionId = handle.SessionId })));
+            }
 
             PublishStepEnd(handle, replyForLoop);
 

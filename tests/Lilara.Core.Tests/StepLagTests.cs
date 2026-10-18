@@ -122,7 +122,7 @@ public class StepLagTests : IDisposable
     /// （模型看得到它、也照它发调用）。这是给真模型跑的同一件事的**忠实版**。</para>
     /// </summary>
     [Fact]
-    public async Task Fetch_OfTheIdInTheNote_Works_WithNoOneTriggeringGc()
+    public async Task Fetch_OfTheIdInTheNote_Works_AfterAWindow_AndAcrossRestart()
     {
         var original = new string('x', BlobStore.InlineThresholdBytes + 1);
         File.WriteAllText(Path.Combine(_work, "big.txt"), original);
@@ -161,7 +161,17 @@ public class StepLagTests : IDisposable
             await _stepper.StepAsync(handle, [], default);
         }
 
-        // ---- 重开推进器（重启）：内存那半没了，回收集合要**自己**算出来 ----
+        // ---- 开一次窗（= `session.gc`）：解析一次，落成窗口记录 ----
+        //
+        // ⚠️ **2026-10-17 起必须显式开窗**：回收只发生在失效窗口里（`00` §3），
+        // 渲染本身不再决定回收。这正是这条测试要覆盖的真实路径。
+        var timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+        var blobs = new BlobStore(_store.DataRoot);
+        var ids = Reclaim.Resolve(timeline, blobs,
+            new SessionToolContext(handle.Spec.WorkingDirectory, blobs, timeline));
+        _store.AppendEvents(handle.ProjectKey, handle.SessionId, [Reclaim.Window("session.gc", ids, null)]);
+
+        // ---- 重开推进器（重启）：窗口是记录，重启之后照样读得到 ----
         var restarted = new Stepper(_store, _adapter, BuiltInTools.All);
         var reloaded = SessionHandle.Load(_store, handle.ProjectKey, handle.SessionId);
 

@@ -72,6 +72,15 @@ public sealed record ModelReply
 
     /// <summary>安全分类器拒答。拒答时 Blocks 通常为空，核心必须当一等结果处理，不能当成「模型说了空话」。</summary>
     public required bool Refused { get; init; }
+
+    /// <summary>上游报告的 token 用量；协议没有提供时为 null。</summary>
+    public TokenUsage? Usage { get; init; }
+
+    /// <summary>上游返回的模型标识；缺失时为 null。</summary>
+    public string? ReportedModel { get; init; }
+
+    /// <summary>上游响应标识；缺失时为 null。</summary>
+    public string? ResponseId { get; init; }
 }
 
 /// <summary>调用失败，带一句人话。</summary>

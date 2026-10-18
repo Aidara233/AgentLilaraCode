@@ -99,12 +99,74 @@ public class OpenAiChatRequestTests
     [Fact]
     public void Build_ThrowsWhenAMessageHasNoReplayableBlocks()
     {
-        // 全是推理块的消息过滤后为空——协议不接受空 content。
+        // 用户消息没有可重放的块——协议不接受空 content。
+        // ⚠️ 用 user 而不是 model（2026-10-17）：带工具时 assistant 有 reasoning_content 兜底，
+        // 不再必然为空；而 user 那一侧没有这条路，判据保持不变。
         var ex = Assert.Throws<ArgumentException>(() =>
-            OpenAiChatRequest.Build(Req(Msg(Speaker.Model, new Block.ReasoningBlock(null, "只想不说")))));
+            OpenAiChatRequest.Build(Req(Msg(Speaker.User, new Block.ReasoningBlock(null, "只想不说")))));
 
         Assert.Contains("空消息", ex.Message);
     }
+
+    // ---- reasoning_content（DeepSeek 思考模式，2026-10-17）----
+    //
+    // 这条 400 是用户实测的：
+    //   The `reasoning_content` in the thinking mode must be passed back to the API.
+    // 规则：**请求带 tools 时**，历史里每条 assistant 消息的 reasoning_content
+    // （空串也算）都必须回传；不带 tools 时不需要（也不发）。
+
+    [Fact]
+    public void Build_WithTools_EchoesReasoningContentVerbatim()
+    {
+        var req = Req(Msg(Speaker.User, new Block.TextBlock("查一下")),
+            Msg(Speaker.Model,
+                new Block.ReasoningBlock(null, "我需要调用工具。"), new Block.TextBlock("好的")))
+            with { Tools = [Tool()] };
+
+        var assistant = Parse(OpenAiChatRequest.Build(req)).GetProperty("messages")[1];
+
+        Assert.Equal("我需要调用工具。", assistant.GetProperty("reasoning_content").GetString());
+        Assert.Equal("好的", assistant.GetProperty("content").GetString());
+    }
+
+    [Fact]
+    public void Build_WithTools_GivesAnEmptyStringWhenTheAssistantTurnHasNoReasoningBlock()
+    {
+        // ⚠️ 这是「缺了兜底」那一半：历史来自这一版之前 / 中途换了模型时，记录里没有推理块。
+        // 省略这个键会得到 `Missing reasoning_content field …`（社区实测）。
+        var req = Req(Msg(Speaker.User, new Block.TextBlock("hi")),
+            Msg(Speaker.Model, new Block.TextBlock("答"))) with { Tools = [Tool()] };
+
+        var assistant = Parse(OpenAiChatRequest.Build(req)).GetProperty("messages")[1];
+
+        Assert.Equal("", assistant.GetProperty("reasoning_content").GetString());
+    }
+
+    [Fact]
+    public void Build_WithTools_ReasoningOnlyAssistantMessageSurvivesTheEmptyMessageGuard()
+    {
+        // 过滤掉推理块之后它一条正文/调用都不剩，但它不是空消息——reasoning_content 就是它的内容。
+        var req = Req(Msg(Speaker.User, new Block.TextBlock("hi")),
+            Msg(Speaker.Model, new Block.ReasoningBlock(null, "只想不说"))) with { Tools = [Tool()] };
+
+        var assistant = Parse(OpenAiChatRequest.Build(req)).GetProperty("messages")[1];
+
+        Assert.Equal("只想不说", assistant.GetProperty("reasoning_content").GetString());
+        Assert.Equal(JsonValueKind.Null, assistant.GetProperty("content").ValueKind);
+    }
+
+    [Fact]
+    public void Build_WithoutTools_OmitsReasoningContentEntirely()
+    {
+        // 不带工具的纯聊天：DeepSeek 不看这个字段 ⇒ 不发（从没思考过的会话线上逐字节不变）。
+        var json = OpenAiChatRequest.Build(Req(Msg(Speaker.User, new Block.TextBlock("hi")),
+            Msg(Speaker.Model, new Block.ReasoningBlock(null, "想想"), new Block.TextBlock("答"))));
+
+        Assert.DoesNotContain("reasoning_content", json);
+    }
+
+    private static ToolSpec Tool() =>
+        new("demo", "演示", "{\"type\":\"object\",\"properties\":{}}");
 
     // 两边是同一个表达式（自比），对「形状对不对」零信息量，只能抓不确定性（字典枚举序、时钟、随机数）。
     [Fact]

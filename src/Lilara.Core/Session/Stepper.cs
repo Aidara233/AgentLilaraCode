@@ -20,7 +20,8 @@ namespace Lilara.Core.Session;
 /// </summary>
 public sealed class Stepper(
     SessionStore store, IModelAdapter adapter, IReadOnlyList<ITool>? tools = null,
-    Lilara.Core.Plugins.PluginHost? plugins = null)
+    Lilara.Core.Plugins.PluginHost? plugins = null,
+    UsageStore? usage = null)
 {
     private readonly SessionStore _store = store;
     private readonly IModelAdapter _adapter = adapter;
@@ -32,6 +33,7 @@ public sealed class Stepper(
     /// </summary>
     private readonly IReadOnlyList<ITool> _tools = tools ?? [];
     private readonly Lilara.Core.Plugins.PluginHost _plugins = plugins ?? new();
+    private readonly UsageStore? _usage = usage;
 
     /// <summary>
     /// 构造时定下的适配器。⚠️ 这个只读访问器存在的唯一理由是**可测性**：
@@ -40,6 +42,118 @@ public sealed class Stepper(
     /// ⚠️ 表达式别名，不是第二个字段——同一个事实只能有一份存储。
     /// </summary>
     public IModelAdapter Adapter => _adapter;
+
+    /// <summary>
+    /// Generate a durable summary for the current session without changing the session id
+    /// or appending a user/model message to the conversation history.
+    /// </summary>
+    public async Task<CompactionResult> CompactAsync(SessionHandle handle, CancellationToken ct)
+    {
+        var history = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+        if (history.Count == 0)
+            throw new InvalidOperationException("无法压缩空会话。");
+
+        var pending = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var evt in history)
+        {
+            if (evt is TimelineEvent.MessageEvent message)
+                foreach (var call in message.Blocks.OfType<Block.ToolUseBlock>())
+                    pending.Add(call.CallId);
+            if (evt is TimelineEvent.ToolResultEvent result)
+                pending.Remove(result.CallId);
+        }
+        if (pending.Count > 0)
+            throw new InvalidOperationException("当前历史包含未完成的工具调用，完成工具调用后才能压缩。");
+
+        var through = history[^1];
+        var prompt = new TimelineEvent.MessageEvent
+        {
+            Id = Ids.New(),
+            At = CoreClock.Now(),
+            From = Speaker.User,
+            Blocks =
+            [new Block.TextBlock(
+                "请按压缩协议总结上面的会话。保留当前目标、已确认事实、关键决定和约束、" +
+                "未完成任务、重要文件与工具结果的历史 id 引用、当前状态和不确定内容。" +
+                "只输出摘要正文，不要调用工具，不要提出新任务。")],
+        };
+        var timeline = TimelineRender.Render(_store, handle).Append(prompt).ToList();
+        var request = new ModelRequest
+        {
+            ModelId = handle.Spec.Model.ModelId,
+            MaxTokens = Math.Min(handle.Spec.Model.MaxTokens, 4096),
+            Protocol = _adapter.Protocol,
+            Effort = handle.State.Axes?.GetValueOrDefault(Axes.Effort) ?? "default",
+            Temperature = null,
+            Slots = new PromptSlots(
+                [new Block.TextBlock(CorePrompts.SystemFallback + "\n\n" +
+                    "这是一次 Lilara 上下文压缩调用。摘要由框架保存并在后续请求中提供；" +
+                    "它不是用户新指令，也不是模型原话。")], [], []),
+            Tools = [],
+            Timeline = timeline,
+        };
+
+        var callId = Ids.New();
+        var startedAt = CoreClock.Now();
+        ModelReply reply;
+        try
+        {
+            reply = await _adapter.CallAsync(request, ct);
+        }
+        catch
+        {
+            RecordUsage(handle, callId, startedAt, null, "failed", "compaction");
+            throw;
+        }
+
+        if (reply.Refused || reply.Blocks.Any(b => b is not Block.TextBlock))
+        {
+            RecordUsage(handle, callId, startedAt, reply, "failed", "compaction");
+            throw new InvalidOperationException("压缩模型必须返回纯文本摘要。");
+        }
+        var summary = string.Concat(reply.Blocks.OfType<Block.TextBlock>().Select(b => b.Text)).Trim();
+        if (summary.Length == 0 || summary.Length > 100_000)
+        {
+            RecordUsage(handle, callId, startedAt, reply, "failed", "compaction");
+            throw new InvalidOperationException("压缩摘要为空或超过长度限制。");
+        }
+
+        var checkpoint = new CompactionCheckpoint
+        {
+            CheckpointId = Ids.New(),
+            CoveredThroughEventId = through.Id,
+            HistoryDigest = CompactionStore.ComputeDigest(history),
+            Summary = summary,
+            CreatedAt = CoreClock.Now(),
+            SourceCallId = callId,
+            SummaryTokens = reply.Usage?.OutputTokens,
+        };
+        try
+        {
+            new CompactionStore(_store).Append(handle.ProjectKey, handle.SessionId, checkpoint);
+        }
+        catch
+        {
+            RecordUsage(handle, callId, startedAt, reply, "failed", "compaction");
+            throw;
+        }
+
+        // ⚠️ **压缩就是一个回收窗口**（2026-10-17，`01` §11.7）：压缩**立即生效**
+        // ⇒ 下一步的前缀反正要重建；既然要重建，就把距离与点杀一并解析一次、落成窗口记录。
+        // 这不是「压力触发」——压力触发是前缀好好的、主动破它；压缩的破是它自己的语义。
+        // ⚠️ 只解析**这次压缩之后仍然可见**的记录：被压掉的那段本来就由摘要代表，
+        // 收它不再省任何字节（而 `Reclaim.Decide` 也只看到投影后的那段）。
+        var visible = ContextCompaction.Project(_store, handle, history).Suffix;
+        var blobs = new BlobStore(_store.DataRoot);
+        var ids = Reclaim.Resolve(visible, blobs,
+            new Tools.SessionToolContext(handle.Spec.WorkingDirectory, blobs, history));
+        _store.AppendEvents(handle.ProjectKey, handle.SessionId,
+            [Reclaim.Window("compaction", ids, null)]);
+
+        RecordUsage(handle, callId, startedAt, reply, "completed", "compaction");
+        return new CompactionResult(checkpoint.CheckpointId, checkpoint.CoveredThroughEventId,
+            checkpoint.Summary, reply.Usage);
+    }
 
     /// <summary>
     /// 一步 = 渲染 → 调用 → 落盘（02 §2）。
@@ -94,14 +208,8 @@ public sealed class Stepper(
         // 而链长只在**用户消息到达时**归零（`HandleSessionSend`）——重启不改变这一点。
         if (handle.ConsecutiveToolSteps < handle.State.Turn) handle.RestoreToolSteps(handle.State.Turn);
 
-        // ⚠️ **过时判定（点杀）这一刻冻住**（2026-10-11）：`Reclaim.Stale` 要**碰文件系统**
-        // （重读那个源、重算指纹），而渲染必须是纯的 ⇒ 判定在渲染**外**算。
-        // 冻在这一刻的理由与上面那行 `now` 逐字相同：这一步里无论如何重复渲染，
-        // 拿到的都是**同一批字节、同一个判定** ⇒ 步内逐字节稳定。
-        // ⚠️ **它就是那个「更窄的那一刻」**（`01` §11.7 找了三轮的东西）：
-        // 不是「进了内存」（`Activate` 太宽，头扫一眼列表就会走），是「**第一步真的要拿它渲染**」。
-        var staleProbe = new Tools.SessionToolContext(
-            handle.Spec.WorkingDirectory, new BlobStore(_store.DataRoot));
+        // ⚠️ **引擎租约**：所有 `StepAsync` 调用都在 **_stepper 的会话内串行** 之内
+        // （`CommandDispatcher` 的会话闸），所以这里不需要再同步。
         // ⚠️ 先记下落盘的那份，失败了原样放回去。
         // 调用方 catch 之后继续用**同一个把手**：不回滚的话，
         // 用户刚看着一步失败，`status` 却报 Running——而磁盘上从来没写过 Running。
@@ -111,6 +219,8 @@ public sealed class Stepper(
         // 两条交错时不会互相整份盖掉（终审 I2）。下同。
         handle.UpdateState(s => s with { Status = SessionStatus.Running });
 
+        var callId = Ids.New();
+        var callStarted = CoreClock.Now();
         ModelReply reply;
         try
         {
@@ -186,7 +296,7 @@ public sealed class Stepper(
                 // `ToolLimits.MaxResultBytes` 的结果只喂开头，尾部的注记给出稳定 id 与下一个偏移
                 // ⇒ 模型用 `fetch(id, offset)` 接着看，不必重跑那个工具。
                 Timeline = FloatingContextPair(
-                    TimelineRender.RenderForModel(_store, handle, staleProbe), slots.Tail, at,
+                    TimelineRender.RenderForModel(_store, handle), slots.Tail, at,
                     // ⚠️ **`Turn + 1` 是「这一步的编号」**（与 `PendingIntent` 给「那一步的 Turn」用的
                     // 同一个约定）：`State.Turn` 数的是**已完成**的步，进行中的这一步是下一号。
                     handle.State.Turn + 1),
@@ -194,9 +304,11 @@ public sealed class Stepper(
 
             // 调用（抛异常时直接传播——这一步没完成，Turn 不动）
             reply = await _adapter.CallAsync(request, ct);
+            RecordUsage(handle, callId, callStarted, reply, "completed");
         }
         catch
         {
+            RecordUsage(handle, callId, callStarted, reply: null, "failed");
             // 回到落盘的那份。⚠️ 用捕获的引用回放，不去读磁盘：
             // 读盘本身可能失败，那会把原始的失败原因盖掉。
             //
@@ -249,6 +361,8 @@ public sealed class Stepper(
         // 有问 ⇒ 事件列表**空**（模型消息也不落——见下），状态转 `WaitingForInput`，
         // 那次暂停冻进 handle，等用户答完由 `CommandDispatcher` 续跑。
         AskRequest? pending = null;
+        // 这一批工具结果——**给头的活事件**（`StepOutcome.ToolResults`）。有问时恒空。
+        IReadOnlyList<TimelineEvent.ToolResultEvent> toolResults = [];
 
         // ⚠️ 工具调用是**模型消息的一部分** ⇒ 有调用就一定有那条模型消息（上面那个 if 通过）。
         // `events.Count > 0` 不是多余的守卫，它挡的是「凭空落一堆悬空结果」——而悬空的
@@ -271,15 +385,15 @@ public sealed class Stepper(
             var batch = await executor.ExecuteAsync(toolCalls, context, ct);
             pending = batch.Pending;
             events.AddRange(batch.Results);
+            toolResults = batch.Results;
 
             // ⚠️ **`release` 的线在这里落盘**（`01` §12.4，2026-10-11）：
             // 它和别的事件**不一样**——工具只跑出一次「成功」，而**记录上要留的那条不是结果**。
             // ⇒ 它的输出去处与时间点都在这一句上。
             //
             // ⚠️ **顺序无关紧要，因为它是判据的输入而不是判据**：真正读它的是
-            // `Reclaim.Decide`，而那个判定发生在**下一次渲染**（`RecordRelease` 先落、
+            // `Reclaim.Decide`，而那个判定只读**已经落盘**的线（`RecordRelease` 先落、
             // 下一步开始才渲染）。⇒ 把 `release` 调在最后一条也照样收得掉它前面的东西。
-            //
             // ⚠️ **配对不受影响**：它照样返回一条（空的）结果、照样配那条 `tool_use`——
             // 「一对不能拆」那条不变量一个字没动，所以这里不新增任何特例。
             //
@@ -287,8 +401,8 @@ public sealed class Stepper(
             // 也在这一批里、名字也叫 `release`，但它**一次都没跑**——为它画线等于让
             // 一次被拒绝的操作改变上下文。判据由执行器交回（`Batch.ExecutedCallIds`），
             // 因为「跑没跑」只有它知道。
-            foreach (var callId in batch.ExecutedCallIds)
-                if (toolCalls.FirstOrDefault(c => string.Equals(c.CallId, callId, StringComparison.Ordinal)) is { Name: ReleaseTool.NameOf } release
+            foreach (var executedCallId in batch.ExecutedCallIds)
+                if (toolCalls.FirstOrDefault(c => string.Equals(c.CallId, executedCallId, StringComparison.Ordinal)) is { Name: ReleaseTool.NameOf } release
                     && RecordRelease(release, at) is TimelineEvent.ReleaseEvent line)
                 {
                     events.Add(line);
@@ -370,7 +484,40 @@ public sealed class Stepper(
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id,
-            ReleasedClaims: releasedClaims, ReleasedLines: releasedLines);
+            ReleasedClaims: releasedClaims, ReleasedLines: releasedLines, ToolResults: toolResults);
+    }
+
+    private void RecordUsage(
+        SessionHandle handle, string callId, DateTimeOffset startedAt,
+        ModelReply? reply, string status, string purpose = "session")
+    {
+        if (_usage is null) return;
+
+        // 统计属于观察面：账本不可写时不能把一次已经完成的模型调用重跑一遍。
+        try
+        {
+            _usage.Append(new UsageCall
+            {
+                CallId = callId,
+                ProjectKey = handle.ProjectKey,
+                SessionId = handle.SessionId,
+                Step = handle.State.Turn + 1,
+                Purpose = purpose,
+                ProviderId = handle.Spec.Model.ProviderId,
+                ModelId = handle.Spec.Model.ModelId,
+                Protocol = _adapter.Protocol,
+                StartedAt = startedAt,
+                EndedAt = CoreClock.Now(),
+                Status = status,
+                Usage = reply?.Usage,
+                ReportedModel = reply?.ReportedModel,
+                ResponseId = reply?.ResponseId,
+            });
+        }
+        catch
+        {
+            // 统计故障不改变会话语义；控制面可在后续版本暴露丢账告警。
+        }
     }
 
     /// <summary>
@@ -546,7 +693,7 @@ public sealed class Stepper(
     /// 仍然只有一个答案。</para>
     ///
     /// <para>⚠️ <b>它<b>不</b>重新渲染</b>（2026-10-11 明确下来）：<see cref="StepAsync"/>
-    /// 里那份渲染与 <c>staleProbe</c> 是**为「调模型」冻的**，而这一步**不调模型**
+    /// 里那份渲染是**为「调模型」冻的**，而这一步**不调模型**
     /// （答复是用户给的，结果由核心自己拼）。⇒ 这里不读时间线、也不跑点杀。
     /// ⚠️ 这不是省事：若这里也跑一次点杀，冻结的那一刻就**不是**「步开始」而是
     /// 「用户按下答应的那一刻」——同一步里就会有两个判定，而那正是要躲的每步破前缀。</para>
@@ -565,6 +712,8 @@ public sealed class Stepper(
         var events = new List<TimelineEvent>();
         var releasedClaims = new List<Claim>();
         var releasedLines = new List<TimelineEvent.ReleaseEvent>();
+        // 答复之后真正跑掉的那批结果——**给头的活事件**（与 `StepAsync` 同一个出口）。
+        IReadOnlyList<TimelineEvent.ToolResultEvent> toolResults = [];
 
         if (calls.Count > 0)
         {
@@ -582,6 +731,7 @@ public sealed class Stepper(
 
             var batch = await executor.ExecuteAsync(calls, context, ct, reply);
             events.AddRange(batch.Results);
+            toolResults = batch.Results;
 
             // ⚠️ **`release` 的线在这里也要落**（2026-10-17）——原先只在 `StepAsync` 有一半：
             // 一批里只要有一条要问，整批就挂起；用户批准之后全部执行（`ToolExecutor` 的
@@ -592,8 +742,8 @@ public sealed class Stepper(
             //
             // ⚠️ **时刻用 `CoreClock.Now()`，不用「步开始」**：这一步没有模型调用，
             // 它是**用户答复**那一刻发生的执行——与 `Answer` / `Blocked` 里的 `At` 同源。
-            foreach (var callId in batch.ExecutedCallIds)
-                if (calls.FirstOrDefault(c => string.Equals(c.CallId, callId, StringComparison.Ordinal)) is { Name: ReleaseTool.NameOf } release
+            foreach (var executedCallId in batch.ExecutedCallIds)
+                if (calls.FirstOrDefault(c => string.Equals(c.CallId, executedCallId, StringComparison.Ordinal)) is { Name: ReleaseTool.NameOf } release
                     && RecordRelease(release, CoreClock.Now()) is TimelineEvent.ReleaseEvent line)
                 {
                     events.Add(line);
@@ -631,7 +781,8 @@ public sealed class Stepper(
             Turn = s.Turn + 1,
         }, diskStatus: SessionStatus.Idle);
 
-        return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines);
+        return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
+            ToolResults: toolResults);
     }
 
     /// <summary>
@@ -773,7 +924,19 @@ public sealed class Stepper(
         DateTimeOffset? DeadlineAt = null,
         string? HistoryId = null,
         IReadOnlyList<Claim>? ReleasedClaims = null,
-        IReadOnlyList<TimelineEvent.ReleaseEvent>? ReleasedLines = null);
+        IReadOnlyList<TimelineEvent.ReleaseEvent>? ReleasedLines = null,
+        /// <summary>
+        /// 这一批工具结果——**给头的活事件**用的，不是落盘的另一份。
+        ///
+        /// <para>⚠️ 它们已经随 `events` 落盘了；这里交回去只是为了 `CommandDispatcher`
+        /// 能发 `tool.result.appended`（2026-10-17：此前没有这个出口，头的「工具结果」
+        /// 只在重拉 `/history` 时出现，正常对话流程里看不见）。</para>
+        ///
+        /// <para>⚠️ 交的是**记录那一份**（未回收、未解引用、未加框架）——与 `TimelineEvent`
+        /// 落盘的内容逐字相同。回收/截断是**渲染期**的事，头收到活事件时那条记录刚写，
+        /// 还没轮到任何判定；重拉时 `/history` 会给同一批结果套上最新形态。</para>
+        /// </summary>
+        IReadOnlyList<TimelineEvent.ToolResultEvent>? ToolResults = null);
 
     /// <summary>
     /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。

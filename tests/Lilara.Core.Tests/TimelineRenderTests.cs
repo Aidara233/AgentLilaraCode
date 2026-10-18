@@ -8,15 +8,14 @@ namespace Lilara.Core.Tests;
 /// <summary>
 /// **记录 → 这一刻的形态**（`TimelineRender`）。
 ///
-/// <para>⚠️ <b>它做三件事</b>（曾经是两步，第三步「解 `Ref`」随那条机制一起删了，
-/// 而 2026-10-11 起多了一件）：解库引用 · **判回收** · 换回收渲染。下面各钉一件。</para>
+/// <para>⚠️ <b>它做三件事</b>：解库引用 · 按**已落盘的回收窗口**换渲染 · 加框架（外加投递截断）。
+/// 下面各钉一件。</para>
 ///
-/// <para>⚠️ <b>「判」与「换」都在这里，是这一组测试的做法与别处不同的原因</b>：
-/// 在那之前，回收集合是 `SessionHandle` 上的一份**内存账**（由 `session.gc` 命令写），
-/// 于是测试得先 `SetReclaimed(…)` 再渲染。现在判据住在渲染里
-/// ⇒ 测试**造出真实的形态**（垫够保护带），让渲染自己判出来。
-/// 这不是风格问题：那个「先设好再渲染」的写法**测不到**「集合是不是这一刻的记录算出来的」，
-/// 而那正是 `fetch` 取不回那个缺陷的所在（见 <see cref="StepLagTests"/>）。</para>
+/// <para>⚠️ <b>回收的<b>判据</b>不在这里</b>（2026-10-17 更正）：距离 / 点杀由
+/// `session.gc` / 压缩在<b>开窗那一刻</b>用 `Reclaim.Resolve` 解析一次、落成 `ReclaimEvent`；
+/// 渲染只读那条记录（`Reclaim.Decide`）。⚠️ 上一版让渲染每次现算，后果是
+/// **每步都改历史中段 ⇒ 每步破一次缓存**，而且模型刚读到的内容在下一步就变成注记。
+/// ⇒ 这里的测试**显式开窗**（`OpenWindow`），而不是「垫够保护带让渲染自己判」。</para>
 /// </summary>
 public class TimelineRenderTests : IDisposable
 {
@@ -58,16 +57,18 @@ public class TimelineRenderTests : IDisposable
     private IReadOnlyList<TimelineEvent> Render() => TimelineRender.Render(_store, _handle);
 
     /// <summary>
-    /// **垫够保护带**，让 `[…]` 里那些结果落进回收范围（`Reclaim.Decide` 只收最近的
-    /// `ProtectedRecentResults` 条**之前**的）。
+    /// **开一次回收窗口**（2026-10-17）：回收只在窗口里发生——渲染发生在每一步，
+    /// 而回收改的是前缀中段（`00` §3：热路径「绝不事后清理」）。
     ///
-    /// <para>⚠️ 垫的那些**本身也可回收**，所以它们会一起被收——按 id 精确断言的那些测试
-    /// 因此各钉各的。⚠️ 而这条正是「判据在渲染里」的形状：`Decide` 是纯函数，
-    /// 同一份时间线永远得到同一个集合。</para>
+    /// <para>⚠️ 窗口里放哪些 id 由调用方给：真实路径是 `session.gc` 用
+    /// <see cref="Reclaim.Resolve"/> 解析一次；这里直接把要收的 id 列出来，
+    /// 因为这些测试钉的是<b>渲染</b>（换成注记 / 框架不动），不是判据本身。</para>
     /// </summary>
-    private void PadPastTheProtectionBand() =>
-        Append([.. Enumerable.Range(0, Reclaim.ProtectedRecentResults)
-            .Select(i => Result($"pad{i}", $"padcall{i}", new Block.TextBlock("垫")))]);
+    private void OpenWindow(params string[] ids) =>
+        Append(new ReclaimEvent
+        {
+            Id = Ids.New(), At = CoreClock.Now(), Trigger = "test", Ids = ids,
+        });
 
     private static TimelineEvent.ToolResultEvent ResultAt(IReadOnlyList<TimelineEvent> rendered, int i) =>
         (TimelineEvent.ToolResultEvent)rendered[i];
@@ -116,12 +117,12 @@ public class TimelineRenderTests : IDisposable
     public void ReclaimedResults_RenderAsTheNote_OthersUntouched()
     {
         // ⚠️ **本测试钉的是「被收的换成注记、没被收的原样」这**两半****，
-        // 不是「收了几条」——所以按「**这一条在不在集合里**」逐个对，
-        // 而垫的那些放**最后**（保护带在末尾 ⇒ 它们原样，正好当「没被收」的那一半）。
+        // 不是「收了几条」——所以窗口只点名 r1 / r2，r3 原样，正好当「没被收」的那一半。
         Append(
             Result("r1", "c1", new Block.TextBlock("被收的")),
-            Result("r2", "c2", new Block.TextBlock("也被收的")));
-        PadPastTheProtectionBand();
+            Result("r2", "c2", new Block.TextBlock("也被收的")),
+            Result("r3", "c3", new Block.TextBlock("没被点名的")));
+        OpenWindow("r1", "r2");
 
         var rendered = Render();
         var reclaimed = Reclaim.Decide(
@@ -135,11 +136,11 @@ public class TimelineRenderTests : IDisposable
         Assert.Contains("r1", note);        // 注记给的是**记录 id**
         Assert.Contains("fetch(id=", note); // 而且是一条能直接抄走的调用
 
-        // ⚠️ **保护带里那些原样**——那正是「只降一部分」的另一半。
+        // ⚠️ **没被点名的那些原样**——那正是「只降一部分」的另一半。
         var untouched = rendered.OfType<TimelineEvent.ToolResultEvent>()
             .Where(r => !reclaimed.Contains(r.Id)).ToList();
         Assert.NotEmpty(untouched);
-        Assert.All(untouched, r => Assert.Equal("垫",
+        Assert.All(untouched, r => Assert.Equal("没被点名的",
             Assert.IsType<Block.TextBlock>(Assert.Single(r.Content)).Text));
 
         // ⚠️ **记录没动**：再读一遍盘，那条还是原文（回收不写盘）。
@@ -149,26 +150,24 @@ public class TimelineRenderTests : IDisposable
     }
 
     /// <summary>
-    /// ⚠️ **判定住在渲染里，所以它跟着记录变**（2026-10-11）。
+    /// ⚠️ **无窗口 ⇒ 渲染不回收**（2026-10-17 的核心性质，取代旧的
+    /// 「判定住在渲染里、每次现算」那条）：同一份时间线反复渲染，
+    /// 只要没人开窗（`session.gc` / 压缩 / release），结果始终是原文。
     ///
-    /// <para>这条钉的是那个**曾经不存在**的性质：同一份时间线上再落一条工具结果，
-    /// 保护带挪一格 ⇒ 下一次渲染的结论就不同。**没有第二次「触发」**。</para>
-    ///
-    /// <para>⚠️ 它为什么值得单独一条：旧形状下集合是 `session.gc` 写进去的，
-    /// 不喊就不变；而那个形状的后果是**注记上给的 id 在下一个渲染窗口里取不回**
-    /// （见 <see cref="StepLagTests"/>）。⇒ 这里不再有「谁记得喊」这一环。</para>
+    /// <para>⚠️ 它钉的是「热路径绝不事后清理」（`00` §3）：若有人把距离 / 点杀搬回
+    /// `Decide`，这条会红——这里的结果早就超过保护带条数，而<b>没有</b>任何窗口。</para>
     /// </summary>
     [Fact]
-    public void TheDecision_FollowsTheRecord_WithNoOneTriggeringIt()
+    public void NoWindow_MeansNoReclaim_EvenAfterManyResults()
     {
         Append(Result("r1", "c1", new Block.TextBlock("大")));
-        // ⚠️ 先确认前提：**只有一条**工具结果时，它落在保护带里 ⇒ 不收。
+        Append([.. Enumerable.Range(0, Reclaim.ProtectedRecentResults + 2)
+            .Select(i => Result($"pad{i}", $"padcall{i}", new Block.TextBlock("垫")))]);
+
         Assert.Contains("大", Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(Render(), 0).Content)).Text);
 
-        PadPastTheProtectionBand();
-
-        // 再来一次 —— 中间**没有任何人**触发过什么。
-        Assert.Contains("[已回收]", Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(Render(), 0).Content)).Text);
+        // 再渲染一次——中间**没有任何人**触发过什么，结论必须逐字相同。
+        Assert.Contains("大", Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(Render(), 0).Content)).Text);
     }
 
     /// <summary>
@@ -179,7 +178,7 @@ public class TimelineRenderTests : IDisposable
     public void ReclaimedResults_ThatWereStoreBlocks_RenderAsTheNote_NotAsAMissingObject()
     {
         Append(Result("r1", "c1", new Block.TextBlock(new string('x', BlobStore.InlineThresholdBytes + 1))));
-        PadPastTheProtectionBand();
+        OpenWindow("r1");
 
         var text = Assert.IsType<Block.TextBlock>(Assert.Single(ResultAt(Render(), 0).Content)).Text;
 
@@ -227,7 +226,7 @@ public class TimelineRenderTests : IDisposable
     public void Reclaim_ReplacesTheContent_ButNotTheFrame()
     {
         Append(Framed("r1", "c1", "read", new Block.TextBlock("正文")));
-        PadPastTheProtectionBand();
+        OpenWindow("r1");
 
         var content = ResultAt(Render(), 0).Content;
 
@@ -301,9 +300,7 @@ public class TimelineRenderTests : IDisposable
     });
 
     private IReadOnlyList<TimelineEvent> RenderForModel() =>
-        TimelineRender.RenderForModel(_store, _handle, new SessionToolContext(
-            Path.Combine(_root, "work"), _blobs,
-            _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)));
+        TimelineRender.RenderForModel(_store, _handle);
 
     private static TimelineEvent.ToolResultEvent ToolResultById(IReadOnlyList<TimelineEvent> rendered, string id) =>
         rendered.OfType<TimelineEvent.ToolResultEvent>().Single(r => r.Id == id);
@@ -403,7 +400,7 @@ public class TimelineRenderTests : IDisposable
     {
         AppendCall("c1", "read");
         Append(Result("r1", "c1", new Block.TextBlock(new string('x', ToolLimits.MaxResultBytes + 100))));
-        PadPastTheProtectionBand();
+        OpenWindow("r1");
 
         var text = ContentOf(RenderForModel(), "r1");
         Assert.Contains("[已回收]", text);

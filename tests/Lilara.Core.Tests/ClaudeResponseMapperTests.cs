@@ -41,6 +41,10 @@ public class ClaudeResponseMapperTests
         Assert.Single(reply.Blocks);
         Assert.Equal("你好！", ((CanonicalBlock.TextBlock)reply.Blocks[0]).Text);
         Assert.False(reply.Refused);
+        Assert.Equal(1, reply.Usage?.InputTokens);
+        Assert.Equal(1, reply.Usage?.OutputTokens);
+        Assert.Equal("claude-opus-5", reply.ReportedModel);
+        Assert.Equal("msg_test", reply.ResponseId);
     }
 
     [Fact]

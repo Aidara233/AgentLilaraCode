@@ -397,27 +397,42 @@ public sealed class ControlServer(
             // ⇒ 在这里显式渲染成 `kind: "release"`，模型侧那份不经过这个函数。
             var events = SessionQueries.HistoryOf(host, handle).ToList();
 
-            var end = events.Count;
+            // ---- 配对的工具结果紧跟它那条模型消息（2026-10-17）----
+            //
+            // ⚠️ **这是分页单位的一次改动，不是排版偏好**：记录里的次序是「模型消息 →
+            // 它那批结果」（`Stepper` 一次 append，调用序），但结果**在记录里是独立事件**，
+            // 而头按事件逐条画 ⇒ 「调用都在上、结果都在下」。
+            // 现在核心把它们**当成一组**交给头（组 = 模型消息 + 它发出的、且在后文出现的
+            // `callId` 对应的结果），于是：
+            //   ① 分页不会把「一条调用」和「它的结果」切到两页（切了那头就配不上）；
+            //   ② 头既可以按组画，也可以把结果挂到调用下面——判据只此一处。
+            //
+            // ⚠️ 组内次序保留「消息在前、结果按出现序在后」：只看 JSON 的消费者仍读得出
+            // 记录里的原始次序；「挂到调用下面」是**头的渲染选择**，不是核心替它决定。
+            var grouped = GroupToolResults(events);
+
+            var end = grouped.Count;
             if (before is not null)
             {
                 if (!TryDecodeHistoryCursor(before, out var cursorSession, out var beforeId)
                     || !string.Equals(cursorSession, id, StringComparison.Ordinal))
                     return Results.BadRequest(new { error = "历史游标无效或不属于此会话。" });
 
-                end = events.FindIndex(e => string.Equals(e.Id, beforeId, StringComparison.Ordinal));
+                end = grouped.FindIndex(g => g.Any(e => string.Equals(e.Id, beforeId, StringComparison.Ordinal)));
                 if (end < 0)
                     return Results.BadRequest(new { error = "历史游标已失效，请重新加载会话。" });
             }
 
             var start = Math.Max(0, end - pageSize);
-            var page = events.GetRange(start, end - start);
+            var page = grouped.GetRange(start, end - start);
             var hasMore = start > 0;
-            var nextCursor = hasMore ? EncodeHistoryCursor(id, page[0].Id) : null;
+            // ⚠️ 游标指到**组的第一条**：它由组拼出，重拉时用「哪一组包含它」来找边界。
+            var nextCursor = hasMore ? EncodeHistoryCursor(id, page[0][0].Id) : null;
 
             return Results.Json(new
             {
                 highWater,
-                rendered = page.Select(Render).ToList(),
+                rendered = page.SelectMany(g => g).Select(Render).ToList(),
                 hasMore,
                 NextCursor = nextCursor ?? "",
             }, WireJson.Options);
@@ -427,6 +442,61 @@ public sealed class ControlServer(
         {
             if (!TryFind(id, out var handle)) return Results.NotFound();
             return Results.Json(new { handle.IsRunning, handle.QueueDepth }, WireJson.Options);
+        });
+
+        // 统计是核心事实的只读投影；这些端点不激活会话、不触发模型或插件。
+        app.MapGet("/usage/calls", (int? skip, int? limit) =>
+        {
+            var all = host.Usage.ReadAll();
+            var offset = Math.Max(0, skip ?? 0);
+            var pageSize = Math.Clamp(limit ?? 100, 1, 1000);
+            return Results.Json(new
+            {
+                AsOf = CoreClock.Now(),
+                Skip = offset,
+                Limit = pageSize,
+                Total = all.Count,
+                Calls = all.Skip(offset).Take(pageSize).ToList(),
+            }, WireJson.Options);
+        });
+
+        app.MapGet("/usage/summary", () => Results.Json(
+            host.Usage.Summarize(), WireJson.Options));
+
+        app.MapGet("/sessions/{id}/usage", (string id) =>
+        {
+            if (host.Store.FindSession(id) is not { } found) return Results.NotFound();
+            var calls = host.Usage.ForSession(id);
+            return Results.Json(new
+            {
+                SessionId = id,
+                ProjectKey = found.ProjectKey,
+                Summary = host.Usage.Summarize(new UsageFilter { SessionId = id }),
+                Calls = calls,
+            }, WireJson.Options);
+        });
+
+        app.MapGet("/sessions/{id}/context", (string id) =>
+        {
+            if (host.Store.FindSession(id) is not { } found) return Results.NotFound();
+            var latest = host.Usage.ForSession(id).LastOrDefault(c => c.Usage is not null);
+            return Results.Json(new
+            {
+                SessionId = id,
+                ProjectKey = found.ProjectKey,
+                Latest = latest is null ? null : new
+                {
+                    latest.CallId,
+                    latest.StartedAt,
+                    latest.EndedAt,
+                    latest.ModelId,
+                    latest.Protocol,
+                    InputTokens = latest.Usage?.InputTokens,
+                    Source = latest.Usage is null ? "unknown" : "reported",
+                    RequestFingerprint = latest.RequestFingerprint,
+                },
+                Preview = (object?)null,
+            }, WireJson.Options);
         });
 
         // 头唯一的轴来源（不许手抄轴表）：标签与告警的两端都从核心交出去，头里写字面量会静默失效。
@@ -572,8 +642,48 @@ public sealed class ControlServer(
         };
     }
 
-    private static string EncodeHistoryCursor(string sessionId, string beforeId) =>
-        Convert.ToBase64String(Encoding.UTF8.GetBytes($"1\n{sessionId}\n{beforeId}"))
+    /// <summary>
+    /// **把工具结果并进那条模型消息所在的组**。组 = 一条事件（非结果），或
+    /// 「模型消息 + 它发出的、且出现在它之后的那些结果」。
+    ///
+    /// <para>⚠️ 判定只用记录里的**事实**：`toolUse` 的 `callId` 与结果的 `CallId`。
+    /// 结果若找不到配对（悬空的，正常不会发生），**自成一组**而不是被前面那组吞掉——
+    /// 「有结果没调用」是必须让人看见的异常，不是可以顺手挂到别的消息下面的东西。</para>
+    /// </summary>
+    private static List<List<Kernel.TimelineEvent>> GroupToolResults(
+        IReadOnlyList<Kernel.TimelineEvent> events)
+    {
+        var grouped = new List<List<Kernel.TimelineEvent>>();
+        Dictionary<string, List<Kernel.TimelineEvent>> open = new(StringComparer.Ordinal);
+
+        foreach (var evt in events)
+        {
+            if (evt is Kernel.TimelineEvent.MessageEvent m)
+            {
+                var group = new List<Kernel.TimelineEvent> { evt };
+                grouped.Add(group);
+                // ⚠️ 只登记**模型**消息的调用：用户消息里不会有 `toolUse`（那是模型输出），
+                // 但按 speaker 判会漏掉「模型消息里夹着文本 + 调用」这一格——所以按块判，
+                // 不按 speaker 判。
+                foreach (var call in m.Blocks.OfType<Kernel.Block.ToolUseBlock>())
+                    open[call.CallId] = group;
+                continue;
+            }
+
+            if (evt is Kernel.TimelineEvent.ToolResultEvent r && open.Remove(r.CallId, out var owner))
+            {
+                owner.Add(evt);
+                continue;
+            }
+
+            // 其他事件（release / 悬空结果）：自成一组。
+            grouped.Add([evt]);
+        }
+
+        return grouped;
+    }
+
+    private static string EncodeHistoryCursor(string sessionId, string beforeId) =>        Convert.ToBase64String(Encoding.UTF8.GetBytes($"1\n{sessionId}\n{beforeId}"))
             .TrimEnd('=')
             .Replace('+', '-')
             .Replace('/', '_');
@@ -903,6 +1013,8 @@ public sealed class ControlServer(
                 payload.GetProperty("sessionId").GetString()!),
             // 同 session.setAxis：线上解析是第三条线。载荷只有一个会话 id（全会话、无范围）。
             "session.gc" => new CoreCommand.SessionGc(
+                payload.GetProperty("sessionId").GetString()!),
+            "session.compact" => new CoreCommand.SessionCompact(
                 payload.GetProperty("sessionId").GetString()!),
             "provider.upsert" => new CoreCommand.ProviderUpsert(
                 payload.GetProperty("id").GetString()!,

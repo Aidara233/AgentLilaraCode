@@ -111,6 +111,53 @@ public class CommandDispatcherTests : IDisposable
         Assert.Equal(1, maxConcurrent);   // 全程没有两个步同时在飞
     }
 
+    [Fact]
+    public async Task Compact_RunsInBackground_AndQueuedSendContinuesAfterIt()
+    {
+        var host = new CoreHost(_root, _work);
+        SaveProvider(host);
+        var compactEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCompact = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var queuedEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var gated = new GatedAdapter(async () =>
+        {
+            var n = Interlocked.Increment(ref calls);
+            if (n == 1) return "seed";
+            if (n == 2)
+            {
+                compactEntered.SetResult();
+                await releaseCompact.Task;
+                return "summary";
+            }
+
+            queuedEntered.SetResult();
+            return "after";
+        });
+        var dispatcher = new CommandDispatcher(host, new EventBus(), _ => new Stepper(host.Store, gated));
+        var sessionId = await CreateSessionAsync(dispatcher);
+
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("seed")]),
+            "seed", true, CancellationToken.None);
+
+        var compact = await dispatcher.DispatchAsync(
+            new CoreCommand.SessionCompact(sessionId), "compact", false, CancellationToken.None);
+        Assert.Contains("开始", Assert.IsType<Ack.Accepted>(compact.Ack).Note);
+        await compactEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(host.Activate(host.Store.FindSession(sessionId)!.Value.ProjectKey, sessionId).IsRunning);
+
+        var queued = await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("after")]),
+            "after", false, CancellationToken.None);
+        Assert.IsType<Ack.Accepted>(queued.Ack);
+        Assert.Equal(2, calls);
+
+        releaseCompact.SetResult();
+        await queuedEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(3, calls);
+    }
+
     // rejected 只用于「命令本身不合法」；会话不存在 ⇒ rejected（用户把 id 写错了）。
     [Fact]
     public async Task UnknownSession_IsRejected()

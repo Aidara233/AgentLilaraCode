@@ -6,7 +6,7 @@ using System.Globalization;
 /// 行为控制轴（`01` §3.5）——**轴的唯一真相来源**。
 ///
 /// <para>⚠️ 它是一张**表**，不是几条独立的散落判断。轴名、中文名、合法值、默认值、
-/// 进不进上下文**五样放在一起**（见 <see cref="Spec"/>），是因为它们必须同步演进：
+/// 进不进上下文及等级解释**放在一起**（见 <see cref="Spec"/>），是因为它们必须同步演进：
 /// 加一个档而忘了改默认值或错误信息，正是这类表最常见的漂移。
 /// 任何别处要用这些值（头的下拉、控制台的解析、错误信息）都**从这张表读**，不许手抄。</para>
 ///
@@ -73,7 +73,7 @@ public static class Axes
     /// </summary>
     private sealed record Spec(
         string Name, string Label, IReadOnlyList<string> Values, string Default, bool InContext,
-        NumericRange? Range = null);
+        NumericRange? Range = null, IReadOnlyDictionary<string, string>? Descriptions = null);
 
     /// <summary>温度的范围与步长。⚠️ **唯一一份**——`Values` 网格由它生成，别在别处再列一遍 0.0…2.0。</summary>
     private static readonly NumericRange TempRange = new(Min: 0, Max: 2, Step: 0.1);
@@ -118,6 +118,13 @@ public static class Axes
     private static Spec Numeric(string name, string label, NumericRange range, string @default) =>
         new(name, label, Grid(range), @default, InContext: false, Range: range);
 
+    // 可见枚举轴的合法值和等级解释由同一组声明派生，避免另维护一份档位表。
+    private static Spec Context(string name, string label, string @default,
+        params (string Value, string Description)[] levels) =>
+        new(name, label, Array.AsReadOnly(levels.Select(l => l.Value).ToArray()), @default,
+            InContext: true, Descriptions: new System.Collections.ObjectModel.ReadOnlyDictionary<string, string>(
+                levels.ToDictionary(l => l.Value, l => l.Description, StringComparer.Ordinal)));
+
     /// <summary>
     /// 轴的**唯一**一张表。顺序**就是**渲染顺序（`01` §3.5 表格），别按字母排。
     /// </summary>
@@ -129,28 +136,34 @@ public static class Axes
         //（`SessionHandle` 用 `Defaults()` / `TryParse` 播种，见 `SessionHandle.cs:155,165`）。
         // ⚠️ 但**模型请求**那条路**不是**：`ClaudeRequestBuilder.ToEffort` 是一份
         // **手抄的第二副本**（已知，即计划 G10 说的那类）——改这里**改不到它**，两头要一起改。
-        new(Initiative, "主动性",
-            Array.AsReadOnly<string>(["step", "standard", "goal"]),
-            "step", InContext: true),
+        Context(Initiative, "主动性", "step",
+            ("step", "按用户明确给出的当前步骤行动；完成本步后汇报，等待下一步指示，不自行扩展目标。"),
+            ("standard", "在用户任务范围内自主行动；遇到需要用户决策的事项时征询，没有后续可执行动作时汇报并停止。"),
+            ("goal", "围绕用户给定目标持续推进，自行处理可判断的实现细节；完成前继续执行可行动的后续工作，遇到审批或缺少关键输入时说明阻塞。此档不授予额外权限。")),
 
         // 权限 = 闸门。0..5 单调阶梯，低档是拒绝线、高档是询问线。
         // ⚠️ 档位**顺序是契约**：头的跨轴告警按
         // `values.indexOf(当前) >= values.indexOf(AlertFrom)` 判「授权及以上」——
         // 重排或插入第 6 档会让告警静默报错档位（正是 `01` §3.5 要防的那种静默失效）。
-        new(Permission, "权限",
-            Array.AsReadOnly<string>(
-                ["off", "readonly", "investigate", "standard", "authorized", "trusted"]),
-            "standard", InContext: true),
+        Context(Permission, "权限", "standard",
+            ("off", "所有工具调用均被拒绝；只能依据已有上下文回答。"),
+            ("readonly", "只读类工具可执行；消耗资源、写入和高危类工具均被拒绝。"),
+            ("investigate", "只读和消耗资源类工具可执行；写入和高危类工具被拒绝。"),
+            ("standard", "只读和消耗资源类工具可执行；写入类工具需要审批，高危类工具被拒绝。"),
+            ("authorized", "只读、消耗资源和写入类工具可执行；高危类工具需要审批。"),
+            ("trusted", "权限闸门允许所有工具类别，包括不可逆的高危操作；仍须遵守用户任务范围与明确约束。")),
 
         // 安全 = 纯提示。⚠️ 没有「机械兜底」——不设「生产 ⇒ 权限封顶」（§3.5 明说不许）。
         // ⚠️ 默认落在**非告警**档（见下 Default 那条注释）。
-        new(Safety, "安全",
-            Array.AsReadOnly<string>(["dev", "staging", "prod"]),
-            "dev", InContext: true),
+        Context(Safety, "安全", "dev",
+            ("dev", "当前为开发环境，可在任务范围内试验和迭代；注意保留已有工作，避免无关改动。"),
+            ("staging", "当前为迭代或预发布环境，关注兼容性、集成影响与回退方式，避免影响其他人的验证。"),
+            ("prod", "当前为生产环境，优先最小改动、数据完整性与可回退性；执行前评估影响范围，对不可逆操作格外谨慎。")),
 
-        new(Verify, "验证强度",
-            Array.AsReadOnly<string>(["none", "self", "strict"]),
-            "self", InContext: true),
+        Context(Verify, "验证强度", "self",
+            ("none", "不主动运行额外验证；完成改动后说明结果，并明确未执行验证。"),
+            ("self", "完成改动后自行执行相关编译、测试或检查，并如实报告结果及未验证部分。"),
+            ("strict", "执行任务所需的完整验证；验证未通过时不得声称完成，受阻无法验证时明确报告阻塞和未验证部分。")),
 
         // ⚠️ 与 `ClaudeRequestBuilder.ToEffort`（`ClaudeRequestBuilder.cs:164-173`，5 条臂
         // 166-170 + 一条 `_ => throw` 在 171）**必须逐值对齐**，但两个方向的后果**不同**，
@@ -236,6 +249,11 @@ public static class Axes
     /// 不知道的轴，一律当作「不进上下文」这一侧。</para>
     /// </summary>
     public static bool InContext(string? axis) => Find(axis)?.InContext ?? false;
+
+    /// <summary>当前等级的提示解释；未知等级和纯请求参数轴没有解释。</summary>
+    public static string? DescriptionOf(string? axis, string? value) =>
+        Find(axis)?.Descriptions is { } descriptions && value is not null &&
+        TryParse(axis, value, out var canonical) ? descriptions.GetValueOrDefault(canonical) : null;
 
     /// <summary>
     /// ⚠️ **所有吃轴名的入口一律把 <see langword="null"/> 当「未知轴」**

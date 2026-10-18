@@ -168,9 +168,15 @@ public class ReclaimFetchTests : IDisposable
         // 造一条「已经被取回过」的结果：它就是一条普通工具结果，内容与别的没有分别。
         var fetched = Result("r2", new Block.TextBlock(Original));
         var timeline = new List<TimelineEvent> { fetched };
-        // 垫够保护带：`Decide` 只收最近 `ProtectedRecentResults` 条**之前**的。
+        // 垫够保护带：`Resolve` 只收最近 `ProtectedRecentResults` 条**之前**的。
         for (var i = 0; i < Reclaim.ProtectedRecentResults; i++)
             timeline.Add(Result($"p{i}", new Block.TextBlock("垫")));
+        // ⚠️ 回收只发生在窗口里（2026-10-17）⇒ 开窗那一刻解析（同 `session.gc`）。
+        timeline.Add(new ReclaimEvent
+        {
+            Id = Ids.New(), At = CoreClock.Now(), Trigger = "test",
+            Ids = Reclaim.Resolve(timeline, Blobs(), new SessionToolContext(_work, Blobs(), timeline)),
+        });
 
         var reclaimed = Reclaim.Decide(timeline, Blobs());
 

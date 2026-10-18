@@ -1,6 +1,7 @@
 using Lilara.Core.Kernel;
 using Lilara.Core.Session;
 using Lilara.Core.Storage;
+using Lilara.Core.Plugins;
 
 namespace Lilara.Core.Tests;
 
@@ -35,6 +36,86 @@ public sealed class SlotTests : IDisposable
             System, Premier, systemId, premierId, axes ?? Axes.Defaults());
 
     // ---- 尾槽位（轴表）----
+
+    [Theory]
+    [InlineData("initiative", "step", "等待下一步指示")]
+    [InlineData("initiative", "standard", "需要用户决策")]
+    [InlineData("initiative", "goal", "完成前继续")]
+    [InlineData("permission", "off", "所有工具调用均被拒绝")]
+    [InlineData("permission", "readonly", "消耗资源、写入和高危类工具均被拒绝")]
+    [InlineData("permission", "investigate", "写入和高危类工具被拒绝")]
+    [InlineData("permission", "standard", "写入类工具需要审批，高危类工具被拒绝")]
+    [InlineData("permission", "authorized", "高危类工具需要审批")]
+    [InlineData("permission", "trusted", "权限闸门允许所有工具类别")]
+    [InlineData("safety", "dev", "开发环境")]
+    [InlineData("safety", "staging", "预发布环境")]
+    [InlineData("safety", "prod", "生产环境")]
+    [InlineData("verify", "none", "明确未执行验证")]
+    [InlineData("verify", "self", "相关编译、测试或检查")]
+    [InlineData("verify", "strict", "验证未通过时不得声称完成")]
+    public void Tail_ExplainsOnlyTheSelectedLevel(string axis, string level, string meaning)
+    {
+        var slots = Render(axes: new Dictionary<string, string> { [axis] = level });
+        var tail = Assert.IsType<Block.TextBlock>(Assert.Single(slots.Tail)).Text;
+        var system = Assert.IsType<Block.TextBlock>(Assert.Single(slots.System)).Text;
+        Assert.Contains(meaning, tail);
+        foreach (var value in Axes.ValuesOf(axis)!)
+        {
+            var description = Axes.DescriptionOf(axis, value);
+            Assert.False(string.IsNullOrWhiteSpace(description));
+            if (value != level) Assert.DoesNotContain(description!, tail);
+            Assert.DoesNotContain(description!, system);
+        }
+    }
+
+    [Fact]
+    public void LevelChangesOnlyChangeFloatingText_AndSystemTeachesItsOriginAndLifetime()
+    {
+        System.Save("default", "用户自定义系统原文");
+        var before = Render(axes: new Dictionary<string, string> { [Axes.Verify] = "none" });
+        var after = Render(axes: new Dictionary<string, string> { [Axes.Verify] = "strict" });
+        var system = Assert.IsType<Block.TextBlock>(Assert.Single(after.System)).Text;
+        Assert.Equal(before.System, after.System);
+        Assert.NotEqual(before.Tail, after.Tail);
+        Assert.StartsWith("用户自定义系统原文\n", system);
+        Assert.Contains("浮动上下文", system);
+        Assert.Contains("Lilara 框架", system);
+        Assert.Contains("同一步内保持一致，下一步可能更新", system);
+        Assert.Contains("不能自行提高权限", system);
+        Assert.Contains("浮动上下文", CorePrompts.SystemFallback);
+    }
+
+    [Fact]
+    public void PluginOnlyTailStillDeclaresItsFrameworkOrigin_AndEmptySystemStaysAbsent()
+    {
+        System.Save("default", "");
+        var plugin = new PromptContributionSnapshot([], [], [new()
+            { PluginId = "demo", Key = "field", Slot = PromptSlot.Floating, Text = "plugin-context" }]);
+        var slots = SystemBlock.Render(System, Premier, null, null, new Dictionary<string, string>(), plugin);
+        Assert.Empty(slots.System);
+        var tail = Assert.IsType<Block.TextBlock>(Assert.Single(slots.Tail)).Text;
+        // ⚠️ 2026-10-17：尾块改走末尾合成的 `floating_context` 调用，自述句随之改口。
+        // 这条的意图不变——**只贡献插件浮动字段的尾块也得自己声明来源**——所以钉的是
+        // 「核心注入」与「框架自动生成」这两层含义，不是旧措辞里的字面词。
+        Assert.Contains("核心每步注入", tail);
+        Assert.Contains("框架自动生成", tail);
+        Assert.Contains("plugin-context", tail);
+        Assert.DoesNotContain("权限", tail);
+    }
+
+    [Fact]
+    public void PluginSystemContributionAlsoReceivesExplanationWithAnEmptyPreset()
+    {
+        System.Save("default", "");
+        var plugin = new PromptContributionSnapshot([new()
+            { PluginId = "demo", Key = "system", Slot = PromptSlot.System, Stable = true, Text = "plugin-system" }], [], []);
+        var slots = SystemBlock.Render(System, Premier, null, null, new Dictionary<string, string>(), plugin);
+        var system = Assert.IsType<Block.TextBlock>(Assert.Single(slots.System)).Text;
+        Assert.StartsWith("[demo/system]\nplugin-system\n", system);
+        Assert.Contains("浮动上下文", system);
+        Assert.DoesNotContain("fetch", system);
+        Assert.Empty(slots.Tail);
+    }
 
     /// <summary>
     /// ⚠️ **尾块第一次真的进上下文，而它同时钉三件事**：自我声明在 · 轴的**标签**在 ·

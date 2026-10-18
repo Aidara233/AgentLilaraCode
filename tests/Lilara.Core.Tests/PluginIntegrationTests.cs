@@ -80,6 +80,7 @@ public sealed class PluginIntegrationTests : IDisposable
         Assert.IsType<Ack.Accepted>((await Set(commands, h, "demo.style", "detailed")).Ack);
         Assert.False(sub.Reader.TryRead(out _));
         Assert.IsType<Ack.Rejected>((await Set(commands, h, "demo.style", "invalid")).Ack);
+        Assert.IsType<Ack.Accepted>((await Set(commands, h, Axes.Verify, "strict")).Ack);
 
         var (fresh, _, _, nextAdapter) = Harness(new DemoPlugin());
         var loaded = fresh.Activate(h.ProjectKey, h.SessionId);
@@ -87,16 +88,33 @@ public sealed class PluginIntegrationTests : IDisposable
         nextAdapter.Reply("two");
         await new Stepper(fresh.Store, nextAdapter, plugins: fresh.Plugins).StepAsync(loaded, "again", CancellationToken.None);
         var after = nextAdapter.Calls.Single();
+        // ⚠️ 读 **RequestText**（槽位 + 时间线），不读 `Slots.Tail`：这里的推进器不带工具表，
+        // 尾块退回槽位；若哪天它带上工具表，尾块会搬到末尾合成对里，那样断言仍然成立。
         Assert.Contains("style=brief", RequestText(before));
         Assert.Contains("style=detailed", RequestText(after));
+        Assert.Contains("Keep the answer concise.", RequestText(before));
+        Assert.Contains("Explain the reasoning with concrete examples.", RequestText(after));
+        Assert.DoesNotContain("Keep the answer concise.", RequestText(after));
+        Assert.Contains("验证未通过时不得声称完成", RequestText(after));
+        Assert.Contains("浮动上下文", Text(after.Slots.System));
         Assert.Equal(Text(before.Slots.System), Text(after.Slots.System));
         Assert.Equal(Text(before.Slots.Premier), Text(after.Slots.Premier));
         Assert.DoesNotContain("style=", JsonSerializer.Serialize(fresh.Store.ReadTimeline(h.ProjectKey, h.SessionId), Json.Options));
+        var history = JsonSerializer.Serialize(fresh.Store.ReadTimeline(h.ProjectKey, h.SessionId), Json.Options);
+        Assert.DoesNotContain("Explain the reasoning with concrete examples.", history);
+        Assert.DoesNotContain("Keep the answer concise.", history);
 
         using var chat = JsonDocument.Parse(OpenAiChatRequest.Build(after with { Protocol = Protocols.OpenAiChat }));
         using var responses = JsonDocument.Parse(OpenAiResponsesRequest.Build(after with { Protocol = Protocols.OpenAiResponses }));
         Assert.Contains("style=detailed", Strings(chat.RootElement));
         Assert.Contains("style=detailed", Strings(responses.RootElement));
+        foreach (var content in new[] { Strings(chat.RootElement), Strings(responses.RootElement) })
+        {
+            Assert.Contains("Explain the reasoning with concrete examples.", content);
+            Assert.DoesNotContain("Keep the answer concise.", content);
+            Assert.Contains("验证未通过时不得声称完成", content);
+            Assert.Contains("浮动上下文是 Lilara 框架", content);
+        }
         var claude = ClaudeRequestBuilder.Build(after);
         var claudeText = string.Join("\n", claude.Messages.SelectMany(m =>
         {
@@ -105,6 +123,11 @@ public sealed class PluginIntegrationTests : IDisposable
             return blocks!.Select(b => b.TryPickText(out var t) ? t!.Text : "");
         }));
         Assert.Contains("style=detailed", claudeText);
+        Assert.Contains("Explain the reasoning with concrete examples.", claudeText);
+        Assert.DoesNotContain("Keep the answer concise.", claudeText);
+        Assert.Contains("验证未通过时不得声称完成", claudeText);
+        using var claudeJson = JsonDocument.Parse(JsonSerializer.Serialize(claude));
+        Assert.Contains("浮动上下文是 Lilara 框架", Strings(claudeJson.RootElement));
     }
 
     [Theory]
@@ -137,12 +160,17 @@ public sealed class PluginIntegrationTests : IDisposable
         plugin.OnPrompt = _ =>
         {
             Assert.IsType<Ack.Accepted>(Set(commands, h, Axes.Effort, "max").GetAwaiter().GetResult().Ack);
+            Assert.IsType<Ack.Accepted>(Set(commands, h, Axes.Verify, "strict").GetAwaiter().GetResult().Ack);
             Assert.IsType<Ack.Accepted>(Set(commands, h, "demo.style", "detailed").GetAwaiter().GetResult().Ack);
         };
         adapter.ReplyWith(request =>
         {
             Assert.Equal("high", request.Effort);
             Assert.Contains("style=brief", RequestText(request));
+            Assert.Contains("Keep the answer concise.", RequestText(request));
+            Assert.DoesNotContain("Explain the reasoning with concrete examples.", RequestText(request));
+            Assert.Contains("相关编译、测试或检查", RequestText(request));
+            Assert.DoesNotContain("验证未通过时不得声称完成", RequestText(request));
             Set(commands, h, "demo.style", "brief").GetAwaiter().GetResult();
             throw new InvalidOperationException("upstream failed");
         });
@@ -220,6 +248,8 @@ public sealed class PluginIntegrationTests : IDisposable
         using var state = JsonDocument.Parse(await client.GetStringAsync($"/sessions/{h.SessionId}/state"));
         Assert.Equal("detailed", state.RootElement.GetProperty("axes").GetProperty("demo.style").GetString());
         Assert.Contains("style=detailed", Strings(state.RootElement.GetProperty("slots")));
+        Assert.Contains("Explain the reasoning with concrete examples.", Strings(state.RootElement.GetProperty("slots")));
+        Assert.Contains("浮动上下文", Strings(state.RootElement.GetProperty("slots")));
         await app.StopAsync();
     }
 
@@ -235,7 +265,9 @@ public sealed class PluginIntegrationTests : IDisposable
     {
         public PluginIdentity Identity { get; } = new("demo", version);
         public IReadOnlyList<AxisDefinition> Axes { get; } = [new AxisDefinition
-        { Id = "demo.style", Label = "Style", Values = ["brief", "detailed"], DefaultValue = "brief" }];
+        { Id = "demo.style", Label = "Style", Values = ["brief", "detailed"], DefaultValue = "brief",
+            LevelDescriptions = new Dictionary<string, string>
+            { ["brief"] = "Keep the answer concise.", ["detailed"] = "Explain the reasoning with concrete examples." } }];
         public IReadOnlyList<AxisCapability> Capabilities => [AxisCapability.None];
         public Action<AxisSnapshot>? OnPrompt { get; set; }
         public int Calls { get; private set; }

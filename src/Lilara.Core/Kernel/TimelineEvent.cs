@@ -14,6 +14,7 @@ public enum Speaker
 [JsonDerivedType(typeof(MessageEvent), "message")]
 [JsonDerivedType(typeof(ToolResultEvent), "toolResult")]
 [JsonDerivedType(typeof(ReleaseEvent), "release")]
+[JsonDerivedType(typeof(ReclaimEvent), "reclaim")]
 public abstract record TimelineEvent
 {
     /// <summary>

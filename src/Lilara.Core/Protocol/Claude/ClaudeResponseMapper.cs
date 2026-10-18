@@ -35,6 +35,15 @@ public static class ClaudeResponseMapper
             Blocks = blocks,
             StopReason = stopReason,
             Refused = refused,
+            Usage = new TokenUsage
+            {
+                InputTokens = response.Usage.InputTokens,
+                OutputTokens = response.Usage.OutputTokens,
+                CacheReadTokens = response.Usage.CacheReadInputTokens,
+                CacheWriteTokens = response.Usage.CacheCreationInputTokens,
+            },
+            ReportedModel = response.Model,
+            ResponseId = response.ID,
         };
     }
 

@@ -13,15 +13,15 @@ namespace Lilara.Core.Tests;
 ///
 /// <para>⚠️ <b>它在 2026-10-11 之前是空集</b>：判据（`00` §5 的三态判定）写着，
 /// 而 `DependsOn` / `Fingerprint` 两个字段**只被写、不被读**——
-/// 全 `src/` 找不到一处比较它们的地方。这批补上了第一个消费者。
-/// ⚠️ 更准确地说：<b>「只回收过时的结果」在实现成「或上 N 保护带」之后才收得到东西</b>——
-/// 单靠点杀会**一条都收不了**，因为今天每一条结果都在保护带里（见 `Reclaim.Decide`）。</para>
+/// 全 `src/` 找不到一处比较它们的地方。这批补上了第一个消费者。</para>
 ///
-/// <para>⚠️ <b>断言落在<b>请求</b>上，不落在盘面上</b>：回收只换渲染、盘上一字不动
-/// （`01` §8.0.2 一 / 八）⇒ 盘面**永远**看不到回收的痕迹。与 `StepLagTests` 同一条纪律。</para>
+/// <para>⚠️ <b>2026-10-17 形状更正：点杀只在<b>开窗那一刻</b>解析</b>——渲染发生在每一步，
+/// 而回收改的是前缀中段（`00` §3：热路径「绝不事后清理」）。⇒ 本测试显式开窗
+/// （同 `session.gc` 的逻辑），并单独钉住「不开窗就不收」。</para>
 ///
-/// <para>⚠️ <b>不显式调 `Reclaim.Stale` / `Decide`</b>：那是被测物的内部动作。
-/// 本测试只做两件事：**让世界变一下**（改那个文件），然后看模型下一步收到了什么。</para>
+/// <para>⚠️ <b>断言落在<b>请求</b>上，不落在盘面上</b>：回收只换渲染、已有记录一字不动
+/// （`01` §8.0.2 一 / 八）⇒ 盘面只看得到**窗口记录**，看不到被收内容的痕迹。
+/// 与 `StepLagTests` 同一条纪律。</para>
 /// </summary>
 public class StaleTests : IDisposable
 {
@@ -69,20 +69,39 @@ public class StaleTests : IDisposable
         new(callId, "read", System.Text.Json.JsonSerializer.Serialize(new { path }));
 
     /// <summary>
+    /// 点杀用的「开窗」：<see cref="Reclaim.Resolve"/> 这一刻解析一次（距离 + 点杀），
+    /// 落成一条窗口记录——**这就是 `session.gc` 在做的事**（逻辑与 `CommandDispatcher` 相同，
+    /// 但这里不需要起一个控制面）。
+    ///
+    /// <para>⚠️ **不开窗就不回收**（2026-10-17）：渲染发生在每一步，而回收只许在失效窗口里
+    /// 改历史中段。⇒ 这条测试用它来**显式制造窗口**，与真实路径同形：
+    /// 解析 → 落盘 → 下一步渲染读它。</para>
+    /// </summary>
+    private void OpenWindow()
+    {
+        var timeline = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId);
+        var blobs = new BlobStore(_store.DataRoot);
+        var ids = Reclaim.Resolve(timeline, blobs,
+            new SessionToolContext(_handle.Spec.WorkingDirectory, blobs, timeline));
+        _store.AppendEvents(_handle.ProjectKey, _handle.SessionId,
+            [Reclaim.Window("test", ids, null)]);
+    }
+
+    /// <summary>
     /// ⚠️ **本批的核心一条**：模型读过 `a.txt`，之后那个文件**被改了** ⇒
-    /// 下一步的请求里那条结果换成注记。
+    /// **下一次开窗**之后，那条结果换成注记。
     ///
     /// <para>⚠️ <b>「被改了」由测试自己制造，而且这是忠实的</b>：现实里改它的是
     /// 另一个会话、或坐在编辑器前的用户——`01` §12.6 那张表最后一行写着
     /// 「人类编辑 / 进程外改动」正是检测层要兜的那一格。⇒ 这里**不通过 `update` 工具**去改，
     /// 就是为了测那一格；走工具改是另一条路径（`Reclaim.Stale` 对它同样成立）。</para>
     ///
-    /// <para>⚠️ **改在「第 2 步的模型调用期间」，不写在两步之间**——那是刻意的：
-    /// 这里要证的是「渲染读到的是**此刻**的磁盘，不是启动时那份」。写在两步之间的话，
-    /// 「判定被冻在步开始」与「判定根本没重算」这两种实现给的是**同一个观测**。</para>
+    /// <para>⚠️ <b>改在「第 2 步的模型调用期间」</b>：开窗发生在它之后，于是窗口里
+    /// 重读到的就是**此刻**的磁盘。⚠️ 而「不开窗就不收」由
+    /// <see cref="NoWindow_MeansTheChangedReadStaysAsItIs"/> 单独钉住。</para>
     /// </summary>
     [Fact]
-    public async Task ARead_WhoseFileWasChanged_RendersAsTheNoteOnTheNextStep()
+    public async Task ARead_WhoseFileWasChanged_RendersAsTheNoteAfterAWindow()
     {
         File.WriteAllText(Path.Combine(_work, "a.txt"), "原来的内容");
 
@@ -107,6 +126,9 @@ public class StaleTests : IDisposable
         });
         await _stepper.StepAsync(_handle, [], default);
 
+        // 开窗（= `session.gc`）：此刻解析，a.txt 已变 ⇒ 第一条结果进窗口。
+        OpenWindow();
+
         // 第 3 步：纯文本 ⇒ 这一趟的请求就是最终要断言的东西。
         _adapter.Reply("看完了。");
         await _stepper.StepAsync(_handle, [], default);
@@ -119,6 +141,40 @@ public class StaleTests : IDisposable
 
         // ⚠️ **反向**：原来那串内容**不在**请求里了——否则这条测的就不是「换掉了」。
         Assert.DoesNotContain("原来的内容", TextOf(sent), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ **没有窗口就不许收**——哪怕源已经被改过（2026-10-17，这条是「回收只发生在
+    /// 失效窗口」那个更正的直接证据）：模型第 2 步照常拿到原文。
+    ///
+    /// <para>⚠️ 缺了这条，「点杀判定在不在」与「回收发生在哪一刻」这两件事就分不开；
+    /// 而后者正是这次要修的那个缺陷（渲染每步都在，回收就每步都在 ⇒ 每步破缓存）。</para>
+    /// </summary>
+    [Fact]
+    public async Task NoWindow_MeansTheChangedReadStaysAsItIs()
+    {
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "原来的内容");
+
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, "看一眼", default);
+
+        var readId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
+
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "换过的内容");
+
+        // ⚠️ **不开窗**。
+        _adapter.Reply("看完了。");
+        await _stepper.StepAsync(_handle, [], default);
+
+        var sent = _adapter.Calls[^1].Timeline
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => r.Id == readId);
+
+        Assert.DoesNotContain("[已回收]", TextOf(sent), StringComparison.Ordinal);
+        Assert.Contains("原来的内容", TextOf(sent), StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -141,7 +197,9 @@ public class StaleTests : IDisposable
         var readId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
             .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
 
-        // 世界**没变**。
+        // 世界**没变**，再正经开一次窗——证明「不收」是判据的结果，不是「没开窗」。
+        OpenWindow();
+
         _adapter.Reply("看完了。");
         await _stepper.StepAsync(_handle, [], default);
 
@@ -174,6 +232,9 @@ public class StaleTests : IDisposable
             .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
 
         File.WriteAllText(Path.Combine(_work, "a.txt"), "换过的内容");
+
+        // 开窗（= `session.gc`）：点杀这一刻解析，a.txt 已变 ⇒ 进窗口。
+        OpenWindow();
 
         _adapter.Reply("嗯。");
         await _stepper.StepAsync(_handle, [], default);
@@ -218,8 +279,9 @@ public class StaleTests : IDisposable
         var lsId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
             .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
 
-        // 目录**真的**变了（多了一个文件）。
+        // 目录**真的**变了（多了一个文件）——再开窗，证明不收是判据的结果。
         File.WriteAllText(Path.Combine(_work, "b.txt"), "y");
+        OpenWindow();
 
         _adapter.Reply("看到了。");
         await _stepper.StepAsync(_handle, [], default);

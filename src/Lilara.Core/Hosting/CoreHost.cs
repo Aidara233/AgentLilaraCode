@@ -16,6 +16,7 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
 {
     private readonly SessionStore _store = new(dataRoot);
     private readonly ProviderStore _providers = new(dataRoot);
+    private readonly UsageStore _usage = new(dataRoot);
 
     /// <summary>
     /// **哪些会话现在真的有东西在替它往下走**（`01` §11.6）。
@@ -42,6 +43,7 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
 
     public SessionStore Store => _store;
     public ProviderStore Providers => _providers;
+    public UsageStore Usage => _usage;
     public string WorkingDirectory { get; } = workingDirectory;
 
     /// <summary>
@@ -195,7 +197,7 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
         {
             if (_steppers.TryGetValue(handle.SessionId, out var cached)) return cached;
 
-            var stepper = StepperResolver.Resolve(_store, _providers, handle.Spec.Model.ProviderId, Plugins);
+            var stepper = StepperResolver.Resolve(_store, _providers, handle.Spec.Model.ProviderId, Plugins, _usage);
             _steppers[handle.SessionId] = stepper;
             return stepper;
         }

@@ -10,6 +10,9 @@ public sealed record AxisDefinition
     public required string Label { get; init; }
     public required IReadOnlyList<string> Values { get; init; }
     public required string DefaultValue { get; init; }
+    /// <summary>可选的等级解释。宿主只把当前可见等级的解释注入浮动槽；注册时复制并冻结。</summary>
+    public IReadOnlyDictionary<string, string> LevelDescriptions { get; init; } =
+        System.Collections.Immutable.ImmutableDictionary<string, string>.Empty;
     /// <summary>false：仅供控制面显示和保存，不进入提示词回调的轴视图。</summary>
     public bool InContext { get; init; } = true;
 

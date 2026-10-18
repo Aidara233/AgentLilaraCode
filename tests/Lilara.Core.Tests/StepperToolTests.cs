@@ -315,24 +315,25 @@ public class StepperToolTests : IDisposable
         _adapter.ReplyWith(_ => Calls(("c1", "read", ReadArgs("src/big.cs"))));
         await _stepper.StepAsync(handle, "读", default);
 
-        // ⚠️ 保护带会让「唯一的这条」落在窗口内 ⇒ 得先垫几条可回收的结果，回收才碰得到它。
-        // （这也是真实形态：保护带本来就是「最近 N 条不动」。）
+        // ⚠️ **保护带会让「唯一的这条」落在窗口内** ⇒ 先垫四条结果，再**开一次窗**
+        // （= `session.gc`：解析一次，落成窗口记录）。2026-10-17 起回收只发生在窗口里。
         for (var i = 0; i < Reclaim.ProtectedRecentResults; i++)
         {
             _adapter.ReplyWith(_ => Calls(($"f{i}", "read", ReadArgs("src/big.cs"))));
             await _stepper.StepAsync(handle, [], default);
         }
 
-        // ⚠️ **回收是内存账**：先记下盘面的字节数，回收之后再核一遍。
+        var timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+        var blobs = new BlobStore(_store.DataRoot);
+        var ids = Reclaim.Resolve(timeline, blobs,
+            new SessionToolContext(handle.Spec.WorkingDirectory, blobs, timeline));
+        _store.AppendEvents(handle.ProjectKey, handle.SessionId, [Reclaim.Window("session.gc", ids, null)]);
+
+        // ⚠️ **窗口记录是唯一新增的那条**：已有记录一字不改。渲染本身也不许再写盘
+        // （回收只换注入）——所以先记下盘面，直接渲染一次后逐字节核一遍。
         var history = Path.Combine(_store.SessionDirectory(handle.ProjectKey, handle.SessionId), "history.jsonl");
         var before = File.ReadAllBytes(history);
-
-        // ⚠️ **回收是渲染的事——这里不用（也不该）显式触发它**：判定住在
-        // `TimelineRender.Render` 里，而它每次现算（2026-10-11 之前这里要手写一句
-        // `handle.SetReclaimed(…)`，那份内存账已经删掉）。
-        // ⚠️ 也就是说**当前这一条的时间线读出来时就已经收了**，不需要先设好再读。
-
-        // ⚠️ **回收只动注入、不动持久化**——盘面逐字节不变。
+        _ = TimelineRender.Render(_store, handle);
         Assert.Equal(before, File.ReadAllBytes(history));
 
         // 下一步的请求里：原文没了、注记在、`tool_use` 原样。

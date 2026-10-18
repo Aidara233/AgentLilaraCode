@@ -6,3 +6,15 @@ obj/
 *.tmp
 .claude/
 .superpowers/
+
+# ⚠️ 预编译产物：上面两条只覆盖 `bin/` / `obj/` 目录。手工 publish 到仓库内
+# （如 `pub/`）、或让依赖把 apphost/原生库落在别处时，这些二进制会**静默进暂存区**——
+# `git add -A`（本仓提交时用的就是它）不留痕迹。2026-10-17 发布前检查发现本机 `head/bin`
+# 下的旧产物能穿过前两条，补这一组兜底。
+*.exe
+*.dll
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+*.nupkg
+*.snupkg
