@@ -275,15 +275,22 @@ public abstract record CoreCommand
     /// 缺的那些会被如实写成「未回答」，而不是编一个空值（那是撒谎）。
     /// </param>
     /// <param name="Remember">
-    /// 记忆档位（`AskMemory` 的名字）。<c>null</c> = **只这一次**。⚠️ 只对
+    /// 记忆档位。<c>null</c> = **只这一次**。⚠️ 只对
     /// <see cref="Kernel.AskKind.Permission"/> 有意义——`Question` 的问**没有**记忆。
+    ///
+    /// <para>⚠️ <b>类型是枚举，不是字符串</b>（2026-10-18 改）：它曾经是 <c>string?</c>，而判据
+    /// 写的是 <c>== nameof(AskMemory.Tool)</c>（即 <c>"Tool"</c>）——线上所有生产方给的却是小写
+    /// <c>"tool"</c> ⇒ **整个功能从没生效过，且无报错**。改成枚举之后，线上拼法由
+    /// <see cref="Lilara.Core.Hosting.WireJson.Options"/> 的 <c>JsonStringEnumConverter</c>
+    /// 接管（camelCase），与 `/state` 的 <c>ask.remember</c> **同一个来源**——同一条纪律见
+    /// <c>WireEvent.ApprovalRequested</c> 的 <c>AskKind</c>。</para>
     /// </param>
     public sealed record ApprovalRespond(
         string SessionId,
         string AskId,
         string Outcome,
         IReadOnlyDictionary<string, string> Answers,
-        string? Remember = null) : CoreCommand;
+        Kernel.AskMemory? Remember = null) : CoreCommand;
 }
 
 /// <summary>

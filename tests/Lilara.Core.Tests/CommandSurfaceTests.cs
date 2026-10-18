@@ -98,13 +98,67 @@ public class CommandSurfaceTests
         }
     }
 
+    // ---- ②补：线上**确实读到了**那几个「键名与属性名不一致 / 曾经被漏读」的字段 ----
+    //
+    // ⚠️ **这条是本批（2026-10-18）的判据，修之前它红**。
+    //
+    // ② 只断类型，而「类型对、字段全是默认值」在它眼里**完全合格**——于是：
+    //   · `session.create` 的线上臂**根本没读 `preset`** ⇒ 头指定预设被静默丢弃；
+    //   · `session.configure` 读的是 `"model"`，而签名 / `/state` / 头发的都是 `modelId`
+    //     ⇒ 换模型被静默丢弃。
+    // 两处回执照样 `accepted:true`，**没有任何东西会报错**。
+    //
+    // ⚠️ 比的是**值**不是类型（同那条分隔符测试的分寸）：这里断言的就是「真的读到了」。
+    [Fact]
+    public void WireLine_ReadsTheFieldsWhoseKeyNamesDifferFromThePropertyNames()
+    {
+        var created = ControlServer.ParseCommand(JsonDocument.Parse(
+            """{"kind":"session.create","cwd":"E:/w","title":"t","preset":"task","askTimeoutMinutes":30}""")
+            .RootElement);
+        var create = Assert.IsType<CoreCommand.SessionCreate>(created);
+        Assert.Equal("E:/w", create.Cwd);
+        Assert.Equal("t", create.Title);
+        Assert.Equal("task", create.Preset);
+        Assert.Equal(30, create.AskTimeoutMinutes);
+
+        var configured = ControlServer.ParseCommand(JsonDocument.Parse(
+            """{"kind":"session.configure","sessionId":"s1","providerId":"p","modelId":"m","askTimeoutMinutes":5}""")
+            .RootElement);
+        var configure = Assert.IsType<CoreCommand.SessionConfigure>(configured);
+        Assert.Equal("p", configure.ProviderId);
+        Assert.Equal("m", configure.ModelId);
+        Assert.Equal(5, configure.AskTimeoutMinutes);
+    }
+
+    // ---- ②补之二：`remember` 的拼法**只有一个来源** ----
+    //
+    // ⚠️ 它曾经是 `string?`，解析层取原文、dispatcher 比 `nameof(AskMemory.Tool)`（`"Tool"`），
+    // 而线上所有生产方给的是 `"tool"` ⇒ **「记住这个工具」从没生效过**，且无报错。
+    // 现在类型是枚举、由 `WireJson.Options` 的转换器接管（与 `/state` 的 `ask.remember` 同源）。
+    // 这里钉两件事：**两种拼法都认**（大小写不敏感是 STJ 的默认），**乱值落回「只这一次」**。
+    [Theory]
+    [InlineData("\"tool\"", AskMemory.Tool)]
+    [InlineData("\"Tool\"", AskMemory.Tool)]
+    [InlineData("\"args\"", AskMemory.Args)]
+    [InlineData("\"Args\"", AskMemory.Args)]
+    [InlineData("null", null)]
+    [InlineData("\"nonsense\"", null)]
+    public void WireLine_RememberAcceptsTheWireSpellingAndFallsBackToNull(string json, AskMemory? expected)
+    {
+        var parsed = ControlServer.ParseCommand(JsonDocument.Parse(
+            $$"""{"kind":"approval.respond","sessionId":"s1","askId":"a1","outcome":"submit","remember":{{json}}}""")
+            .RootElement);
+
+        Assert.Equal(expected, Assert.IsType<CoreCommand.ApprovalRespond>(parsed).Remember);
+    }
+
     // 输入数据，**不是 `ParseCommand` 的复刻**——每种命令一个最小合法载荷。
     private static string WirePayload(string kind) => kind switch
     {
         "session.send" => """{"kind":"session.send","sessionId":"s1","blocks":[]}""",
         "claim.release" => """{"kind":"claim.release","sessionId":"s1","scope":["src/foo"]}""",
         "session.setAxis" => """{"kind":"session.setAxis","sessionId":"s1","axis":"safety","value":"prod"}""",
-        "session.configure" => """{"kind":"session.configure","sessionId":"s1","model":"m"}""",
+        "session.configure" => """{"kind":"session.configure","sessionId":"s1","modelId":"m"}""",
         // ⚠️ 预设这几条**不能走那个兜底载荷**：它会塞一个 `sessionId`，而这三条
         // 各自要的是 `id`（预设名）与 `content`。用兜底的话会漏测「真的读到了那两个键没有」。
         "preset.set" => """{"kind":"preset.set","id":"default","content":"你是助手"}""",

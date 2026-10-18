@@ -568,6 +568,41 @@ public class AskTests : IDisposable
     }
 
     /// <summary>
+    /// **`approval.respond` 的 `remember` 真的落成「工具级」记忆**——本批（2026-10-18）的判据，
+    /// 修之前它红。⚠️ 走的必须是**命令那条路**（`DispatchAsync`），不是直接写 `ApprovalStore`：
+    /// 缺陷正出在「线上拼法 ↔ dispatcher 判据」之间，而 `RememberTool_CoversAnyArgumentsOfThatTool`
+    /// 那种直接写库的测试**碰不到那一层**（它测的是 store，不是命令）。
+    ///
+    /// <para>⚠️ <b>缺陷形状</b>：`Remember` 曾经是 <c>string?</c>，dispatcher 比
+    /// <c>nameof(AskMemory.Tool)</c>（<c>"Tool"</c>），而线上所有生产方（`03` §3、头、控制台）
+    /// 给的都是 <c>"tool"</c> ⇒ 勾「记住这个工具」只写了一条 args 粒度的记忆，**且无任何报错**。
+    /// 头尤其自相矛盾：它把 `/state` 的 <c>ask.remember</c>（小写）原样发回。</para>
+    ///
+    /// <para>⚠️ <b>判据是「换个参数也放行」</b>——只断言「批过一条记忆」是分不出两档的
+    /// （两档都会写一条）。</para>
+    /// </summary>
+    [Fact]
+    public async Task RememberTool_FromTheCommand_CoversAnyArgumentsOfThatTool()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", """{"a":1}""")));
+
+        await StepperWith(_store, _adapter, [writer]).StepAsync(handle, "go", CancellationToken.None);
+        Assert.NotNull(handle.State.Ask);
+
+        var (dispatcher, _) = DispatcherFor(handle, writer);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ApprovalRespond(handle.SessionId, handle.State.Ask!.AskId, "submit",
+                new Dictionary<string, string> { ["decision"] = "allow" }, AskMemory.Tool),
+            "cmd-1", awaitCompletion: false, CancellationToken.None);
+
+        // ⚠️ 记忆在 `DispatchAsync` 里**同步**写（在排那一步之前）⇒ 这里不用等后台步。
+        var store = new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId);
+        Assert.True(store.Covers("write_thing", ApprovalStore.HashArgs("""{"totally":"different"}""")));
+    }
+
+    /// <summary>
     /// **键序不同 = 同一个请求**（`01` §3.8）。⚠️ <b>真模型实测逼出来的</b>（2026-10-11）：
     /// 同一个 `update` 调用，模型第一次发 <c>{"path":…,"old":…,"new":…}</c>、
     /// 重发时发 <c>{"new":…,"old":…,"path":…}</c> ⇒ 按原文哈希是两个指纹

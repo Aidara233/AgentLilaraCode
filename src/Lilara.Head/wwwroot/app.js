@@ -1167,7 +1167,11 @@ function renderModelPicker(spec) {
 
   const bind = (providerId, modelId) => {
     commandNow(crypto.randomUUID().slice(0, 8),
-      { kind: "session.configure", sessionId: current, providerId, model: modelId })
+      // ⚠️ 键名是 `modelId`，**不是** `model`（2026-10-18 修）。
+      // 核心曾经读 `"model"`，而 `03` §3 的签名与 `/state` 的 `spec.model.modelId` 都是 `modelId`
+      // ⇒ 头与文档一致、核心自成一格。现在核心认 `modelId`，这里跟着改；
+      // `provider.upsert` 的键仍叫 `model`（那是 `defaultModel`，不是同一个字段）。
+      { kind: "session.configure", sessionId: current, providerId, modelId })
       .then((r) => { if (!r.accepted) { note.textContent = "✗ " + r.reason; note.className = "note-bad"; } });
     // ⚠️ 改完**不**本地改显示：等核心的 `spec.changed`（那是真相）。
     // 本地先改的话，核心若拒绝，页面会先显示成功再被打脸。

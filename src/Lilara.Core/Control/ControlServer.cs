@@ -968,12 +968,18 @@ public sealed class ControlServer(
         var kind = payload.GetProperty("kind").GetString()!;
         return kind switch
         {
-            // 两个字段全走 Opt：**键缺失 = 「没给」**（回落规则在 dispatcher）。
+            // 三个字段全走 Opt：**键缺失 = 「没给」**（回落规则在 dispatcher）。
             // 用 GetProperty 会让「只起名、不选目录」这种常见形态抛 KeyNotFoundException。
             "session.create" => new CoreCommand.SessionCreate
             {
                 Cwd = Opt(payload, "cwd"),
                 Title = Opt(payload, "title"),
+                // ⚠️ **`preset` 必须在这里读**（2026-10-18 修）。它曾经缺席：控制台解析与
+                // dispatcher 都收这个字段，唯独线上这一臂不读 ⇒ 头发的 `preset` 被**静默丢弃**，
+                // 建出来的会话用默认提示词，而回执照样 `accepted:true`。
+                // `CommandSurfaceTests` 只断类型不断字段，所以那条守卫对这个洞是瞎的
+                // （现在 §② 的 `SessionCreate` 载荷带 `preset` 并断言值，见那里的注释）。
+                Preset = Opt(payload, "preset"),
                 // ⚠️ 数字不是字符串 ⇒ 走 OptNumber（`Opt` 只收字符串，拿它取数字会静默给 null）。
                 AskTimeoutMinutes = OptNumber(payload, "askTimeoutMinutes"),
             },
@@ -990,11 +996,15 @@ public sealed class ControlServer(
                 payload.GetProperty("axis").GetString()!,
                 payload.GetProperty("value").GetString()!),
             // 同 session.setAxis：线上解析是第三条线。
-            // providerId / model 走 Opt：**键缺失 = 「保留旧值」**（与 provider.upsert 同一条语义）。
+            // providerId / modelId 走 Opt：**键缺失 = 「保留旧值」**（与 provider.upsert 同一条语义）。
             // 用 GetProperty 会在头只想换模型、不提 provider 时抛 KeyNotFoundException。
+            // ⚠️ **线上键名是 `modelId`**（2026-10-18 修）。它曾经读 `"model"`，与
+            // `03` §3 的签名、`/state` 的 `spec.model.modelId` 都不一致 ⇒ 照文档写的客户端
+            // 发的 `modelId` 被静默当成「没给」，回执照样 `accepted:true` 而模型没换。
+            // （`provider.upsert` 的键仍叫 `model`——那是 provider 的 `defaultModel`，不是同一个字段。）
             "session.configure" => new CoreCommand.SessionConfigure(
                 payload.GetProperty("sessionId").GetString()!,
-                Opt(payload, "providerId"), Opt(payload, "model"),
+                Opt(payload, "providerId"), Opt(payload, "modelId"),
                 OptNumber(payload, "askTimeoutMinutes")),
             // 同 session.setAxis：线上解析是第三条线。
             // 只有 release、没有 acquire（头的认领走控制台）；字段名是 scope（数组），不是 path。
@@ -1053,7 +1063,18 @@ public sealed class ControlServer(
                 payload.GetProperty("askId").GetString()!,
                 payload.GetProperty("outcome").GetString()!,
                 OptStringMap(payload, "answers"),
-                Opt(payload, "remember")),
+                // ⚠️ `remember` 的类型是枚举（见 `ApprovalRespond.Remember` 的注释）：它曾经是一个
+                // 原样字符串、再在 dispatcher 里比 `nameof(...)`，两个拼法不一致 ⇒
+                // 「记住这个工具」**从没生效过**，且无报错。
+                // ⚠️ 不用 STJ 的 `Deserialize<AskMemory?>`：认不出的值它会**抛** ⇒ 整条命令变成
+                // 「命令形状不对」——而那条命令的其余字段都是好的，把一次「`remember` 写错了」
+                // 报成「命令写错了」是错方向的诊断。旧行为是「认不出 = 只这一次」，
+                // 方向安全（记忆更窄），这里保留它。
+                payload.TryGetProperty("remember", out var rm) && rm.ValueKind == JsonValueKind.String
+                    && Enum.TryParse<AskMemory>(rm.GetString(), ignoreCase: true, out var remembered)
+                    && Enum.IsDefined(remembered)
+                    ? remembered
+                    : null),
             _ => throw new ArgumentException($"认不出的命令 '{kind}'"),
         };
 

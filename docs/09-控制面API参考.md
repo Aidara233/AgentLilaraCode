@@ -1,6 +1,6 @@
 # 控制面 API 参考
 
-> **最后更新：未提交工作区（`b00835f` 之后的 dotnet 自检 / 投递截断 / `floating_context` 批，2026-10-18 核对）**
+> **最后更新：master `9efbe0a` + 本工作树（2026-10-18，三个线上键名缺陷已修）**
 >
 > 本文是**远程 API 的接口面**：HTTP 端点、WS 帧、命令、事件、快照字段。
 > 读者是**接核心的程序**（头、脚本、第三方客户端），不是读设计的开发者。
@@ -119,7 +119,7 @@
 
 ### 2.5 事件载荷
 
-以下是**核心 → 客户端**的全部事件（`WireEvent.cs:8-25`，17 个类型）。
+以下是**核心 → 客户端**的全部事件（`WireEvent.cs:8-28`，20 个类型）。
 所有事件都带判别式 `kind`；所有时间都是 ISO-8601 带时区（`DateTimeOffset`）。
 
 | `kind` | 载荷 | 发在哪条流 | 何时发 |
@@ -138,6 +138,9 @@
 | `session.deleted` | `sessionId` · `projectKey` | **只发项目流** | `session.delete` 成功 |
 | `session.reclaimed` | `sessionId` · `reason`（一句回执原话） | 会话流 | `session.gc`、询问超时收尾 |
 | `release.recorded` | `sessionId` · `id` · `scope` · `summary` · `at` | 会话流 | 模型侧 `release` 画了一条线 |
+| `tool.result.appended` | `sessionId` · `id` · `callId` · `blocks` · `at` | 会话流 | 工具结果落盘（一条结果一条事件） |
+| `usage.updated` | `sessionId` · `call`（`UsageCall`）· `summary`（`UsageSummary`） | 会话流 | 一次会话模型调用记账之后 |
+| `session.compaction.completed` | `sessionId` · `checkpointId` · `coveredThroughEventId` · `summaryTokens`（可空） | 会话流 | `session.compact` 完成 |
 | `approval.requested` | `sessionId` · `askId` · `askKind` · `items` · `remember` · `deadlineAt` | `approvals` 流 **+** 会话流 | 会话挂起等回答 |
 | `approval.resolved` | `sessionId` · `askId` · `outcome` | `approvals` 流 **+** 会话流 | 回答 / 作废 / 超时 / **顶替** |
 | `error` | `sessionId` · `message` | 会话流 | 业务失败（模型调用失败等） |
@@ -184,6 +187,23 @@
 - `id`：那条线在记录里的稳定 id。
 - `scope`：字符串数组（路径）。
 - `summary`：可空。
+
+**`tool.result.appended`**
+- `id`：这条结果在 `history.jsonl` 里的**记录 id**；`callId`：配对的协议 id。
+- `blocks`：结果的内容块（与 `/history` 里同一条的现有形态一致——可能是回收注记）。
+- ⚠️ **一条结果一条事件，不打包**。头按 `callId` 挂到前面那条 `toolUse` 下面，按 `id` 去重。
+- ⚠️ 它和 `message.appended` 是两件事：模型消息走后者，工具结果走这一条。之前只有前者，
+  所以实时流里工具结果看起来「没有下文」，只有重拉 `/history` 才出现。
+
+**`usage.updated`**
+- `call`：本次调用的 `UsageCall`（见 §3.14 的字段）。
+- `summary`：该会话的 `UsageSummary`（累计值）。
+- 每条会话流事件都可能来；只在这条会话的账本**真的多了**一条时发（`PublishLatestUsage`）。
+
+**`session.compaction.completed`**
+- `checkpointId`：压缩检查点的稳定 id。
+- `coveredThroughEventId`：这条检查点覆盖到的记录 id（此前的记录在后续渲染中被摘要替代）。
+- `summaryTokens`：摘要那次模型调用报的 `outputTokens`，可空（没报就是 `null` ⇒ 键不存在）。
 
 **`reset` / 重连**
 - 收到 `resync_required` ⇒ 该 topic 的旧订阅已经失聪。拉一次快照，再重新 `subscribe`。
@@ -477,6 +497,11 @@
 - **`highWater` 是 WS 游标**，`nextCursor` 是分页游标。别混。
 - **分页发生在**库解引用、回收注记替换、framing、内部事件过滤**之后** ⇒ 页边界是「渲染后的项」，
   不是 `history.jsonl` 的行。
+- ⚠️ **分页单位是「组」，不是单条**（2026-10-17）：核心把「模型消息 + 它发出的那些结果」
+  当成一组交给头（`GroupToolResults`）。一条调用与它的结果**不会被切到两页**
+  （切了头就配不上）。组内次序仍是「消息在前、结果按出现序在后」。
+  `rendered` 仍是**扁平数组**；分页只是按组切，客户端仍按 `callId` / `id` 自行组装。
+  `nextCursor` 指向组的第一条。
 - ⚠️ **`release` 项**只出现在这里，不进模型上下文。
 - ⚠️ 工具结果里 `blocks` 的 `store` 块只有地址，**没有内容**。取内容没有端点（见 §2.6）。
 - ⚠️ 用户能看到的历史是**不带点杀**的回收形态（`SessionQueries.HistoryOf` 的注释记着这条差额）。
@@ -574,7 +599,118 @@
   （`CommandDispatcher.ProviderIdRule`）。
 - 证据：`ControlServer.cs:497-510`。
 
-### 3.14 不存在的端点
+### 3.14 `GET /usage/calls?skip=0&limit=100`
+
+核心的模型调用账本（token 用量；**费用不在核心**）。
+
+```jsonc
+{
+  "asOf": "2026-10-18T09:00:00+08:00",
+  "skip": 0,
+  "limit": 100,
+  "total": 37,
+  "calls": [ /* UsageCall[]，见下 */ ]
+}
+```
+
+- `skip` 缺省 `0`（负数按 `0`）；`limit` 缺省 `100`，**夹在 `1..1000`**（越界不报错，夹到边界）。
+- `calls` 顺序 = `usage.jsonl` 的**文件序**（追加序，`UsageStore.ReadAll`）；`total` 是全部条数。
+
+**`UsageCall`**（`Storage/UsageStore.cs:65-82`）：
+
+```jsonc
+{
+  "callId": "…",
+  "projectKey": "…",              // 可空
+  "sessionId": "…",               // 可空（provider 探针没有）
+  "step": 3,                      // 可空
+  "purpose": "session",           // ⚠️ 今天只有三个字面量："session" | "probe" | "compaction"
+  "providerId": "local",
+  "modelId": "deepseek-flash",
+  "protocol": "claude-messages",
+  "startedAt": "…",
+  "endedAt": "…",                 // 可空（进行中 / 崩了）
+  "status": "completed",          // ⚠️ 今天只有 "completed" | "failed"
+  "usage": {                      // 可空（上游没报用量）
+    "inputTokens": 1200, "outputTokens": 300, "totalTokens": 1500,
+    "cacheReadTokens": 0, "cacheWriteTokens": 0, "reasoningTokens": 0,
+    "rawJson": "…"                // 可空：受限的原始 usage 摘要
+  },
+  "reportedModel": "…",           // 可空：上游自报的模型名
+  "responseId": "…",              // 可空
+  "requestFingerprint": "…"       // 可空
+}
+```
+
+- ⚠️ `usage` 为 `null` = **上游没报**，不是「0」。客户端不要把它当 0 累加。
+- 证据：`ControlServer.cs:448-461`。
+
+### 3.15 `GET /usage/summary`
+
+全部调用的 token 总览（**没有过滤参数**——按会话汇总用 §3.16）。
+
+```jsonc
+{
+  "calls": 37,
+  "callsWithKnownInput": 35,
+  "callsWithKnownOutput": 35,
+  "callsWithUnknownUsage": 2,
+  "inputTokens": 41000,
+  "outputTokens": 9000,
+  "cacheReadTokens": 12000,
+  "cacheWriteTokens": 3000,
+  "reasoningTokens": 4000,
+  "byProvider": [ { "key": "local", "calls": 37, "callsWithUnknownUsage": 2,
+                    "inputTokens": 41000, "outputTokens": 9000,
+                    "cacheReadTokens": 12000, "cacheWriteTokens": 3000, "reasoningTokens": 4000 } ],
+  "byModel":    [ /* 同形状，key = modelId */ ]
+}
+```
+
+- ⚠️ **汇总的数字是可空的**（`long?`）：一个 token 都没报过 ⇒ `null`，不是 `0`。
+- `byProvider` / `byModel` 按 key 的 **ordinal 升序**。
+- 证据：`ControlServer.cs:463-464`；`Storage/UsageStore.cs:104-151`。
+
+### 3.16 `GET /sessions/{id}/usage`
+
+```jsonc
+{ "sessionId": "…", "projectKey": "…", "summary": { /* UsageSummary，同 §3.15 */ },
+  "calls": [ /* 该会话的 UsageCall[]，按 startedAt 升序 */ ] }
+```
+
+- 不存在 ⇒ **404**。
+- ⚠️ 它**不激活会话**（走 `Store.FindSession`，不是 `TryFind`）⇒ 没有副作用。
+- 证据：`ControlServer.cs:466-477`。
+
+### 3.17 `GET /sessions/{id}/context`
+
+**最近一次实际请求的输入 token**（上下文长度的事实来源）。
+
+```jsonc
+{
+  "sessionId": "…",
+  "projectKey": "…",
+  "latest": {                       // 没有任何一次报了用量的调用 ⇒ null（键被省略）
+    "callId": "…",
+    "startedAt": "…", "endedAt": "…",
+    "modelId": "deepseek-flash",
+    "protocol": "claude-messages",
+    "inputTokens": 1200,
+    "source": "reported",           // 或 "unknown"（那次调用没报）
+    "requestFingerprint": "…"       // 可空
+  },
+  "preview": null                   // 本地 tokenizer 预估；**今天恒为 null**
+}
+```
+
+- ⚠️ `preview` 是显式 `null`（键**存在**，值为 `null`），不是省略——两者在线上可分辨。
+  今天它恒为 `null`：预估未实现。
+- ⚠️ `latest` 只取**报了用量**的最近一条；`source` 因此今天恒是 `"reported"`
+  （`"unknown"` 那条分支实际够不着，留着是给将来）。
+- 不存在 ⇒ **404**；不激活会话。
+- 证据：`ControlServer.cs:479-500`。
+
+### 3.18 不存在的端点
 
 | 路径 | 状态 |
 |---|---|
@@ -620,13 +756,13 @@
 |---|---|---|
 | `cwd` | 否 | 工作目录（绝对或相对核心的工作目录）。决定会话属于哪个项目。**不存在 ⇒ rejected** |
 | `title` | 否 | 会话名。只在这里写一次，**此后没有改名命令** |
-| `preset` | 否 | 系统提示词预设 id。**⚠️ 今天线上会被静默丢弃（见 §7 #1）** |
+| `preset` | 否 | 系统提示词预设 id。保存的是**引用**；文件不存在不报错（渲染回落内置模板） |
 | `askTimeoutMinutes` | 否 | 询问最多等多少**分钟**，必须 > 0；不给 = 不超时 |
 
 - 成功回执带 `sessionId`；`note` 是新会话的 `projectKey`。
 - 没有提供商 ⇒ rejected「先配提供商」。
 - ⚠️ 本命令**没有** `projectKey` 参数（键推不回目录）。
-- 证据：`ControlServer.cs:863-869`；`CommandDispatcher.cs:577-625`。
+- 证据：`ControlServer.cs:973-984`；`CommandDispatcher.cs:577-625`。
 
 #### `session.activate`
 
@@ -720,14 +856,14 @@
 #### `session.configure`
 
 ```jsonc
-{ "kind": "session.configure", "sessionId": "s1", "providerId": "local", "model": "deepseek-flash",
+{ "kind": "session.configure", "sessionId": "s1", "providerId": "local", "modelId": "deepseek-flash",
   "askTimeoutMinutes": 30 }
 ```
 
 | 键 | 必给 | 语义 |
 |---|---|---|
 | `providerId` | 否 | 换绑供应商；省略 = 保留 |
-| **`model`** | 否 | 换模型；省略 = 保留。⚠️ **键名是 `model`，不是 `modelId`**（见 §7 #3） |
+| `modelId` | 否 | 换模型；省略 = 保留。⚠️ **键名是 `modelId`**，与 `03` §3 的签名、`/state` 的 `spec.model.modelId` 一致。（`provider.upsert` 的键仍叫 `model`——那是 provider 的 `defaultModel`，不是同一个字段。） |
 | `askTimeoutMinutes` | 否 | 改询问超时，必须 > 0 |
 
 - 三个都没给 ⇒ rejected。
@@ -736,7 +872,7 @@
 - 真的变了才发 `spec.changed`；没变也回 `accepted:true`（`note: null`）。
 - 成功 `note` 是 `"{providerId} / {modelId}"`。
 - ⚠️ **没有「取消询问超时」的入口**（`askTimeoutMinutes` 只能设成正数，不能设回「不超时」）。
-- 证据：`ControlServer.cs:885-888`；`CommandDispatcher.cs:1176-1265`。
+- 证据：`ControlServer.cs:1005-1011`；`CommandDispatcher.cs:1176-1265`。
 
 #### `session.gc`
 
@@ -744,8 +880,24 @@
 { "kind": "session.gc", "sessionId": "s1" }
 ```
 
-回收的**观察口**：立刻算一次、说一句，发 `session.reclaimed`。磁盘一字不动。
-⚠️ 它报的条数**小于等于**模型实际会收到的回收量（不含点杀）。证据：`CommandDispatcher.cs:660-706`。
+**开一次回收窗口**（2026-10-17 起）：解析一次判据（距离 + 点杀），落一条 `ReclaimEvent` 记录，
+发 `session.reclaimed`，`note` 说清结果（「回收了 N 条结果」/「没有可回收的结果…」）。
+⚠️ 渲染**不再每次现算**——没有窗口就不回收（那条路曾让每步都改写前缀、缓存连续失效）。
+证据：`CommandDispatcher.cs:705-746`。
+
+#### `session.compact`
+
+```jsonc
+{ "kind": "session.compact", "sessionId": "s1" }
+```
+
+把此前的上下文压成一条摘要检查点。完成时发 `session.compaction.completed`。
+
+- 以下任一 ⇒ **rejected**：会话在跑 / 在等回答 / 队列非空（先推进再压）。
+- 回执立刻到，压缩在后台跑；完成或失败都经事件（失败发 `error`）。
+- 成功 `note` 是 `"已压缩至 {coveredThroughEventId}。"`。
+- ⚠️ 压缩会**破前缀**（摘要替代了原来的中段）——这是它唯一的目的，也是它的代价。
+- 证据：`ControlServer.cs:1027-1028`；`CommandDispatcher.cs:740-850`。
 
 #### `preset.set` / `preset.list` / `preset.delete`
 
@@ -836,63 +988,68 @@
 - `outcome:"cancel"` ⇒ 作废这次询问，落拒绝结果，不续跑。
 - 没有询问在等 / `askId` 对不上 ⇒ rejected。
 - 已过 `deadlineAt` ⇒ 答案**不采用**，按超时处理。
-- ⚠️ **`remember` 的拼法有缺陷**（§7 #2）：核心认的是 `"Tool"`（PascalCase），
-  客户端按文档发 `"tool"` 只会写一条「只这一次」的记忆。发 `"Tool"` 才能拿到全工具放开。
+- ⚠️ **`remember` 认 `"args"` / `"tool"`（小写，线上契约），也兼容 `"Args"` / `"Tool"`
+  （大小写不敏感）**。认不出的值按「只这一次」处理——**不**拒绝整条命令（旧行为，方向安全）。
 - `answers` 里的键除 `decision` / `arguments` 外，按**问题 id**（`items[].id`）取值；
   `submit` 时允许缺项，缺的会被写成「未回答」，不会编一个空值。
-- 证据：`ControlServer.cs:939-944`；`CommandDispatcher.cs:1536-1752`。
+- 证据：`ControlServer.cs:1061-1076`；`CommandDispatcher.cs:1536-1752`。
 
 ## 5. 客户端校验清单
 
 按这个顺序核，能挡住绝大多数「看着对、实际错」的接入：
 
 1. `subscribe` 用的是 `{kind:"subscribe", topic, since}`，不是 `hello`。
-2. 事件按 `payload.kind` 分派；`message.appended` 按 `historyId` 幂等。
+2. 事件按 `payload.kind` 分派；`message.appended` 按 `historyId` 幂等，
+   `tool.result.appended` 按 `id` 幂等。
 3. `ack.accepted:true` 之后**仍然**要处理 `error` 事件。
 4. `session.archive` 的 `archived` 发**真布尔**，别发字符串。
-5. `session.configure` 的模型键是 `model`。
-6. `approval.respond` 的授权判决放在 `answers.decision`（`"allow"`），并且
-   ⚠️ `remember` 要发 `"Tool"` 才能拿到工具级放开（§7 #2）。
+5. `session.configure` 的模型键是 **`modelId`**。
+6. `approval.respond` 的授权判决放在 `answers.decision`（`"allow"`），
+   `remember` 发 `"tool"` 就是工具级放开。
 7. `GET /sessions` 的 `ask` 空值是 `{}`，判据是 `ask?.askId`；`title` 可能整个不存在。
 8. `GET /directories` 的 `error` 成功时是显式 `null`，不是省略。
-9. `GET /sessions/{id}/history` 的 `nextCursor` 到头时是 `""`。
+9. `GET /sessions/{id}/history` 的 `nextCursor` 到头时是 `""`；
+   `GET /sessions/{id}/context` 的 `preview` 今天恒为 `null`（键在）。
 10. 收到 `resync_required` ⇒ 拉快照、重新 `subscribe`。
+11. 用量里的 `null` **不是 0**：`usage` / 汇总里的 token 可为 `null`（上游没报），别当零累加。
 
 ## 6. 与其它文档的差异（本文覆盖它们）
 
 | 位置 | 写的 | 实际 |
 |---|---|---|
 | `03` §6 `/history`「分页未实现」、§11「零个 `Request.Query`」 | 无分页 | 有 `limit` / `before` / `hasMore` / `nextCursor`（§3.8） |
-| `03` §11「11 个端点」、§7「11 个…」 | 11 | **13** 个 `MapGet` |
-| `03` §4.2 事件载荷表 | 14 个事件 | 缺 `session.reclaimed`、`release.recorded`，缺 `message.appended.historyId` |
-| `03` §4「已上线」表 | 15 个事件名 | 17 个类型（`WireEvent.cs:8-25`） |
-| `03` §6「13 个 `GET`」那一行 | 13 | ✅（本文核对时是 13） |
+| `03` §6 端点清单 | 缺 4 条 usage / context | 实际共 **17** 个 `MapGet`（§3.14–§3.17 是新的四条） |
+| `03` §4.2 事件载荷表 | 缺新事件 | 缺 `session.reclaimed`、`release.recorded`、`tool.result.appended`、`usage.updated`、`session.compaction.completed`，缺 `message.appended.historyId` |
+| `03` §4「已上线」表 | 20 个事件名 | 20 个类型（`WireEvent.cs:8-28`）✅ 数对，但 §4.2 载荷表没跟上 |
 | `03` §7「hello(lastSeq)」 | 有这个帧 | ❌ 不存在（§2.2） |
 | `03` §8.1「控制台够不到 `session.start`」 | 旧 | ✅ 2026-10-12 已补 |
 | `03` §314「审批这条流是空的」 | 空 | 同一页三行前刚说它有生产者；实际有（§2.3） |
+| `03` §6 `/sessions/{id}/history` 注释 | 「把当前可渲染的全给我」 | 已分页（§3.8） |
 | `实现现状.md` §五 ④「`/history` 无分页」 | 无分页 | 同第一条 |
 
-## 7. 已知缺陷（会影响客户端写法）
+## 7. 已知缺陷
 
-以下三条是**代码里的真缺陷**，本文按实况记录，不按设计意图写。
+> ⚠️ **2026-10-18：下面三条都已修复**（同一次提交里配了会红的守卫）。
+> 留在这里是因为**线上契约变过**——升级之前写的客户端可能还按旧拼法发。
 
-1. **`session.create` 的 `preset` 在线上被静默丢弃**（`ControlServer.cs:863-869` 没读这个键）。
-   控制台解析有（`CoreCommandParser.cs:505`），dispatcher 也存
-   （`CommandDispatcher.cs:606`），只有线上这一条断了。
-   ⇒ 客户端通过 WS 建会话时**无法指定系统提示词预设**；能用的路只有控制台 `session create --preset`。
-   `CommandSurfaceTests` 只断类型不断字段，所以全绿。
+1. ~~**`session.create` 的 `preset` 在线上被静默丢弃**~~ ✅ **已修**：
+   `ParseCommand` 的 `session.create` 臂补读 `preset`（`ControlServer.cs:973-984`）。
+   守卫：`CommandSurfaceTests.WireLine_ReadsTheFieldsWhoseKeyNamesDifferFromThePropertyNames`。
+   ⚠️ 缺陷曾经存在的原因值得记：`CommandSurfaceTests` 的 ② 只断**类型**，
+   不断字段 ⇒「类型对、字段全默认」在它眼里完全合格。
 
-2. **`approval.respond` 的 `remember` 线上拼法与文档/vs 客户端不一致**。
-   核心判的是 `c.Remember == nameof(AskMemory.Tool)`（即 `"Tool"`，`CommandDispatcher.cs:1637-1640`），
-   而 `03` §3、`/state` 的 `ask.remember`、控制台（`CoreCommandParser.cs:424-431` 的 `nameof`）
-   与头的代码（`app.js:1918`）给的都是 `"tool"`。
-   ⇒ 头勾「本会话内不再问某工具」实际只写了一条 `args` 粒度的记忆。
-   ⚠️ 本文 §4.2 按**代码实况**写「发 `"Tool"` 才能生效」，同时把这条列在这里——
-   修代码之后这里要一起改。
+2. ~~**`approval.respond` 的 `remember` 拼法与客户端不一致**~~ ✅ **已修**：
+   `Remember` 从 `string?` 改成 `AskMemory?`，线上解析走枚举（大小写不敏感），
+   控制台也改成枚举（`CoreCommandParser.cs`）。线的契约是 `"args"` / `"tool"`。
+   守卫：`CommandSurfaceTests.WireLine_RememberAcceptsTheWireSpellingAndFallsBackToNull`
+   + `AskTests.RememberTool_FromTheCommand_CoversAnyArgumentsOfThatTool`。
+   ⚠️ 修复之前**头的「记住这个工具」从没生效过**（它把 `/state` 里的小写值原样发回，
+   核心却比 `nameof(...)` 的 `"Tool"`），且全程无报错。
 
-3. **`session.configure` 的模型键名是 `model`，不是 `modelId`**。
-   `03` §3 的签名写 `modelId?`，线上读的是 `"model"`（`ControlServer.cs:887`），
-   而 `/state` 的 `spec` 里同一件事叫 `modelId`。按文档写客户端的会静默丢掉模型选择。
+3. ~~**`session.configure` 的模型键名是 `model`，不是 `modelId`**~~ ✅ **已修**：
+   线上读 `modelId`（`ControlServer.cs:1005-1011`），头也跟着改（`app.js` 的 `bind`）。
+   守卫同上第一条。⚠️ `provider.upsert` 的键**仍然叫 `model`**（那是 `defaultModel`）——
+   两条命令的键名不同是**有意的**，别为了「一致」把它改掉。
 
 ## 8. 这份文档怎么保持不过期
 
