@@ -879,12 +879,11 @@ public sealed class Stepper(
     }
 
     /// <summary>
-    /// **这一步没有模型回复**——答复那条路不调模型（用户答完是核心自己往下走）。
+    /// **这一步没有模型回复**——答复路径先把用户的选择变成 `tool_result`，再由
+    /// `CommandDispatcher` 安排下一步模型调用。
     ///
-    /// <para>⚠️ 它不是一个「空回复」的占位：<see cref="StepOutcome.Reply"/> 那一格
-    /// 被读的地方只有 `CommandDispatcher`（发 `message.appended` 与判循环），
-    /// 而这两个判断都按「**没有模型消息**」处理才是对的。⇒ 用一个**说得出名字**的
-    /// 常量，而不是在调用点 `null!` 或者现造一个空 `ModelReply`。</para>
+    /// <para>它不是一个「空回复」的占位：<see cref="StepOutcome.Reply"/> 只用于本步的
+    /// 事件收尾；恢复后的续跑由调用方按显式的恢复标志触发，而不是靠伪造 `tool_use`。</para>
     /// </summary>
     private static readonly ModelReply NoReply = new()
     {

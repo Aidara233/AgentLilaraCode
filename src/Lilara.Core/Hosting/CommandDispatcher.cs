@@ -993,6 +993,7 @@ public sealed class CommandDispatcher(
         // ⚠️ 声明在 try **外面**：循环的续推发生在 finally 之后（那边得先 `ExitStep`），
         // 所以结果要活过 try 这个作用域。
         ModelReply? reply = null;
+        var resumed = false;
 
         // ⚠️ **摘槽排在这里**（2026-10-12 打断批）——不是因为它必须早于下面那把闸
         // （**调用方已经拿过 `_step` 那把标志了**，所以这一趟本来就是独占的），
@@ -1018,6 +1019,7 @@ public sealed class CommandDispatcher(
 
             if (pending is not null)
             {
+                resumed = true;
                 // ---- 答复之后直接执行（`01` §3.8）----
                 //
                 // ⚠️ **它走的仍是这一步的整条仪式**（闸 / `step.begin` / 事件 / 落盘 / 循环续推）
@@ -1026,8 +1028,7 @@ public sealed class CommandDispatcher(
                 step = await _resolveStepper(handle).ResumeAsync(
                     handle, pending.Calls, pending.Reply, stepCts.Token, pending.Paused);
 
-                // ⚠️ 答复那条路**不发模型消息**（没有模型消息可发）——`ResumeAsync` 交回的
-                // `Reply` 是那个「说得出名字的空回复」，喂给下面的事件与循环判断正好。
+                // ⚠️ 恢复步本身不发模型消息；它先落工具结果，随后由循环尾部安排模型消费结果。
                 reply = step.Reply;
                 replyForLoop = step.Reply;
             }
@@ -1154,10 +1155,44 @@ public sealed class CommandDispatcher(
         // ⇒ **那个会话在用户答完之前一点都推不动**，而它当时看起来完全正常。
         //
         // ⇒ 判据是**状态**，不是「回复里有没有 tool_use」：挂起是一种**刻意的停顿**，
-        // 而循环的继续权归「等到了回答」那个时刻（`HandleApprovalRespond` 里那次续跑）。
+        // 而恢复结果已配对后由恢复路径显式安排模型消费。
         if (handle.State.Status == SessionStatus.WaitingForInput) return reply;
 
+        // 成功恢复后，`ResumeAsync` 已经把用户答复/批准后的工具结果落盘；模型必须再读这条
+        // `tool_result` 才能继续自己的工作。用户答复重置连续调用计数；恢复期间若再次挂起则停止。
+        if (resumed)
+            return await ContinueAfterResumeAsync(handle, throwOnFailure);
+
         return await ContinueIfToolCalledAsync(handle, reply, throwOnFailure);
+    }
+
+    /// <summary>
+    /// 答复已经被转换成工具结果（权限批准还可能已经执行工具），现在让模型消费它。
+    /// 这不是工具循环：恢复步没有模型回复，续跑必须无条件发生，除非恢复又挂起。
+    /// </summary>
+    private async Task<ModelReply?> ContinueAfterResumeAsync(
+        SessionHandle handle, bool throwOnFailure)
+    {
+        if (handle.State.Status == SessionStatus.WaitingForInput)
+            return null;
+
+        if (handle.ConsecutiveToolSteps >= MaxConsecutiveToolSteps)
+        {
+            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                new WireEvent.Error(handle.SessionId,
+                    $"连续 {MaxConsecutiveToolSteps} 步都在调工具，已停下——这多半是循环打转（`01` §6.2 的熔断）。"));
+            return null;
+        }
+
+        if (!handle.TryEnterStep()) return null;
+
+        handle.BumpToolStep();
+        if (throwOnFailure)
+            return await RunStepAsync(handle, CancellationToken.None, throwOnFailure: true);
+
+        _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
+            CancellationToken.None);
+        return null;
     }
 
     /// <summary>
@@ -1849,6 +1884,7 @@ public sealed class CommandDispatcher(
                 : [.. Stepper.Amended(waiting, paused, edited)];
 
             handle.QueueResume(new SessionHandle.PendingResume(calls, reply, paused));
+            handle.ResetToolSteps();
             ClearPause(handle);
 
             _bus.Publish(EventBus.SessionTopic(c.SessionId),

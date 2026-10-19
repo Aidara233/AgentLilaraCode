@@ -387,6 +387,7 @@ public class AskTests : IDisposable
         var handle = NewSession();
         var writer = new CountingWriter();
         _adapter.ReplyWith(_ => Calls(("c1", "write_thing", """{"a":1}""")));
+        _adapter.Reply("已按要求完成。", "end_turn");
 
         await StepperWith(_store, _adapter, [writer])
             .StepAsync(handle, "go", CancellationToken.None);
@@ -403,6 +404,11 @@ public class AskTests : IDisposable
         await WaitUntil(() => writer.Runs > 0);
 
         Assert.Equal(1, writer.Runs);        // ⚠️ 真的跑了，而且只跑一次
+        await WaitUntil(() => _adapter.Calls.Count >= 2);
+
+        var resumedTimeline = _adapter.Calls[1].Timeline;
+        Assert.Contains(resumedTimeline,
+            e => e is TimelineEvent.ToolResultEvent r && r.CallId == "c1");
 
         // 那条 `tool_use` 配上了——而这就是「不悬空」的全部内容。
         var results = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
@@ -491,12 +497,12 @@ public class AskTests : IDisposable
     }
 
     /// <summary>
-    /// **`ask`（问意见）批准之后不跑任何工具**——答案是内容，工具一个字都不碰。
-    /// ⚠️ 它与上面那几条是**两个 Kind 的两条路**，别混：授权那条跑，
-    /// 提问那条落用户给的答案（`01` §3.8 的判据是「答完谁动手」）。
+    /// **`ask` 的回答先落成 `tool_result`，再让模型继续**——答案是内容，工具本身不再执行。
+    /// ⚠️ 它与权限批准是两条路：授权那条先执行原工具，提问这条只合成结果；两者都要
+    /// 把结果交回模型，否则模型看不到用户选择，会话会在回答后悄悄停住。
     /// </summary>
     [Fact]
-    public async Task AnsweringAQuestion_RecordsTheAnswerWithoutRunningAnything()
+    public async Task AnsweringAQuestion_RecordsTheAnswerAndContinuesTheModel()
     {
         var handle = NewSession();
         var writer = new CountingWriter();
@@ -514,6 +520,8 @@ public class AskTests : IDisposable
             Refused = false,
         });
 
+        _adapter.Reply("收到，使用 Markdown。", "end_turn");
+
         await StepperWith(_store, _adapter, [ask, writer])
             .StepAsync(handle, "go", CancellationToken.None);
         Assert.NotNull(handle.State.Ask);
@@ -530,14 +538,17 @@ public class AskTests : IDisposable
             .OfType<TimelineEvent.ToolResultEvent>()
             .Any(r => string.Concat(r.Content.OfType<Block.TextBlock>().Select(b => b.Text)).Contains("fmt")));
 
-        // ⚠️ **核心自己把答案拼进去，不经过模型**（这正是这一批的重点之一）。
-        Assert.Contains("fmt: Markdown", LastResultText(handle));
+        await WaitUntil(() => _adapter.Calls.Count >= 2);
+
+        // ⚠️ 第二次请求才是模型真正消费 `tool_result` 的地方。
+        Assert.Contains(_adapter.Calls[1].Timeline,
+            e => e is TimelineEvent.ToolResultEvent r
+                && r.CallId == "c1"
+                && string.Concat(r.Content.OfType<Block.TextBlock>().Select(b => b.Text))
+                    .Contains("fmt: Markdown"));
         Assert.Equal(0, writer.Runs);
 
-        // ⚠️ **而且没有多调一次模型**——那条路**只有一次**模型调用（最开始那一步）。
-        // 这一格是这条测试真正的判据：答复之后核心直接往下走，
-        // 旧行为（落一句正文 + 安排下一步）会**再调一次模型**去把答案转述出来。
-        Assert.Single(_adapter.Calls);
+        Assert.Equal(2, _adapter.Calls.Count);
     }
 
     /// <summary>
