@@ -419,7 +419,7 @@ public static class CoreCommandParser
         if (outcome is null) return (null, usage);
 
         var answers = new Dictionary<string, string>(StringComparer.Ordinal);
-        string? remember = null;
+        AskMemory? remember = null;
 
         if (string.Equals(verb, "allow", StringComparison.OrdinalIgnoreCase)) answers["decision"] = "allow";
         if (string.Equals(verb, "deny", StringComparison.OrdinalIgnoreCase)) answers["decision"] = "deny";
@@ -434,8 +434,8 @@ public static class CoreCommandParser
 
                 remember = parts[++i].ToLowerInvariant() switch
                 {
-                    "args" => nameof(AskMemory.Args),
-                    "tool" => nameof(AskMemory.Tool),
+                    "args" => AskMemory.Args,
+                    "tool" => AskMemory.Tool,
                     _ => null,
                 };
 

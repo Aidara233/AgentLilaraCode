@@ -1834,10 +1834,12 @@ public sealed class CommandDispatcher(
             //
             // <para>⚠️ 判据是「记忆的粒度本来就是『这一次调用』」——用户裁定过
             // 「这一次」是**默认**。勾选**不是**「要不要记住」，是「要不要把粒度放宽到整个工具」。</para>
+            // ⚠️ `Remember` 是枚举（2026-10-18 改）。它曾经是字符串，判据写 `== nameof(AskMemory.Tool)`
+            // 即 `"Tool"`，而线上生产方给的是 `"tool"` ⇒ **「记住这个工具」从没生效过**
+            // （那头自己的复选框还把 `/state` 里的小写值原样发回，等于自我矛盾），且无报错。
             var store = new ApprovalStore(_host.Store.DataRoot, handle.ProjectKey, handle.SessionId);
             store.Add(new Approval(paused.ToolName, paused.ArgsHash,
-                ToolWide: c.Remember is { Length: > 0 } rm
-                          && string.Equals(rm, nameof(AskMemory.Tool), StringComparison.Ordinal),
+                ToolWide: c.Remember == AskMemory.Tool,
                 At: CoreClock.Now()));
 
             // ⚠️ **参数改写在这里生效**：把用户改的那份换进要执行的调用
