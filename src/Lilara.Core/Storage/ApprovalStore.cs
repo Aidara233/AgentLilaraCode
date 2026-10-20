@@ -96,8 +96,7 @@ public sealed class ApprovalStore(string dataRoot, string projectKey, string ses
     /// 那两串是**同一个请求**——模型重发一次、键序换一下，用户批的那一次**本来就该**
     /// 放行。按原文哈希的后果是**每次重发都重新问一遍**（实测：同一个 <c>update</c>
     /// 调用，第一次 <c>{"path":…,"old":…,"new":…}</c>、重发
-    /// <c>{"new":…,"old":…,"path":…}</c> ⇒ 两个哈希 ⇒ 批准**不生效** ⇒ 活锁，
-    /// 被 `MaxConsecutiveToolSteps` 兜住）。</para>
+    /// <c>{"new":…,"old":…,"path":…}</c> ⇒ 两个哈希 ⇒ 批准**不生效** ⇒ 活锁）。</para>
     ///
     /// <para>⚠️ <b>而它当年真正想防的那件事，靠的是另一条判据</b>：
     /// 「批的是这一次调用」表达在 <see cref="Approval.ToolWide"/> 上

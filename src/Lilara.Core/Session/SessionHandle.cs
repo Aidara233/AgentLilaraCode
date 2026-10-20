@@ -103,39 +103,6 @@ public sealed record SessionHandle
     public void ExitStep() => Volatile.Write(ref _step, 0);
 
     /// <summary>
-    /// **本条消息链上已经跑了几步**——`01` §6.2 的「最大连续步数熔断」要它。
-    ///
-    /// <para>⚠️ <b>它是内存账，不落盘</b>：熔断防的是**这一次**失控，而重启之后
-    /// 「链」已经断了（没有任何东西还在续跑）。落盘反而会带来一个新问题——
-    /// 崩在链中间留下的计数会让重启后的第一次 `send` **继承**一个陈旧的高度。</para>
-    ///
-    /// <para>⚠️ <b>必须在用户消息到达时归零</b>（<see cref="ResetToolSteps"/>）：
-    /// 不归零的话，一个会话用久了之后，「用户按了回车」与「模型自己续跑」就再也分不开，
-    /// 熔断会在用户**正常提问**时触发。⇒ 计数的语义是「**自上次用户输入以来**」。</para>
-    /// </summary>
-    private int _toolSteps;
-
-    public int ConsecutiveToolSteps => Volatile.Read(ref _toolSteps);
-
-    public void BumpToolStep() => Interlocked.Increment(ref _toolSteps);
-
-    public void ResetToolSteps() => Volatile.Write(ref _toolSteps, 0);
-
-    /// <summary>
-    /// **从盘上恢复链长**（`01` §6.2 的熔断）。
-    ///
-    /// <para>⚠️ <b>类型注释里那句「它是内存账，不落盘」只对了一半</b>，2026-10-12 更正：
-    /// 它<b>不单独落一个字段</b>——但它的值**能从 `state.Turn` 推出来**
-    /// （链长 = 那次崩的一步算进去之后的 `Turn`，而用户消息到达时归零）。
-    /// ⇒ 重启不恢复等于「熔断只在没重启过时有效」，那正是最容易失控的那种会话
-    /// （`Program.cs` 启动时**恰好会**把最近一个会话载入内存）。</para>
-    ///
-    /// <para>⚠️ <b>只升不降</b>（调用点判 `&lt;`）：内存里那个数更小，只可能是
-    /// 「刚归过零」或「还没跑到那么远」——两种情况都**不该**被盘上那个更大的数盖掉。</para>
-    /// </summary>
-    public void RestoreToolSteps(int turn) => Volatile.Write(ref _toolSteps, turn);
-
-    /// <summary>
     /// **答复那条路要交给下一步的东西**（`01` §3.8）。
     ///
     /// <para>⚠️ <b>为什么不走「重新入队」那条路</b>：答复不是一条用户消息

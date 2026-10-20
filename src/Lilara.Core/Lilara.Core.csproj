@@ -1,27 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>Lilara.Core</RootNamespace>
-    <AssemblyName>lilara</AssemblyName>
+    <AssemblyName>Lilara.Core</AssemblyName>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
-    <!-- ⚠️ 版本号保留 Task 7 里 `dotnet add package Anthropic` 写进去的那个，
-         不要改成浮动的 "*"。 -->
     <PackageReference Include="Anthropic" Version="12.51.0" />
   </ItemGroup>
   <ItemGroup>
-    <!-- ⚠️ 控制面要 Kestrel + WebSockets。用 FrameworkReference 而**不是 NuGet 包**：
-         共享框架随 SDK 装，不引入版本管理，目标机上只要有 ASP.NET Core Runtime 就能跑。
-         ⚠️ 代价两条，都实测过：
-           ① ASP.NET Core 的 analyzer 会进编译，而本项目 TreatWarningsAsErrors=true
-              ⇒ **预期第一把 build 冒新警告**。真被误伤就用点 ID 的 NoWarn + 写明理由，
-              别整体关 analyzer（那会让本项目最依赖的那条纪律失效）。
-           ② 框架依赖 ⇒ 目标机需要 **ASP.NET Core Runtime**（不只是 .NET Runtime），
-              且经 ProjectReference **测试项目也会被传染**。 -->
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
   <ItemGroup>

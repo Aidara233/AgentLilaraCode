@@ -156,6 +156,17 @@ public class CommandDispatcherTests : IDisposable
         releaseCompact.SetResult();
         await queuedEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Equal(3, calls);
+
+        // queuedEntered 在模型适配器返回前触发；等待 Stepper 完成最后的 state/history 写入，
+        // 再由 Dispose 删除临时目录，避免 Windows 上与后台写句柄竞争。
+        var projectKey = host.Store.FindSession(sessionId)!.Value.ProjectKey;
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (host.Store.ReadState(projectKey, sessionId).Turn < 2)
+        {
+            if (DateTime.UtcNow >= deadline)
+                throw new TimeoutException("后台 queued send 未完成持久化");
+            await Task.Delay(10);
+        }
     }
 
     // rejected 只用于「命令本身不合法」；会话不存在 ⇒ rejected（用户把 id 写错了）。

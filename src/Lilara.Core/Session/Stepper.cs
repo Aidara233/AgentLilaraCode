@@ -201,13 +201,6 @@ public sealed class Stepper(
             handle.Spec.SystemPromptPreset, handle.Spec.PremierPrompt,
             pluginAxes.Values, pluginPrompt);
 
-        // ⚠️ **熔断计数从盘上恢复**（`01` §6.2）。不恢复的话，一次重启就把它清零
-        // ⇒ 「自上次用户输入以来跑了多少步」这个语义**只在没重启过时成立**，
-        // 而失控的循环只要跨过一次重启就再也停不下来。
-        // ⚠️ 它**不是**陈旧值：`Turn` 是盘上的事实（那次崩的一步已经被 `Recovery` 计过），
-        // 而链长只在**用户消息到达时**归零（`HandleSessionSend`）——重启不改变这一点。
-        if (handle.ConsecutiveToolSteps < handle.State.Turn) handle.RestoreToolSteps(handle.State.Turn);
-
         // ⚠️ **引擎租约**：所有 `StepAsync` 调用都在 **_stepper 的会话内串行** 之内
         // （`CommandDispatcher` 的会话闸），所以这里不需要再同步。
         // ⚠️ 先记下落盘的那份，失败了原样放回去。

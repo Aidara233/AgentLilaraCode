@@ -21,7 +21,7 @@ public static class Reclaim
     /// 保护带：最近多少条工具结果**不动**（`01` §11.3「GC 保护窗」）。
     ///
     /// <para>⚠️ <b>这个数是占位的</b>——§11.3 只写了「最近 N 步不优化」，N 本身是**未定项**。
-    /// 取一个保守值并如实标注它是占位（同 `CommandDispatcher.MaxConsecutiveToolSteps`）。
+    /// 取一个保守值并如实标注它是占位（与 `ToolLimits` 那几个占位值同一条纪律）。
     /// 按「条数」而不是 token 的理由见 §11.3：保护带保护的是**动作链**，而 token 会不可预测地塌缩。</para>
     /// </summary>
     public const int ProtectedRecentResults = 4;

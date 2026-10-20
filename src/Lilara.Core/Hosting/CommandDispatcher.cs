@@ -937,11 +937,6 @@ public sealed class CommandDispatcher(
         });
         handle.Enqueue(s.Blocks);
 
-        // ⚠️ **用户输入把链长度归零**：熔断算的是「自上次用户输入以来跑了多少步」
-        // （见 `SessionHandle.ConsecutiveToolSteps` 的注释——不归零的话，
-        // 一个用久了的会话会在用户**正常提问**时触发熔断）。
-        handle.ResetToolSteps();
-
         // 事件从 dispatcher 发，不从 `Stepper` 发——否则控制台敲的那句话在头上看不见
         // （控制台不订阅，但它的命令照样产生事件；缺了它头的视图会静默少一步）。
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
@@ -1159,7 +1154,7 @@ public sealed class CommandDispatcher(
         if (handle.State.Status == SessionStatus.WaitingForInput) return reply;
 
         // 成功恢复后，`ResumeAsync` 已经把用户答复/批准后的工具结果落盘；模型必须再读这条
-        // `tool_result` 才能继续自己的工作。用户答复重置连续调用计数；恢复期间若再次挂起则停止。
+        // `tool_result` 才能继续自己的工作。恢复期间若再次挂起则停止。
         if (resumed)
             return await ContinueAfterResumeAsync(handle, throwOnFailure);
 
@@ -1176,17 +1171,8 @@ public sealed class CommandDispatcher(
         if (handle.State.Status == SessionStatus.WaitingForInput)
             return null;
 
-        if (handle.ConsecutiveToolSteps >= MaxConsecutiveToolSteps)
-        {
-            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                new WireEvent.Error(handle.SessionId,
-                    $"连续 {MaxConsecutiveToolSteps} 步都在调工具，已停下——这多半是循环打转（`01` §6.2 的熔断）。"));
-            return null;
-        }
-
         if (!handle.TryEnterStep()) return null;
 
-        handle.BumpToolStep();
         if (throwOnFailure)
             return await RunStepAsync(handle, CancellationToken.None, throwOnFailure: true);
 
@@ -1198,12 +1184,11 @@ public sealed class CommandDispatcher(
     /// <summary>
     /// 这一步的模型调了工具吗？调了就**接着推下一步**。
     ///
-    /// <para>⚠️ <b>三个提前返回，每条都有理由</b>：</para>
+    /// <para>⚠️ <b>两个提前返回，每条都有理由</b>：</para>
     /// <list type="number">
     ///   <item><b>没调工具</b> ⇒ 循环正常结束（这是绝大多数情形）。</item>
     ///   <item><b>没拿到那把标志</b> ⇒ 已经有别的推进在排队了。⚠️ **不重新入队**：
     ///   队列里已经有东西（那条推进就是为此排的），再塞一次等于凭空多推一步。</item>
-    ///   <item><b>撞上熔断</b> ⇒ 见 <see cref="MaxConsecutiveToolSteps"/>。</item>
     /// </list>
     ///
     /// <para>⚠️ <b>不重入队也要推</b>：`启动(s)` 的判据里「队列非空」是**必要条件**，
@@ -1220,20 +1205,7 @@ public sealed class CommandDispatcher(
     {
         if (!reply.Blocks.OfType<Kernel.Block.ToolUseBlock>().Any()) return reply;
 
-        // ⚠️ **熔断的阈值是占位的**（`01` §14 #14 明确写着阈值与触发后的行为**待定**）。
-        // 取一个保守值只为「不让它无限跑」——今天没有任何一档会自动续跑，
-        // 所以这条**在真实路径上还打不到**；它防的是将来接上「目标」档那天的失控。
-        if (handle.ConsecutiveToolSteps >= MaxConsecutiveToolSteps)
-        {
-            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                new WireEvent.Error(handle.SessionId,
-                    $"连续 {MaxConsecutiveToolSteps} 步都在调工具，已停下——这多半是循环打转（`01` §6.2 的熔断）。"));
-            return reply;
-        }
-
         if (!handle.TryEnterStep()) return reply;
-
-        handle.BumpToolStep();
 
         if (throwOnFailure)
             return await RunStepAsync(handle, CancellationToken.None, throwOnFailure: true);
@@ -1245,15 +1217,6 @@ public sealed class CommandDispatcher(
 
         return reply;
     }
-
-    /// <summary>
-    /// 「目标」档的**最大连续步数熔断**（`01` §6.2 规矩 1 / §14 #14）。
-    ///
-    /// <para>⚠️ <b>阈值是占位的</b>：§14 #14 把「阈值与触发后的行为」列为**未定项**。
-    /// 这里取一个保守值（够跑完一次正常的多轮工具使用，又不至于失控），
-    /// <b>并如实标注它是占位</b>——本仓栽过「把占位值当成定论写进文档」。</para>
-    /// </summary>
-    private const int MaxConsecutiveToolSteps = 24;
 
     /// <summary>
     /// `step.end` 必须在 `Turn` 自增之后（`Stepper` 已经加过了），且在拒答分支之外——
@@ -1884,7 +1847,6 @@ public sealed class CommandDispatcher(
                 : [.. Stepper.Amended(waiting, paused, edited)];
 
             handle.QueueResume(new SessionHandle.PendingResume(calls, reply, paused));
-            handle.ResetToolSteps();
             ClearPause(handle);
 
             _bus.Publish(EventBus.SessionTopic(c.SessionId),

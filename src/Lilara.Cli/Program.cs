@@ -153,7 +153,7 @@ try
 {
     api = await controlServer.StartAsync(CancellationToken.None);
     Console.WriteLine($"  控制面 {controlServer.Url}（头连这个；只监听本机）");
-    Console.WriteLine($"  WS 只接受来自 {controlServer.AllowedOrigin} 的页面（{AllowedOriginResolver.Describe(allowedOrigin.Source)}）。");
+    Console.WriteLine($"  WS 只接受来自 {allowedOrigin.Origin} 的页面（{AllowedOriginResolver.Describe(allowedOrigin.Source)}）。");
 }
 catch (Exception ex)
 {

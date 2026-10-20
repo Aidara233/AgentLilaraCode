@@ -4,9 +4,13 @@
 
 ## 是什么
 
+本仓由 `Lilara.Core` 内核库、`Lilara.Cli` 常驻核心程序、`Lilara.Head` 独立 UI 组成。内核负责 canonical 会话机制；CLI 是一个宿主/组合根，头通过 HTTP/WS 与运行中的核心交互。ALP 集成应引用 `Lilara.Core`，不能引用 CLI 可执行项目，也不能把 ALP 的领域服务反向放进 Kernel。
+
 一个**轻量但好用**的 agent 程序。与 AgentLilaraProject（下称 ALP）不是同一生态位——ALP 是重型服务器、功能高度内聚；本项目注重分离设计。
 
 核心是**无头常驻进程**，类似 Claude Code 的典型 agent，但**没有头**：头是独立的 UI 程序，通过 HTTP/WS 与控制核心连接。核心不关心头在不在看。
+
+- **核心**程序集位于 `src/Lilara.Core`（class library），常驻命令行组合根位于 `src/Lilara.Cli`，程序集输出名仍为 `lilara`；独立 UI 位于 `src/Lilara.Head`。ALP 集成目标是引用内核库，不引用 CLI。
 
 ## 硬约束
 
