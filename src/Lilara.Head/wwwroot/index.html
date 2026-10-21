@@ -888,6 +888,9 @@ button:disabled:hover { border-color: var(--rule); }
   <div class="head">
     <h2>统计</h2>
     <span class="muted mono" id="usage-asof"></span>
+    <!-- 口径写在这里，不写进代码注释里等人猜：命中率的分母是「被缓存覆盖的输入」，
+         而没有报告缓存的调用不进分母（否则未报告会被读成未命中）。 -->
+    <span class="muted" title="命中率 = 缓存命中 token / (未命中输入 + 缓存命中)；只统计报告了缓存的调用。缺少缓存明细的调用显示「未报告」，不计入分母。">基于报告了缓存的调用</span>
     <span class="spacer"></span>
     <button id="usage-refresh">刷新</button>
   </div>
@@ -895,16 +898,16 @@ button:disabled:hover { border-color: var(--rule); }
   <div class="usage-columns">
     <section class="usage-section">
       <h3>按供应商</h3>
-      <div class="table-wrap"><table class="bucket-table"><thead><tr><th>供应商</th><th class="num">调用</th><th class="num">输入</th><th class="num">输出</th></tr></thead><tbody id="usage-providers"></tbody></table></div>
+      <div class="table-wrap"><table class="bucket-table"><thead><tr><th>供应商</th><th class="num">调用</th><th class="num" title="未命中输入（不含缓存命中部分）">输入</th><th class="num">输出</th><th class="num" title="缓存命中 / 被缓存覆盖的输入">命中率</th></tr></thead><tbody id="usage-providers"></tbody></table></div>
     </section>
     <section class="usage-section">
       <h3>按模型</h3>
-      <div class="table-wrap"><table class="bucket-table"><thead><tr><th>模型</th><th class="num">调用</th><th class="num">输入</th><th class="num">输出</th></tr></thead><tbody id="usage-models"></tbody></table></div>
+      <div class="table-wrap"><table class="bucket-table"><thead><tr><th>模型</th><th class="num">调用</th><th class="num" title="未命中输入（不含缓存命中部分）">输入</th><th class="num">输出</th><th class="num" title="缓存命中 / 被缓存覆盖的输入">命中率</th></tr></thead><tbody id="usage-models"></tbody></table></div>
     </section>
   </div>
   <section class="usage-section" style="margin-top:16px">
     <h3>调用明细</h3>
-    <div class="table-wrap"><table class="calls-table"><thead><tr><th>时间</th><th>来源</th><th>供应商 / 模型</th><th>状态</th><th class="num">输入</th><th class="num">输出</th></tr></thead><tbody id="usage-calls"></tbody></table></div>
+    <div class="table-wrap"><table class="calls-table"><thead><tr><th>时间</th><th>来源</th><th>供应商 / 模型</th><th>状态</th><th class="num" title="未命中输入（不含缓存命中部分）">输入</th><th class="num">输出</th><th class="num">命中率</th></tr></thead><tbody id="usage-calls"></tbody></table></div>
     <div class="usage-foot"><span id="usage-page-note"></span><span class="spacer"></span><button id="usage-prev" disabled>上一页</button><button id="usage-next" disabled>下一页</button></div>
   </section>
 </section>

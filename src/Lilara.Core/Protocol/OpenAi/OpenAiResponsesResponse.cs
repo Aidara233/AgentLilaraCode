@@ -15,7 +15,8 @@ public static class OpenAiResponsesResponse
         if (root.ValueKind != JsonValueKind.Object)
             return new ModelReply { Blocks = [], StopReason = "unknown", Refused = false };
 
-        var usage = UsageJson.Parse(root);
+        // OpenAI 的 input_tokens 含缓存命中 ⇒ 让 UsageJson 归一成「未命中输入」（见那边的注释）。
+        var usage = UsageJson.Parse(root, inputIncludesCache: true);
         var reportedModel = root.TryGetProperty("model", out var model)
             && model.ValueKind == JsonValueKind.String ? model.GetString() : null;
         var responseId = root.TryGetProperty("id", out var id)

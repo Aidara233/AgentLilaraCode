@@ -237,4 +237,105 @@ public class OpenAiChatResponseTests
         Assert.Single(reply.Blocks);
         Assert.IsType<Block.TextBlock>(reply.Blocks[0]);
     }
+
+    // ---- usage：缓存明细与输入口径（2026-10-20）----
+    //
+    // ⚠️ 这一组的形状来自**真实账本**（`~/.lilara/usage.jsonl`，本机网关，2026-10-18）：
+    // 网关同时给 `prompt_tokens_details.cached_tokens` 与平级的 `prompt_cache_hit_tokens`。
+    // 旧的解析器只认 `cached_tokens` / `cache_read_input_tokens`（Anthropic 的名字）⇒ **每一笔都是 null**，
+    // 于是统计页把「缓存读取 0」当成事实显示出来。下面第一条抓的就是这个「看不见的 0」。
+
+    [Fact]
+    public void Map_ReadsDeepSeekCacheHitTokensFromTheDetailsObject()
+    {
+        var reply = OpenAiChatResponse.Map("""
+            {"choices":[{"message":{"role":"assistant","content":"答"},"finish_reason":"stop"}],
+             "usage":{"prompt_tokens":3867,"completion_tokens":78,"total_tokens":3945,
+                      "prompt_tokens_details":{"cached_tokens":3456},
+                      "completion_tokens_details":{"reasoning_tokens":69}}}
+            """);
+
+        // 归一后输入是**未命中**部分（3867 - 3456），与缓存读取不相交。
+        Assert.Equal(411, reply.Usage?.InputTokens);
+        Assert.Equal(3456, reply.Usage?.CacheReadTokens);
+        Assert.Equal(3945, reply.Usage?.TotalTokens);   // 上游报的 total 原样保留（3867 全量 + 78）
+        Assert.Equal(78, reply.Usage?.OutputTokens);
+        // 推理明细的旧字段名是 `completion_tokens_details`（不是 `output_tokens_details`）——
+        // 只认后者会让 DeepSeek 的推理 token 一直是 null。
+        Assert.Equal(69, reply.Usage?.ReasoningTokens);
+    }
+
+    [Fact]
+    public void Map_ReadsTheFlatPromptCacheHitTokens_WhenDetailsAreAbsent()
+    {
+        // 实测账本里并不是每一次都带 details：49 笔带 `prompt_cache_hit_tokens`，53 笔带 `cached_tokens`。
+        // ⇒ 两条路都要读，缺一条就有一坨调用静默变成「未报告」。
+        var reply = OpenAiChatResponse.Map("""
+            {"choices":[{"message":{"role":"assistant","content":"答"},"finish_reason":"stop"}],
+             "usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020,
+                      "prompt_cache_hit_tokens":900,"prompt_cache_miss_tokens":100}}
+            """);
+
+        Assert.Equal(900, reply.Usage?.CacheReadTokens);
+        Assert.Equal(100, reply.Usage?.InputTokens);
+    }
+
+    [Fact]
+    public void Map_PrefersTheDetailsObject_WhenBothCacheFieldsArePresent()
+    {
+        var reply = OpenAiChatResponse.Map("""
+            {"choices":[{"message":{"role":"assistant","content":"答"},"finish_reason":"stop"}],
+             "usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020,
+                      "prompt_tokens_details":{"cached_tokens":640},
+                      "prompt_cache_hit_tokens":900}}
+            """);
+
+        // 「正式字段优先」：平级的是网关的附加信息，details 才是协议定义的形状。
+        Assert.Equal(640, reply.Usage?.CacheReadTokens);
+        Assert.Equal(360, reply.Usage?.InputTokens);
+    }
+
+    [Fact]
+    public void Map_ReportsZeroInput_WhenEverythingWasCached()
+    {
+        var reply = OpenAiChatResponse.Map("""
+            {"choices":[{"message":{"role":"assistant","content":"答"},"finish_reason":"stop"}],
+             "usage":{"prompt_tokens":1200,"completion_tokens":10,"total_tokens":1210,
+                      "prompt_tokens_details":{"cached_tokens":1200}}}
+            """);
+
+        // 全部命中 ⇒ 未命中输入是 **0**（上游确实这么报的），不是 null。
+        // 两者的区别：0 能算命中率（100%），null 算不出来（未报告）。
+        Assert.Equal(1200, reply.Usage?.CacheReadTokens);
+        Assert.Equal(0, reply.Usage?.InputTokens);
+    }
+
+    [Fact]
+    public void Map_KeepsCacheUnknown_WhenTheUpstreamDoesNotReportIt()
+    {
+        // 「没报」必须与「报了 0」区分：两者都让命中率算不出来 vs 算成 0%，含义完全不同。
+        var reply = OpenAiChatResponse.Map(Body("答"));
+
+        Assert.Null(reply.Usage?.CacheReadTokens);
+        Assert.Equal(1, reply.Usage?.InputTokens);
+        Assert.Null(new Lilara.Core.Storage.UsageCall
+        {
+            CallId = "c", ProviderId = "p", ModelId = "m", Protocol = Protocols.OpenAiChat,
+            StartedAt = DateTimeOffset.UnixEpoch, Status = "completed", Usage = reply.Usage,
+        }.CacheHitRate);
+    }
+
+    [Fact]
+    public void Map_DerivesTotalFromInputAndOutput_WhenTheUpstreamOmitsIt()
+    {
+        var reply = OpenAiChatResponse.Map("""
+            {"choices":[{"message":{"role":"assistant","content":"答"},"finish_reason":"stop"}],
+             "usage":{"prompt_tokens":1000,"completion_tokens":20,
+                      "prompt_tokens_details":{"cached_tokens":900}}}
+            """);
+
+        // 1000 是归一前的全量；归一后 100 未命中 + 20 输出 ≠ 1020 的直觉来源——
+        // total 由**上游原值**推出（1000 + 20），不是由归一后的输入推出。见 UsageJson 的注释。
+        Assert.Equal(1020, reply.Usage?.TotalTokens);
+    }
 }

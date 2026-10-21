@@ -33,6 +33,23 @@ public class OpenAiResponsesResponseTests
         Assert.Equal("incomplete", OpenAiResponsesResponse.Map(Body("x", "incomplete")).StopReason);
     }
 
+    // Responses 的缓存明细在 `input_tokens_details.cached_tokens`（与 Chat 的 `prompt_tokens_details` 是**两个**父对象）。
+    // 同一套解析器要两条路都读得到；input_tokens 同样是**全量**、归一后为未命中输入。
+    [Fact]
+    public void Map_ReadsCachedTokensFromInputTokensDetails_AndNormalizesTheInput()
+    {
+        var reply = OpenAiResponsesResponse.Map("""
+            {"id":"resp_1","status":"completed","model":"deepseek-flash","output":[],
+             "usage":{"input_tokens":5000,"output_tokens":100,"total_tokens":5100,
+                      "input_tokens_details":{"cached_tokens":4600},
+                      "output_tokens_details":{"reasoning_tokens":40}}}
+            """);
+
+        Assert.Equal(4600, reply.Usage?.CacheReadTokens);
+        Assert.Equal(400, reply.Usage?.InputTokens);
+        Assert.Equal(40, reply.Usage?.ReasoningTokens);
+    }
+
     [Fact]
     public void Map_SkipsNonMessageOutputItems()
     {

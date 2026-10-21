@@ -22,7 +22,8 @@ public static class OpenAiChatResponse
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
 
-        var usage = UsageJson.Parse(root);
+        // OpenAI 的 prompt_tokens 含缓存命中 ⇒ 让 UsageJson 归一成「未命中输入」（见那边的注释）。
+        var usage = UsageJson.Parse(root, inputIncludesCache: true);
         var reportedModel = root.ValueKind == JsonValueKind.Object
             && root.TryGetProperty("model", out var model)
             && model.ValueKind == JsonValueKind.String ? model.GetString() : null;

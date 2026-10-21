@@ -108,4 +108,34 @@ public class ClaudeResponseMapperTests
         Assert.Equal("sig", reasoning.Signature);
         Assert.Equal("答案", ((CanonicalBlock.TextBlock)reply.Blocks[1]).Text);
     }
+
+    // ⚠️ Anthropic 的 `input_tokens` **本来就是未命中部分**（官方口径）。映射层**不许**再做减法——
+    // 与 OpenAI 系相反（那边的 prompt_tokens 含缓存）。做错了输入会被压成 0，而数字看起来仍然「像那么回事」。
+    [Fact]
+    public void Map_TakesInputTokensVerbatim_AndKeepsCacheAsSeparateDetails()
+    {
+        var message = new Message
+        {
+            ID = "msg_test",
+            Model = "claude-opus-5",
+            StopReason = "end_turn",
+            Content = [new ContentBlock(new TextBlock { Text = "答案", Citations = [] })],
+            Usage = UsageOf(1) with
+            {
+                InputTokens = 300,
+                CacheReadInputTokens = 1200,
+                CacheCreationInputTokens = 500,
+            },
+            Container = null,
+            Diagnostics = null,
+            StopDetails = null,
+            StopSequence = null,
+        };
+
+        var reply = ClaudeResponseMapper.Map(message);
+
+        Assert.Equal(300, reply.Usage?.InputTokens);
+        Assert.Equal(1200, reply.Usage?.CacheReadTokens);
+        Assert.Equal(500, reply.Usage?.CacheWriteTokens);
+    }
 }

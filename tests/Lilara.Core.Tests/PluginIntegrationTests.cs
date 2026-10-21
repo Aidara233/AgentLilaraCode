@@ -187,10 +187,15 @@ public sealed class PluginIntegrationTests : IDisposable
     {
         var (host, commands, _, _) = Harness(null);
         var h = await Create(host, commands);
+        // 当前格式 → 更旧的格式。⚠️ 别写死两个版本号：这条测的是「旧格式会升级到现在」，
+        // 写成字面量就会在每次 +1 时红一次，而红的原因与它要守的性质无关。
+        var current = Lilara.Core.Kernel.Json.FormatVersion;
+        var legacy = current - 1;
         foreach (var name in new[] { "spec.json", "state.json" })
         {
             var path = Path.Combine(h.Directory, name);
-            File.WriteAllText(path, File.ReadAllText(path).Replace("\"version\":7", "\"version\":6"));
+            File.WriteAllText(path,
+                File.ReadAllText(path).Replace($"\"version\":{current}", $"\"version\":{legacy}"));
         }
         var plugin = new DemoPlugin();
         var (fresh, d, _, adapter) = Harness(plugin);
@@ -201,7 +206,7 @@ public sealed class PluginIntegrationTests : IDisposable
         adapter.Reply("ok");
         await new Stepper(fresh.Store, adapter, plugins: fresh.Plugins).StepAsync(loaded, "hello", CancellationToken.None);
         Assert.Equal(0, plugin.Calls);
-        Assert.Equal(7, fresh.Store.ReadState(h.ProjectKey, h.SessionId).Version);
+        Assert.Equal(Lilara.Core.Kernel.Json.FormatVersion, fresh.Store.ReadState(h.ProjectKey, h.SessionId).Version);
     }
 
     [Fact]

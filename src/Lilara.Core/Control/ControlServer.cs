@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using Lilara.Core.Hosting;
 using Lilara.Core.Kernel;
+using Lilara.Core.Protocol;
 using Lilara.Core.Storage;
 using Lilara.Core.Session;
 using Microsoft.AspNetCore.Builder;
@@ -445,9 +446,13 @@ public sealed class ControlServer(
         });
 
         // 统计是核心事实的只读投影；这些端点不激活会话、不触发模型或插件。
+        //
+        // ⚠️ 磁盘上格式 8 之前的行里，OpenAI 系的 `inputTokens` 是上游原值（**含**缓存命中），
+        // 而现在的口径是「未命中输入」（`08` §3.1）。读盘后一律过一遍 `NormalizeLegacyInput`，
+        // 否则「输入 + 缓存读取」在旧行上会把同一批 token 数两遍（`Json.FormatVersion` 8 的说明）。
         app.MapGet("/usage/calls", (int? skip, int? limit) =>
         {
-            var all = host.Usage.ReadAll();
+            var all = host.Usage.ReadAll().Select(Normalized).ToList();
             var offset = Math.Max(0, skip ?? 0);
             var pageSize = Math.Clamp(limit ?? 100, 1, 1000);
             return Results.Json(new
@@ -461,17 +466,17 @@ public sealed class ControlServer(
         });
 
         app.MapGet("/usage/summary", () => Results.Json(
-            host.Usage.Summarize(), WireJson.Options));
+            UsageSummary.From(host.Usage.ReadAll().Select(Normalized).ToList()), WireJson.Options));
 
         app.MapGet("/sessions/{id}/usage", (string id) =>
         {
             if (host.Store.FindSession(id) is not { } found) return Results.NotFound();
-            var calls = host.Usage.ForSession(id);
+            var calls = host.Usage.ForSession(id).Select(Normalized).ToList();
             return Results.Json(new
             {
                 SessionId = id,
                 ProjectKey = found.ProjectKey,
-                Summary = host.Usage.Summarize(new UsageFilter { SessionId = id }),
+                Summary = UsageSummary.From(calls),
                 Calls = calls,
             }, WireJson.Options);
         });
@@ -479,7 +484,11 @@ public sealed class ControlServer(
         app.MapGet("/sessions/{id}/context", (string id) =>
         {
             if (host.Store.FindSession(id) is not { } found) return Results.NotFound();
-            var latest = host.Usage.ForSession(id).LastOrDefault(c => c.Usage is not null);
+            // ⚠️ 只挑**报了输入**的调用：一次失败的尝试可以带 usage（有输出、没输入），
+            // 挑到它会让「上下文长度」变成「未报告」——而那比一条旧值更糟，它看起来像上下文没了。
+            // 判据与 `UsageSummary.CallsWithKnownInput` 同一个谓词。
+            var latest = host.Usage.ForSession(id).Select(Normalized)
+                .LastOrDefault(c => c.Usage?.InputTokens is not null);
             return Results.Json(new
             {
                 SessionId = id,
@@ -492,7 +501,8 @@ public sealed class ControlServer(
                     latest.ModelId,
                     latest.Protocol,
                     InputTokens = latest.Usage?.InputTokens,
-                    Source = latest.Usage is null ? "unknown" : "reported",
+                    // 判据在上面的 LastOrDefault 里已经收死了：能走到这里就一定报了输入。
+                    Source = "reported",
                     RequestFingerprint = latest.RequestFingerprint,
                 },
                 Preview = (object?)null,
@@ -1176,4 +1186,14 @@ public sealed class ControlServer(
     }
 
     private IReadOnlyList<string> ProjectKeys() => host.Store.ListProjects();
+
+    /// <summary>
+    /// 读盘后的口径归一：格式 8 之前的 OpenAI 系行里 <c>inputTokens</c> 含缓存命中，
+    /// 今天的口径是「未命中输入」⇒ 旧行必须把命中的部分减出去（见 `Json.FormatVersion` 的 8 号条目）。
+    /// 只对旧行生效；新行本就在映射层归一过，这里再减一次就会把输入压成 0。
+    /// </summary>
+    private static UsageCall Normalized(UsageCall call) =>
+        call.Usage is null || call.FormatVersion >= UsageCall.NormalizedInputSinceFormat
+            ? call
+            : call with { Usage = UsageJson.NormalizeLegacyInput(call.Usage, call.Protocol) };
 }

@@ -56,7 +56,18 @@ public static class Json
     /// 「静默地按旧含义解释新数据」。</para>
     /// </summary>
     // 7：会话绑定插件版本及默认值，状态保存插件轴；旧核心必须拒绝，避免丢配置。
-    public const int FormatVersion = 7;
+    //
+    // 8（2026-10-20，缓存明细批）：⚠️ 这一批**没有加任何新字段**，改的是两件既有事实——
+    //   ① `usage.jsonl` 的**行**开始带 `formatVersion`（此前账本行上没有版本号；
+    //      `VersionKey` 的注释说过它不管 `history.jsonl`，账本是同一类追加文件，同样得按行判）；
+    //   ② OpenAI 系（chat / responses）的 `inputTokens` **含义变了**：此前是上游原值
+    //      （`prompt_tokens`，**含**缓存命中），此后是「未命中输入」（`08` §3.1 的口径，
+    //      与 Anthropic 的 `input_tokens` 对齐）。同一批 token 从此与 `cacheReadTokens` **不相交**，
+    //      相加才是全部输入。同时解析器开始读 `prompt_tokens_details.cached_tokens` /
+    //      `prompt_cache_hit_tokens`——旧行里那些调用记的是「缓存读取未报告」，不是 0。
+    //   ⇒ 这正是版本号要终结的那类事：老核心读新行，**同一个键、同一个数、不同的意思**，
+    //      而且它会照旧把「输入 + 缓存读取」当成两次独立输入去理解。
+    public const int FormatVersion = 8;
 
     public static readonly JsonSerializerOptions Options = new()
     {

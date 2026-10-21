@@ -616,7 +616,7 @@
 - `skip` 缺省 `0`（负数按 `0`）；`limit` 缺省 `100`，**夹在 `1..1000`**（越界不报错，夹到边界）。
 - `calls` 顺序 = `usage.jsonl` 的**文件序**（追加序，`UsageStore.ReadAll`）；`total` 是全部条数。
 
-**`UsageCall`**（`Storage/UsageStore.cs:65-82`）：
+**`UsageCall`**（`Storage/UsageStore.cs`）：
 
 ```jsonc
 {
@@ -627,15 +627,21 @@
   "purpose": "session",           // ⚠️ 今天只有三个字面量："session" | "probe" | "compaction"
   "providerId": "local",
   "modelId": "deepseek-flash",
-  "protocol": "claude-messages",
+  "protocol": "openai-chat",
   "startedAt": "…",
   "endedAt": "…",                 // 可空（进行中 / 崩了）
   "status": "completed",          // ⚠️ 今天只有 "completed" | "failed"
   "usage": {                      // 可空（上游没报用量）
-    "inputTokens": 1200, "outputTokens": 300, "totalTokens": 1500,
-    "cacheReadTokens": 0, "cacheWriteTokens": 0, "reasoningTokens": 0,
+    // ⚠️ 口径（`08` §3.1）：inputTokens 是**未命中输入**，与 cacheReadTokens **不相交**；
+    //    两族协议在映射层已归一（OpenAI 的 prompt_tokens 含缓存 ⇒ 减去命中）。
+    //    全部输入 = inputTokens + cacheReadTokens（cacheWriteTokens 是「这次新写进缓存的前缀」，不算复用）。
+    "inputTokens": 411, "outputTokens": 300, "totalTokens": 3945,
+    "cacheReadTokens": 3456, "cacheWriteTokens": 0, "reasoningTokens": 0,
     "rawJson": "…"                // 可空：受限的原始 usage 摘要
   },
+  "formatVersion": 8,             // 写盘时的格式版本；缺这个键 = 格式 8 之前的行（旧口径）
+  "promptTokens": 3867,           // 派生：inputTokens + cacheReadTokens；任一未知 ⇒ 键省略
+  "cacheHitRate": 0.8937,         // 派生：cacheReadTokens / promptTokens；分母未知或为 0 ⇒ 键省略
   "reportedModel": "…",           // 可空：上游自报的模型名
   "responseId": "…",              // 可空
   "requestFingerprint": "…"       // 可空
@@ -643,7 +649,11 @@
 ```
 
 - ⚠️ `usage` 为 `null` = **上游没报**，不是「0」。客户端不要把它当 0 累加。
-- 证据：`ControlServer.cs:448-461`。
+- ⚠️ **`promptTokens` / `cacheHitRate` 是派生投影**，落盘也会带，但读回时被忽略、每次从 `usage` 现算
+  （盘上那两行不是第二份真相）。
+- ⚠️ **格式 8 之前的行**（无 `formatVersion`）：OpenAI 系的 `inputTokens` 是上游原值（**含**缓存），
+  服务端读盘时已按 `NormalizeLegacyInput` 减掉命中再交出去——下面三条端点交的都是归一后的值。
+- 证据：`ControlServer.cs` 的 `/usage/*` 三处与 `Normalized`（文件尾部）。
 
 ### 3.15 `GET /usage/summary`
 
@@ -655,21 +665,31 @@
   "callsWithKnownInput": 35,
   "callsWithKnownOutput": 35,
   "callsWithUnknownUsage": 2,
-  "inputTokens": 41000,
+  "inputTokens": 41000,            // 未命中输入
   "outputTokens": 9000,
   "cacheReadTokens": 12000,
   "cacheWriteTokens": 3000,
   "reasoningTokens": 4000,
+  "callsWithKnownCache": 35,       // 参与命中率的调用数（分母已知的那些）
+  "cacheHitTokens": 12000,         // 只累加分母已知的调用
+  "promptTokens": 53000,           // 这些调用的全部输入 = 41000 + 12000
+  "cacheHitRate": 0.2264,          // 12000 / 53000
   "byProvider": [ { "key": "local", "calls": 37, "callsWithUnknownUsage": 2,
                     "inputTokens": 41000, "outputTokens": 9000,
-                    "cacheReadTokens": 12000, "cacheWriteTokens": 3000, "reasoningTokens": 4000 } ],
+                    "cacheReadTokens": 12000, "cacheWriteTokens": 3000, "reasoningTokens": 4000,
+                    "callsWithKnownCache": 35, "cacheHitTokens": 12000,
+                    "promptTokens": 53000, "cacheHitRate": 0.2264 } ],
   "byModel":    [ /* 同形状，key = modelId */ ]
 }
 ```
 
 - ⚠️ **汇总的数字是可空的**（`long?`）：一个 token 都没报过 ⇒ `null`，不是 `0`。
+- ⚠️ **命中率的分母只收「分母已知」的调用**：没报缓存的调用若被算进分母，命中率会被它拉低——
+  那看起来像「缓存变差了」，其实是「这笔没报」。未报告的量由 `callsWithKnownCache` 对 `calls` 的差体现。
+  没有任何一笔分母已知 ⇒ `cacheHitRate` 键省略（未报告，不是 0%）。
+- ⚠️ **命中率按调用+按桶各算**，不是从总量倒推（总量口径下，一笔没报缓存的调用会稀释结果）。
 - `byProvider` / `byModel` 按 key 的 **ordinal 升序**。
-- 证据：`ControlServer.cs:463-464`；`Storage/UsageStore.cs:104-151`。
+- 证据：`ControlServer.cs` 的 `/usage/summary`；`Storage/UsageStore.cs` 的 `UsageSummary.From` / `UsageBucket.From`。
 
 ### 3.16 `GET /sessions/{id}/usage`
 
@@ -680,7 +700,7 @@
 
 - 不存在 ⇒ **404**。
 - ⚠️ 它**不激活会话**（走 `Store.FindSession`，不是 `TryFind`）⇒ 没有副作用。
-- 证据：`ControlServer.cs:466-477`。
+- 证据：`ControlServer.cs` 的 `/sessions/{id}/usage`。
 
 ### 3.17 `GET /sessions/{id}/context`
 
@@ -690,13 +710,13 @@
 {
   "sessionId": "…",
   "projectKey": "…",
-  "latest": {                       // 没有任何一次报了用量的调用 ⇒ null（键被省略）
+  "latest": {                       // 没有任何一次**报了输入**的调用 ⇒ null（键被省略）
     "callId": "…",
     "startedAt": "…", "endedAt": "…",
     "modelId": "deepseek-flash",
     "protocol": "claude-messages",
     "inputTokens": 1200,
-    "source": "reported",           // 或 "unknown"（那次调用没报）
+    "source": "reported",           // 能走到这里就一定是上报的（没报输入的那次不会入选）
     "requestFingerprint": "…"       // 可空
   },
   "preview": null                   // 本地 tokenizer 预估；**今天恒为 null**
@@ -705,10 +725,12 @@
 
 - ⚠️ `preview` 是显式 `null`（键**存在**，值为 `null`），不是省略——两者在线上可分辨。
   今天它恒为 `null`：预估未实现。
-- ⚠️ `latest` 只取**报了用量**的最近一条；`source` 因此今天恒是 `"reported"`
+- ⚠️ `latest` 只取**报了输入**（`usage.inputTokens`）的最近一条——不是「带了 usage」：
+  一次失败的尝试可以只报输出、没报输入，挑到它会把「上下文长度」显示成未报告，
+  那比一条旧值更糟（看起来像上下文没了）。`source` 因此今天恒是 `"reported"`
   （`"unknown"` 那条分支实际够不着，留着是给将来）。
 - 不存在 ⇒ **404**；不激活会话。
-- 证据：`ControlServer.cs:479-500`。
+- 证据：`ControlServer.cs` 的 `/sessions/{id}/context`。
 
 ### 3.18 不存在的端点
 

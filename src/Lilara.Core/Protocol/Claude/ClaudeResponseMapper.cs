@@ -35,6 +35,8 @@ public static class ClaudeResponseMapper
             Blocks = blocks,
             StopReason = stopReason,
             Refused = refused,
+            // ⚠️ Anthropic 的 input_tokens 本来就是「未命中部分」：这里**不做减法**，
+            // 与 OpenAI 系那边相反（见 UsageJson 的口径说明）。
             Usage = new TokenUsage
             {
                 InputTokens = response.Usage.InputTokens,

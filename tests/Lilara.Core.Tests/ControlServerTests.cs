@@ -988,6 +988,89 @@ public class ControlServerTests : IAsyncLifetime
     private async Task<JsonElement> GetJson(string path) =>
         (await JsonDocument.ParseAsync(await Client.GetStreamAsync(Http(path)))).RootElement.Clone();
 
+    // ---- 统计端点的口径（2026-10-20）----
+    //
+    // 这一组钉两件事：① 命中率与分家后的输入**上得了线**；② 账本里【格式 8 之前】的 OpenAI 行
+    // 必须按旧口径解释（inputTokens 含缓存 ⇒ 读的时候减掉），否则旧账本的「输入 + 缓存读取」会把同一批 token 数两遍。
+
+    private void Seed(string line) => File.AppendAllText(
+        Path.Combine(_root, "usage.jsonl"), line + "\n", Encoding.UTF8);
+
+    // 结构化行用匿名对象拼：`$$"""` 里连续的 `}}` 会撞上内插原始字面量的收尾歧义（CS9007）。
+    private void SeedRow(object row) => Seed(JsonSerializer.Serialize(row, Lilara.Core.Kernel.Json.Options));
+
+    [Fact]
+    public async Task UsageSummary_ExposesCacheHitRate_AndLegacyRowsAreNormalized()
+    {
+        // 没有 formatVersion 的键 ⇒ 这是格式 8 之前的行；上游原值 3867 **含**缓存 3456。
+        Seed("""{"callId":"old","providerId":"apiplan","modelId":"deepseek-flash","protocol":"openai-chat","startedAt":"2026-10-18T00:00:00+00:00","status":"completed","usage":{"inputTokens":3867,"outputTokens":78,"totalTokens":3945,"cacheReadTokens":3456}}""");
+        // 新行（有版本）已经归一过：411 是未命中输入，**不能再减**。
+        SeedRow(new
+        {
+            CallId = "new", FormatVersion = Json.FormatVersion, ProviderId = "apiplan",
+            ModelId = "deepseek-flash", Protocol = Protocols.OpenAiChat,
+            StartedAt = DateTimeOffset.Parse("2026-10-18T01:00:00Z"), Status = "completed",
+            Usage = new TokenUsage { InputTokens = 411, OutputTokens = 78, TotalTokens = 3945, CacheReadTokens = 3456 },
+        });
+
+        var summary = await GetJson("/usage/summary");
+
+        Assert.Equal(822, summary.GetProperty("inputTokens").GetInt64());       // 411 + 411
+        Assert.Equal(6912, summary.GetProperty("cacheHitTokens").GetInt64());   // 3456 + 3456
+        Assert.Equal(7734, summary.GetProperty("promptTokens").GetInt64());
+        Assert.Equal(2, summary.GetProperty("callsWithKnownCache").GetInt32());
+        Assert.Equal(6912d / 7734d, summary.GetProperty("cacheHitRate").GetDouble(), 12);
+    }
+
+    [Fact]
+    public async Task UsageSummary_RateIsNull_NotZero_WhenNoCallReportedCache()
+    {
+        SeedRow(new
+        {
+            CallId = "a", ProviderId = "p", ModelId = "m", Protocol = Protocols.OpenAiChat,
+            StartedAt = DateTimeOffset.Parse("2026-10-18T00:00:00Z"), Status = "completed",
+            Usage = new TokenUsage { InputTokens = 100, OutputTokens = 5 },
+        });
+
+        var summary = await GetJson("/usage/summary");
+
+        // 键被省略（WhenWritingNull）——与 tokenText 的「未报告」同一个判据：未报告不是 0。
+        Assert.False(summary.TryGetProperty("cacheHitRate", out _));
+        Assert.False(summary.TryGetProperty("promptTokens", out _));
+        Assert.Equal(0, summary.GetProperty("callsWithKnownCache").GetInt32());
+    }
+
+    // ⚠️ 旧实现挑的是「最后一条带 usage 的调用」：一条只有输出、没报输入的失败行会把
+    // 「上下文长度」变成「未报告」——比一条旧值更糟，它看起来像上下文没了。
+    [Fact]
+    public async Task Context_SkipsCallsThatDidNotReportInput()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        SeedRow(new
+        {
+            CallId = "good", FormatVersion = Json.FormatVersion, SessionId = sid,
+            ProviderId = "p", ModelId = "m", Protocol = Protocols.OpenAiChat,
+            StartedAt = DateTimeOffset.Parse("2026-10-18T00:00:00Z"), Status = "completed",
+            Usage = new TokenUsage { InputTokens = 1200, OutputTokens = 5 },
+        });
+        SeedRow(new
+        {
+            CallId = "noinput", FormatVersion = Json.FormatVersion, SessionId = sid,
+            ProviderId = "p", ModelId = "m", Protocol = Protocols.OpenAiChat,
+            StartedAt = DateTimeOffset.Parse("2026-10-18T01:00:00Z"), Status = "failed",
+            Usage = new TokenUsage { OutputTokens = 5 },
+        });
+
+        var context = await GetJson($"/sessions/{sid}/context");
+
+        var latest = context.GetProperty("latest");
+        Assert.Equal("good", latest.GetProperty("callId").GetString());
+        Assert.Equal(1200, latest.GetProperty("inputTokens").GetInt64());
+        Assert.Equal("reported", latest.GetProperty("source").GetString());
+    }
+
     [Fact]
     public async Task Snapshot_Health_CarriesExactlyTheseKeys() =>
         AssertKeysOf(await GetJson("/health"), "ok", "dataRoot", "workingDirectory", "sessions");

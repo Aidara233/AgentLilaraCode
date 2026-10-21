@@ -61,6 +61,18 @@ function tokenText(value) {
   return value === null || value === undefined ? "未报告" : Number(value).toLocaleString();
 }
 
+// 比例（0..1）→ 百分比。⚠️ 与 tokenText 同一个判据：null = 上游没报，**不是 0%**。
+// 分母未知时核心给的是 null（不是 0），这里照它显示「未报告」。
+function rateText(rate) {
+  if (rate === null || rate === undefined) return "未报告";
+  // ⚠️ **截断，不四舍五入**：99.6% 舍入成 100% 就等于宣称「全命中」，而那正好是缓存诊断
+  // 最想知道的一个区别（`08` §3.2 的验收就有一条：缓存明细不许把未命中算成命中）。
+  const p = Math.max(0, Number(rate)) * 100;
+  const digits = p > 0 && p < 10 ? 1 : 0;
+  const f = 10 ** digits;
+  return `${(Math.floor(p * f) / f).toFixed(digits)}%`;
+}
+
 function renderContextStatus(context) {
   sessionContext = context || null;
   const el = $("context-status");
@@ -103,7 +115,13 @@ function usageBucketRow(bucket) {
   const output = document.createElement("td");
   output.className = "num";
   output.textContent = tokenText(bucket.outputTokens);
-  tr.append(key, calls, input, output);
+  const hit = document.createElement("td");
+  hit.className = "num";
+  hit.textContent = rateText(bucket.cacheHitRate);
+  // 悬停说明分母：命中率是在哪几笔上算的（未报告的调用不进分母，见 UsageSummary.CacheHitRate）。
+  hit.title = `命中 ${tokenText(bucket.cacheHitTokens)} / 输入 ${tokenText(bucket.promptTokens)}`
+    + `（${tokenText(bucket.callsWithKnownCache)} 笔报告了缓存）`;
+  tr.append(key, calls, input, output, hit);
   return tr;
 }
 
@@ -114,7 +132,7 @@ function renderUsageTable(id, rows) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
     td.className = "empty-row";
-    td.colSpan = 4;
+    td.colSpan = 5;
     td.textContent = "暂无调用记录";
     tr.appendChild(td);
     body.appendChild(tr);
@@ -130,7 +148,7 @@ function renderUsageCalls() {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
     td.className = "empty-row";
-    td.colSpan = 6;
+    td.colSpan = 7;
     td.textContent = "暂无调用记录";
     tr.appendChild(td);
     body.appendChild(tr);
@@ -153,7 +171,12 @@ function renderUsageCalls() {
       const output = document.createElement("td");
       output.className = "num";
       output.textContent = tokenText(call.usage?.outputTokens);
-      tr.append(time, purpose, target, status, input, output);
+      // 逐笔命中率：核心按**这一笔**算（UsageCall.CacheHitRate），不是从总量倒推。
+      const hit = document.createElement("td");
+      hit.className = "num";
+      hit.textContent = rateText(call.cacheHitRate);
+      hit.title = `命中 ${tokenText(call.cacheHitTokens)} / 输入 ${tokenText(call.promptTokens)}`;
+      tr.append(time, purpose, target, status, input, output, hit);
       body.appendChild(tr);
     }
   }
@@ -169,14 +192,21 @@ function renderUsageView() {
   const s = usageSummary;
   const box = $("usage-summary");
   box.replaceChildren();
+  // ⚠️ 「输入」是**未命中输入**（`08` §3.1 的口径：它与「缓存读取」并列、不相交）。
+  // 写成「输入 token」会被读成「这次请求的全部输入」，而那是两者之和 —— 差一个缓存读取的量。
   const stats = [
-    ["调用次数", s?.calls],
-    ["输入 token", s?.inputTokens],
-    ["输出 token", s?.outputTokens],
-    ["缓存读取", s?.cacheReadTokens],
-    ["缓存写入", s?.cacheWriteTokens],
-    ["推理 token", s?.reasoningTokens],
-    ["未知用量", s?.callsWithUnknownUsage],
+    ["调用次数", tokenText(s?.calls)],
+    ["未命中输入 token", tokenText(s?.inputTokens)],
+    ["输出 token", tokenText(s?.outputTokens)],
+    ["缓存命中率", rateText(s?.cacheHitRate)],
+    ["缓存命中 token", tokenText(s?.cacheHitTokens)],
+    ["被缓存覆盖的输入", tokenText(s?.promptTokens)],
+    ["缓存写入 token", tokenText(s?.cacheWriteTokens)],
+    ["推理 token", tokenText(s?.reasoningTokens)],
+    ["未知用量", tokenText(s?.callsWithUnknownUsage)],
+    ["报告缓存的调用", s?.callsWithKnownCache === undefined || s?.calls === undefined
+      ? "未报告"
+      : `${tokenText(s.callsWithKnownCache)} / ${tokenText(s.calls)}`],
   ];
   for (const [label, value] of stats) {
     const stat = document.createElement("div");
@@ -184,7 +214,7 @@ function renderUsageView() {
     const name = document.createElement("label");
     name.textContent = label;
     const number = document.createElement("strong");
-    number.textContent = tokenText(value);
+    number.textContent = value;
     stat.append(name, number);
     box.appendChild(stat);
   }
