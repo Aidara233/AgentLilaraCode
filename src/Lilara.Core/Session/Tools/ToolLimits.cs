@@ -70,6 +70,43 @@ internal static class ToolLimits
     public const int MaxDirectoryEntries = 1000;
 
     /// <summary>
+    /// `search` 一次**最多返回多少条匹配**。
+    ///
+    /// <para>⚠️ **占位值**。它与 <see cref="MaxDirectoryEntries"/> 防的是同一件事：
+    /// 一个普通的小目录也能有几千处命中，而「搜一个常见词」不该把上下文撑满。
+    /// 超限必须**明说**（见 `SearchTool`），因为模型会把它当成「只有这些」。</para>
+    /// </summary>
+    public const int MaxSearchResults = 200;
+
+    /// <summary>
+    /// `search` 一次**最多遍历多少条目录项**（文件 + 目录）。
+    ///
+    /// <para>⚠️ **占位值**。它是「别让一次递归搜索走一整天」的保险丝：
+    /// `bin` / `obj` / `node_modules` 已在遍历时整棵跳过，但一个没有这些目录的大树
+    /// 仍然可能很大。到达上限时**明说**只走了一部分。</para>
+    /// </summary>
+    public const int MaxSearchEntries = 20000;
+
+    /// <summary>
+    /// `search` 内容搜索**单个文件的大小上限**。
+    ///
+    /// <para>⚠️ **占位值**。超限是**跳过并计数**（结果末尾写明跳了几个），
+    /// 不是悄悄读一半——读一半会让「后面有没有」变成一个假答案。</para>
+    /// </summary>
+    public const int MaxSearchFileBytes = 2 * 1024 * 1024;
+
+    /// <summary>
+    /// `search` 每条命中**最多显示多少个字符**。
+    ///
+    /// <para>⚠️ **占位值**。压缩过的 JS / 单行日志会把一条命中撑到几十 KB；
+    /// 截断处用可见的省略号标明。</para>
+    /// </summary>
+    public const int MaxSearchLineChars = 400;
+
+    /// <summary>搜索词最多多少字符。占位值：超长 query 对搜索没有帮助，只会撑请求。</summary>
+    public const int MaxWebSearchQueryChars = 500;
+
+    /// <summary>
     /// `ask` 一次**最多问几个问题**（`01` §3.8）。
     ///
     /// <para>⚠️ **占位值**。多问是**一次询问一个信封**，所以没有协议层的上限兜着——

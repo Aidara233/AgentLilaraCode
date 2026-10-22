@@ -1,6 +1,7 @@
 using Lilara.Core.Protocol;
 using Lilara.Core.Storage;
 using Lilara.Core.Kernel;
+using Lilara.Core.Network;
 using Lilara.Core.Session.Tools;
 
 namespace Lilara.Core.Session;
@@ -22,7 +23,8 @@ public sealed class Stepper(
     SessionStore store, IModelAdapter adapter, IReadOnlyList<ITool>? tools = null,
     Lilara.Core.Plugins.PluginHost? plugins = null,
     UsageStore? usage = null,
-    Func<TimeSpan, CancellationToken, Task>? retryDelay = null)
+    Func<TimeSpan, CancellationToken, Task>? retryDelay = null,
+    INetworkTransport? networkTransport = null)
 {
     private readonly SessionStore _store = store;
     private readonly IModelAdapter _adapter = adapter;
@@ -55,6 +57,12 @@ public sealed class Stepper(
     private readonly IReadOnlyList<ITool> _tools = tools ?? [];
     private readonly Lilara.Core.Plugins.PluginHost _plugins = plugins ?? new();
     private readonly UsageStore? _usage = usage;
+
+    /// <summary>
+    /// 联网传输。⚠️ **可注入**（与 `retryDelay` 同一个理由）：SSRF 与超时的判据必须有测试，
+    /// 而测试不能真的连公网。生产路径不传 = 真的走 HTTP。
+    /// </summary>
+    private readonly INetworkTransport _networkTransport = networkTransport ?? new HttpNetworkTransport();
 
     /// <summary>
     /// 构造时定下的适配器。⚠️ 这个只读访问器存在的唯一理由是**可测性**：
@@ -245,7 +253,9 @@ public sealed class Stepper(
             new PresetStore(_store.DataRoot, PresetStore.SystemDir),
             new PresetStore(_store.DataRoot, PresetStore.PremierDir),
             handle.Spec.SystemPromptPreset, handle.Spec.PremierPrompt,
-            pluginAxes.Values, pluginPrompt);
+            pluginAxes.Values, pluginPrompt,
+            // ⚠️ 目标线进**尾块**（浮动上下文），不落盘：目标是状态，不是事件。
+            GoalMode.IsActive(stepState) ? CorePrompts.GoalDirective : null);
 
         // ⚠️ **引擎租约**：所有 `StepAsync` 调用都在 **_stepper 的会话内串行** 之内
         // （`CommandDispatcher` 的会话闸），所以这里不需要再同步。
@@ -421,6 +431,9 @@ public sealed class Stepper(
         // 这一批工具结果——**给头的活事件**（`StepOutcome.ToolResults`）。有问时恒空。
         IReadOnlyList<TimelineEvent.ToolResultEvent> toolResults = [];
 
+        // `finish_goal` 真的执行过 ⇒ 把主动性拨回 standard（见本方法末尾的状态写入）。
+        var goalEnded = false;
+
         // ⚠️ 工具调用是**模型消息的一部分** ⇒ 有调用就一定有那条模型消息（上面那个 if 通过）。
         // `events.Count > 0` 不是多余的守卫，它挡的是「凭空落一堆悬空结果」——而悬空的
         // `tool_result` 与悬空的 `tool_use` 一样会让下一步的请求非法（`01` §3.6）。
@@ -437,12 +450,17 @@ public sealed class Stepper(
                 // ⚠️ **与合成注入同一份字节**（`slots` 就是构造请求时用的那份尾块）：
                 // `floating_context` 若在这里现渲染，同一步里「核心注入的」与「模型自己要来的」
                 // 会分叉，而两边都看起来是对的（本仓栽过的形状）。
-                FloatingTextOf(slots));
+                FloatingTextOf(slots),
+                // ⚠️ 联网配置与轴值**在执行这一刻**读（同权限档位）：它们是浮动字段，
+                // 用户可以在模型调用期间改；按步开始的值判会与头显示的档位分叉。
+                NetworkFor(handle),
+                GoalMode.IsActive(handle.State));
 
             var batch = await executor.ExecuteAsync(toolCalls, context, ct);
             pending = batch.Pending;
             events.AddRange(batch.Results);
             toolResults = batch.Results;
+            goalEnded = GoalMode.IsActive(handle.State) && EndedGoal(batch, toolCalls);
 
             // ⚠️ **`release` 的线在这里落盘**（`01` §12.4，2026-10-11）：
             // 它和别的事件**不一样**——工具只跑出一次「成功」，而**记录上要留的那条不是结果**。
@@ -538,10 +556,15 @@ public sealed class Stepper(
             Status = SessionStatus.Idle,
             Turn = s.Turn + 1,
             PendingIntent = null,
+            // ⚠️ **`finish_goal` 的效果就是这一行**：把主动性拨回 standard。
+            // 拨回之后普通工具循环还会再走一步（它是一次工具调用）⇒ 模型有时间收尾总结。
+            // 只在**真的执行过**且当时确实处于 goal 时才改（见 `goalEnded` 的算法）。
+            Axes = goalEnded ? WithStandardInitiative(s.Axes) : s.Axes,
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id,
-            ReleasedClaims: releasedClaims, ReleasedLines: releasedLines, ToolResults: toolResults);
+            ReleasedClaims: releasedClaims, ReleasedLines: releasedLines, ToolResults: toolResults,
+            GoalEnded: goalEnded);
     }
 
     /// <summary>
@@ -782,6 +805,7 @@ public sealed class Stepper(
         var releasedLines = new List<TimelineEvent.ReleaseEvent>();
         // 答复之后真正跑掉的那批结果——**给头的活事件**（与 `StepAsync` 同一个出口）。
         IReadOnlyList<TimelineEvent.ToolResultEvent> toolResults = [];
+        var goalEnded = false;
 
         if (calls.Count > 0)
         {
@@ -795,11 +819,14 @@ public sealed class Stepper(
                 // ⚠️ **答复路径没有步开始的槽位快照**：`floating_context` 要说的话是
                 // 「答复这一刻」的那份（与头的 `/state` 同一个时间轴），所以在这里现装配一次。
                 // ⚠️ 它与上面那次模型调用无关——那条路**不调模型**。
-                FloatingTextAt(handle, CoreClock.Now()));
+                FloatingTextAt(handle, CoreClock.Now()),
+                NetworkFor(handle),
+                GoalMode.IsActive(handle.State));
 
             var batch = await executor.ExecuteAsync(calls, context, ct, reply);
             events.AddRange(batch.Results);
             toolResults = batch.Results;
+            goalEnded = GoalMode.IsActive(handle.State) && EndedGoal(batch, calls);
 
             // ⚠️ **`release` 的线在这里也要落**（2026-10-17）——原先只在 `StepAsync` 有一半：
             // 一批里只要有一条要问，整批就挂起；用户批准之后全部执行（`ToolExecutor` 的
@@ -834,10 +861,12 @@ public sealed class Stepper(
                         ApprovalStore.HashArgs(calls[0].Arguments),
                         DeadlineOf(handle.Spec.AskTimeout)),
                     Turn = s.Turn + 1,
+                    Axes = goalEnded ? WithStandardInitiative(s.Axes) : s.Axes,
                 }, diskStatus: SessionStatus.WaitingForInput);
 
                 return new StepOutcome(NoReply, again, handle.State.Ask?.DeadlineAt,
-                    ReleasedClaims: releasedClaims, ReleasedLines: releasedLines);
+                    ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
+                    GoalEnded: goalEnded);
             }
         }
 
@@ -847,10 +876,11 @@ public sealed class Stepper(
         {
             Status = SessionStatus.Idle,
             Turn = s.Turn + 1,
+            Axes = goalEnded ? WithStandardInitiative(s.Axes) : s.Axes,
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
-            ToolResults: toolResults);
+            ToolResults: toolResults, GoalEnded: goalEnded);
     }
 
     /// <summary>
@@ -935,7 +965,9 @@ public sealed class Stepper(
         var state = handle.State;
         var axes = _plugins.Freeze(PluginSessionView.Values(state), now, handle.Spec.Plugins ?? []);
         var prompt = _plugins.Collect(axes, handle.Spec.Plugins ?? []);
-        var slots = SystemBlock.Build(systemText: null, premierText: null, axes.Values, prompt);
+        var slots = SystemBlock.Build(systemText: null, premierText: null, axes.Values, prompt,
+            // 与 `StepAsync` 同一来源：答复路径 / 控制面探测看到的尾块也要带目标线。
+            GoalMode.IsActive(state) ? CorePrompts.GoalDirective : null);
         return FloatingTextOf(slots);
     }
 
@@ -944,6 +976,42 @@ public sealed class Stepper(
     {
         var text = string.Concat(slots.Tail.OfType<Block.TextBlock>().Select(b => b.Text));
         return text.Length == 0 ? null : text;
+    }
+
+    /// <summary>
+    /// 这一刻的联网能力快照（配置 + 轴值 + 传输）。⚠️ <b>每步读一次配置</b>：
+    /// 用户在头上改了端点 / key，下一步就生效；而步内是冻结的（同权限档位）。
+    /// </summary>
+    private NetworkAccess NetworkFor(SessionHandle handle) =>
+        new(new NetworkStore(_store.DataRoot).Load(),
+            handle.State.Axes?.GetValueOrDefault(Axes.Network) ?? "off",
+            _networkTransport);
+
+    /// <summary>
+    /// 这一批里有没有**真的执行过** `finish_goal`。⚠️ 走 `ExecutedCallIds`（`release` 的先例）：
+    /// 被权限闸拒绝的调用也在 `toolCalls` 里，但**一次都没跑**——为它改轴等于让一次被拒绝的
+    /// 操作改变控制面状态。
+    /// </summary>
+    private static bool EndedGoal(
+        ToolExecutor.Batch batch, IReadOnlyList<Block.ToolUseBlock> calls) =>
+        batch.ExecutedCallIds.Any(executed =>
+            calls.Any(call => string.Equals(call.CallId, executed, StringComparison.Ordinal)
+                              && string.Equals(call.Name, FinishGoalTool.NameOf, StringComparison.Ordinal)));
+
+    /// <summary>
+    /// 把主动性拨回 `standard`——**复制一份新字典**，不原地改。
+    /// ⚠️ `Axes` 是只读视图，原地改会写到进程级静态表（同 `ProviderStore` 那条纪律）。
+    /// </summary>
+    private static IReadOnlyDictionary<string, string>? WithStandardInitiative(
+        IReadOnlyDictionary<string, string>? axes)
+    {
+        if (axes is null) return null;
+
+        var copy = new Dictionary<string, string>(axes, StringComparer.Ordinal)
+        {
+            [Axes.Initiative] = "standard",
+        };
+        return copy;
     }
 
     /// <summary>
@@ -1017,7 +1085,13 @@ public sealed class Stepper(
         /// 落盘的内容逐字相同。回收/截断是**渲染期**的事，头收到活事件时那条记录刚写，
         /// 还没轮到任何判定；重拉时 `/history` 会给同一批结果套上最新形态。</para>
         /// </summary>
-        IReadOnlyList<TimelineEvent.ToolResultEvent>? ToolResults = null);
+        IReadOnlyList<TimelineEvent.ToolResultEvent>? ToolResults = null,
+        /// <summary>
+        /// 本步**真的执行了** `finish_goal`，主动性已经拨回 `standard`。
+        /// ⚠️ 调用方据此发 `axis.changed`（头的行 / 调音台靠它把目标标记撤掉）；
+        /// <b>不要</b>据此掐掉下一次推进——用户要的是「再多跑一步让模型收尾」。
+        /// </summary>
+        bool GoalEnded = false);
 
     /// <summary>
     /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。

@@ -51,6 +51,32 @@ public abstract record CoreCommand
     public sealed record ProviderTest(string Id) : CoreCommand;
 
     /// <summary>
+    /// **配置联网能力**（`&lt;数据根&gt;/network.json`，2026-10-22）。除下面说明外，
+    /// **null = 本次没提到 = 保留旧值**（与 <see cref="ProviderUpsert"/> 同一条语义）。
+    ///
+    /// <para>⚠️ <b>它管的是「基础设施」</b>：搜索端点 / key / 上限 / 抓取白名单。
+    /// 「这个会话能不能联网」属于 `network` 轴（`session.setAxis`）——两件事分开，
+    /// 否则每开一次联网都要改全局配置。</para>
+    ///
+    /// <para>⚠️ <b>空串 = 清掉 key</b>：`ApiKey == ""` 是有意义的值（与「没提到」不同）。
+    /// 这是唯一一个「空串不是 no-op」的字段，反方向（想保留 key）就**别发这个键**。</para>
+    /// </summary>
+    public sealed record NetworkConfigure(
+        bool? Enabled,
+        string? ApiKey,
+        string? Endpoint,
+        int? MaxResults,
+        int? TimeoutSeconds,
+        int? MaxBytes,
+        IReadOnlyList<string>? AllowDomains) : CoreCommand;
+
+    /// <summary>
+    /// 用**已保存的**联网配置发一次最小搜索，回答「通不通 + 为什么」。
+    /// 与 <see cref="ProviderTest"/> 同形：业务失败走 <c>Ack.Accepted.Note</c>，不是 rejected。
+    /// </summary>
+    public sealed record NetworkTest : CoreCommand;
+
+    /// <summary>
     /// 写一份预设（`&lt;数据根&gt;/presets/&lt;id&gt;.md`）。<b>内容就是那段系统提示词</b>。
     ///
     /// <para>⚠️ <b>空 <paramref name="Content"/> 是合法且有意义的值</b>（= 纯聊天），

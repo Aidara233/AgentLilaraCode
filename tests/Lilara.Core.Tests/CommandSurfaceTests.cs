@@ -28,6 +28,10 @@ public class CommandSurfaceTests
         (typeof(CoreCommand.ProviderDelete),   "provider.delete",   "provider delete p"),
         (typeof(CoreCommand.ProviderTest),     "provider.test",     "provider test p"),
 
+        // 联网（2026-10-22）：`network set` / `network test`。
+        (typeof(CoreCommand.NetworkConfigure), "network.configure", "network set --enabled on"),
+        (typeof(CoreCommand.NetworkTest),      "network.test",      "network test"),
+
         // 预设：系统提示词的存放（预设批）。三条**都有线上形态**——
         // 连 `preset list` 也有（它走线，不像 `provider list` 是控制台本地查询：
         // 头只有一个入口，而它要用这个做下拉）。
@@ -165,6 +169,9 @@ public class CommandSurfaceTests
         "preset.delete" => """{"kind":"preset.delete","id":"default"}""",
         "preset.list" => """{"kind":"preset.list"}""",
         "approval.respond" => """{"kind":"approval.respond","sessionId":"s1","askId":"a1","outcome":"submit"}""",
+        // 联网：显式载荷，因为兜底那张塞的 `id` / `sessionId` 这两个键它一个都不读。
+        "network.configure" => """{"kind":"network.configure","enabled":true,"endpoint":"https://api.tavily.com/search","maxResults":5}""",
+        "network.test" => """{"kind":"network.test"}""",
         _ => $$"""{"kind":"{{kind}}","id":"x","sessionId":"s1"}""",
     };
 

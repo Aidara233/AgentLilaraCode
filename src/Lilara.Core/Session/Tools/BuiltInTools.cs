@@ -51,6 +51,10 @@ namespace Lilara.Core.Session.Tools;
 ///
 /// <para><see cref="SystemInfoTool"/> 是只读的按需设备快照：报告 CPU、内存、磁盘和可用时的 NVIDIA GPU 状态，不持续采样。</para>
 ///
+/// <para>⚠️ <b><see cref="SearchTool"/>（2026-10-22）是「模型能看见自己的工作目录」的第三个入口</b>：
+/// `ls` 回答「这一层有什么」，`read` 回答「这一个是什么」，`search` 回答「这一片里哪里有它」。
+/// 它只读、不走网络，判据与 `ls` / `read` 同一条——是**机制**，不是插件提供的「干活能力」。</para>
+///
 /// <para>⚠️ <b><see cref="FloatingContextTool"/>（2026-10-17）是这一列里唯一一个「核心自己每步都会合成调用它」的工具</b>：
 /// 浮动块不再拼进 user 消息，而是由 <c>Stepper.FloatingContextPair</c> 在时间线末尾
 /// 合成一对 <c>tool_use</c> + <c>tool_result</c>——那条合成的调用引用的就是这个**声明过的名字**。
@@ -61,9 +65,12 @@ public static class BuiltInTools
 {
     public static IReadOnlyList<ITool> All { get; } =
     [
-        new ListTool(), new ReadTool(), new FetchTool(), new AskTool(),
+        new ListTool(), new ReadTool(), new SearchTool(), new FetchTool(), new AskTool(),
         new UpdateTool(), new WriteTool(), new ReleaseTool(),
         new MakeDirectoryTool(), new DeleteTool(), new PathTool(), new SystemInfoTool(), new GitReadTool(), new GitWriteTool(),
         new DotnetBuildTool(), new DotnetTestTool(), new FloatingContextTool(),
+        // 2026-10-22：联网与 goal 收尾。三个都常驻——配置和轴值**不进工具声明**，
+        // 因此拨轴 / 改配置不会破前缀；关着时它们只回一句人话。
+        new WebSearchTool(), new WebFetchTool(), new FinishGoalTool(),
     ];
 }

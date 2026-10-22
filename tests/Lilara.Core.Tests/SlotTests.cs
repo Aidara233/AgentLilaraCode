@@ -198,12 +198,12 @@ public sealed class SlotTests : IDisposable
     {
         // 序列被钉死——重排/增删轴会红（见上面那条注释：文化序那一半钉不住）。
         Assert.Equal(
-            ["effort", "initiative", "permission", "safety", "temperature", "verify"],
+            ["effort", "initiative", "network", "permission", "safety", "temperature", "verify"],
             Axes.RenderOrder);
 
         // 表序**保持不变**：它是控制面 `/axes` 与人看的序（`Axes.Names` 的注释）。
         Assert.Equal(
-            ["initiative", "permission", "safety", "verify", "effort", "temperature"],
+            ["initiative", "permission", "safety", "verify", "network", "effort", "temperature"],
             Axes.Names);
 
         // ⚠️ 再看文本里的**先后**与 `RenderOrder` 一致（而不是与表序一致）。

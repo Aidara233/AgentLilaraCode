@@ -26,7 +26,8 @@ public class ArchitectureTests
         // 18 → 19（2026-10-12 打断批）：加了 `Interruption.cs`（打断的识别：配对规则）。
         // 19 → 20（2026-10-15 统计批）：加了 `TokenUsage.cs`（跨层共享的 token 事实）。
         // 20 → 21（2026-10-17 回收窗口批）：加了 `ReclaimEvent.cs`（窗口记录：回收只在窗口里发生）。
-        Assert.Equal(21, files.Length);
+        // 21 → 22（2026-10-22 联网批）：加了 `Network.cs`（联网配置 / 能力 / 传输契约）。
+        Assert.Equal(22, files.Length);
 
         var offenders = files
             .SelectMany(f => ExternalUsings(f).Select(u => $"{Path.GetFileName(f)}:{u.Line}  {u.Text}"))

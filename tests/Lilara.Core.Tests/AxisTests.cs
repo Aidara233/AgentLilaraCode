@@ -12,8 +12,18 @@ public class AxisTests
         // 顺序决定快照里轴的排列，也就决定头的渲染顺序——顺序不稳等于每步重排。
         // ⚠️ "temperature" 是本表第一条**数值范围**轴（01 §3.5），排在最后 = 渲染在最后。
         Assert.Equal(
-            ["initiative", "permission", "safety", "verify", "effort", "temperature"],
+            ["initiative", "permission", "safety", "verify", "network", "effort", "temperature"],
             Axes.Names);
+    }
+
+    [Fact]
+    public void NetworkAxis_IsInContext_AndDefaultsToOff()
+    {
+        Assert.Equal(["off", "search", "fetch", "all"], Axes.ValuesOf(Axes.Network));
+        Assert.Equal("off", Axes.Defaults()[Axes.Network]);
+        Assert.Equal("联网", Axes.LabelOf(Axes.Network));
+        // ⚠️ 进上下文：模型要知道这个会话能联网到哪一步；否则它只会从工具被拒的结果里猜。
+        Assert.True(Axes.InContext(Axes.Network));
     }
 
     [Fact]

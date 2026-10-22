@@ -73,14 +73,15 @@ public static class SystemBlock
         PresetStore presets, PresetStore premiers,
         string? systemPresetId, string? premierId,
         IReadOnlyDictionary<string, string> axes,
-        PromptContributionSnapshot? pluginPrompt = null) =>
+        PromptContributionSnapshot? pluginPrompt = null,
+        string? goalDirective = null) =>
         Build(
             // ⚠️ 传**可空**的预设正文，不在这里折成 `SystemFallback`：那一折会抹掉
             // 「文件不在」与「文件在」的区分，而 `SystemBody` 的判据正是它
             // （文件不在时兜底里已含机制说明；文件在时补一句）。
             Load(presets, systemPresetId),
             Load(premiers, premierId),
-            axes, pluginPrompt);
+            axes, pluginPrompt, goalDirective);
 
     /// <summary>
     /// 三块槽位的**纯装配**——输入是已经读好的两份正文 + 轴 + 插件贡献，不碰任何存储。
@@ -97,13 +98,14 @@ public static class SystemBlock
     internal static PromptSlots Build(
         string? systemText, string? premierText,
         IReadOnlyDictionary<string, string> axes,
-        PromptContributionSnapshot? pluginPrompt = null) =>
+        PromptContributionSnapshot? pluginPrompt = null,
+        string? goalDirective = null) =>
         new(
             System: Text(SystemBody(systemText, pluginPrompt?.Text(PromptSlot.System))),
             Premier: Wrap(CorePrompts.PremierOpen,
                 Join(premierText, pluginPrompt?.Text(PromptSlot.Primary)), CorePrompts.PremierClose),
             Tail: Wrap(CorePrompts.TailOpen,
-                TailBody(axes, pluginPrompt?.Text(PromptSlot.Floating)), CorePrompts.TailClose));
+                TailBody(axes, pluginPrompt?.Text(PromptSlot.Floating), goalDirective), CorePrompts.TailClose));
 
     // 非空自定义预设也需要机制说明；显式空预设且无系统贡献时仍不产生系统块。
     private static string SystemBody(string? preset, string? plugin)
@@ -155,7 +157,8 @@ public static class SystemBlock
     /// <b>有没有轴表或插件浮动字段</b>。若把自述也算进去，一个没有内容的会话会得到一个只有自述的尾块
     /// ——而那正是 <see cref="Wrap"/> 那条「空的不能长得像有内容」要防的。</para>
     /// </summary>
-    private static string? TailBody(IReadOnlyDictionary<string, string> axes, string? plugin)
+    private static string? TailBody(
+        IReadOnlyDictionary<string, string> axes, string? plugin, string? goalDirective)
     {
         var table = AxisTable(axes);
         var descriptions = Axes.RenderOrder.Where(Axes.InContext)
@@ -163,7 +166,7 @@ public static class SystemBlock
             .Select(axis => Axes.DescriptionOf(axis, axes[axis]) is { } explanation
                 ? $"{Axes.LabelOf(axis)} {axes[axis]}：{explanation}" : null);
         var body = Join(table is null ? null : CorePrompts.TailAxesPrefix + table,
-            Join(descriptions.ToArray()), plugin);
+            Join(descriptions.ToArray()), goalDirective, plugin);
         return body is null ? null : $"{CorePrompts.TailDeclaration}\n{body}";
     }
 

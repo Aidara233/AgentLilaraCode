@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using Lilara.Core.Hosting;
 using Lilara.Core.Kernel;
+using Lilara.Core.Network;
 using Lilara.Core.Protocol;
 using Lilara.Core.Storage;
 using Lilara.Core.Session;
@@ -279,6 +280,10 @@ public sealed class ControlServer(
                     }
                     : new { AskId = (string?)null, ToolName = (string?)null, Kind = (AskKind?)null,
                             DeadlineAt = (DateTimeOffset?)null },
+                // ⚠️ **goal 永远是对象**（照 `Ask` 的 `{}` 纪律）：`WhenWritingNull` 会把 null 键
+                // 整个省掉，头就分不清「不在 goal」与「这个核心不认识 goal」。
+                // 判据只有一处：主动性轴是不是 `goal`（`GoalMode`）。
+                Goal = new { Active = Session.GoalMode.IsActive(state) },
             };
         });
 
@@ -304,6 +309,10 @@ public sealed class ControlServer(
                     Axes = PluginSessionView.Values(handle.State),
                     AxisDefinitions = PluginSessionView.Definitions(host.Plugins, handle.Spec),
                     PluginProblems = PluginSessionView.Problems(host.Plugins, handle.Spec),
+
+                    // goal 状态（2026-10-22）。⚠️ 判据仍然是主动性轴（`GoalMode`），
+                    // 这里只是把它**显式交出去**，省得头为了一个布尔自己去翻 axes。
+                    Goal = new { Active = Session.GoalMode.IsActive(handle.State) },
 
                     // 整个 spec 交出去、不做子集裁剪：SessionSpec 里没有 ApiKey，所以天生不泄 key。
                     // 代价：WorkingDirectory 是本机绝对路径，在开放 CORS(*) 下可读。
@@ -585,6 +594,32 @@ public sealed class ControlServer(
             // 那份曾经内联在此，改谓词的人看不见它 ⇒ 人话会静默变成假话。
             ProviderIdRule = CommandDispatcher.ProviderIdRule,
         }, WireJson.Options));
+
+        // 联网配置（2026-10-22）。⚠️ 与 `/providers` 同一条纪律：**key 只回 hasApiKey**。
+        // 头据此画「已配置 / 没 key」，而拿不到 key 本身。
+        app.MapGet("/network-config", () =>
+        {
+            var config = new NetworkStore(host.DataRoot).Load();
+
+            return Results.Json(new
+            {
+                config.Enabled,
+                HasApiKey = !string.IsNullOrWhiteSpace(config.Search.ApiKey),
+                Search = new
+                {
+                    config.Search.Provider,
+                    config.Search.Endpoint,
+                    config.Search.MaxResults,
+                    config.Search.TimeoutSeconds,
+                },
+                Fetch = new
+                {
+                    config.Fetch.TimeoutSeconds,
+                    config.Fetch.MaxBytes,
+                    config.Fetch.AllowDomains,
+                },
+            }, WireJson.Options);
+        });
     }
 
     // 一条事件的可渲染形态（核心渲染，头只显示）。
@@ -637,7 +672,9 @@ public sealed class ControlServer(
             new PresetStore(host.DataRoot, PresetStore.PremierDir),
             handle.Spec.SystemPromptPreset,
             handle.Spec.PremierPrompt,
-            values, contribution);
+            values, contribution,
+            // 与 `Stepper.StepAsync` 同一来源：头看到的浮动槽也要带目标线。
+            Session.GoalMode.IsActive(handle.State) ? CorePrompts.GoalDirective : null);
 
         return new
         {
@@ -1054,6 +1091,18 @@ public sealed class ControlServer(
             // 连通性自检。与 provider.delete 同形（只带 id）。
             "provider.test" => new CoreCommand.ProviderTest(
                 payload.GetProperty("id").GetString()!),
+            // 联网配置（2026-10-22）。全部走 Opt：**键缺失 = 保留旧值**。
+            // ⚠️ `apiKey` 的空串是**有意义的值**（清掉 key），所以不能把它折进「没给」——
+            // dispatcher 按「null = 保留 / "" = 清空」判。
+            "network.configure" => new CoreCommand.NetworkConfigure(
+                OptBool(payload, "enabled"),
+                Opt(payload, "apiKey"),
+                Opt(payload, "endpoint"),
+                ToInt(OptNumber(payload, "maxResults")),
+                ToInt(OptNumber(payload, "timeoutSeconds")),
+                ToInt(OptNumber(payload, "maxBytes")),
+                OptStringList(payload, "allowDomains")),
+            "network.test" => new CoreCommand.NetworkTest(),
             // 预设：系统的系统提示词从哪来。三条同 `provider.*` 一族（id 闸也在 dispatcher）。
             // ⚠️ `content` 走 GetProperty（**必给**）——`preset.set` 没有别的字段，
             // 所以「没给 content」只可能是发命令的程序写错了；而「给了空串」是**合法值**（纯 chat）。
@@ -1116,6 +1165,10 @@ public sealed class ControlServer(
         static double? OptNumber(JsonElement e, string name) =>
             e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number
             && v.TryGetDouble(out var n) ? n : null;
+
+        // 整数字段。⚠️ 截断发生在 dispatcher 的范围校验**之前**——所以那里仍要再判一次
+        // （`1.5` 到这里变成 `1`，而用户以为他给了 1.5）。
+        static int? ToInt(double? n) => n is { } d ? (int)d : null;
 
         // 布尔版。⚠️ **只认 `true` / `false` 两个字面量**，其余（缺失 / null / 字符串 `"false"` /
         // 数字）一律当「没给」⇒ 在 `session.archive` 上就是**归档**。

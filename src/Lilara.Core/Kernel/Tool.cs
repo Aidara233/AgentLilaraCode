@@ -269,6 +269,26 @@ public interface IToolContext
     /// 想要某一步当时发出去的那份，不存在，也不需要存在。</para>
     /// </summary>
     string FloatingContext { get; }
+
+    /// <summary>
+    /// 这个会话**这一刻的联网能力快照**（`network.json` + `network` 轴值），2026-10-22。
+    ///
+    /// <para>⚠️ <b>`null` = 没有联网上下文</b>（纯单测手工构造的句柄）。联网工具据此回一句
+    /// 说人话的「这里没有联网配置」，而不是猜一个「开着」——与 `FloatingContext` 的空串同向：
+    /// **不知道就说不**。</para>
+    ///
+    /// <para>⚠️ <b>它是一份快照，不是「让工具现读配置」</b>：一步之内两条调用必须按同一份
+    /// 配置与同一个轴值判定（同权限档位那条）。</para>
+    /// </summary>
+    NetworkAccess? Network { get; }
+
+    /// <summary>
+    /// 这个会话此刻是否处于 goal 模式（主动性轴 = `goal`）。
+    ///
+    /// <para>⚠️ <b>只给 `finish_goal` 用</b>：不在 goal 模式下调用它应当是**一句说明 + 什么都不做**，
+    /// 而不是假装收尾。真正的「把轴拨回 standard」在推进器那一侧做（工具没有改状态的手）。</para>
+    /// </summary>
+    bool GoalActive { get; }
 }
 
 /// <summary>

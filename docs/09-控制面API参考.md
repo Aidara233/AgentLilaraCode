@@ -361,13 +361,16 @@
       "toolName": "write",
       "kind": "permission",
       "deadlineAt": "2026-10-18T12:00:00+08:00"
-    }
+    },
+    "goal": { "active": false } // 主动性轴是不是 goal；永远是对象
   }
 ]
 ```
 
 - ⚠️ **「没在等」的 `ask` 是 `{}`，不是 `null`、也不是省略**。判据是 `row.ask?.askId`——
   `{}` 在 JS 里是 truthy，`if (row.ask)` 会误判。
+- ⚠️ `goal` 同理**永远是对象**（判 `row.goal?.active`）。它只是主动性轴的投影：
+  `goal.active === (axes.initiative === "goal")`，没有第二份目标状态。
 - ⚠️ `title` 未起名时**键不存在**（`WhenWritingNull`）。判据是 `row.title`。
 - `status` 与 `active` 是**两件事**：`active` = 载入内存了；`running` 是 `status`。
   今天两者恰好同延（队列随内存一起丢），但别当同一个概念。
@@ -397,6 +400,7 @@
   },
   "highWater": 17,
   "axes": { "initiative": "step", …, "style.detail": "brief" },  // 核心轴 + 插件轴合并后的**当前值**
+  "goal": { "active": false },  // 主动性轴是不是 goal（2026-10-22）
   "axisDefinitions": [ /* 见下 */ ],
   "pluginProblems": ["插件 'style' 版本不一致：绑定 1，现有 2"],  // 无问题时 []
   "spec": {                     // SessionSpec，见下面
@@ -735,7 +739,34 @@
 - 不存在 ⇒ **404**；不激活会话。
 - 证据：`ControlServer.cs` 的 `/sessions/{id}/context`。
 
-### 3.18 不存在的端点
+### 3.18 `GET /network-config`
+
+联网能力的**设备级**配置（`<数据根>/network.json`，2026-10-22）。它不控制「这个会话能不能联网」——
+那属于 `network` 轴（`session.setAxis`）；这里只有端点、key 与上限。
+
+```jsonc
+{
+  "enabled": false,
+  "hasApiKey": false,           // ⚠️ key 本身永不回显（与 /providers 同一条纪律）
+  "search": {
+    "provider": "tavily",
+    "endpoint": "https://api.tavily.com/search",
+    "maxResults": 5,
+    "timeoutSeconds": 20
+  },
+  "fetch": {
+    "timeoutSeconds": 20,
+    "maxBytes": 2097152,
+    "allowDomains": []          // 空 = 只许公网；显式名单可指向本机 / 内网
+  }
+}
+```
+
+- `enabled=false` 时 `web_search` / `web_fetch` 仍出现在工具表里（保前缀稳定），调用只回一句「未启用」。
+- 写入口是 WS 的 `network.configure`；`network.test` 是同步试搜。
+- 证据：`ControlServer.cs` 的 `/network-config`；键集守卫 `ControlServerTests.Snapshot_NetworkConfig_CarriesExactlyTheseKeys`。
+
+### 3.19 不存在的端点
 
 | 路径 | 状态 |
 |---|---|
@@ -747,7 +778,7 @@
 
 ## 4. WS 命令
 
-⚠️ 一共 **19** 条（`ControlServer.ParseCommand` 的 `kind`，`ControlServer.cs:856-946`）。
+⚠️ 一共 **21** 条（`ControlServer.ParseCommand` 的 `kind`）。
 **对照 `03` §3 那张设计全集**：`project.setConfig` · `tool.setEnabled` · `session.continue` 不存在；
 `claim.acquire` 有 dispatcher 与控制台解析，**线上没有**（刻意的，用户裁定）。
 
@@ -990,6 +1021,38 @@
 结果在 `note` 里：`✓ 通（model @ url（来源））` / `✗ 不通（url（来源））：原因`。
 证据：`CommandDispatcher.cs:478-566`。
 
+#### `network.configure`
+
+```jsonc
+{ "kind": "network.configure", "enabled": true, "apiKey": "tvly-…",
+  "endpoint": "https://api.tavily.com/search", "maxResults": 5,
+  "timeoutSeconds": 20, "maxBytes": 2097152, "allowDomains": ["wiki.intra"] }
+```
+
+| 键 | 必给 | 语义 |
+|---|---|---|
+| `enabled` | 否 | 总开关；省略 = 保留 |
+| `apiKey` | 否 | 省略 = 保留；**空串 = 清掉**（唯一一个「空串不是 no-op」的字段） |
+| `endpoint` | 否 | 绝对 http / https；省略 = 保留 |
+| `maxResults` | 否 | 1..10 |
+| `timeoutSeconds` | 否 | 1..120，同时管搜索与抓取 |
+| `maxBytes` | 否 | 4096..8 MiB（抓取单页上限） |
+| `allowDomains` | 否 | 域名列表；省略 = 保留，`[]` = 清空 |
+
+- 语义与 `provider.upsert` 同一条：**null / 键缺失 = 保留旧值**。
+- 成功后 `note` 说明「已启用 / 已关闭」与当前条数、超时。
+- 证据：`CoreCommand.NetworkConfigure` · `CommandDispatcher.HandleNetworkConfigure`。
+
+#### `network.test`
+
+```jsonc
+{ "kind": "network.test" }
+```
+
+用**已保存的**配置发一次最小搜索（**同步**，最多 10 秒）。与 `provider.test` 同形：
+业务失败也是 `accepted:true`，结果在 `note`：`✓ 通（N 条结果）` / `✗ 不通：原因`。
+证据：`CommandDispatcher.HandleNetworkTestAsync`。
+
 #### `approval.respond`
 
 ```jsonc
@@ -1043,7 +1106,7 @@
 | 位置 | 写的 | 实际 |
 |---|---|---|
 | `03` §6 `/history`「分页未实现」、§11「零个 `Request.Query`」 | 无分页 | 有 `limit` / `before` / `hasMore` / `nextCursor`（§3.8） |
-| `03` §6 端点清单 | 缺 4 条 usage / context | 实际共 **17** 个 `MapGet`（§3.14–§3.17 是新的四条） |
+| `03` §6 端点清单 | 缺 4 条 usage / context | 实际共 **18** 个 `MapGet`（§3.14–§3.17 是 usage / context；§3.18 是 `/network-config`） |
 | `03` §4.2 事件载荷表 | 缺新事件 | 缺 `session.reclaimed`、`release.recorded`、`tool.result.appended`、`usage.updated`、`session.compaction.completed`，缺 `message.appended.historyId` |
 | `03` §4「已上线」表 | 20 个事件名 | 20 个类型（`WireEvent.cs:8-28`）✅ 数对，但 §4.2 载荷表没跟上 |
 | `03` §7「hello(lastSeq)」 | 有这个帧 | ❌ 不存在（§2.2） |

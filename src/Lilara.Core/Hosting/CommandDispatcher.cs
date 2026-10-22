@@ -1,5 +1,6 @@
 using Lilara.Core.Protocol;
 using Lilara.Core.Kernel;
+using Lilara.Core.Network;
 using Lilara.Core.Storage;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
@@ -22,7 +23,8 @@ public sealed class CommandDispatcher(
     CoreHost host,
     EventBus bus,
     Func<SessionHandle, Stepper> resolveStepper,
-    Func<ProviderDefinition, IModelAdapter>? createAdapter = null)
+    Func<ProviderDefinition, IModelAdapter>? createAdapter = null,
+    INetworkTransport? networkTestTransport = null)
 {
     private readonly CoreHost _host = host;
     private readonly EventBus _bus = bus;
@@ -55,6 +57,13 @@ public sealed class CommandDispatcher(
     // 它无状态、只包一个路径前缀，做成字段就得给 `CoreHost` 再开一个属性，
     // 而那个属性没有任何别的地方要用。
     private readonly PresetStore _presets = new(host.DataRoot);
+
+    /// <summary>
+    /// `network.test` 用的传输。⚠️ **可注入**（与 `createAdapter` 同一个理由）：
+    /// 自检要发一次真请求，不给测试留注入口就只能打真网络。
+    /// </summary>
+    private readonly INetworkTransport _networkTestTransport =
+        networkTestTransport ?? new HttpNetworkTransport();
 
     /// <summary>
     /// **「启动」那个推进出口**——§6.1 三条判据的第二次落点，也是**收尾之后接着走**
@@ -181,6 +190,10 @@ public sealed class CommandDispatcher(
 
                 case CoreCommand.ProviderTest t:
                     return await HandleProviderTestAsync(t, commandId, ct);
+
+                // ---- 联网（2026-10-22）----
+                case CoreCommand.NetworkConfigure nc: return HandleNetworkConfigure(nc, commandId);
+                case CoreCommand.NetworkTest nt: return await HandleNetworkTestAsync(nt, commandId, ct);
 
                 // ---- 预设：系统块从哪来（`01` §3.1；`14` 未决项 6）----
                 case CoreCommand.PresetSet ps: return HandlePresetSet(ps, commandId);
@@ -607,6 +620,128 @@ public sealed class CommandDispatcher(
         }
     }
 
+    /// <summary>
+    /// **保存联网配置**（2026-10-22）。⚠️ 与 `provider.upsert` 同一条合并语义：
+    /// null = 保留；唯一例外是 `ApiKey == ""` = **清掉 key**。
+    /// </summary>
+    private DispatchResult HandleNetworkConfigure(CoreCommand.NetworkConfigure c, string id)
+    {
+        if (c.Endpoint is not null)
+        {
+            if (!Uri.TryCreate(c.Endpoint, UriKind.Absolute, out var endpoint)
+                || (endpoint.Scheme != Uri.UriSchemeHttp && endpoint.Scheme != Uri.UriSchemeHttps))
+                return Reject(id, "搜索端点必须是绝对的 http / https URL。");
+        }
+
+        if (c.MaxResults is { } maxResults
+            && (maxResults < 1 || maxResults > NetworkLimits.MaxSearchResults))
+            return Reject(id, $"maxResults 要在 1..{NetworkLimits.MaxSearchResults} 之间。");
+
+        if (c.TimeoutSeconds is { } timeout
+            && (timeout < NetworkLimits.MinTimeoutSeconds || timeout > NetworkLimits.MaxTimeoutSeconds))
+            return Reject(id,
+                $"timeoutSeconds 要在 {NetworkLimits.MinTimeoutSeconds}..{NetworkLimits.MaxTimeoutSeconds} 之间。");
+
+        if (c.MaxBytes is { } maxBytes
+            && (maxBytes < NetworkLimits.MinFetchBytes || maxBytes > NetworkLimits.MaxFetchBytes))
+            return Reject(id,
+                $"maxBytes 要在 {NetworkLimits.MinFetchBytes}..{NetworkLimits.MaxFetchBytes} 之间。");
+
+        if (c.AllowDomains is { } domains)
+        {
+            foreach (var raw in domains)
+            {
+                if (!IsSafeDomainName(raw.Trim().TrimStart('.').ToLowerInvariant()))
+                    return Reject(id, $"域名 '{raw}' 形状不对（只允许字母、数字、`-`、`.`）。");
+            }
+        }
+
+        var store = new NetworkStore(_host.DataRoot);
+        var current = store.Load();
+
+        var next = current with
+        {
+            Enabled = c.Enabled ?? current.Enabled,
+            Search = current.Search with
+            {
+                // ⚠️ 三态：null = 保留；"" = 清掉；其余 = 换新。
+                ApiKey = c.ApiKey is null ? current.Search.ApiKey
+                    : c.ApiKey.Length == 0 ? null : c.ApiKey,
+                Endpoint = c.Endpoint ?? current.Search.Endpoint,
+                MaxResults = c.MaxResults ?? current.Search.MaxResults,
+                TimeoutSeconds = c.TimeoutSeconds ?? current.Search.TimeoutSeconds,
+            },
+            Fetch = current.Fetch with
+            {
+                // 一个 timeoutSeconds 同时管搜索与抓取——头上只有一个「超时」输入框，
+                // 两条路各自一个数只会让用户以为其中一个没生效。
+                TimeoutSeconds = c.TimeoutSeconds ?? current.Fetch.TimeoutSeconds,
+                MaxBytes = c.MaxBytes ?? current.Fetch.MaxBytes,
+                AllowDomains = c.AllowDomains is null
+                    ? current.Fetch.AllowDomains
+                    : c.AllowDomains
+                        .Select(d => d.Trim().TrimStart('.').ToLowerInvariant())
+                        .Where(d => d.Length > 0)
+                        .Distinct(StringComparer.Ordinal)
+                        .ToList(),
+            },
+        };
+
+        store.Save(next);
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Note = next.Enabled
+                ? $"已保存：联网已启用 · 最多 {next.Search.MaxResults} 条 · 超时 {next.Search.TimeoutSeconds} 秒"
+                : "已保存：联网已关闭",
+        });
+    }
+
+    /// <summary>域名形状：非空、不太长、只有字母数字与 `-` `.` `_`、没有连续点。</summary>
+    private static bool IsSafeDomainName(string domain) =>
+        domain.Length is > 0 and <= 253
+        && !domain.Contains("..", StringComparison.Ordinal)
+        && domain.All(ch => char.IsLetterOrDigit(ch) || ch is '-' or '.' or '_');
+
+    /// <summary>
+    /// **试搜**（2026-10-22）。与 `provider.test` 同一条判据：业务失败（没开 / 没 key /
+    /// 连不上 / 限流）都走 `Ack.Accepted.Note`，只有命令本身不合法才是 rejected。
+    /// </summary>
+    private async Task<DispatchResult> HandleNetworkTestAsync(
+        CoreCommand.NetworkTest t, string id, CancellationToken ct)
+    {
+        var config = new NetworkStore(_host.DataRoot).Load();
+
+        if (!config.Enabled)
+            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = "✗ 联网未启用" });
+
+        if (string.IsNullOrWhiteSpace(config.Search.ApiKey))
+            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = "✗ 还没有配置搜索 API key" });
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+
+        try
+        {
+            var result = await _networkTestTransport.SearchAsync(
+                config, "lilara connectivity test", timeout.Token);
+
+            return new DispatchResult(new Ack.Accepted
+            {
+                CommandId = id,
+                Note = $"✓ 通（{result.Hits.Count} 条结果）",
+            });
+        }
+        catch (Exception ex)
+        {
+            var why = timeout.IsCancellationRequested && !ct.IsCancellationRequested
+                ? "10 秒内没有响应（端点没起，或上游太慢）"
+                : ex.Message;
+            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = $"✗ 不通：{why}" });
+        }
+    }
+
     private void RecordProbeUsage(
         ProviderDefinition provider, IModelAdapter adapter, string callId,
         DateTimeOffset startedAt, ModelReply? reply, string status,
@@ -1030,6 +1165,13 @@ public sealed class CommandDispatcher(
         ModelReply? reply = null;
         var resumed = false;
 
+        // ⚠️ **这一趟开始时的「停止计数」**：goal 自动续跑前要比一次（见循环尾部）。
+        // 用户在这条步运行期间按了停止 ⇒ 序号变了 ⇒ 不续跑。
+        var interruptEpoch = handle.InterruptEpoch;
+
+        // `finish_goal` 真的执行过（主动性已拨回 standard）——要发 `axis.changed`。
+        var goalEnded = false;
+
         // ⚠️ **摘槽排在这里**（2026-10-12 打断批）——不是因为它必须早于下面那把闸
         // （**调用方已经拿过 `_step` 那把标志了**，所以这一趟本来就是独占的），
         // 而是因为它必须**早于**任何可能再放一次槽的路径。⚠️ 原先那两句挪到
@@ -1066,6 +1208,7 @@ public sealed class CommandDispatcher(
                 // ⚠️ 恢复步本身不发模型消息；它先落工具结果，随后由循环尾部安排模型消费结果。
                 reply = step.Reply;
                 replyForLoop = step.Reply;
+                goalEnded = step.GoalEnded;
             }
             else
             {
@@ -1078,6 +1221,7 @@ public sealed class CommandDispatcher(
                     handle, blocks, stepCts.Token, explicitStart: explicitStart);
                 reply = step.Reply;
                 replyForLoop = step.Reply;
+                goalEnded = step.GoalEnded;
 
                 // 模型消息由这里发（`Stepper` 不碰事件总线）；判据与它落盘时一致：拒答 / 空块不产生模型消息。
                 if (!reply.Refused && reply.Blocks.Count > 0)
@@ -1125,6 +1269,13 @@ public sealed class CommandDispatcher(
             foreach (var line in step.ReleasedLines ?? [])
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                     new WireEvent.ReleaseRecorded(handle.SessionId, line.Id, line.Scope, line.Summary, line.At));
+
+            // ⚠️ **`finish_goal` 改的是轴**（不是目标事件）：它把主动性拨回 standard，
+            // 而头已有的 `axis.changed` 分支正好能把它落到行 / 调音台 / 快照上。
+            // 在 `step.end` 之前发：头看到的次序是「这一步结束了，而那一步把目标收了」。
+            if (goalEnded)
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.AxisChanged(handle.SessionId, Axes.Initiative, "standard"));
 
             var usageCalls = _host.Usage.ForSession(handle.SessionId);
             if (usageCalls.Count > usageCountBefore)
@@ -1198,6 +1349,19 @@ public sealed class CommandDispatcher(
         if (resumed)
             return await ContinueAfterResumeAsync(handle, throwOnFailure);
 
+        // ---- goal 循环：模型停回合、而目标还没收（`01` §3.5 的 goal 档）----
+        //
+        // ⚠️ **只在「没有工具调用」时走到这里**（有调用的话下面那条会接着推）。
+        // 判据里的三格都是**停止**方向：拒答（同一句拒绝会无限重放）、空回复（没有可继续的内容）、
+        // 以及用户在这条步期间按过停止（序号变了）。其余情况一路续跑——
+        // ⚠️ **没有步数上限**（用户 2026-10-22 明确选择）：唯一的停止是模型调用失败。
+        if (handle.InterruptEpoch == interruptEpoch
+            && GoalMode.IsActive(handle.State)
+            && !reply.Refused
+            && reply.Blocks.Count > 0
+            && !reply.Blocks.OfType<Kernel.Block.ToolUseBlock>().Any())
+            return await ContinueGoalAsync(handle, throwOnFailure);
+
         return await ContinueIfToolCalledAsync(handle, reply, throwOnFailure);
     }
 
@@ -1222,11 +1386,34 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
-    /// 这一步的模型调了工具吗？调了就**接着推下一步**。
+    /// **goal 模式的自动续跑**：模型这一回合没调工具就结束了，而目标还没收 ⇒ 直接再推一步。
+    ///
+    /// <para>⚠️ <b>它复用 `session.start` 那条「继续」（`explicitStart: true`）</b>：
+    /// 队列可以是空的——自主续跑没有新输入，正是 `01` §6.2 说的那件事。
+    /// 不往队列里塞一条假消息：记录里出现的每一条用户消息都必须是用户真的说过的话。</para>
+    ///
+    /// <para>⚠️ <b>不设步数上限</b>（用户 2026-10-22）：模型不调 `finish_goal` 就会一直推。
+    /// 停止只有三条路：模型调用失败（异常分支返回 null）、用户中断（序号变了）、
+    /// 或者模型拒答 / 空回复。</para>
+    /// </summary>
+    private async Task<ModelReply?> ContinueGoalAsync(SessionHandle handle, bool throwOnFailure)
+    {
+        if (!handle.TryEnterStep()) return null;
+
+        if (throwOnFailure)
+            return await RunStepAsync(handle, CancellationToken.None, throwOnFailure: true, explicitStart: true);
+
+        _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false, explicitStart: true),
+            CancellationToken.None);
+        return null;
+    }
+
+    /// <summary>
+    /// 这一步之后还要不要接着推：**调了工具**，或者**队列里有用户消息**。
     ///
     /// <para>⚠️ <b>两个提前返回，每条都有理由</b>：</para>
     /// <list type="number">
-    ///   <item><b>没调工具</b> ⇒ 循环正常结束（这是绝大多数情形）。</item>
+    ///   <item><b>没调工具、队列也空</b> ⇒ 循环正常结束（这是绝大多数情形）。</item>
     ///   <item><b>没拿到那把标志</b> ⇒ 已经有别的推进在排队了。⚠️ **不重新入队**：
     ///   队列里已经有东西（那条推进就是为此排的），再塞一次等于凭空多推一步。</item>
     /// </list>
@@ -1236,6 +1423,10 @@ public sealed class CommandDispatcher(
     /// ⇒ 直接调这一步的推进入口，不走「入队 + 启动」，免得为「触发一次推进」塞一条假待办
     /// （那条假待办会被当成一条真的要发给用户的消息）。</para>
     ///
+    /// <para>⚠️ <b>「队列非空也要推」是 2026-10-22 补的那半</b>：用户在上一步收尾期间
+    /// 发的话只入了队（`TryEnterStep` 失败），若这里因「没调工具」直接停，那条消息会
+    /// **一直躺着**——用户看到「发出了，模型没反应」。判据是队列深度，不是工具调用。</para>
+    ///
     /// <para>⚠️ <b>它会让 <c>turn</c> 一步一增</b>：一次 <c>send</c> 里模型调了两轮工具，
     /// `turn` 就 +2、+3。这是**对的**——步是持久化的原子单位，每一次模型调用都是一步。
     /// ⇒ 头看到的「会话推进了几步」与实际调用次数一致，而不是与用户按了几次回车一致。</para>
@@ -1243,7 +1434,13 @@ public sealed class CommandDispatcher(
     private async Task<ModelReply?> ContinueIfToolCalledAsync(
         SessionHandle handle, ModelReply reply, bool throwOnFailure)
     {
-        if (!reply.Blocks.OfType<Kernel.Block.ToolUseBlock>().Any()) return reply;
+        var calledTools = reply.Blocks.OfType<Kernel.Block.ToolUseBlock>().Any();
+
+        // ⚠️ **队列非空也算「还有事要做」**（2026-10-22）：`session.send` 撞上「正在跑」
+        // 时只入队（`TryEnterStep` 失败），它指望这一条链把它拿走。若这里因为
+        // 「这一步没调工具」就停，那条用户消息会**一直躺在队列里**，直到下一次 send / start
+        // ——用户看到的是「发出了，模型没反应」。判据是队列深度，不是「有没有工具调用」。
+        if (!calledTools && handle.QueueDepth == 0) return reply;
 
         if (!handle.TryEnterStep()) return reply;
 
@@ -1315,6 +1512,11 @@ public sealed class CommandDispatcher(
     private DispatchResult HandleSessionInterrupt(CoreCommand.SessionInterrupt i, string id)
     {
         if (!TryFind(i.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
+
+        // ⚠️ **先记一笔「有人叫停」**，再去找 CTS：goal 的自动续跑在步与步之间有一个窄窗口，
+        // 那时 CTS 已经摘掉、而续跑还没起来——只靠 Cancel 的话这一下是 no-op，
+        // 续跑会照样起来。序号让续跑那一侧能看见它。
+        handle.NoteInterrupt();
 
         // 两个条件都必需：该会话确实在跑（否则是在打断还没开始的步）、且 CTS 非空
         // （它是「当前那个步」的句柄，空说明步刚结束、还没来得及摘）。

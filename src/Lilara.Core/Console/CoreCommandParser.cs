@@ -227,6 +227,10 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("provider test ", StringComparison.Ordinal))
             return ParseProviderTest(trimmed);
 
+        // 联网配置（2026-10-22）：`network set …` / `network test`。
+        // ⚠️ 交**归一化后**的行（与 `provider set` 一致）：Tab / NBSP 分隔必须与空格等价。
+        if (StartsWithToken(trimmed, "network")) return ParseNetwork(trimmed);
+
         // 预设：系统提示词的存放（`01` §3.1）。三条**都走命令通道**——
         // 连 `list` 也走，因为头要拿它做下拉，而头只有「命令 + 快照」两层的入口。
         // ⚠️ 动词判据在**归一化后**的行上（词是单个词，折空白无妨），
@@ -622,6 +626,91 @@ public static class CoreCommandParser
 
         // 这里不要求 --key：「新 provider 省 key 要拒」的语义在 dispatcher，别在这里再写一遍。
         return (new CoreCommand.ProviderUpsert(id, key, model, protocol, endpoint, auth) { Models = models }, null);
+    }
+
+    // `network set [--enabled on|off] [--key <k> | --clear-key] [--endpoint <u>]
+    //             [--max-results <n>] [--timeout <秒>] [--max-bytes <n>] [--allow a,b]`
+    // `network test`
+    //
+    // 与 `provider set` 同一条拆词纪律：省略的标志 ⇒ null = 保留旧值。
+    // 唯一的例外是 `--clear-key`（一个无值标志）——控制台没法给「空串」，
+    // 而「清掉 key」是必须能表达的一件事。
+    private static (CoreCommand?, string?) ParseNetwork(string line)
+    {
+        const string usage =
+            "用法：network set [--enabled on|off] [--key <k> | --clear-key] [--endpoint <url>] "
+            + "[--max-results <n>] [--timeout <秒>] [--max-bytes <n>] [--allow <域名,域名>]\n"
+            + "      network test";
+
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 1) return (null, usage);
+
+        if (string.Equals(parts[1], "test", StringComparison.OrdinalIgnoreCase))
+            return parts.Length == 2 ? (new CoreCommand.NetworkTest(), null) : (null, usage);
+
+        if (!string.Equals(parts[1], "set", StringComparison.OrdinalIgnoreCase))
+            return (null, usage);
+
+        bool? enabled = null;
+        var clearKey = false;
+        string? apiKey = null, endpoint = null;
+        int? maxResults = null, timeout = null, maxBytes = null;
+        IReadOnlyList<string>? allow = null;
+
+        for (var i = 2; i < parts.Length; i++)
+        {
+            var flag = parts[i];
+
+            if (flag == "--clear-key") { clearKey = true; continue; }
+
+            if (i + 1 >= parts.Length) return (null, $"参数 {flag} 缺少值。");
+
+            var value = parts[i + 1];
+            if (value.StartsWith("--", StringComparison.Ordinal)) return (null, $"参数 {flag} 缺少值。");
+
+            switch (flag)
+            {
+                case "--enabled":
+                    enabled = value.ToLowerInvariant() switch
+                    {
+                        "on" or "true" or "1" => true,
+                        "off" or "false" or "0" => false,
+                        _ => null,
+                    };
+                    if (enabled is null) return (null, "--enabled 只接受 on / off。");
+                    break;
+
+                case "--key": apiKey = value; break;
+                case "--endpoint": endpoint = value; break;
+
+                case "--max-results":
+                    if (!int.TryParse(value, out var results)) return (null, "--max-results 要一个整数。");
+                    maxResults = results;
+                    break;
+
+                case "--timeout":
+                    if (!int.TryParse(value, out var seconds)) return (null, "--timeout 要一个整数（秒）。");
+                    timeout = seconds;
+                    break;
+
+                case "--max-bytes":
+                    if (!int.TryParse(value, out var bytes)) return (null, "--max-bytes 要一个整数。");
+                    maxBytes = bytes;
+                    break;
+
+                case "--allow":
+                    allow = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                    break;
+
+                default: return (null, $"未知参数 '{flag}'。");
+            }
+
+            i++;
+        }
+
+        if (clearKey) apiKey = "";
+
+        return (new CoreCommand.NetworkConfigure(enabled, apiKey, endpoint, maxResults, timeout, maxBytes, allow), null);
     }
 
     // `provider delete <id>`：id 合法性由 dispatcher 判（控制台与头共用同一条判据），

@@ -1128,7 +1128,7 @@ public class ControlServerTests : IAsyncLifetime
         // 这条不是我推出来的，是这条守卫头一次跑就抓出来的（我原先按七个字段写）。
         // ⇒ 头的判据必须是 `r.title` 而不是「`title` 一定在」。
         Assert.Equal(
-            ["active", "ask", "projectKey", "sessionId", "status", "turn"],
+            ["active", "ask", "goal", "projectKey", "sessionId", "status", "turn"],
             row.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray());
     }
 
@@ -1139,7 +1139,10 @@ public class ControlServerTests : IAsyncLifetime
         var sid = ((Ack.Accepted)created.Ack).SessionId!;
 
         var root = await GetJson($"/sessions/{sid}/state");
-        AssertKeysOf(root, "sessionId", "state", "highWater", "axes", "spec", "slots", "axisDefinitions", "pluginProblems");
+        AssertKeysOf(root, "sessionId", "state", "highWater", "axes", "spec", "slots", "goal", "axisDefinitions", "pluginProblems");
+
+        // goal 是「永远在的对象」（照 `ask` 的 `{}` 纪律），内部只有 active 一格。
+        AssertKeysOf(root.GetProperty("goal"), "active");
 
         // ⚠️ 嵌套那层也钉：往 `slots` / `model` 里加字段，顶层看不见。
         //（`spec` 自己那层**不在这里钉**——它归 `SessionSpec_HasExactlyTheseProperties` +
@@ -1353,6 +1356,19 @@ public class ControlServerTests : IAsyncLifetime
     [Fact]
     public async Task Snapshot_ProviderSchema_CarriesExactlyTheseKeys() =>
         AssertKeysOf(await GetJson("/provider-schema"), "protocols", "authSchemes", "defaultAuthScheme", "providerIdRule");
+
+    [Fact]
+    public async Task Snapshot_NetworkConfig_CarriesExactlyTheseKeys()
+    {
+        var root = await GetJson("/network-config");
+
+        // ⚠️ key 只回 hasApiKey（与 `/providers` 同一条纪律）。这条同时钉住「没有泄漏 apiKey 这个键」。
+        AssertKeysOf(root, "enabled", "hasApiKey", "search", "fetch");
+        Assert.False(root.TryGetProperty("apiKey", out _));
+
+        AssertKeysOf(root.GetProperty("search"), "provider", "endpoint", "maxResults", "timeoutSeconds");
+        AssertKeysOf(root.GetProperty("fetch"), "timeoutSeconds", "maxBytes", "allowDomains");
+    }
 
     // SessionSpec 的属性集就是这几样——将来谁往里加一个凭据字段，这条会红。
     // 只靠 Assert.False(spec.TryGetProperty("apiKey")) 不够：WhenWritingNull 会省掉值为 null 的键；

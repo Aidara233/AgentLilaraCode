@@ -25,7 +25,7 @@ namespace Lilara.Core.Session.Tools;
 /// 省略 = 空串（没有浮动块，或调用方确实不需要它）。</param>
 public sealed class SessionToolContext(
     string workingDirectory, BlobStore blobs, IReadOnlyList<TimelineEvent>? timeline = null,
-    string? floatingContext = null)
+    string? floatingContext = null, NetworkAccess? network = null, bool goalActive = false)
     : IToolContext
 {
     private readonly string _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workingDirectory));
@@ -132,4 +132,10 @@ public sealed class SessionToolContext(
 
     /// <summary>见 <see cref="IToolContext.FloatingContext"/>：建设点冻住的那份，由构造参数交进来。</summary>
     public string FloatingContext { get; } = floatingContext ?? "";
+
+    /// <summary>见 <see cref="IToolContext.Network"/>：步开始时冻住的那份配置 + 轴值快照。</summary>
+    public NetworkAccess? Network { get; } = network;
+
+    /// <summary>见 <see cref="IToolContext.GoalActive"/>：步开始时的主动性轴快照。</summary>
+    public bool GoalActive { get; } = goalActive;
 }

@@ -47,9 +47,10 @@ public class QueueSemanticsTests : IDisposable
             new CoreCommand.SessionSend(h.SessionId, [new Block.TextBlock(text)]),
             Guid.NewGuid().ToString("N")[..8], true, CancellationToken.None);
 
-    // 连发 3 条合并成一次推进，但三条消息都进历史——合并的是推进次数，不是消息。
+    // 连发 3 条：第一条已经进模型了，后两条只能落到**下一步**；它们必须真的被消费
+    // （2026-10-22 修正：旧断言只查历史，于是「后两条永远躺在队列里」也能绿）。
     [Fact]
-    public async Task ThreeSendsWhileRunning_MergeIntoOneStepButKeepAllMessages()
+    public async Task ThreeSendsWhileRunning_AreConsumedInAFollowUpStep_NotLeftInTheQueue()
     {
         var (host, dispatcher, session) = NewHarness();
 
@@ -73,8 +74,10 @@ public class QueueSemanticsTests : IDisposable
         release.SetResult();
         await Task.WhenAll(first, second, third);
 
-        Assert.Equal(1, call);                                     // ① 一次模型调用
-        Assert.Equal(1, session.State.Turn);                       // ② Turn 只加一
+        // ① 第一条已经是第一步；后两条合并成第二步。
+        Assert.Equal(2, call);
+        Assert.Equal(2, session.State.Turn);
+        Assert.Equal(0, session.QueueDepth);
 
         var timeline = host.Store.ReadTimeline(session.ProjectKey, session.SessionId);
         var userTexts = timeline
@@ -83,7 +86,7 @@ public class QueueSemanticsTests : IDisposable
             .Select(e => ((Block.TextBlock)e.Blocks[0]).Text)
             .ToList();
 
-        Assert.Equal(["一", "二", "三"], userTexts);               // ③ 三条都进历史，一条不丢
+        Assert.Equal(["一", "二", "三"], userTexts);               // 三条都进历史，一条不丢
     }
 
     // 用户消息在 send 时就落盘，不是等步开始——模型调用失败时它仍在历史里（它是事实，抹不掉）。

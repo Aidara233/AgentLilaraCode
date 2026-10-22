@@ -33,6 +33,13 @@ public static class Axes
     public const string Effort = "effort";
 
     /// <summary>
+    /// 联网能力（2026-10-22）。⚠️ 它管的是「这个会话能碰哪一类联网工具」，
+    /// **不是凭据**——端点与 key 属于 `<数据根>/network.json` 的全局配置。
+    /// 与权限轴是两道闸：这一根管能力开没开，`permission` 管 `Consuming` 这一类允不允许。
+    /// </summary>
+    public const string Network = "network";
+
+    /// <summary>
     /// 温度（采样参数）。**与 effort 同侧**：有机械层（进请求）、零上下文暴露（`InContext: false`）。
     ///
     /// <para>⚠️ **它是本表第一条「数值范围」轴**，取值不像别的轴那样是一个能穷举的枚举档列表。
@@ -164,6 +171,14 @@ public static class Axes
             ("none", "不主动运行额外验证；完成改动后说明结果，并明确未执行验证。"),
             ("self", "完成改动后自行执行相关编译、测试或检查，并如实报告结果及未验证部分。"),
             ("strict", "执行任务所需的完整验证；验证未通过时不得声称完成，受阻无法验证时明确报告阻塞和未验证部分。")),
+
+        // 联网 = 能力开关（2026-10-22）。⚠️ 默认 off：新会话不该在没人点头时出网。
+        // 档名是**本表定义的**串，`NetworkAccess.Allows` 按它判；未知值落到「全拒」。
+        Context(Network, "联网", "off",
+            ("off", "不联网：web_search 与 web_fetch 的调用都会被拒绝，模型只能依据已有上下文回答。"),
+            ("search", "允许联网搜索（web_search）；直接抓取网页（web_fetch）被拒绝。"),
+            ("fetch", "允许抓取指定网页（web_fetch）；联网搜索（web_search）被拒绝。"),
+            ("all", "搜索与抓取都允许；仍受权限轴（消耗型工具）与核心联网配置的约束。")),
 
         // ⚠️ 与 `ClaudeRequestBuilder.ToEffort`（`ClaudeRequestBuilder.cs:164-173`，5 条臂
         // 166-170 + 一条 `_ => throw` 在 171）**必须逐值对齐**，但两个方向的后果**不同**，

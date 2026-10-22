@@ -108,6 +108,20 @@ public static class CorePrompts
     public const string TailAxesPrefix = "轴 ";
 
     /// <summary>
+    /// goal 模式的目标线（2026-10-22）。⚠️ <b>它进尾块、不落盘</b>：目标是一件**状态**
+    /// （主动性轴 = goal），不是一条事件；写进历史会让模型以为用户又说了句话。
+    ///
+    /// <para>⚠️ <b>它必须说清两件事</b>：① 目标没完成就继续做，别因为「这一回合没什么可说的」就停；
+    /// ② `finish_goal` 只是把轴拨回 `standard`，拨回之后模型还会有一回合收尾——
+    /// 否则模型会把「调完就结束」当成事实，最后一句总结直接没了。</para>
+    /// </summary>
+    public const string GoalDirective =
+        "目标模式：本会话有一个尚未完成的目标。继续执行可行动的后续工作，不要因为本回合暂时没有新输出就停下。"
+        + "只有当你确认目标真正完成时才调用 finish_goal——它只是把主动性轴拨回 standard，"
+        + "拨回之后你还会有一回合，用那段话总结已完成的工作。"
+        + "需要用户决定或缺少关键信息时，用 ask 把阻塞说清楚。";
+
+    /// <summary>
     /// 会话没指定**首要**提示词时找的那个名字（`<数据根>/premiers/default.md`）。
     ///
     /// <para>⚠️ <b>与 <see cref="DefaultPreset"/> 是同一条约定、两个目录</b>——

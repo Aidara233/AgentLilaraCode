@@ -103,6 +103,23 @@ public sealed record SessionHandle
     public void ExitStep() => Volatile.Write(ref _step, 0);
 
     /// <summary>
+    /// **用户按过停止的次数**（2026-10-22，goal 循环）。每按一次 +1；`RunStepAsync` 在步开始时
+    /// 记下它，自动续跑前再比一次。
+    ///
+    /// <para>⚠️ <b>它堵的是那条窄窗口</b>：步已经结束、`finally` 已放掉 `_step`，
+    /// 而 goal 续跑还没起来——此时按停止，`interrupt` 找不到 CTS（它是 no-op），
+    /// 续跑照样会起来。有了序号，续跑那一侧就能看出「这段时间里有人叫停过」。</para>
+    ///
+    /// <para>⚠️ 它**不阻止**后续的用户发话 / `session.start`：那两个入口会重新记下新序号，
+    /// 所以「停一次」只影响当时那一次自动续跑，不是永久闸。</para>
+    /// </summary>
+    private int _interruptEpoch;
+
+    public int InterruptEpoch => Volatile.Read(ref _interruptEpoch);
+
+    public void NoteInterrupt() => Interlocked.Increment(ref _interruptEpoch);
+
+    /// <summary>
     /// **答复那条路要交给下一步的东西**（`01` §3.8）。
     ///
     /// <para>⚠️ <b>为什么不走「重新入队」那条路</b>：答复不是一条用户消息
