@@ -5,7 +5,14 @@
     <Nullable>enable</Nullable>
     <RootNamespace>Lilara.Core</RootNamespace>
     <AssemblyName>Lilara.Core</AssemblyName>
+    <PackageId>Lilara.Core</PackageId>
+    <Version>0.1.0</Version>
+    <PackageVersion>$(Version)</PackageVersion>
+    <Authors>Agent Lilara</Authors>
+    <Description>Reusable Agent Lilara execution and context kernel.</Description>
+    <PackageTags>agent;kernel;llm</PackageTags>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Anthropic" Version="12.51.0" />
