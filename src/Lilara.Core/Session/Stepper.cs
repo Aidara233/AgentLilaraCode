@@ -21,10 +21,31 @@ namespace Lilara.Core.Session;
 public sealed class Stepper(
     SessionStore store, IModelAdapter adapter, IReadOnlyList<ITool>? tools = null,
     Lilara.Core.Plugins.PluginHost? plugins = null,
-    UsageStore? usage = null)
+    UsageStore? usage = null,
+    Func<TimeSpan, CancellationToken, Task>? retryDelay = null)
 {
     private readonly SessionStore _store = store;
     private readonly IModelAdapter _adapter = adapter;
+
+    /// <summary>
+    /// 两次重试之间怎么等（`RetryPolicy` 的 <c>delay</c> 参数）。
+    /// ⚠️ **只为可测性存在**：生产路径不传（= 真的等）；测试传一个立即返回的委托，
+    /// 否则一条「十次退避」的用例要把测试套件拖慢四十多秒——而那种慢测试最后一定会被删掉或跳过。
+    /// </summary>
+    private readonly Func<TimeSpan, CancellationToken, Task>? _retryDelay = retryDelay;
+
+    /// <summary>
+    /// **这次调用失败了、马上要再试一次**（`RetryPolicy` 的 `onRetry`）：失败的序号、那句人话、等多久。
+    ///
+    /// <para>⚠️ <b>它只为「让客户端看得见」而存在</b>（用户裁定，2026-10-21：头那边不能只看到一直等待）。
+    /// 与 <c>usage</c> 同一个理由**不由这里发事件**：`Stepper` 不碰事件总线——交回给调用方
+    /// （`CommandDispatcher` 在会话流上发 `retry.attempt`）。
+    /// ⚠️ 判据不在调用方：「要不要重试」只有 `RetryPolicy` 一处，这里只是原样转交。</para>
+    ///
+    /// <para>⚠️ <b>可赋值</b>（生产路径上由 `CommandDispatcher` 在解析出推进器之后赋值）：
+    /// 那样「每个推进器都接上了」是一个**结构**，而不是每个构造点各自记得接的约定。</para>
+    /// </summary>
+    public Action<RetryNotice>? OnRetry { get; set; }
 
     /// <summary>
     /// 工具表。⚠️ **默认空** = 纯 chat（`04` §1.3 推论 1：「没有任何插件」是完全合法的形态）。
@@ -94,27 +115,49 @@ public sealed class Stepper(
         };
 
         var callId = Ids.New();
-        var startedAt = CoreClock.Now();
+        var attempts = 0;
+        var compactionStarted = CoreClock.Now();
+        // 成功那一次请求的窗口（默认 = 整串的起点，一次就成时两者相同）。
+        var callStarted = compactionStarted;
         ModelReply reply;
         try
         {
-            reply = await _adapter.CallAsync(request, ct);
+            // ⚠️ 与 `StepAsync` 同一条路（`RetryPolicy`）：压缩也是一次模型调用，
+            // 同样会被限流 / 撞上 5xx。⚠️ 失败逐次记账；**成功那一行不在这里记**——
+            // 压缩还要求「回复是纯文本摘要」，而「回了但回错了」在该落 `failed`（下面三条出口）。
+            // 一条请求只落一行账：这里的出口与下面三条终端出口是互斥的。
+            var outcome = await RetryPolicy.CallAsync(_adapter, request, ct,
+                delay: _retryDelay,
+                onFailedAttempt: failed =>
+                {
+                    attempts = failed.Index;
+                    RecordUsage(handle, callId, failed.StartedAt, reply: null, "failed",
+                        purpose: "compaction", attempt: failed.Index,
+                        endedAt: failed.EndedAt, error: failed.Failure.Message);
+                },
+                onRetry: NotifyRetry);
+            reply = outcome.Reply;
+            callStarted = outcome.StartedAt;
+            attempts = outcome.Attempts;
         }
         catch
         {
-            RecordUsage(handle, callId, startedAt, null, "failed", "compaction");
+            if (attempts == 0)
+                RecordUsage(handle, callId, compactionStarted, null, "failed", "compaction");
             throw;
         }
 
         if (reply.Refused || reply.Blocks.Any(b => b is not Block.TextBlock))
         {
-            RecordUsage(handle, callId, startedAt, reply, "failed", "compaction");
+            RecordUsage(handle, callId, callStarted, reply, "failed", "compaction",
+                attempt: attempts, error: "压缩模型返回的不是纯文本摘要。");
             throw new InvalidOperationException("压缩模型必须返回纯文本摘要。");
         }
         var summary = string.Concat(reply.Blocks.OfType<Block.TextBlock>().Select(b => b.Text)).Trim();
         if (summary.Length == 0 || summary.Length > 100_000)
         {
-            RecordUsage(handle, callId, startedAt, reply, "failed", "compaction");
+            RecordUsage(handle, callId, callStarted, reply, "failed", "compaction",
+                attempt: attempts, error: "压缩摘要为空或超过长度限制。");
             throw new InvalidOperationException("压缩摘要为空或超过长度限制。");
         }
 
@@ -134,7 +177,10 @@ public sealed class Stepper(
         }
         catch
         {
-            RecordUsage(handle, callId, startedAt, reply, "failed", "compaction");
+            // ⚠️ `callStarted`（不是整串的起点）与 `attempt`：这一行讲的是**那一次请求**，
+            // 它已经成功了、失在「压缩记录写不进去」——把次数与窗口留全，事后才分得清
+            // 「上游一次就成、坏在磁盘」与「上游试了十次」。
+            RecordUsage(handle, callId, callStarted, reply, "failed", "compaction", attempt: attempts);
             throw;
         }
 
@@ -150,7 +196,7 @@ public sealed class Stepper(
         _store.AppendEvents(handle.ProjectKey, handle.SessionId,
             [Reclaim.Window("compaction", ids, null)]);
 
-        RecordUsage(handle, callId, startedAt, reply, "completed", "compaction");
+        RecordUsage(handle, callId, callStarted, reply, "completed", "compaction", attempt: attempts);
         return new CompactionResult(checkpoint.CheckpointId, checkpoint.CoveredThroughEventId,
             checkpoint.Summary, reply.Usage);
     }
@@ -213,7 +259,8 @@ public sealed class Stepper(
         handle.UpdateState(s => s with { Status = SessionStatus.Running });
 
         var callId = Ids.New();
-        var callStarted = CoreClock.Now();
+        var attempts = 0;
+        var startedAt = CoreClock.Now();
         ModelReply reply;
         try
         {
@@ -295,13 +342,30 @@ public sealed class Stepper(
                     handle.State.Turn + 1),
             };
 
-            // 调用（抛异常时直接传播——这一步没完成，Turn 不动）
-            reply = await _adapter.CallAsync(request, ct);
-            RecordUsage(handle, callId, callStarted, reply, "completed");
+            // 调用（抛异常时直接传播——这一步没完成，Turn 不动）。
+            // ⚠️ **重试在这里，不在步上**（`RetryPolicy` 的类注释）：一次重试只重发这一个请求，
+            // 不碰记录、不碰 `Turn`、不碰工具副作用。⚠️ **每一次失败各记一行账**——被限流后重试成功
+            // 的那一步，上游实际被打了好几次，账本只记最后一次会让统计看起来比实际便宜。
+            // （成功那一行由下面补记：只有这里知道「这个回复能不能用」。）
+            var outcome = await RetryPolicy.CallAsync(_adapter, request, ct,
+                delay: _retryDelay,
+                onFailedAttempt: failed =>
+                {
+                    attempts = failed.Index;
+                    RecordUsage(handle, callId, failed.StartedAt, reply: null, "failed",
+                        attempt: failed.Index, endedAt: failed.EndedAt, error: failed.Failure.Message);
+                },
+                onRetry: NotifyRetry);
+            reply = outcome.Reply;
+            attempts = outcome.Attempts;
+            RecordUsage(handle, callId, outcome.StartedAt, reply, "completed", attempt: attempts);
         }
         catch
         {
-            RecordUsage(handle, callId, callStarted, reply: null, "failed");
+            // ⚠️ **只有「一次请求都没发出去」才在这里补一行**（装配请求那一半抛了）。
+            // 模型调用本身的失败已经被上面的记账口逐次记过——在这里再记一次会把最后那次
+            // 请求记两遍，而账本的总次数正是「上游被打了几次」这个问题的答案。
+            if (attempts == 0) RecordUsage(handle, callId, startedAt, reply: null, "failed");
             // 回到落盘的那份。⚠️ 用捕获的引用回放，不去读磁盘：
             // 读盘本身可能失败，那会把原始的失败原因盖掉。
             //
@@ -480,9 +544,16 @@ public sealed class Stepper(
             ReleasedClaims: releasedClaims, ReleasedLines: releasedLines, ToolResults: toolResults);
     }
 
+    /// <summary>
+    /// 记一行账。⚠️ <b>一次真实请求一行</b>（`RetryPolicy` 的记账分工）：重试的每一步各调一次，
+    /// 同一个 <paramref name="callId"/> 下按 <paramref name="attempt"/> 递增。
+    ///
+    /// <para>⚠️ <b>`try` 里的注释仍然成立</b>：账本不可写时不能把一次已经完成的模型调用重跑一遍。</para>
+    /// </summary>
     private void RecordUsage(
         SessionHandle handle, string callId, DateTimeOffset startedAt,
-        ModelReply? reply, string status, string purpose = "session")
+        ModelReply? reply, string status, string purpose = "session",
+        int attempt = 1, DateTimeOffset? endedAt = null, string? error = null)
     {
         if (_usage is null) return;
 
@@ -500,11 +571,15 @@ public sealed class Stepper(
                 ModelId = handle.Spec.Model.ModelId,
                 Protocol = _adapter.Protocol,
                 StartedAt = startedAt,
-                EndedAt = CoreClock.Now(),
+                EndedAt = endedAt ?? CoreClock.Now(),
                 Status = status,
                 Usage = reply?.Usage,
                 ReportedModel = reply?.ReportedModel,
                 ResponseId = reply?.ResponseId,
+                // ⚠️ 只在「不止一次」时才写（`WhenWritingNull` 会让它整键消失）：
+                // 一次就成的行**逐字节**与加重试之前相同。
+                Attempt = attempt > 1 ? attempt : null,
+                Error = error,
             });
         }
         catch
@@ -884,6 +959,20 @@ public sealed class Stepper(
         StopReason = "end_turn",
         Refused = false,
     };
+
+    /// <summary>
+    /// **这一次模型调用失败了，马上要再试一次**（`RetryPolicy` 的 `onRetry` 原样转交）。
+    /// ⚠️ 调用方（`CommandDispatcher`）据此在会话流上发 `retry.attempt`——**它不判「要不要重试」**，
+    /// 收到就是「一定会再试」。
+    /// </summary>
+    /// <param name="Attempt">**已经失败的请求**的序号（1 起，所以「重试 N/10」正好是它：
+    /// 第 1 次请求失败 ⇒ 这是第 1 次重试）。</param>
+    /// <param name="Reason">那句人话（`ModelCallFailedException.Message`，已含状态码解释）。</param>
+    /// <param name="Wait">即将等待多久再发下一次。</param>
+    public readonly record struct RetryNotice(int Attempt, string Reason, TimeSpan Wait);
+
+    private void NotifyRetry(RetryPolicy.FailedAttempt failed, TimeSpan wait) =>
+        OnRetry?.Invoke(new RetryNotice(failed.Index, failed.Failure.Message, wait));
 
     /// <para>⚠️ <b><see cref="Refused"/> 是新增的</b>：`Stepper` 刻意**不碰事件总线**
     /// （模型消息与 `step.end` 都由 `CommandDispatcher` 发，这样控制台敲的那句话

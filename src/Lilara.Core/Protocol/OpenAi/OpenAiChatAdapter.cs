@@ -25,14 +25,23 @@ public sealed class OpenAiChatAdapter : IModelAdapter
         _http = new OpenAiHttp(provider);
     }
 
-    public async Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct)
+    public Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct) =>
+        CallAsync(request, ct, transport: null);
+
+    /// <param name="transport">
+    /// ⚠️ **只为可测性**：`null` = 生产路径（共用的 HttpClient）。测试传一个假 handler 进来，
+    /// 让 `OpenAiHttp.PostAsync` 的状态码分支（含「这次失败值不值得重试」那个标志）被**真的跑到**。
+    /// ⚠️ 它不是接口的一部分（`IModelAdapter` 只有一个两参数的重载）——生产调用点永远走上面那个。
+    /// </param>
+    public async Task<ModelReply> CallAsync(
+        ModelRequest request, CancellationToken ct, HttpMessageHandler? transport)
     {
         // Build 必须在 try 里面：它的两处 ArgumentException（时间线为空 / 空消息）也是「调用失败」的一种，
         // 逃出去会变成未捕获异常。
         try
         {
             var body = OpenAiChatRequest.Build(request);
-            var json = await _http.PostAsync(OpenAiChatRequest.Path, body, ct);
+            var json = await _http.PostAsync(OpenAiChatRequest.Path, body, ct, transport);
             return OpenAiChatResponse.Map(json);
         }
         catch (ModelCallFailedException) { throw; }               // 已经是人话，别套两层

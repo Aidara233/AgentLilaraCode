@@ -37,6 +37,68 @@ public class HeadAssetsTests
     }
 
     /// <summary>
+    /// **`WireEvent` 表里的每一个 `kind`，`app.js` 的 `handleEvent` 要么处理、要么明说不管。**
+    ///
+    /// <para>⚠️ <b>为什么要它</b>（2026-10-21）：加一条事件时核心侧有三条守卫
+    /// （判别式、载荷形状、有发射点），而**头那侧一条都没有**——新事件在头眼里就是
+    /// 「什么都没发生」，且**不会有任何测试红**。这条守卫是那个空白的补丁。</para>
+    ///
+    /// <para>⚠️ <b>它比「全都处理」宽一档，但宽得有据可查</b>：`handleEvent` 自己处理的那批
+    /// 必须在 `case "…":` 里出现；**其余的必须写进 <c>IGNORED</c>**，并在这里带着理由列出来。
+    /// 「不管」是一个**决定**，不是一次遗忘——列表让下一个读的人看得见那个决定。</para>
+    /// </summary>
+    [Fact]
+    public void EveryWireEventKind_IsEitherHandledOrExplicitlyIgnoredByTheHead()
+    {
+        // ⚠️ 这张表是**决定**，不是名单快照：加一条事件而头真不管它，就是往这里加一行 + 写理由。
+        var ignored = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            // 左栏靠 `loadSessions()` 重拉（`session.created` / 归档 / 删除那几条在项目流上处理）。
+            ["session.created"] = "项目流 → loadSessions()",
+            ["claim.acquired"] = "项目流 → loadClaims()",
+            ["claim.released"] = "项目流 → loadClaims()",
+            ["session.deactivated"] = "头的界面不显示『激活』这件事（只给别的客户端看）",
+        };
+
+        var handled = DeclaredEventKinds();
+
+        var js = Read("app.js");
+        var start = js.IndexOf("function handleEvent(", StringComparison.Ordinal);
+        Assert.True(start >= 0, "app.js 里找不到 handleEvent —— 守卫的锚点没了，先修守卫");
+        var end = js.IndexOf("\nfunction ", start + 1, StringComparison.Ordinal);
+        var body = js[start..(end < 0 ? js.Length : end)];
+
+        var handledByAppJs = Regex.Matches(body, "case \"([a-z.]+)\":").Select(m => m.Groups[1].Value).ToHashSet(StringComparer.Ordinal);
+
+        // ⚠️ 项目流那三条由 `handleProjectEvent` 处理，不在 `handleEvent` 里。
+        var projectStart = js.IndexOf("function handleProjectEvent(", StringComparison.Ordinal);
+        Assert.True(projectStart >= 0, "app.js 里找不到 handleProjectEvent —— 守卫的锚点没了，先修守卫");
+        var projectEnd = js.IndexOf("\nfunction ", projectStart + 1, StringComparison.Ordinal);
+        var projectBody = js[projectStart..(projectEnd < 0 ? js.Length : projectEnd)];
+
+        handledByAppJs.UnionWith(Regex.Matches(projectBody, "case \"([a-z.]+)\":")
+            .Select(m => m.Groups[1].Value));
+
+        var silent = handled
+            .Where(kind => !handledByAppJs.Contains(kind) && !ignored.ContainsKey(kind))
+            .OrderBy(k => k, StringComparer.Ordinal)
+            .ToList();
+
+        Assert.Empty(silent.Select(k => $"`{k}` 在 WireEvent 表里，而 app.js 既不处理、也没写进 IGNORED。"));
+
+        // ⚠️ 反方向：IGNORED 里不许留已删事件的化石（会让这份「决定」清单慢慢腐成谎言）。
+        var stale = ignored.Keys.Where(k => !handled.Contains(k)).ToList();
+        Assert.Empty(stale.Select(k => $"IGNORED 里的 `{k}` 已经不是线上事件了——删掉这一行。"));
+    }
+
+    /// <summary>线上事件 kind 的**唯一来源**：`WireEvent` 的 `JsonDerivedType` 特性（不手抄）。</summary>
+    private static HashSet<string> DeclaredEventKinds() =>
+        typeof(Lilara.Core.Hosting.WireEvent).GetCustomAttributes(typeof(System.Text.Json.Serialization.JsonDerivedTypeAttribute), inherit: false)
+            .Cast<System.Text.Json.Serialization.JsonDerivedTypeAttribute>()
+            .Select(a => (string)a.TypeDiscriminator!)
+            .ToHashSet(StringComparer.Ordinal);
+
+    /// <summary>
     /// ⚠️ **`app.js` 里用 `$("…")` 抓的每一个 id，`index.html` 里都得有**——
     /// 否则那行（或那段函数）在运行时**静默什么都不做**。
     ///

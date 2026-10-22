@@ -21,6 +21,7 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(SessionReclaimed), "session.reclaimed")]
 [JsonDerivedType(typeof(ReleaseRecorded), "release.recorded")]
 [JsonDerivedType(typeof(ToolResultAppended), "tool.result.appended")]
+[JsonDerivedType(typeof(RetryAttempt), "retry.attempt")]
 [JsonDerivedType(typeof(ApprovalRequested), "approval.requested")]
 [JsonDerivedType(typeof(ApprovalResolved), "approval.resolved")]
 [JsonDerivedType(typeof(Error), "error")]
@@ -222,6 +223,29 @@ public abstract record WireEvent
     /// <summary>**那次询问结束了**（答了 / 作废了 / 超时了）。同投两条流。</summary>
     /// <param name="Outcome">`submit` / `cancel` / `expired`。</param>
     public sealed record ApprovalResolved(string SessionId, string AskId, string Outcome) : WireEvent;
+
+    /// <summary>
+    /// **这次模型调用失败了，马上要再试一次**（`RetryPolicy`，2026-10-21）。
+    ///
+    /// <para>⚠️ <b>为什么需要它</b>（用户裁定）：「头那边不能只看到一直等待」。重试不产生任何
+    /// 记录、`Turn` 不动、`step.end` 也不会来——一次十次退避的失败在时间线上要静默四十秒左右，
+    /// 客户端只能看到一个 `Running` 纹丝不动。⇒ 每次「真的会再试」都报一声。</para>
+    ///
+    /// <para>⚠️ <b>不是「一次重试一条账」那件事</b>：账本每条**真实请求**一行（含失败），
+    /// 这里只报**还会再来的那些**——重试用尽的那次失败不报（它后面跟着 `error` 事件），
+    /// 非瞬态失败也不报。判据全在 `RetryPolicy` 一处（`onRetry` 钩子），这里只转发。</para>
+    ///
+    /// <para>⚠️ <b>次数语义</b>：<see cref="Attempt"/> 是**刚刚失败的那一次**（1 起），
+    /// 所以界面上「重试 <c>attempt</c> / 10」是对的；<see cref="MaxAttempts"/> 是重试上限（今天恒为 10），
+    /// 客户端**不该**把它写死在自己的输出里（它是核心的事实，会随配置变）。</para>
+    ///
+    /// <para>⚠️ **它不落盘、也不需要**：重试是一次调用内部的事，重启之后无从接续
+    /// （那次调用本来就不重放，见 `01` §12.8）。</para>
+    /// </summary>
+    /// <param name="Reason">那句人话（含「被限流了（429）」这类解释），给客户端直接显示。</param>
+    /// <param name="DelayMs">即将等待的毫秒数——客户端据它画倒计时，而不是自己按曲线算。</param>
+    public sealed record RetryAttempt(
+        string SessionId, int Attempt, int MaxAttempts, string Reason, int DelayMs) : WireEvent;
 
     /// <summary>一次会话模型调用的 token 账本已经更新，头可据此刷新实时统计。</summary>
     public sealed record UsageUpdated(

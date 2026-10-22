@@ -598,7 +598,7 @@ public class CommandDispatcherTests : IDisposable
     {
         var (host, d) = NewHarness();
         SaveProvider(host);
-        _adapter.Throws(new ModelCallFailedException("连不上上游"));
+        _adapter.Throws(new ModelCallFailedException("连不上上游") { Transient = false });
 
         var r = await d.DispatchAsync(
             new CoreCommand.ProviderTest("p"), "t", true, CancellationToken.None);
@@ -606,6 +606,31 @@ public class CommandDispatcherTests : IDisposable
         var ack = Assert.IsType<Ack.Accepted>(r.Ack);   // ← 不是 Rejected
         Assert.Contains("不通", ack.Note);
         Assert.Contains("连不上上游", ack.Note);
+    }
+
+    // ⚠️ 自检走与正式调用**同一条**重试路（RetryPolicy）：一次 429 / 5xx 的老实回答是「再试一次」，
+    // 不是「不通」。⚠️ 这会真的等一次退避（约 0.5s）——那是这条路应有的代价，别为了快把它改成 0。
+    [Fact]
+    public async Task ProviderTest_TransientFailure_IsRetriedThenReportsReachable()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        _adapter.Throws(new ModelCallFailedException("上游 503") { Transient = true }).Reply("pong");
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.ProviderTest("p"), "t", true, CancellationToken.None);
+
+        var ack = Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.Contains("通", ack.Note);
+        Assert.Equal(2, _adapter.Calls.Count);
+
+        // 两次真实请求各记一行账：失败那行带原因与次数，成功那行带 2。
+        var calls = host.Usage.ReadAll();
+        Assert.Equal(2, calls.Count);
+        Assert.Equal("failed", calls[0].Status);
+        Assert.Contains("上游 503", calls[0].Error);
+        Assert.Equal("completed", calls[1].Status);
+        Assert.Equal(2, calls[1].Attempt);
     }
 
     [Fact]

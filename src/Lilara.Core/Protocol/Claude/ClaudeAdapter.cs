@@ -55,13 +55,38 @@ public sealed class ClaudeAdapter : IModelAdapter
         }
         catch (Exception ex) when (ShouldWrap(ex, ct))
         {
-            throw new ModelCallFailedException(Describe(ex), ex);
+            throw new ModelCallFailedException(Describe(ex), ex) { Transient = IsTransient(ex) };
         }
     }
 
     // 转发到 Cancellation.ShouldWrap——判据只有一份，别在这里加逻辑。
     internal static bool ShouldWrap(Exception ex, CancellationToken ct) =>
         Cancellation.ShouldWrap(ex, ct);
+
+    /// <summary>
+    /// **这次失败值不值得再发一次**（`RetryPolicy` 读它）。
+    ///
+    /// <para>⚠️ <b>判据的主体是「状态码」，不是「哪一个异常类」</b>：SDK 的
+    /// <see cref="Anthropic.Exceptions.AnthropicApiException"/> 上带着
+    /// <c>StatusCode</c>（本地反射核过），而它同时是 4xx / 5xx 那一族的基类 ⇒
+    /// 拿状态码去过 <see cref="RetryPolicy.IsTransientStatus"/> 与 OpenAI 那条链路**是同一张表**。
+    /// 按类名各写一份会让两条协议在「529 算不算 5xx」「408 算不算临时」这种地方悄悄分叉。</para>
+    ///
+    /// <para>⚠️ <b>例外一条是 `AnthropicIOException`</b>：它<b>不继承</b> `AnthropicApiException`
+    /// （反射确认：直接继承 <c>AnthropicException</c>），表示「请求没发出去 / 没拿到响应」
+    /// （本地实测：连一个拒绝连接的端口拿到的就是它）⇒ 与 OpenAI 那条 `ShouldWrap` 的兜底同一类，
+    /// 一律瞬态。</para>
+    ///
+    /// <para>⚠️ 其余一律 <c>false</c>：400 / 422（请求内容的问题）、`AnthropicInvalidDataException`
+    /// （响应读不出来——那是我们或上游的形状问题，再发一次同样读不出来）。
+    /// ⚠️ 本方法**不会被用户取消走到**：`ShouldWrap` 在那之前已经把取消放行了。</para>
+    /// </summary>
+    internal static bool IsTransient(Exception ex) => ex switch
+    {
+        Anthropic.Exceptions.AnthropicApiException api => RetryPolicy.IsTransientStatus(api.StatusCode),
+        Anthropic.Exceptions.AnthropicIOException => true,
+        _ => false,
+    };
 
     /// <summary>
     /// 把 SDK 的异常翻译成一句人话。
@@ -84,9 +109,9 @@ public sealed class ClaudeAdapter : IModelAdapter
         Anthropic.Exceptions.AnthropicNotFoundException =>
             "模型 id 不存在（404）。检查 --model 拼写。",
         Anthropic.Exceptions.AnthropicRateLimitException =>
-            "被限流了（429）。等一会儿再试。",
+            "被限流了（429）。要等一会儿——会自动重试。",
         Anthropic.Exceptions.Anthropic5xxException =>
-            "上游 5xx。这是临时的，重试即可。",
+            "上游 5xx。这是临时的——会自动重试。",
 
         // 上游回了**不符合 Anthropic 规范的响应体**时，SDK 内部的 STJ 会抛这句
         //（实测：本机网关 401 回 `{"error":"Authentication required"}`——规范要求 `error` 是

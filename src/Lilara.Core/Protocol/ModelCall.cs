@@ -84,5 +84,15 @@ public sealed record ModelReply
 }
 
 /// <summary>调用失败，带一句人话。</summary>
+/// <param name="Transient">
+/// **再发一次有没有可能成功**——只由两个协议适配器在**看得见状态码 / 异常类型的那一层**打标，
+/// 由 <see cref="RetryPolicy"/> 读取。⚠️ 默认 <c>false</c>：说不清的失败一律不重试
+/// （方向是「少重试一次」，不是「多撞一次上游」）。
+///
+/// <para>⚠️ <b>它<b>不是</b>持久化字段</b>——这个异常从不上线、也不落盘，它只活在一次调用的栈里。</para>
+/// </param>
 public sealed class ModelCallFailedException(string message, Exception? inner = null)
-    : Exception(message, inner);
+    : Exception(message, inner)
+{
+    public bool Transient { get; init; }
+}

@@ -119,7 +119,7 @@
 
 ### 2.5 事件载荷
 
-以下是**核心 → 客户端**的全部事件（`WireEvent.cs:8-28`，20 个类型）。
+以下是**核心 → 客户端**的全部事件（`WireEvent.cs:8-28`，21 个类型）。
 所有事件都带判别式 `kind`；所有时间都是 ISO-8601 带时区（`DateTimeOffset`）。
 
 | `kind` | 载荷 | 发在哪条流 | 何时发 |
@@ -140,6 +140,7 @@
 | `release.recorded` | `sessionId` · `id` · `scope` · `summary` · `at` | 会话流 | 模型侧 `release` 画了一条线 |
 | `tool.result.appended` | `sessionId` · `id` · `callId` · `blocks` · `at` | 会话流 | 工具结果落盘（一条结果一条事件） |
 | `usage.updated` | `sessionId` · `call`（`UsageCall`）· `summary`（`UsageSummary`） | 会话流 | 一次会话模型调用记账之后 |
+| `retry.attempt` | `sessionId` · `attempt` · `maxAttempts` · `reason` · `delayMs` | 会话流 | 一次模型调用失败、**马上要自动重试**（在等待之前发；重试用尽 / 非瞬态失败不发，那两条走 `error`） |
 | `session.compaction.completed` | `sessionId` · `checkpointId` · `coveredThroughEventId` · `summaryTokens`（可空） | 会话流 | `session.compact` 完成 |
 | `approval.requested` | `sessionId` · `askId` · `askKind` · `items` · `remember` · `deadlineAt` | `approvals` 流 **+** 会话流 | 会话挂起等回答 |
 | `approval.resolved` | `sessionId` · `askId` · `outcome` | `approvals` 流 **+** 会话流 | 回答 / 作废 / 超时 / **顶替** |
@@ -631,6 +632,8 @@
   "startedAt": "…",
   "endedAt": "…",                 // 可空（进行中 / 崩了）
   "status": "completed",          // ⚠️ 今天只有 "completed" | "failed"
+  "attempt": 2,                   // 可空：同一个 callId 下的第几次真实请求（重试，02 §3.3）；缺键 = 1
+  "error": "被限流了（429）…",     // 可空：这一次请求为什么失败（failed 行才有）
   "usage": {                      // 可空（上游没报用量）
     // ⚠️ 口径（`08` §3.1）：inputTokens 是**未命中输入**，与 cacheReadTokens **不相交**；
     //    两族协议在映射层已归一（OpenAI 的 prompt_tokens 含缓存 ⇒ 减去命中）。

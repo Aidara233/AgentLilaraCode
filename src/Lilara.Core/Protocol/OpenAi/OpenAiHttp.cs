@@ -21,6 +21,14 @@ public sealed class OpenAiHttp
     public string AuthScheme { get; }
     public ResolvedEndpoint Endpoint { get; }
 
+    /// <summary>
+    /// **最近一次 `PostAsync` 收到的 HTTP 状态码**（成功或失败都记；没发请求 / 传输失败时为 `null`）。
+    /// ⚠️ 只为可测性：`Describe` 拿不到「这是哪一次请求」，而抛出的异常上也不带状态码
+    /// ⇒ 「那个瞬态标志真的被打上了」只能在这一层被观察。
+    /// ⚠️ 普通字段、**不是** `AsyncLocal`：后者在读的那个 `async` 方法里是另一份副本（实测读到 null）。
+    /// </summary>
+    internal static System.Net.HttpStatusCode? LastStatus;
+
     public OpenAiHttp(ProviderDefinition provider)
     {
         ArgumentNullException.ThrowIfNull(provider);
@@ -36,7 +44,8 @@ public sealed class OpenAiHttp
         _key = provider.ApiKey;
     }
 
-    public async Task<string> PostAsync(string path, string body, CancellationToken ct)
+    public async Task<string> PostAsync(
+        string path, string body, CancellationToken ct, HttpMessageHandler? transport = null)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, ComposeUrl(Endpoint.Url, path));
         request.Content = new StringContent(body, Encoding.UTF8, "application/json");
@@ -46,13 +55,25 @@ public sealed class OpenAiHttp
         else
             request.Headers.TryAddWithoutValidation("x-api-key", _key);
 
+        // ⚠️ 生产路径走共用的那个 client（不泄漏 socket）；测试传 `transport` 时才现造一个。
+        using var oneOff = transport is null ? null : new HttpClient(transport, disposeHandler: false);
+        var client = oneOff ?? Client;
+
         try
         {
-            using var response = await Client.SendAsync(request, ct);
+            LastStatus = null;
+            using var response = await client.SendAsync(request, ct);
+            LastStatus = response.StatusCode;
             var text = await response.Content.ReadAsStringAsync(ct);
 
             if (!response.IsSuccessStatusCode)
-                throw new ModelCallFailedException(Describe(response.StatusCode, text));
+                throw new ModelCallFailedException(Describe(response.StatusCode, text))
+                {
+                    // ⚠️ 打标只能在这一行：`Describe` 是纯函数、拿不到「这是哪一次请求」，
+                    // 这个异常也不带状态码字段 ⇒ 这是唯一知道「该不该再发一次」的地方。
+                    // 判据本身在 `RetryPolicy.IsTransientStatus`，两条协议共用同一张表。
+                    Transient = RetryPolicy.IsTransientStatus(response.StatusCode),
+                };
 
             return text;
         }
@@ -61,7 +82,9 @@ public sealed class OpenAiHttp
         // 调用方取消要放行，判据见 ShouldWrap。
         catch (Exception ex) when (ShouldWrap(ex, ct))
         {
-            throw new ModelCallFailedException($"模型调用失败：{ex.Message}", ex);
+            // ⚠️ **这里的一切都是瞬态**：没拿到响应（连不上 / DNS / 超时），或者拿到了一个读不动的响应。
+            // 调用方自己的取消已经在 `ShouldWrap` 那一关被放行了，所以走到这里的一定是「这一次没成」。
+            throw new ModelCallFailedException($"模型调用失败：{ex.Message}", ex) { Transient = true };
         }
     }
 
@@ -87,9 +110,9 @@ public sealed class OpenAiHttp
         HttpStatusCode.NotFound =>
             "端点或模型不存在（404）。检查 provider 的 endpoint 与 model。",
         HttpStatusCode.TooManyRequests =>
-            "被限流了（429）。等一会儿再试。",
+            "被限流了（429）。要等一会儿——会自动重试。",
         >= HttpStatusCode.InternalServerError =>
-            $"上游 {(int)status}。这是临时的，重试即可。",
+            $"上游 {(int)status}。这是临时的——会自动重试。",
         _ => $"模型调用失败（{(int)status}）：{Truncate(body)}",
     };
 

@@ -31,6 +31,7 @@ public class AdapterFactoryTests
 
         Assert.Contains("gemini", ex.Message);
         Assert.Contains(Protocols.ClaudeMessages, ex.Message);   // 列出支持的
+        Assert.False(ex.Transient);                              // 坏配置不重试
     }
 
     [Fact]

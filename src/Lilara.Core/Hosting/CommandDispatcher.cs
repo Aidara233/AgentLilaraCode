@@ -26,7 +26,28 @@ public sealed class CommandDispatcher(
 {
     private readonly CoreHost _host = host;
     private readonly EventBus _bus = bus;
-    private readonly Func<SessionHandle, Stepper> _resolveStepper = resolveStepper;
+
+    // ⚠️ **包装一次 `resolveStepper`，让这个实例解析出的每一个推进器都接上「重试上报」。**
+    //
+    // 为什么不把上报做成 `Stepper` 的默认行为：它**不碰事件总线**是刻意的
+    // （`StepOutcome` 的注释：工具结果 / 摘锁 / 线都由调用方发）——推进器交出事实、
+    // 这里决定去哪条流。⚠️ 而同一条纪律要求在**每一个** `Stepper` 上接同一个回调；
+    // 「每个入口各接一次」的漂法是具体的：新加一个解析入口时忘接，那条路上的重试**静默不可见**。
+    // ⇒ 解析口只有这一个方法，接一次。
+    //
+    // ⚠️ 它写成**方法**而不是字段初始化器：后者读不到实例字段 `_bus`（CS0236）。
+    // ⚠️ 每条事件用**这条会话**的 topic / id——解析口是按会话调用的，它们就来自那个 handle。
+    private Stepper ResolveStepperWithReports(SessionHandle handle)
+    {
+        var stepper = resolveStepper(handle);
+        stepper.OnRetry = notice => _bus.Publish(
+            EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.RetryAttempt(
+                handle.SessionId, notice.Attempt, RetryPolicy.MaxRetries,
+                notice.Reason, (int)notice.Wait.TotalMilliseconds));
+        return stepper;
+    }
+
     private readonly Func<ProviderDefinition, IModelAdapter> _createAdapter =
         createAdapter ?? AdapterFactory.Create;
 
@@ -548,21 +569,36 @@ public sealed class CommandDispatcher(
         timeout.CancelAfter(TimeSpan.FromSeconds(10));
         var probeCallId = Ids.New();
         var probeStarted = CoreClock.Now();
+        var attempts = 0;
 
         try
         {
-            var reply = await adapter.CallAsync(probe, timeout.Token);
-            RecordProbeUsage(provider, adapter, probeCallId, probeStarted, reply, "completed");
+            // ⚠️ **重试与正式调用同一条路**（`RetryPolicy`）：自检要回答的是「现在通不通」，
+            // 而一次 429 / 5xx 的老实回答是「再试一次看看」，不是「不通」。⚠️ 但上限仍是那 10 秒总预算
+            // ——被限流的端点会把自检拖满预算，然后如实说「没在预算内通」。
+            // ⚠️ 每次真实请求各记一行（同 `Stepper` 的记账），否则「自检为什么花了 8 秒」看不出来。
+            var outcome = await RetryPolicy.CallAsync(adapter, probe, timeout.Token,
+                onFailedAttempt: failed =>
+                {
+                    attempts = failed.Index;
+                    RecordProbeUsage(provider, adapter, probeCallId, failed.StartedAt, null, "failed",
+                        failed.Index, failed.EndedAt, failed.Failure.Message);
+                });
+            attempts = outcome.Attempts;
+            RecordProbeUsage(provider, adapter, probeCallId, outcome.StartedAt, outcome.Reply,
+                "completed", attempts);
             return new DispatchResult(new Ack.Accepted
             {
                 CommandId = id,
                 Note = $"✓ 通（{provider.DefaultModel} @ {where}）"
-                    + (reply.Refused ? "，但模型拒答了这次探针" : ""),
+                    + (outcome.Reply.Refused ? "，但模型拒答了这次探针" : ""),
             });
         }
         catch (Exception ex)
         {
-            RecordProbeUsage(provider, adapter, probeCallId, probeStarted, null, "failed");
+            // ⚠️ **只有一次都没发出去才补一行**（装配请求那一半抛了）——其余失败已逐次记过。
+            if (attempts == 0)
+                RecordProbeUsage(provider, adapter, probeCallId, probeStarted, null, "failed");
             // 超时与真失败分开说：前者是「端点在，但没在 10 秒内答」，后者是「根本连不上 / 被拒」。
             var why = timeout.IsCancellationRequested && !ct.IsCancellationRequested
                 ? "10 秒内没有响应（端点没起，或上游太慢）"
@@ -573,7 +609,8 @@ public sealed class CommandDispatcher(
 
     private void RecordProbeUsage(
         ProviderDefinition provider, IModelAdapter adapter, string callId,
-        DateTimeOffset startedAt, ModelReply? reply, string status)
+        DateTimeOffset startedAt, ModelReply? reply, string status,
+        int attempt = 1, DateTimeOffset? endedAt = null, string? error = null)
     {
         try
         {
@@ -585,11 +622,14 @@ public sealed class CommandDispatcher(
                 ModelId = provider.DefaultModel,
                 Protocol = adapter.Protocol,
                 StartedAt = startedAt,
-                EndedAt = CoreClock.Now(),
+                EndedAt = endedAt ?? CoreClock.Now(),
                 Status = status,
                 Usage = reply?.Usage,
                 ReportedModel = reply?.ReportedModel,
                 ResponseId = reply?.ResponseId,
+                // 与 `Stepper.RecordUsage` 同一条约定：一次就成的行不带这个键。
+                Attempt = attempt > 1 ? attempt : null,
+                Error = error,
             });
         }
         catch
@@ -860,7 +900,7 @@ public sealed class CommandDispatcher(
         CompactionResult result;
         try
         {
-            result = await _resolveStepper(handle).CompactAsync(handle, ct);
+            result = await ResolveStepperWithReports(handle).CompactAsync(handle, ct);
         }
         catch
         {
@@ -1020,7 +1060,7 @@ public sealed class CommandDispatcher(
                 // ⚠️ **它走的仍是这一步的整条仪式**（闸 / `step.begin` / 事件 / 落盘 / 循环续推）
                 // ——这正是它**不另开一条路**的理由：另开一条会把这些一条条抄一遍，
                 // 而抄漏一条的表现是「答复之后那个会话看起来正常，而它推不动了」。
-                step = await _resolveStepper(handle).ResumeAsync(
+                step = await ResolveStepperWithReports(handle).ResumeAsync(
                     handle, pending.Calls, pending.Reply, stepCts.Token, pending.Paused);
 
                 // ⚠️ 恢复步本身不发模型消息；它先落工具结果，随后由循环尾部安排模型消费结果。
@@ -1034,7 +1074,7 @@ public sealed class CommandDispatcher(
                 // （队列是空的），但它是**有人要它动**这一件事的另一个落点
                 // ⇒ 收尾的 ① 那一支也认它（否则那条命令在**唯一需要它的时候**是空的）。
                 var blocks = handle.DrainQueue();
-                step = await _resolveStepper(handle).StepAsync(
+                step = await ResolveStepperWithReports(handle).StepAsync(
                     handle, blocks, stepCts.Token, explicitStart: explicitStart);
                 reply = step.Reply;
                 replyForLoop = step.Reply;

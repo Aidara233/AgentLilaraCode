@@ -182,7 +182,11 @@ public class WireFormatTests
         // 17 → 18：`session.compaction.completed`（2026-10-16，压缩批）。
         // 18 → 19：`session.compaction.completed` 之外，`tool.result.appended`（2026-10-17，
         //          工具结果的实时出口——此前结果只有重拉 `/history` 才看得见）。
-        Assert.Equal(20, declared.Length);
+        // 19 → 20：`release.recorded` 与 `usage.updated` 之外，`session.compaction.completed`… ——
+        //          这条链一直记少了一格（表里是 20 个，注释只列到 19）。⚠️ 下一次改这个数时，
+        //          先数 `WireEvent.cs` 的 `JsonDerivedType`，别信这行注释。
+        // 20 → 21：`retry.attempt`（2026-10-21，重试上报——头不能只看到一直等待）。
+        Assert.Equal(21, declared.Length);
 
         var dispatcher = File.ReadAllText(Path.Combine(
             RepoRoot(), "src", "Lilara.Core", "Hosting", "CommandDispatcher.cs"));
@@ -194,11 +198,24 @@ public class WireFormatTests
 
     // 同族的探针守卫：`03` §4 的数条数那句的自动化版。
     // ⚠️ 它钉的是「表本身」，不是「文档里写的那个数」——文档那个数靠这条测试红来维护。
-    // 13 → 14：`session.reclaimed`（2026-10-06，回收批）。
+    // 13 → 14：`session.reclaimed`（2026-10-06，回收批）……20 → 21：`retry.attempt`（2026-10-21）。
     [Fact]
     public void WireEventTable_HasExactlyTheTypesWeThinkItDoes()
     {
-        Assert.Equal(20, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+        Assert.Equal(21, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+    }
+
+    // ⚠️ 重试上报的**载荷形状**（2026-10-21）：头按字段名取值（`p.attempt` / `p.maxAttempts` /
+    // `p.delayMs`），名字一漂头拿到的就是 `undefined`——而那个圆括号里写的仍是「重试 undefined/undefined」。
+    [Fact]
+    public void WireEvent_RetryAttempt_CarriesTheCountsAndTheWait()
+    {
+        var json = WireEvent.StableSerialize(new WireEvent.RetryAttempt("s1", 3, 10, "被限流了（429）。", 1621));
+
+        Assert.Contains("\"kind\":\"retry.attempt\"", json);
+        Assert.Contains("\"attempt\":3", json);
+        Assert.Contains("\"maxAttempts\":10", json);
+        Assert.Contains("\"delayMs\":1621", json);
     }
 
     /// <summary>

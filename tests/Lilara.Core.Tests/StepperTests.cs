@@ -284,3 +284,153 @@ public class StepperTests : IDisposable
         Assert.Null(_adapter.Calls[0].Temperature);
     }
 }
+
+// ---- 重试（RetryPolicy）：步的语义是「一次成功 = 一步」，失败只在账本里留痕 ----
+//
+// ⚠️ `Stepper` 自己调 `RetryPolicy.CallAsync`（见 `StepAsync`），而**适配器本身不重试**
+// （`AdapterFactory` 的注释写了为什么不能做成包装层：两个调用点各套一层 = 121 次）。
+public class StepperRetryTests : IDisposable
+{
+    private readonly string _root =
+        Path.Combine(Path.GetTempPath(), "lilara-retrystep-" + Guid.NewGuid().ToString("N"));
+    private readonly SessionStore _store;
+    private readonly UsageStore _usage;
+    private readonly FakeAdapter _adapter = new();
+
+    public StepperRetryTests()
+    {
+        _store = new SessionStore(_root);
+        _usage = new UsageStore(_root);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
+    }
+
+    private Stepper Stepper() => new(_store, _adapter, usage: _usage,
+        retryDelay: static (_, _) => Task.CompletedTask);
+
+    private static ModelReply Pong(string text = "好") => new()
+    {
+        Blocks = [new Block.TextBlock(text)],
+        StopReason = "end_turn",
+        Refused = false,
+        Usage = new TokenUsage { InputTokens = 10, OutputTokens = 2 },
+    };
+
+    private static ModelCallFailedException Transient(string why = "上游 503") =>
+        new(why) { Transient = true };
+
+    private SessionHandle NewSession() => SessionHandle.Create(_store, @"C:\work", new ModelSelection
+    {
+        ProviderId = "claude",
+        ModelId = "claude-opus-5",
+        Protocol = Protocols.ClaudeMessages,
+        Effort = "high",
+        MaxTokens = 16000,
+    });
+
+    // 一次失败之后成功：**记录里只有一步**（用户 + 模型两条消息），Turn 只 +1。
+    // ⚠️ 这正是「重试在适配器里、不在步上」的可观测后果：要是把失败抛到步上再重跑，
+    // 这里会看到 Turn 抖动 / 账本里两条 completed，而两者的区别在盘上分得出来。
+    [Fact]
+    public async Task TransientFailure_RetriedInsideTheStep_LeavesExactlyOneTurn()
+    {
+        var handle = NewSession();
+        _adapter.Throws(Transient()).Reply("好");
+
+        var outcome = await Stepper().StepAsync(handle, "hi", CancellationToken.None);
+
+        Assert.Equal("好", ((Block.TextBlock)outcome.Reply.Blocks[0]).Text);
+        Assert.Equal(2, _adapter.Calls.Count);            // 两次真实请求
+        Assert.Equal(1, handle.State.Turn);
+        Assert.Equal(1, _store.ReadState(handle.ProjectKey, handle.SessionId).Turn);
+
+        var timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+        Assert.Equal(2, timeline.Count);                  // 用户 + 模型，**没有多出来一条**
+    }
+
+    // 账本：一次失败一行（failed，带原因）+ 成功一行（completed，带次数）；同一个 callId。
+    [Fact]
+    public async Task TransientFailure_RecordsEveryAttemptInTheLedger()
+    {
+        var handle = NewSession();
+        _adapter.Throws(Transient("第一次 503")).ReplyWith(_ => Pong());
+
+        await Stepper().StepAsync(handle, "hi", CancellationToken.None);
+
+        var calls = _usage.ForSession(handle.SessionId);
+        Assert.Equal(2, calls.Count);
+        Assert.Single(calls.Select(c => c.CallId).Distinct());
+
+        Assert.Equal("failed", calls[0].Status);
+        Assert.Null(calls[0].Attempt);                     // 第一次请求不带这个键（缺 = 1）
+        Assert.Contains("第一次 503", calls[0].Error);
+        Assert.Null(calls[0].Usage);
+
+        Assert.Equal("completed", calls[1].Status);
+        Assert.Equal(2, calls[1].Attempt);
+        Assert.Null(calls[1].Error);
+        Assert.Equal(10, calls[1].Usage!.InputTokens);
+    }
+
+    // 一次就成：**账本与加这个功能之前逐字节相同**（不带 attempt / error 两个键）——
+    // 格式版本不必 +1 的凭据就是这一条。
+    [Fact]
+    public async Task FirstTrySuccess_WritesTheSameShapeAsBefore()
+    {
+        var handle = NewSession();
+        _adapter.ReplyWith(_ => Pong());
+
+        await Stepper().StepAsync(handle, "hi", CancellationToken.None);
+
+        var call = Assert.Single(_usage.ForSession(handle.SessionId));
+        Assert.Equal("completed", call.Status);
+        Assert.Null(call.Attempt);
+        Assert.Null(call.Error);
+
+        var line = File.ReadAllLines(_usage.Path).Single();
+        Assert.DoesNotContain("\"attempt\"", line);
+        Assert.DoesNotContain("\"error\"", line);
+    }
+
+    [Fact]
+    public async Task NonTransientFailure_IsNotRetried_AndDiskStaysClean()
+    {
+        var handle = NewSession();
+        _adapter.Throws(new ModelCallFailedException("请求被上游拒绝（400）"));
+
+        await Assert.ThrowsAsync<ModelCallFailedException>(() =>
+            Stepper().StepAsync(handle, "hi", CancellationToken.None));
+
+        Assert.Single(_adapter.Calls);
+        Assert.Single(_store.ReadTimeline(handle.ProjectKey, handle.SessionId));   // 只有用户那条
+        Assert.Equal(0, handle.State.Turn);
+        var call = Assert.Single(_usage.ForSession(handle.SessionId));
+        Assert.Equal("failed", call.Status);
+        Assert.Null(call.Attempt);                       // 一次都没重试过：缺键 = 1
+    }
+
+    // 十次重试用尽：**11 次请求**、句子里说清试过了、步没完成。
+    // ⚠️ 这是用户裁定那条「最大重试十次」唯一的端到端证据。
+    [Fact]
+    public async Task RetriesExhausted_FailsTheStepAfterElevenCalls()
+    {
+        var handle = NewSession();
+        for (var i = 0; i <= RetryPolicy.MaxRetries + 3; i++) _adapter.Throws(Transient());
+
+        var ex = await Assert.ThrowsAsync<ModelCallFailedException>(() =>
+            Stepper().StepAsync(handle, "hi", CancellationToken.None));
+
+        Assert.Contains("已自动重试 10 次", ex.Message);
+        Assert.Equal(11, _adapter.Calls.Count);
+        Assert.Equal(0, handle.State.Turn);
+
+        // 每一次都留了账（含最后那次失败）——不多不少。
+        var calls = _usage.ForSession(handle.SessionId);
+        Assert.Equal(11, calls.Count);
+        Assert.All(calls, c => Assert.Equal("failed", c.Status));
+        Assert.Equal([null, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], calls.Select(c => c.Attempt));
+    }
+}

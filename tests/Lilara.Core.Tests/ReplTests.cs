@@ -658,7 +658,7 @@ public class ReplTests : IDisposable
     [Fact]
     public async Task ProviderTest_WhenTheCallFails_SaysWhyNotJustFails()
     {
-        _adapter.Throws(new Lilara.Core.Protocol.ModelCallFailedException("连不上上游"));
+        _adapter.Throws(new Lilara.Core.Protocol.ModelCallFailedException("连不上上游") { Transient = false });
         var (repl, _, _) = NewHarness();
 
         await repl.ExecuteAsync("provider test claude", CancellationToken.None);

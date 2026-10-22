@@ -35,6 +35,10 @@ const claims = new Map();           // sessionId -> Set<path>（声明）
 // （「这条还有没有人认」）——混进同一张表会让冲突逻辑被迫理解它不关心的维度。
 const staleClaims = new Set();
 let axes = {};                      // 当前会话的轴值
+// 「重试 N/10 · X 秒后再试」这类**附着在状态上的事实**（由 retry.attempt 设、离开 Running 就清）。
+// ⚠️ 单独一格而不是拼进 `status` 字符串：状态有它自己的身份（`setStatus` 里比较 `Running`），
+// 拼进去会让「状态是什么」变成一个要被拆解的字符串。
+let statusNote = null;
 
 // 派生视图缓存：不发事件的东西靠它渲染（项目名 / 步数 / 状态）。
 const projects = new Map();         // pk -> { dir?, count }
@@ -854,10 +858,19 @@ function renderSlots(slots) {
   put($("floating-body"), slots && slots.floating);
 }
 
-function setStatus(status, turn) {
+function setStatus(status, turn, note) {
   const el = $("status");
   // ⚠️ `turn` 可以是 undefined（调用方拿不到步数时不编一个——那会印出「第 undefined 步」）。
-  el.textContent = turn === undefined || turn === null ? String(status) : `${status} · 第 ${turn} 步`;
+  //
+  // ⚠️ **附注（note）的存活规则**：只有 `retry.attempt` 会设它；`Running` 期间的其它状态更新
+  // （`step.begin`）与**任何离开 `Running` 的迁移**（`step.end` / `state` / 打开会话）都把它清掉。
+  // ⚠️ 别改成「每次调用都把上一条 note 传下来」：那样下一个事件来临之前，状态条上会一直挂着
+  // 上一句「重试」——而它描述的等待已经结束了。
+  statusNote = status === "Running" ? (note ?? null) : null;
+
+  let text = turn === undefined || turn === null ? String(status) : `${status} · 第 ${turn} 步`;
+  if (statusNote) text += ` · ${statusNote}`;
+  el.textContent = text;
   el.className = "chip " + (status === "Running" ? "running" : "live");
 }
 
@@ -1802,6 +1815,18 @@ function handleEvent(p) {
     case "session.step.begin":
       // 「在跑」的信号源是它：session.state 是磁盘的镜像，而磁盘从不存 Running。
       if (p.sessionId === current) setStatus("Running", p.turn - 1);
+      break;
+
+    // ⚠️ **重试上报**（2026-10-21，`retry.attempt`）。没有它的话，一次十次退避的失败在头这边
+    // 就是 `Running` **纹丝不动**四十秒——用户看不出「在重试」与「卡死了」的区别。
+    // ⚠️ **不画进时间线**（`renderTurn` 那种）：重试不是对话里的一条，它是**这一步的临时状态**，
+    // 所以落在状态条上，`step.end` / `state` / `error` 一到就自然消失。
+    // ⚠️ `p.attempt` 是**刚刚失败的那一次**，而「重试 N/10」说的是**即将发出的那次**的序号
+    // ——两者恰好相等（失败第 1 次 ⇒ 接下来是第 2 次尝试 = 第 1 次重试）；核心的载荷就是按这个意思给的。
+    case "retry.attempt":
+      if (p.sessionId === current)
+        setStatus("Running", null,
+          `重试 ${p.attempt}/${p.maxAttempts} · ${(p.delayMs / 1000).toFixed(1)} 秒后再试`);
       break;
 
     case "session.step.end":
