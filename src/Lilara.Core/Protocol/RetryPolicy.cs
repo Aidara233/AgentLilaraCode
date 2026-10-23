@@ -110,13 +110,15 @@ public static class RetryPolicy
     /// 一次**成功**的调用。⚠️ <paramref name="StartedAt"/> 是**成功那一次请求**的开始时刻
     /// （不是整串的起点）：账本里那一行的窗口就该是真正发出并拿到回复的那一次。
     /// ⚠️ 成功的这一行**由调用方记**（见 <c>onFailedAttempt</c> 的契约）：只有它知道
-    /// 「这个回复能不能被用」——压缩要求纯文本摘要，而「回了但回错了」在该落 `failed`。
+    /// 「这个回复能不能被用」。⚠️ 2026-10-22 起压缩不再走这条路（它是一次普通步里的
+    /// `compact` 工具调用），这里的「能不能用」只剩普通步的含义。
     /// </summary>
     public sealed record Outcome(ModelReply Reply, DateTimeOffset StartedAt, int Attempts);
 
     /// <summary>
-    /// **重试循环本身**——三个调用点（`Stepper.StepAsync` / `Stepper.CompactAsync` /
-    /// `provider.test` 的探针）共用这一份。
+    /// **重试循环本身**——两个调用点（`Stepper.StepAsync` / `provider.test` 的探针）共用这一份。
+    /// ⚠️ 2026-10-22 之前还有第三个（`Stepper.CompactAsync`）；压缩改成工具之后，
+    /// 「被限流」重新只经过 `StepAsync` 这一处。
     ///
     /// <para>⚠️ <b>失败不是瞬态 ⇒ 原样抛</b>（不包、不改消息）：调用方对那几种失败的措辞
     /// 全都是一句能直接给用户看的人话。

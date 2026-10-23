@@ -74,14 +74,15 @@ public static class SystemBlock
         string? systemPresetId, string? premierId,
         IReadOnlyDictionary<string, string> axes,
         PromptContributionSnapshot? pluginPrompt = null,
-        string? goalDirective = null) =>
+        string? goalDirective = null,
+        string? compactDirective = null) =>
         Build(
             // ⚠️ 传**可空**的预设正文，不在这里折成 `SystemFallback`：那一折会抹掉
             // 「文件不在」与「文件在」的区分，而 `SystemBody` 的判据正是它
             // （文件不在时兜底里已含机制说明；文件在时补一句）。
             Load(presets, systemPresetId),
             Load(premiers, premierId),
-            axes, pluginPrompt, goalDirective);
+            axes, pluginPrompt, goalDirective, compactDirective);
 
     /// <summary>
     /// 三块槽位的**纯装配**——输入是已经读好的两份正文 + 轴 + 插件贡献，不碰任何存储。
@@ -99,13 +100,15 @@ public static class SystemBlock
         string? systemText, string? premierText,
         IReadOnlyDictionary<string, string> axes,
         PromptContributionSnapshot? pluginPrompt = null,
-        string? goalDirective = null) =>
+        string? goalDirective = null,
+        string? compactDirective = null) =>
         new(
             System: Text(SystemBody(systemText, pluginPrompt?.Text(PromptSlot.System))),
             Premier: Wrap(CorePrompts.PremierOpen,
                 Join(premierText, pluginPrompt?.Text(PromptSlot.Primary)), CorePrompts.PremierClose),
             Tail: Wrap(CorePrompts.TailOpen,
-                TailBody(axes, pluginPrompt?.Text(PromptSlot.Floating), goalDirective), CorePrompts.TailClose));
+                TailBody(axes, pluginPrompt?.Text(PromptSlot.Floating), goalDirective, compactDirective),
+                CorePrompts.TailClose));
 
     // 非空自定义预设也需要机制说明；显式空预设且无系统贡献时仍不产生系统块。
     private static string SystemBody(string? preset, string? plugin)
@@ -158,15 +161,18 @@ public static class SystemBlock
     /// ——而那正是 <see cref="Wrap"/> 那条「空的不能长得像有内容」要防的。</para>
     /// </summary>
     private static string? TailBody(
-        IReadOnlyDictionary<string, string> axes, string? plugin, string? goalDirective)
+        IReadOnlyDictionary<string, string> axes, string? plugin, string? goalDirective,
+        string? compactDirective = null)
     {
         var table = AxisTable(axes);
         var descriptions = Axes.RenderOrder.Where(Axes.InContext)
             .Where(axes.ContainsKey)
             .Select(axis => Axes.DescriptionOf(axis, axes[axis]) is { } explanation
                 ? $"{Axes.LabelOf(axis)} {axes[axis]}：{explanation}" : null);
+        // ⚠️ 压缩线排在目标线**之后**：两者可以同时成立（目标模式下也要能压），而「此刻该动手做的那件事」
+        // ——压缩——放最后，离模型最近。
         var body = Join(table is null ? null : CorePrompts.TailAxesPrefix + table,
-            Join(descriptions.ToArray()), goalDirective, plugin);
+            Join(descriptions.ToArray()), goalDirective, compactDirective, plugin);
         return body is null ? null : $"{CorePrompts.TailDeclaration}\n{body}";
     }
 

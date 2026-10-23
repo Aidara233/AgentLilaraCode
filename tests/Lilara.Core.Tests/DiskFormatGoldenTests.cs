@@ -70,12 +70,12 @@ public class DiskFormatGoldenTests
         };
 
         var onDisk = JsonSerializer.Serialize(spec, Json.Options);
-        Assert.StartsWith("""{"version":8,""", onDisk);
+        Assert.StartsWith("""{"version":9,""", onDisk);
 
         // 线上那一份：同一批选项（`WireFormatTests` 钉着两份设置一致），端点又直接序列化这个类型
         // ⇒ 版本号跟着走。**这就是它出现在头那边的原因**，不是谁忘了挡。
         var onWire = JsonSerializer.Serialize(spec, Hosting.WireJson.Options);
-        Assert.StartsWith("""{"version":8,""", onWire);
+        Assert.StartsWith("""{"version":9,""", onWire);
     }
 
     [Fact]
@@ -91,7 +91,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":8,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
+            """{"version":9,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000}}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -112,7 +112,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":8,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
+            """{"version":9,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"title":"重构会话","archivedAt":"1970-01-01T00:00:00+00:00"}""",
             System.Text.Json.JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -154,7 +154,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":8,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"systemPromptPreset":"task"}""",
+            """{"version":9,"sessionId":"abc123","projectKey":"pk1","workingDirectory":"C:\\work","createdAt":"1970-01-01T00:00:00+00:00","model":{"providerId":"p","modelId":"m","protocol":"claude-messages","effort":"high","maxTokens":16000},"systemPromptPreset":"task"}""",
             JsonSerializer.Serialize(spec, Json.Options));
     }
 
@@ -164,7 +164,7 @@ public class DiskFormatGoldenTests
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"version":8,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":9,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"pendingCompact":false}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -320,13 +320,19 @@ public class DiskFormatGoldenTests
     }
 
     // 老 state.json 没有 axes 键，必须仍然合法——WhenWritingNull 让没设轴的 state 不写出那个键。
+    //
+    // ⚠️ **版本 9 的一个例外**（2026-10-22，压缩改成工具）：`pendingCompact` 是**布尔**，
+    // `WhenWritingNull` 对 `false` 不生效 ⇒ 它**每次都会写出来**。这不是漏了可空化：
+    // 把它写成 `bool?` 就多出「null / false」两种表达同一个意思的状态（本仓明令要躲的形状）。
+    // 代价如实记在这里——老文件读进来再写出去会多一个 `"pendingCompact":false`，
+    // 语义不变（缺键与 false 都是「没有指令」）。
     [Fact]
     public void SessionState_WithoutAxes_OmitsTheKeyEntirely()
     {
         var state = new SessionState { SessionId = "abc123", Status = "Idle", Turn = 0, Pending = [] };
 
         Assert.Equal(
-            """{"version":8,"sessionId":"abc123","status":"Idle","turn":0,"pending":[]}""",
+            """{"version":9,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"pendingCompact":false}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 
@@ -341,7 +347,7 @@ public class DiskFormatGoldenTests
         };
 
         Assert.Equal(
-            """{"version":8,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"}}""",
+            """{"version":9,"sessionId":"abc123","status":"Idle","turn":0,"pending":[],"axes":{"safety":"prod"},"pendingCompact":false}""",
             System.Text.Json.JsonSerializer.Serialize(state, Json.Options));
     }
 }

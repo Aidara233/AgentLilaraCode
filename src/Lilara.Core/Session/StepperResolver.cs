@@ -14,6 +14,12 @@ namespace Lilara.Core.Session;
 public static class StepperResolver
 {
     /// <summary>
+    /// 压缩指令那句尾块文本（`CorePrompts.CompactDirective`）。
+    /// ⚠️ **由解析器交进去、推进器只转交**：推进器不读 `CorePrompts`，尾块那一套装配判据
+    /// 也仍然只有 `SystemBlock` 一处；测试构造推进器时不传它，行为就与加压缩之前逐字节相同。
+    /// </summary>
+    private const string CompactText = Kernel.CorePrompts.CompactDirective;
+    /// <summary>
     /// 优先用 <paramref name="preferredProviderId"/>（会话 spec 里快照的提供商）。
     /// ⚠️ 指定了 preferred 却**解析不出来**时，**绝不替换成别的提供商**——
     /// 会话的 <c>ProviderId</c> 正是为了钉住「这一步是哪个提供商跑的」（01 §7.2），
@@ -29,8 +35,10 @@ public static class StepperResolver
         {
             var any = providers.List().FirstOrDefault();
             return any is null
-                ? new Stepper(store, new UnconfiguredAdapter(), Tools.BuiltInTools.All, plugins, usage)
-                : new Stepper(store, AdapterFactory.Create(any), Tools.BuiltInTools.All, plugins, usage);
+                ? new Stepper(store, new UnconfiguredAdapter(), Tools.BuiltInTools.All, plugins, usage,
+                    pendingCompactText: CompactText)
+                : new Stepper(store, AdapterFactory.Create(any), Tools.BuiltInTools.All, plugins, usage,
+                    pendingCompactText: CompactText);
         }
 
         var bound = providers.Load(preferredProviderId);
@@ -39,9 +47,11 @@ public static class StepperResolver
             // 点名缺的是哪个——「还没有配置提供商」在这里是句误导人的话，
             // 用户明明配了（别的）提供商，只是这个会话绑的那个没了。
             return new Stepper(store, new UnconfiguredAdapter(
-                $"会话绑定的提供商 '{preferredProviderId}' 已不存在。用 `provider set` 重新配一个。"), plugins: plugins, usage: usage);
+                $"会话绑定的提供商 '{preferredProviderId}' 已不存在。用 `provider set` 重新配一个。"),
+                plugins: plugins, usage: usage, pendingCompactText: CompactText);
         }
 
-        return new Stepper(store, AdapterFactory.Create(bound), Tools.BuiltInTools.All, plugins, usage);
+        return new Stepper(store, AdapterFactory.Create(bound), Tools.BuiltInTools.All, plugins, usage,
+            pendingCompactText: CompactText);
     }
 }

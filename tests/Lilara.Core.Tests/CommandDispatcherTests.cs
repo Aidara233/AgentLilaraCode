@@ -5,6 +5,7 @@ using Lilara.Core.Hosting;
 using Lilara.Core.Storage;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
+using Lilara.Core.Session.Tools;
 using Lilara.Core.Tests.Fakes;
 
 namespace Lilara.Core.Tests;
@@ -111,30 +112,27 @@ public class CommandDispatcherTests : IDisposable
         Assert.Equal(1, maxConcurrent);   // 全程没有两个步同时在飞
     }
 
+    // 2026-10-22：压缩改成「下发指令 + 推一步」，不再是「核心自己跑一次模型调用」。
+    // 这一条钉两件事：① `session.compact` 只落指令并推进（下一次调用里看得到它）；
+    // ② 模型调 `compact` 之后检查点落地、指令被清。
     [Fact]
-    public async Task Compact_RunsInBackground_AndQueuedSendContinuesAfterIt()
+    public async Task Compact_RecordsARequest_AndTheNextStepHonoursIt()
     {
         var host = new CoreHost(_root, _work);
         SaveProvider(host);
-        var compactEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var releaseCompact = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var queuedEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var calls = 0;
-        var gated = new GatedAdapter(async () =>
-        {
-            var n = Interlocked.Increment(ref calls);
-            if (n == 1) return "seed";
-            if (n == 2)
-            {
-                compactEntered.SetResult();
-                await releaseCompact.Task;
-                return "summary";
-            }
 
-            queuedEntered.SetResult();
-            return "after";
-        });
-        var dispatcher = new CommandDispatcher(host, new EventBus(), _ => new Stepper(host.Store, gated));
+        var adapter = new FakeAdapter()
+            .Reply("seed")
+            .ReplyBlocks(new Block.ToolUseBlock(
+                "c1", "compact", """{"requested":true,"summary":"摘要"}"""))
+            .Reply("done");
+        // ⚠️ 工具表必须带上内建工具：压缩是模型调 `compact` 完成的，没有工具表那一步只会
+        // 得到一条「不存在的工具」的结果——而**那不会报错**，只是检查点永远不出现。
+        // 尾块那句话也要带上，否则「指令进没进请求」没法按请求本身判。
+        var dispatcher = new CommandDispatcher(host, new EventBus(),
+            _ => new Stepper(host.Store, adapter, BuiltInTools.All,
+                pendingCompactText: CorePrompts.CompactDirective),
+            _ => adapter);
         var sessionId = await CreateSessionAsync(dispatcher);
 
         await dispatcher.DispatchAsync(
@@ -143,28 +141,125 @@ public class CommandDispatcherTests : IDisposable
 
         var compact = await dispatcher.DispatchAsync(
             new CoreCommand.SessionCompact(sessionId), "compact", false, CancellationToken.None);
-        Assert.Contains("开始", Assert.IsType<Ack.Accepted>(compact.Ack).Note);
-        await compactEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.True(host.Activate(host.Store.FindSession(sessionId)!.Value.ProjectKey, sessionId).IsRunning);
+        Assert.IsType<Ack.Accepted>(compact.Ack);
 
-        var queued = await dispatcher.DispatchAsync(
-            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("after")]),
-            "after", false, CancellationToken.None);
-        Assert.IsType<Ack.Accepted>(queued.Ack);
-        Assert.Equal(2, calls);
-
-        releaseCompact.SetResult();
-        await queuedEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.Equal(3, calls);
-
-        // queuedEntered 在模型适配器返回前触发；等待 Stepper 完成最后的 state/history 写入，
-        // 再由 Dispose 删除临时目录，避免 Windows 上与后台写句柄竞争。
         var projectKey = host.Store.FindSession(sessionId)!.Value.ProjectKey;
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
-        while (host.Store.ReadState(projectKey, sessionId).Turn < 2)
+        // 指令被消费（检查点在它之前落、状态在它之后清 —— 见 `Stepper.CommitCompaction` 的次序）。
+        await WaitUntil(() => new CompactionStore(host.Store).ReadAll(projectKey, sessionId).Count == 1);
+        await WaitUntil(() => host.Store.ReadState(projectKey, sessionId).PendingCompact == false);
+
+        // ⚠️ 判据是**真正发出去的请求**（`FakeAdapter.Calls`）：第一次（`seed`）不带压缩指令，
+        // 第二次（模型在里面调 `compact`）带。
+        Assert.True(adapter.Calls.Count >= 2);
+        Assert.DoesNotContain(CorePrompts.CompactDirective, DirectiveText(adapter.Calls[0]));
+        Assert.Contains(CorePrompts.CompactDirective, DirectiveText(adapter.Calls[1]));
+    }
+
+    /// <summary>
+    /// 请求里所有「核心注入的文字」。⚠️ **尾块通常不在 `Slots.Tail` 里**：
+    /// 工具表有 `floating_context` 时它被挪进末尾那条合成调用/结果（`Stepper.FloatingContextPair`），
+    /// 而两者对模型是同一件事——只看 `Slots.Tail` 会得到一个假阴性。
+    /// </summary>
+    private static string DirectiveText(ModelRequest request) =>
+        string.Concat(request.Slots.Tail.OfType<Block.TextBlock>().Select(b => b.Text))
+        + string.Concat(request.Timeline.OfType<TimelineEvent.ToolResultEvent>()
+            .SelectMany(r => r.Content.OfType<Block.TextBlock>()).Select(b => b.Text));
+
+    // 指令是**持久状态**：它写进 `state.json`，而不是只活在内存里。
+    // ⚠️ 这条刻意用**拒绝一切**的适配器 + 没有工具表的推进器：那一步一定失败、一点不动盘，
+    // 于是「指令还在」只可能来自 `session.compact` 那次写入本身
+    // （否则「指令被消费」与「指令没写进去」在断言上长得一样）。
+    [Fact]
+    public async Task Compact_PersistsTheRequestToDisk()
+    {
+        var host = new CoreHost(_root, _work);
+        SaveProvider(host);
+        var failing = new ThrowingAdapter();
+        var dispatcher = new CommandDispatcher(host, new EventBus(), _ => new Stepper(host.Store, failing),
+            _ => failing);
+        var sessionId = await CreateSessionAsync(dispatcher);
+
+        // 先有一条用户消息（空会话会被这条命令拒绝）。
+        AddUserMessage(host, sessionId, "seed");
+
+        var projectKey = host.Store.FindSession(sessionId)!.Value.ProjectKey;
+        var r = await dispatcher.DispatchAsync(
+            new CoreCommand.SessionCompact(sessionId), "compact", false, CancellationToken.None);
+        Assert.IsType<Ack.Accepted>(r.Ack);
+
+        await WaitUntil(() => failing.Called > 0);   // 那一步真的试过（然后失败了）
+        Assert.True(host.Store.ReadState(projectKey, sessionId).PendingCompact);
+    }
+
+    // 模型在拿到指令后的**第一回合没有调工具就结束了** ⇒ 续跑一步，而记录里**没有**假用户消息
+    // （2026-10-22：`session.compact` 没有新输入，靠的就是这条续跑；塞一条假消息会污染记录）。
+    [Fact]
+    public async Task Compact_KeepsPushing_UntilTheModelCallsTheTool()
+    {
+        var host = new CoreHost(_root, _work);
+        SaveProvider(host);
+
+        var adapter = new FakeAdapter()
+            .Reply("seed")
+            .Reply("我需要先看一下再总结。")          // 停回合、没调工具
+            .ReplyBlocks(new Block.ToolUseBlock(
+                "c1", "compact", """{"requested":true,"summary":"摘要"}"""))
+            .Reply("done");
+        var dispatcher = new CommandDispatcher(host, new EventBus(),
+            _ => new Stepper(host.Store, adapter, BuiltInTools.All,
+                pendingCompactText: CorePrompts.CompactDirective),
+            _ => adapter);
+        var sessionId = await CreateSessionAsync(dispatcher);
+
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("seed")]),
+            "seed", true, CancellationToken.None);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionCompact(sessionId), "compact", false, CancellationToken.None);
+
+        var projectKey = host.Store.FindSession(sessionId)!.Value.ProjectKey;
+        await WaitUntil(() => new CompactionStore(host.Store).ReadAll(projectKey, sessionId).Count == 1);
+
+        // 用户消息只有 `seed` 那一条：续跑不能往记录里写东西。
+        var userMessages = host.Store.ReadTimeline(projectKey, sessionId)
+            .OfType<TimelineEvent.MessageEvent>().Count(m => m.From == Speaker.User);
+        Assert.Equal(1, userMessages);
+        Assert.True(adapter.Calls.Count >= 3);   // seed → 「先看一下」→ compact（+ 可能还有一步收尾）
+    }
+
+    private static void AddUserMessage(CoreHost host, string sessionId, string text)
+    {
+        var found = host.Store.FindSession(sessionId)!.Value;
+        host.Store.AppendEvent(found.ProjectKey, sessionId, new TimelineEvent.MessageEvent
         {
-            if (DateTime.UtcNow >= deadline)
-                throw new TimeoutException("后台 queued send 未完成持久化");
+            Id = Guid.NewGuid().ToString("N")[..12],
+            At = CoreClock.Now(),
+            From = Speaker.User,
+            Blocks = [new Block.TextBlock(text)],
+        });
+    }
+
+    private sealed class ThrowingAdapter : Lilara.Core.Protocol.IModelAdapter
+    {
+        private int _called;
+        public int Called => Volatile.Read(ref _called);
+        public Lilara.Core.Protocol.ResolvedEndpoint? Endpoint => null;
+        public string Protocol => Protocols.ClaudeMessages;
+
+        public Task<Lilara.Core.Protocol.ModelReply> CallAsync(
+            Lilara.Core.Protocol.ModelRequest request, CancellationToken ct)
+        {
+            Interlocked.Increment(ref _called);
+            throw new ModelCallFailedException("测试：故意失败") { Transient = false };
+        }
+    }
+
+    private static async Task WaitUntil(Func<bool> condition, int timeoutMs = 5000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (!condition())
+        {
+            if (DateTime.UtcNow >= deadline) throw new TimeoutException("条件没有在时限内成立");
             await Task.Delay(10);
         }
     }

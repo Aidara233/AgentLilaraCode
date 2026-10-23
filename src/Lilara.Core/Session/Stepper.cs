@@ -2,6 +2,7 @@ using Lilara.Core.Protocol;
 using Lilara.Core.Storage;
 using Lilara.Core.Kernel;
 using Lilara.Core.Network;
+using Lilara.Core.Shell;
 using Lilara.Core.Session.Tools;
 
 namespace Lilara.Core.Session;
@@ -24,10 +25,18 @@ public sealed class Stepper(
     Lilara.Core.Plugins.PluginHost? plugins = null,
     UsageStore? usage = null,
     Func<TimeSpan, CancellationToken, Task>? retryDelay = null,
-    INetworkTransport? networkTransport = null)
+    INetworkTransport? networkTransport = null,
+    string? pendingCompactText = null)
 {
     private readonly SessionStore _store = store;
     private readonly IModelAdapter _adapter = adapter;
+
+    /// <summary>
+    /// **用户下发过压缩指令时，尾块里那句「现在该做什么」**（2026-10-22）。
+    /// ⚠️ 与 `GoalDirective` 同一条分工：**文本由解析器渲染好、推进器只转交**——
+    /// 推进器不碰预设文件，也就能在「答复路径」与「步」两条路上给出同一句话。
+    /// </summary>
+    private readonly string? _pendingCompactText = pendingCompactText;
 
     /// <summary>
     /// 两次重试之间怎么等（`RetryPolicy` 的 <c>delay</c> 参数）。
@@ -71,143 +80,6 @@ public sealed class Stepper(
     /// ⚠️ 表达式别名，不是第二个字段——同一个事实只能有一份存储。
     /// </summary>
     public IModelAdapter Adapter => _adapter;
-
-    /// <summary>
-    /// Generate a durable summary for the current session without changing the session id
-    /// or appending a user/model message to the conversation history.
-    /// </summary>
-    public async Task<CompactionResult> CompactAsync(SessionHandle handle, CancellationToken ct)
-    {
-        var history = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
-        if (history.Count == 0)
-            throw new InvalidOperationException("无法压缩空会话。");
-
-        var pending = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var evt in history)
-        {
-            if (evt is TimelineEvent.MessageEvent message)
-                foreach (var call in message.Blocks.OfType<Block.ToolUseBlock>())
-                    pending.Add(call.CallId);
-            if (evt is TimelineEvent.ToolResultEvent result)
-                pending.Remove(result.CallId);
-        }
-        if (pending.Count > 0)
-            throw new InvalidOperationException("当前历史包含未完成的工具调用，完成工具调用后才能压缩。");
-
-        var through = history[^1];
-        var prompt = new TimelineEvent.MessageEvent
-        {
-            Id = Ids.New(),
-            At = CoreClock.Now(),
-            From = Speaker.User,
-            Blocks =
-            [new Block.TextBlock(
-                "请按压缩协议总结上面的会话。保留当前目标、已确认事实、关键决定和约束、" +
-                "未完成任务、重要文件与工具结果的历史 id 引用、当前状态和不确定内容。" +
-                "只输出摘要正文，不要调用工具，不要提出新任务。")],
-        };
-        var timeline = TimelineRender.Render(_store, handle).Append(prompt).ToList();
-        var request = new ModelRequest
-        {
-            ModelId = handle.Spec.Model.ModelId,
-            MaxTokens = Math.Min(handle.Spec.Model.MaxTokens, 4096),
-            Protocol = _adapter.Protocol,
-            Effort = handle.State.Axes?.GetValueOrDefault(Axes.Effort) ?? "default",
-            Temperature = null,
-            Slots = new PromptSlots(
-                [new Block.TextBlock(CorePrompts.SystemFallback + "\n\n" +
-                    "这是一次 Lilara 上下文压缩调用。摘要由框架保存并在后续请求中提供；" +
-                    "它不是用户新指令，也不是模型原话。")], [], []),
-            Tools = [],
-            Timeline = timeline,
-        };
-
-        var callId = Ids.New();
-        var attempts = 0;
-        var compactionStarted = CoreClock.Now();
-        // 成功那一次请求的窗口（默认 = 整串的起点，一次就成时两者相同）。
-        var callStarted = compactionStarted;
-        ModelReply reply;
-        try
-        {
-            // ⚠️ 与 `StepAsync` 同一条路（`RetryPolicy`）：压缩也是一次模型调用，
-            // 同样会被限流 / 撞上 5xx。⚠️ 失败逐次记账；**成功那一行不在这里记**——
-            // 压缩还要求「回复是纯文本摘要」，而「回了但回错了」在该落 `failed`（下面三条出口）。
-            // 一条请求只落一行账：这里的出口与下面三条终端出口是互斥的。
-            var outcome = await RetryPolicy.CallAsync(_adapter, request, ct,
-                delay: _retryDelay,
-                onFailedAttempt: failed =>
-                {
-                    attempts = failed.Index;
-                    RecordUsage(handle, callId, failed.StartedAt, reply: null, "failed",
-                        purpose: "compaction", attempt: failed.Index,
-                        endedAt: failed.EndedAt, error: failed.Failure.Message);
-                },
-                onRetry: NotifyRetry);
-            reply = outcome.Reply;
-            callStarted = outcome.StartedAt;
-            attempts = outcome.Attempts;
-        }
-        catch
-        {
-            if (attempts == 0)
-                RecordUsage(handle, callId, compactionStarted, null, "failed", "compaction");
-            throw;
-        }
-
-        if (reply.Refused || reply.Blocks.Any(b => b is not Block.TextBlock))
-        {
-            RecordUsage(handle, callId, callStarted, reply, "failed", "compaction",
-                attempt: attempts, error: "压缩模型返回的不是纯文本摘要。");
-            throw new InvalidOperationException("压缩模型必须返回纯文本摘要。");
-        }
-        var summary = string.Concat(reply.Blocks.OfType<Block.TextBlock>().Select(b => b.Text)).Trim();
-        if (summary.Length == 0 || summary.Length > 100_000)
-        {
-            RecordUsage(handle, callId, callStarted, reply, "failed", "compaction",
-                attempt: attempts, error: "压缩摘要为空或超过长度限制。");
-            throw new InvalidOperationException("压缩摘要为空或超过长度限制。");
-        }
-
-        var checkpoint = new CompactionCheckpoint
-        {
-            CheckpointId = Ids.New(),
-            CoveredThroughEventId = through.Id,
-            HistoryDigest = CompactionStore.ComputeDigest(history),
-            Summary = summary,
-            CreatedAt = CoreClock.Now(),
-            SourceCallId = callId,
-            SummaryTokens = reply.Usage?.OutputTokens,
-        };
-        try
-        {
-            new CompactionStore(_store).Append(handle.ProjectKey, handle.SessionId, checkpoint);
-        }
-        catch
-        {
-            // ⚠️ `callStarted`（不是整串的起点）与 `attempt`：这一行讲的是**那一次请求**，
-            // 它已经成功了、失在「压缩记录写不进去」——把次数与窗口留全，事后才分得清
-            // 「上游一次就成、坏在磁盘」与「上游试了十次」。
-            RecordUsage(handle, callId, callStarted, reply, "failed", "compaction", attempt: attempts);
-            throw;
-        }
-
-        // ⚠️ **压缩就是一个回收窗口**（2026-10-17，`01` §11.7）：压缩**立即生效**
-        // ⇒ 下一步的前缀反正要重建；既然要重建，就把距离与点杀一并解析一次、落成窗口记录。
-        // 这不是「压力触发」——压力触发是前缀好好的、主动破它；压缩的破是它自己的语义。
-        // ⚠️ 只解析**这次压缩之后仍然可见**的记录：被压掉的那段本来就由摘要代表，
-        // 收它不再省任何字节（而 `Reclaim.Decide` 也只看到投影后的那段）。
-        var visible = ContextCompaction.Project(_store, handle, history).Suffix;
-        var blobs = new BlobStore(_store.DataRoot);
-        var ids = Reclaim.Resolve(visible, blobs,
-            new Tools.SessionToolContext(handle.Spec.WorkingDirectory, blobs, history));
-        _store.AppendEvents(handle.ProjectKey, handle.SessionId,
-            [Reclaim.Window("compaction", ids, null)]);
-
-        RecordUsage(handle, callId, callStarted, reply, "completed", "compaction", attempt: attempts);
-        return new CompactionResult(checkpoint.CheckpointId, checkpoint.CoveredThroughEventId,
-            checkpoint.Summary, reply.Usage);
-    }
 
     /// <summary>
     /// 一步 = 渲染 → 调用 → 落盘（02 §2）。
@@ -255,7 +127,10 @@ public sealed class Stepper(
             handle.Spec.SystemPromptPreset, handle.Spec.PremierPrompt,
             pluginAxes.Values, pluginPrompt,
             // ⚠️ 目标线进**尾块**（浮动上下文），不落盘：目标是状态，不是事件。
-            GoalMode.IsActive(stepState) ? CorePrompts.GoalDirective : null);
+            GoalMode.IsActive(stepState) ? CorePrompts.GoalDirective : null,
+            // 压缩指令同源：它也是状态（`state.json` 的 `pendingCompact`），不是事件。
+            // ⚠️ 文本由解析器交进来（`StepperResolver`），推进器不碰预设——两条路给出同一句话。
+            stepState.PendingCompact ? _pendingCompactText : null);
 
         // ⚠️ **引擎租约**：所有 `StepAsync` 调用都在 **_stepper 的会话内串行** 之内
         // （`CommandDispatcher` 的会话闸），所以这里不需要再同步。
@@ -412,6 +287,10 @@ public sealed class Stepper(
         // 理由见 `SessionToolContext` 的构造参数注释。
         var recorded = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
 
+        // ⚠️ **真正执行过的调用**（`Batch.ExecutedCallIds`）要活过下面那个 `if`：
+        // 压缩的判据与 `release` 的画线同源——名字在批里 ≠ 它跑过（闸门拒掉的也在这批里）。
+        IReadOnlyList<string> executedCallIds = [];
+
         // 拒答不写空模型消息（Review Focus #2）
         if (!reply.Refused && reply.Blocks.Count > 0)
         {
@@ -454,12 +333,19 @@ public sealed class Stepper(
                 // ⚠️ 联网配置与轴值**在执行这一刻**读（同权限档位）：它们是浮动字段，
                 // 用户可以在模型调用期间改；按步开始的值判会与头显示的档位分叉。
                 NetworkFor(handle),
-                GoalMode.IsActive(handle.State));
+                GoalMode.IsActive(handle.State),
+                // ⚠️ 压缩指令是**持久状态**（`state.json`），执行这一刻现读：用户完全可能在
+                // 模型思考期间刚下发它。⚠️ 但落检查点时**再用一次** `Parse`（它会重读上下文），
+                // 所以「谁算数」只有 `CompactTool.Parse` 一个答案。
+                handle.State.PendingCompact,
+                // ⚠️ shell 配置与联网同形：执行这一刻现读（浮动字段），步内冻结。
+                ShellFor());
 
             var batch = await executor.ExecuteAsync(toolCalls, context, ct);
             pending = batch.Pending;
             events.AddRange(batch.Results);
             toolResults = batch.Results;
+            executedCallIds = batch.ExecutedCallIds;
             goalEnded = GoalMode.IsActive(handle.State) && EndedGoal(batch, toolCalls);
 
             // ⚠️ **`release` 的线在这里落盘**（`01` §12.4，2026-10-11）：
@@ -529,9 +415,45 @@ public sealed class Stepper(
             return new StepOutcome(reply, pending, handle.State.Ask?.DeadlineAt,
                 events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id, releasedClaims, releasedLines);
         }
+
+        // ---- 压缩（2026-10-22，`compact` 是一次普通工具调用）----
+        //
+        // ⚠️ **次序在这里是契约，不能随手调**（`docs/superpowers/plans/2026-10-22-compaction-as-tool.md`）：
+        //   ① 记录（下面那句 `AppendEvents`）→ ② 检查点 → ③ 清指令 → ④ 回收窗口。
+        //   检查点若先于记录写，崩在中间会得到一个「覆盖到 X、而 X 之后什么都没有」的窗口：
+        //   新检查点的摘要只在**那条调用**的参数里，而那条调用在 X 之后 ⇒ 模型既看不到摘要、
+        //   也看不到历史。反过来（记录先）最坏只是「模型以为自己压了、其实没压」——可见、可重试。
+        //
+        // ⚠️ **`CoveredThroughEventId` 是本步之前最后一条记录**，不是那条 compact 调用本身：
+        //   后者会让「调用之前的那几步工具结果」被切掉，而用户要的「最新的一批消息」正是它们。
+        //
+        // ⚠️ **判据只有 `CompactTool.Parse` 一个**（它与工具回答那句话用的是同一个函数）：
+        //   `context.CompactRequested` 是那一刻的快照，而写检查点是这一刻——两者不同时，
+        //   以这一刻的上下文为准。
+        var compactCall = toolCalls
+            .LastOrDefault(c => string.Equals(c.Name, Tools.CompactTool.NameOf, StringComparison.Ordinal)
+                                && executedCallIds.Contains(c.CallId));
+        string? compactSummary = null;
+        if (compactCall is not null && events.Count > 0)
+        {
+            var blobsForCompact = new BlobStore(_store.DataRoot);
+            var contextForCompact = new SessionToolContext(
+                handle.Spec.WorkingDirectory, blobsForCompact, recorded,
+                FloatingTextOf(slots), NetworkFor(handle), GoalMode.IsActive(handle.State),
+                handle.State.PendingCompact, ShellFor());
+            compactSummary = Tools.CompactTool.Parse(
+                new ToolCall(compactCall.CallId, compactCall.Name, compactCall.Arguments),
+                contextForCompact, out _);
+        }
+
         // 一次落盘 = 一个原子。⚠️ 空批次**不写**（拒答且没有工具的那一步就是空的），
         // 而 `AppendEvents` 对空批次是 no-op、不抛——见它的注释。
         _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
+
+        // ② + ③ + ④：检查点 → 清指令 → 回收窗口（见上面那段次序）。
+        CompactionCheckpoint? compaction = compactSummary is null
+            ? null
+            : CommitCompaction(handle, compactCall!.CallId, recorded);
 
         // ⚠️ Turn 递增**在拒答分支之外**：拒答是成功返回的、完成的一步，
         // 只是没有内容可写。让它和「抛异常」一样不计数，
@@ -556,6 +478,9 @@ public sealed class Stepper(
             Status = SessionStatus.Idle,
             Turn = s.Turn + 1,
             PendingIntent = null,
+            // ⚠️ **指令的清理在 `CommitCompaction` 里、排在检查点之后**（次序见那边）——
+            // 这里不再碰它：先清指令后写检查点，崩在中间就是「指令丢了、历史没压」，
+            // 而用户看到的「点过压缩」与盘面完全对不上。⚠️ 没有压缩时它原样保留。
             // ⚠️ **`finish_goal` 的效果就是这一行**：把主动性拨回 standard。
             // 拨回之后普通工具循环还会再走一步（它是一次工具调用）⇒ 模型有时间收尾总结。
             // 只在**真的执行过**且当时确实处于 goal 时才改（见 `goalEnded` 的算法）。
@@ -564,7 +489,64 @@ public sealed class Stepper(
 
         return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id,
             ReleasedClaims: releasedClaims, ReleasedLines: releasedLines, ToolResults: toolResults,
-            GoalEnded: goalEnded);
+            GoalEnded: goalEnded, Compacted: compaction);
+    }
+
+    /// <summary>
+    /// **压缩的落地**：检查点 → 清指令 → 回收窗口（2026-10-22）。
+    ///
+    /// <para>⚠️ <b>调用它的前提</b>：本步的记录已经落盘（调用点保证），并且那条调用已经过
+    /// <see cref="Tools.CompactTool.Parse"/>——所以这里不再判「算不算数」，只负责写。</para>
+    ///
+    /// <para>⚠️ <b>次序，以及为什么</b>：
+    /// ① 检查点先写：它的 `CoveredThroughEventId` 是本步之前最后一条记录，而摘要只在
+    ///    <paramref name="callId"/> 那条调用的参数里——那条调用已经落盘了（调用点先写记录）。
+    ///    崩在这之后：历史已压、指令还在 ⇒ 下一步会**再压一次**（多一份摘要，可见、可恢复）。
+    /// ② 清指令：它必须<b>晚于</b>检查点。反过来（先清）崩在中间就是「指令没了、历史没压」，
+    ///    而那是**静默的**——用户点过压缩，盘上两处都看不出它发生过。
+    /// ③ 回收窗口最后：它只影响回收判定，前两步才是语义。</para>
+    ///
+    /// <para>⚠️ <b>清指令走的是「读-改-写 + 落盘」同一个临界区</b>（`UpdateStateAndPersist`），
+    /// 与 `Turn + 1` 那一句同锁——两处各写一次整份 state 会互相盖掉。</para>
+    /// </summary>
+    private CompactionCheckpoint? CommitCompaction(
+        SessionHandle handle, string callId, IReadOnlyList<TimelineEvent> recorded)
+    {
+        // ⚠️ **没有可覆盖的记录 ⇒ 不落检查点**：边界得有一个锚（`CoveredThroughEventId`），
+        // 而空记录里没有。命令那一侧已经拒掉空会话；这一条挡的是「不走命令、直接推一步」的调用
+        // （测试、以及将来的嵌入方）——那里 `recorded[^1]` 会抛，而抛出来的是一条
+        // 与本意无关的 `IndexOutOfRangeException`。
+        if (recorded.Count == 0) return null;
+
+        var checkpoint = new CompactionCheckpoint
+        {
+            CheckpointId = Ids.New(),
+            // ⚠️ 本步之前最后一条（`recorded` 是本步开始时读到的那份）；
+            // 步内没有记录时它就是**上一次压缩的 `compact` 调用**——那正是「保留最新的一批」的边界。
+            CoveredThroughEventId = recorded[^1].Id,
+            HistoryDigest = CompactionStore.ComputeDigest(recorded),
+            CreatedAt = CoreClock.Now(),
+            SourceCallId = callId,
+        };
+
+        new CompactionStore(_store).Append(handle.ProjectKey, handle.SessionId, checkpoint);
+
+        handle.UpdateStateAndPersist(_store, s => s with { PendingCompact = false },
+            diskStatus: SessionStatus.Idle);
+
+        // ⚠️ **压缩就是一个回收窗口**（2026-10-17，`01` §11.7）：压缩**立即生效**
+        // ⇒ 下一步的前缀反正要重建；既然要重建，就把距离与点杀一并解析一次、落成窗口记录。
+        // ⚠️ 只解析**这次压缩之后仍然可见**的记录：被压掉的那段本来就由摘要代表，
+        // 收它不再省任何字节（而 `Reclaim.Decide` 也只看到投影后的那段）。
+        // ⚠️ 那份投影读的是**刚落盘的**历史（含本步），所以窗口覆盖到 `compact` 调用及其结果之后的一切。
+        var visible = ContextCompaction.Project(_store, handle).Suffix;
+        var blobs = new BlobStore(_store.DataRoot);
+        var ids = Reclaim.Resolve(visible, blobs,
+            new Tools.SessionToolContext(handle.Spec.WorkingDirectory, blobs, recorded));
+        _store.AppendEvents(handle.ProjectKey, handle.SessionId,
+            [Reclaim.Window("compaction", ids, null)]);
+
+        return checkpoint;
     }
 
     /// <summary>
@@ -821,7 +803,9 @@ public sealed class Stepper(
                 // ⚠️ 它与上面那次模型调用无关——那条路**不调模型**。
                 FloatingTextAt(handle, CoreClock.Now()),
                 NetworkFor(handle),
-                GoalMode.IsActive(handle.State));
+                GoalMode.IsActive(handle.State),
+                handle.State.PendingCompact,
+                ShellFor());
 
             var batch = await executor.ExecuteAsync(calls, context, ct, reply);
             events.AddRange(batch.Results);
@@ -967,7 +951,10 @@ public sealed class Stepper(
         var prompt = _plugins.Collect(axes, handle.Spec.Plugins ?? []);
         var slots = SystemBlock.Build(systemText: null, premierText: null, axes.Values, prompt,
             // 与 `StepAsync` 同一来源：答复路径 / 控制面探测看到的尾块也要带目标线。
-            GoalMode.IsActive(state) ? CorePrompts.GoalDirective : null);
+            GoalMode.IsActive(state) ? CorePrompts.GoalDirective : null,
+            // 压缩指令同理：答复路径上也必须看得到它，否则用户下发指令后去批准一次询问，
+            // 那条尾块会「忽然没有压缩请求」——而指令明明还在。
+            state.PendingCompact ? _pendingCompactText : null);
         return FloatingTextOf(slots);
     }
 
@@ -986,6 +973,12 @@ public sealed class Stepper(
         new(new NetworkStore(_store.DataRoot).Load(),
             handle.State.Axes?.GetValueOrDefault(Axes.Network) ?? "off",
             _networkTransport);
+
+    /// <summary>
+    /// 这一刻的 shell 能力快照（`shell.json`）。⚠️ 与 <see cref="NetworkFor"/> 同一条：
+    /// **每步读一次配置**，步内冻结。「能不能跑」不在这里——那是权限轴的事。
+    /// </summary>
+    private ShellAccess ShellFor() => new(new ShellStore(_store.DataRoot).Load());
 
     /// <summary>
     /// 这一批里有没有**真的执行过** `finish_goal`。⚠️ 走 `ExecutedCallIds`（`release` 的先例）：
@@ -1091,7 +1084,15 @@ public sealed class Stepper(
         /// ⚠️ 调用方据此发 `axis.changed`（头的行 / 调音台靠它把目标标记撤掉）；
         /// <b>不要</b>据此掐掉下一次推进——用户要的是「再多跑一步让模型收尾」。
         /// </summary>
-        bool GoalEnded = false);
+        bool GoalEnded = false,
+        /// <summary>
+        /// 本步**落了检查点**（`compact` 真的执行了且指令还在）。<c>null</c> = 没压（绝大多数步）。
+        ///
+        /// <para>⚠️ 交回去是为了让调用方发 `session.compaction.completed`——与
+        /// <see cref="ReleasedLines"/> 同一条分工（`Stepper` 不碰事件总线）。
+        /// 而**发不发得出去不影响已经落盘的检查点**：那是事实。</para>
+        /// </summary>
+        CompactionCheckpoint? Compacted = null);
 
     /// <summary>
     /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。

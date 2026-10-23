@@ -107,6 +107,20 @@ public static class Gate
     }
 
     /// <summary>
+    /// **执行期用的那个判定**——先问工具自己「要不要过闸」（<see cref="ITool.GatedByPermission"/>）。
+    ///
+    /// <para>⚠️ <b>它<b>不是</b> <see cref="Decide(PermissionClass, string?)"/> 的替代品</b>：那张
+    /// `档位 × 类别` 的表还在，也仍然是<b>唯一</b>一张——本方法只是多了一个「这类调用压根不在表里」
+    /// 的分支。<c>GatedByPermission == false</c> 的工具今天只有一个（`compact`），理由写在那个属性上。</para>
+    ///
+    /// <para>⚠️ <b>为什么是「按工具放行」而不是「往类别里加一档」</b>：`Allowed` / `Asks` 两张表的
+    /// 每一行都写着每一档的边界，加一档等于让六个档位各移动一次边界，而
+    /// `GateTests` 钉的是「单调阶梯」（只移动一格）——那会静默错位（见 <see cref="Allowed"/> 的注释）。</para>
+    /// </summary>
+    public static Verdict Decide(ITool tool, string? level) =>
+        tool.GatedByPermission ? Decide(tool.PermissionClass, level) : Verdict.Allow;
+
+    /// <summary>
     /// 拒绝理由。⚠️ <b>它在<b>执行那一刻</b>就落进结果、此后冻结</b>
     /// （`01` §9.2 点 3）：`ToolResultEvent` 是**只追加的记录**，
     /// ⇒ 理由**不能**在渲染时按当前档位重算——那样改一次档位，

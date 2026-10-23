@@ -147,7 +147,9 @@ public sealed class ToolExecutor(
                 continue;
             }
 
-            var verdict = Gate.Decide(tool.PermissionClass, permissionLevel);
+            // ⚠️ 用**工具**那个重载，不是按类别那个：`compact` 声明了不归闸门管
+            // （`ITool.GatedByPermission`），而那个判断必须先于 `档位 × 类别` 那张表。
+            var verdict = Gate.Decide(tool, permissionLevel);
 
             // ⚠️ **记忆只把 `Ask` 变成 `Allow`**（`01` §3.8）：它**绝不**把 `Deny` 变成 `Allow`
             // ——档位不够是**硬线**，而批准记的是「这一次调用」，不是「这一类工具」。

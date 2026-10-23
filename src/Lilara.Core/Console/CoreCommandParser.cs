@@ -231,6 +231,9 @@ public static class CoreCommandParser
         // ⚠️ 交**归一化后**的行（与 `provider set` 一致）：Tab / NBSP 分隔必须与空格等价。
         if (StartsWithToken(trimmed, "network")) return ParseNetwork(trimmed);
 
+        // shell 配置（2026-10-23）：`shell set …` / `shell test`。与 `network` 同一形状。
+        if (StartsWithToken(trimmed, "shell")) return ParseShell(trimmed);
+
         // 预设：系统提示词的存放（`01` §3.1）。三条**都走命令通道**——
         // 连 `list` 也走，因为头要拿它做下拉，而头只有「命令 + 快照」两层的入口。
         // ⚠️ 动词判据在**归一化后**的行上（词是单个词，折空白无妨），
@@ -711,6 +714,73 @@ public static class CoreCommandParser
         if (clearKey) apiKey = "";
 
         return (new CoreCommand.NetworkConfigure(enabled, apiKey, endpoint, maxResults, timeout, maxBytes, allow), null);
+    }
+
+    // `shell set [--enabled on|off] [--executable <路径> | --auto] [--timeout <秒>]`
+    // `shell test`
+    //
+    // 与 `network set` 同一条拆词纪律：省略的标志 ⇒ null = 保留旧值。
+    // 唯一的例外是 `--auto`（一个无值标志）——控制台没法给「空串」，
+    // 而「清掉路径、回到自动探测」是必须能表达的一件事。
+    private static (CoreCommand?, string?) ParseShell(string line)
+    {
+        const string usage =
+            "用法：shell set [--enabled on|off] [--executable <sh 路径> | --auto] [--timeout <秒>]\n"
+            + "      shell test";
+
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 1) return (null, usage);
+
+        if (string.Equals(parts[1], "test", StringComparison.OrdinalIgnoreCase))
+            return parts.Length == 2 ? (new CoreCommand.ShellTest(), null) : (null, usage);
+
+        if (!string.Equals(parts[1], "set", StringComparison.OrdinalIgnoreCase))
+            return (null, usage);
+
+        bool? enabled = null;
+        var auto = false;
+        string? executable = null;
+        int? timeout = null;
+
+        for (var i = 2; i < parts.Length; i++)
+        {
+            var flag = parts[i];
+
+            if (flag == "--auto") { auto = true; continue; }
+
+            if (i + 1 >= parts.Length) return (null, $"参数 {flag} 缺少值。");
+
+            var value = parts[i + 1];
+            if (value.StartsWith("--", StringComparison.Ordinal)) return (null, $"参数 {flag} 缺少值。");
+
+            switch (flag)
+            {
+                case "--enabled":
+                    enabled = value.ToLowerInvariant() switch
+                    {
+                        "on" or "true" or "1" => true,
+                        "off" or "false" or "0" => false,
+                        _ => null,
+                    };
+                    if (enabled is null) return (null, "--enabled 只接受 on / off。");
+                    break;
+
+                case "--executable": executable = value; break;
+
+                case "--timeout":
+                    if (!int.TryParse(value, out var seconds)) return (null, "--timeout 要一个整数（秒）。");
+                    timeout = seconds;
+                    break;
+
+                default: return (null, $"未知参数 '{flag}'。");
+            }
+
+            i++;
+        }
+
+        if (auto) executable = "";
+
+        return (new CoreCommand.ShellConfigure(enabled, executable, timeout), null);
     }
 
     // `provider delete <id>`：id 合法性由 dispatcher 判（控制台与头共用同一条判据），

@@ -1,6 +1,7 @@
 using Lilara.Core.Protocol;
 using Lilara.Core.Kernel;
 using Lilara.Core.Network;
+using Lilara.Core.Shell;
 using Lilara.Core.Storage;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
@@ -195,6 +196,10 @@ public sealed class CommandDispatcher(
                 case CoreCommand.NetworkConfigure nc: return HandleNetworkConfigure(nc, commandId);
                 case CoreCommand.NetworkTest nt: return await HandleNetworkTestAsync(nt, commandId, ct);
 
+                // ---- shell（2026-10-23）----
+                case CoreCommand.ShellConfigure sc: return HandleShellConfigure(sc, commandId);
+                case CoreCommand.ShellTest st: return await HandleShellTestAsync(st, commandId, ct);
+
                 // ---- 预设：系统块从哪来（`01` §3.1；`14` 未决项 6）----
                 case CoreCommand.PresetSet ps: return HandlePresetSet(ps, commandId);
                 case CoreCommand.PresetDelete pd: return HandlePresetDelete(pd, commandId);
@@ -235,8 +240,10 @@ public sealed class CommandDispatcher(
                 case CoreCommand.SessionGc g:
                     return HandleSessionGc(g, commandId);
 
+                // ⚠️ 2026-10-22：压缩是**下发指令 + 推一步**，不再是「核心自己跑一次模型调用」
+                // ⇒ 不再需要 `awaitCompletion` 分流（那条分流原本是为了「同步等压缩跑完」）。
                 case CoreCommand.SessionCompact c:
-                    return await HandleSessionCompactAsync(c, commandId, awaitCompletion, ct);
+                    return HandleSessionCompact(c, commandId);
 
                 case CoreCommand.ClaimAcquire a: return HandleClaimAcquire(a, commandId);
                 case CoreCommand.ClaimRelease r: return HandleClaimRelease(r, commandId);
@@ -705,6 +712,81 @@ public sealed class CommandDispatcher(
         && domain.All(ch => char.IsLetterOrDigit(ch) || ch is '-' or '.' or '_');
 
     /// <summary>
+    /// **保存 shell 配置**（2026-10-23）。⚠️ 与 `network.configure` 同一条合并语义：
+    /// null = 保留；唯一例外是 `Executable == ""` = **清掉路径、回到自动探测**。
+    /// </summary>
+    private DispatchResult HandleShellConfigure(CoreCommand.ShellConfigure c, string id)
+    {
+        if (c.TimeoutSeconds is { } timeout
+            && (timeout < ShellLimits.MinTimeoutSeconds || timeout > ShellLimits.MaxTimeoutSeconds))
+            return Reject(id,
+                $"timeoutSeconds 要在 {ShellLimits.MinTimeoutSeconds}..{ShellLimits.MaxTimeoutSeconds} 之间。");
+
+        if (c.Executable is { Length: > 0 } executable
+            && (executable.Length > 1024 || executable.Any(char.IsControl)))
+            return Reject(id, "executable 必须是普通路径（不超过 1024 字符，不能含控制字符）。");
+
+        var store = new ShellStore(_host.DataRoot);
+        var current = store.Load();
+
+        var next = current with
+        {
+            Enabled = c.Enabled ?? current.Enabled,
+            // ⚠️ 三态：null = 保留；"" = 清掉（自动探测）；其余 = 换新。
+            Executable = c.Executable is null ? current.Executable : c.Executable,
+            TimeoutSeconds = c.TimeoutSeconds ?? current.TimeoutSeconds,
+        };
+
+        store.Save(next);
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Note = next.Enabled
+                ? $"已保存：shell 已启用 · {(string.IsNullOrWhiteSpace(next.Executable) ? "自动探测 sh" : next.Executable)} · 超时 {next.TimeoutSeconds} 秒"
+                : "已保存：shell 已关闭",
+        });
+    }
+
+    /// <summary>
+    /// **自检**（2026-10-23）。与 `network.test` 同一条判据：业务失败（关着 / 找不到 sh /
+    /// 跑不起来）都走 `Ack.Accepted.Note`，只有命令本身不合法才是 rejected。
+    /// ⚠️ 它**真的起一个进程**（`echo`），不是只看文件在不在——「能定位」与「能跑」是两件事。
+    /// </summary>
+    private async Task<DispatchResult> HandleShellTestAsync(
+        CoreCommand.ShellTest t, string id, CancellationToken ct)
+    {
+        var config = new ShellStore(_host.DataRoot).Load();
+
+        if (!config.Enabled)
+            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = "✗ shell 未启用" });
+
+        var usable = ShellTool.TryLocateForTest(config.Executable, out var executable, out var why);
+        if (!usable)
+            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = $"✗ {why}" });
+
+        try
+        {
+            var (exitCode, stdout, stderr, timedOut) = await ShRunner.RunAsync(
+                executable, "echo lilara-sh-ok", _host.WorkingDirectory, TimeSpan.FromSeconds(10), ct);
+
+            return new DispatchResult(new Ack.Accepted
+            {
+                CommandId = id,
+                Note = timedOut
+                    ? $"✗ {executable} 10 秒内没有返回"
+                    : exitCode == 0 && stdout.Trim() == "lilara-sh-ok"
+                        ? $"✓ 通（{executable}）"
+                        : $"✗ {executable} 起来了但输出不对（退出码 {exitCode}）：{stdout.Trim()}{(stderr.Length > 0 ? " / " + stderr.Trim() : "")}",
+            });
+        }
+        catch (ShellStartException ex)
+        {
+            return new DispatchResult(new Ack.Accepted { CommandId = id, Note = $"✗ {ex.Message}" });
+        }
+    }
+
+    /// <summary>
     /// **试搜**（2026-10-22）。与 `provider.test` 同一条判据：业务失败（没开 / 没 key /
     /// 连不上 / 限流）都走 `Ack.Accepted.Note`，只有命令本身不合法才是 rejected。
     /// </summary>
@@ -912,142 +994,68 @@ public sealed class CommandDispatcher(
         });
     }
 
-    private async Task<DispatchResult> HandleSessionCompactAsync(
-        CoreCommand.SessionCompact c, string id, bool awaitCompletion, CancellationToken ct)
+    /// <summary>
+    /// **`session.compact`：下发一条压缩指令**（2026-10-22，压缩改成工具）。
+    ///
+    /// <para>⚠️ <b>它不再自己跑一次模型调用</b>。指令是**状态**（`state.json` 的 `pendingCompact`），
+    /// 而「压缩」是模型在那一步里调用 `compact` 完成的——与 `finish_goal` 同一个形状：
+    /// 核心只记下「用户要求了这件事」，兑现发生在模型的下一次工具调用里。</para>
+    ///
+    /// <para>⚠️ <b>为什么指令必须落盘</b>：核心崩在「下发之后、调用之前」时，重启后工具表与
+    /// 提示词都恢复正常——指令若只在内存里，这个会话就<b>永远压不成</b>，且没有任何报错。
+    /// 持久化的代价是「用户点了两次」会变成一条指令（幂等），而不是两次压缩。</para>
+    ///
+    /// <para>⚠️ <b>已经在下发状态时重复下发 ⇒ 不再推进</b>：用户在模型还没调到 `compact` 之前
+    /// 又点了一次，推进第二遍只会白烧一次调用（而第一步本来就会看到这条指令）。</para>
+    /// </summary>
+    private DispatchResult HandleSessionCompact(CoreCommand.SessionCompact c, string id)
     {
         if (!TryFind(c.SessionId, out var handle, out var notFound))
             return Reject(id, notFound!);
-        if (handle.IsRunning)
-            return Reject(id, "会话正在运行，请等待当前步骤结束后再压缩。");
+
+        // ⚠️ **没有可总结的东西 ⇒ 直接拒绝**：空会话下发指令，模型只会得到一句
+        // 「摘要要代替的是一段对话」而无从下笔——那会烧掉一次调用、留下一条永远不会被调用的指令。
+        // 判据是**记录里有没有用户说过的话**（合成摘要事件不进记录，不会被算进来）。
+        if (!_host.Store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+                .OfType<TimelineEvent.MessageEvent>().Any(m => m.From == Speaker.User))
+            return Reject(id, "这个会话还没有可压缩的对话。");
+
+        var already = handle.State.PendingCompact;
+        if (!already)
+        {
+            // ⚠️ 与 `setAxis` 同一把锁、同一个「改内存 + 落盘」入口：指令是**盘面事实**，
+            // 与 `Turn` / `Status` 在同一次整份写入里（分开写会互相盖掉）。
+            handle.UpdateStateAndPersist(_host.Store, s => s with { PendingCompact = true },
+                diskStatus: SessionStatus.Idle);
+        }
+
+        // ⚠️ **已经在等用户回答时不推进**：那一步停了，模型连工具表都没机会看；
+        // 指令留在盘上，用户答完之后的续跑会带上它（尾块与上下文都是那一刻现读的）。
         if (handle.State.Status == SessionStatus.WaitingForInput)
-            return Reject(id, "会话正在等待工具审批，完成审批后再压缩。");
-        if (handle.QueueDepth > 0)
-            return Reject(id, "会话还有待处理消息，请先推进队列后再压缩。");
+            return new DispatchResult(new Ack.Accepted
+            {
+                CommandId = id,
+                SessionId = handle.SessionId,
+                Note = "已记录压缩指令；它会在当前询问回答之后生效。",
+            });
 
-        var gate = _host.GateFor(handle.SessionId);
-        if (!awaitCompletion)
-            return StartBackgroundCompaction(handle, id, gate);
-
-        await gate.WaitAsync(ct);
-        var entered = false;
-        CancellationTokenSource? stepCts = null;
-        try
-        {
-            if (handle.IsRunning || handle.QueueDepth > 0
-                || handle.State.Status == SessionStatus.WaitingForInput
-                || !(entered = handle.TryEnterStep()))
-                return Reject(id, "会话状态已变化，请稍后重试压缩。");
-            _host.Live.Mark(handle.SessionId);
-            stepCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            _host.SetCts(handle.SessionId, stepCts);
-            try
+        // ⚠️ 拿不到「推进标志」⇒ 已经有一步在跑了：指令已经落盘，而**那一步之后**的续跑
+        // （工具循环 / 队列 / 压缩续跑）会看到它——`StepAsync` 在**执行那一刻**现读
+        // `PendingCompact`，而不是按步开始的值判（与权限档位同一条）。
+        if (!Start(handle))
+            return new DispatchResult(new Ack.Accepted
             {
-                var result = await CompactAndPublishAsync(handle, stepCts.Token);
-                return new DispatchResult(new Ack.Accepted
-                {
-                    CommandId = id,
-                    SessionId = handle.SessionId,
-                    Note = $"已压缩至 {result.CoveredThroughEventId}。"
-                });
-            }
-            catch (OperationCanceledException) when (stepCts.IsCancellationRequested)
-            {
-                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                    new WireEvent.Error(handle.SessionId, "上下文压缩已中断。"));
-                throw new DispatchException("上下文压缩已中断。");
-            }
-            catch (Exception ex)
-            {
-                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                    new WireEvent.Error(handle.SessionId, ex.Message));
-                throw new DispatchException(ex.Message, ex);
-            }
-        }
-        finally
-        {
-            if (entered)
-            {
-                _host.SetCts(handle.SessionId, null);
-                handle.ExitStep();
-                _host.Live.Clear(handle.SessionId);
-            }
-            stepCts?.Dispose();
-            gate.Release();
-            if (handle.QueueDepth > 0 && !handle.IsRunning) Start(handle);
-        }
-    }
-
-    private DispatchResult StartBackgroundCompaction(SessionHandle handle, string id, SemaphoreSlim gate)
-    {
-        if (!gate.Wait(0))
-            return Reject(id, "会话状态已变化，请稍后重试压缩。");
-
-        if (handle.IsRunning || handle.QueueDepth > 0
-            || handle.State.Status == SessionStatus.WaitingForInput
-            || !handle.TryEnterStep())
-        {
-            gate.Release();
-            return Reject(id, "会话状态已变化，请稍后重试压缩。");
-        }
-
-        var stepCts = new CancellationTokenSource();
-        _host.Live.Mark(handle.SessionId);
-        _host.SetCts(handle.SessionId, stepCts);
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await CompactAndPublishAsync(handle, stepCts.Token);
-            }
-            catch (OperationCanceledException) when (stepCts.IsCancellationRequested)
-            {
-                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                    new WireEvent.Error(handle.SessionId, "上下文压缩已中断。"));
-            }
-            catch (Exception ex)
-            {
-                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                    new WireEvent.Error(handle.SessionId, ex.Message));
-            }
-            finally
-            {
-                _host.SetCts(handle.SessionId, null);
-                stepCts.Dispose();
-                handle.ExitStep();
-                _host.Live.Clear(handle.SessionId);
-                gate.Release();
-                if (handle.QueueDepth > 0 && !handle.IsRunning) Start(handle);
-            }
-        }, CancellationToken.None);
+                CommandId = id,
+                SessionId = handle.SessionId,
+                Note = already ? "压缩指令已经记下了，它会在当前这一步之后生效。" : "已记录压缩指令，它会在当前这一步之后生效。",
+            });
 
         return new DispatchResult(new Ack.Accepted
         {
             CommandId = id,
             SessionId = handle.SessionId,
-            Note = "上下文压缩已开始。",
+            Note = "已下发压缩指令。",
         });
-    }
-
-    private async Task<CompactionResult> CompactAndPublishAsync(
-        SessionHandle handle, CancellationToken ct)
-    {
-        var usageCountBefore = _host.Usage.ForSession(handle.SessionId).Count;
-        CompactionResult result;
-        try
-        {
-            result = await ResolveStepperWithReports(handle).CompactAsync(handle, ct);
-        }
-        catch
-        {
-            PublishLatestUsage(handle, usageCountBefore);
-            throw;
-        }
-        PublishLatestUsage(handle, usageCountBefore);
-        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-            new WireEvent.CompactionCompleted(
-                handle.SessionId, result.CheckpointId,
-                result.CoveredThroughEventId, result.Usage?.OutputTokens));
-        return result;
     }
 
     private void PublishLatestUsage(SessionHandle handle, int countBefore)
@@ -1277,6 +1285,15 @@ public sealed class CommandDispatcher(
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                     new WireEvent.AxisChanged(handle.SessionId, Axes.Initiative, "standard"));
 
+            // ⚠️ `CompactionCompleted` 的载荷里没有摘要正文（它在 `compact` 调用的参数里，
+            // 随 `message.appended` 已经到达）；`SummaryTokens` 传 `null`——压缩不再是一次
+            // 单独记账的调用，「那一步的 output tokens」不是摘要的体积（传它会把两件事混淆）。
+            // ⚠️ **载荷形状一个字没改**（线上契约）：那个键仍可空、仍是同一个类型。
+            if (step.Compacted is { } compacted)
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.CompactionCompleted(
+                        handle.SessionId, compacted.CheckpointId, compacted.CoveredThroughEventId, null));
+
             var usageCalls = _host.Usage.ForSession(handle.SessionId);
             if (usageCalls.Count > usageCountBefore)
             {
@@ -1348,6 +1365,27 @@ public sealed class CommandDispatcher(
         // `tool_result` 才能继续自己的工作。恢复期间若再次挂起则停止。
         if (resumed)
             return await ContinueAfterResumeAsync(handle, throwOnFailure);
+
+        // ---- 压缩续跑：模型停回合、而压缩指令还没被兑现（2026-10-22）----
+        //
+        // ⚠️ **为什么它与 goal 那条并列、而不是合进它**：两者是**不同的**指令来源
+        // （状态里的 `pendingCompact` vs 主动性轴），而「该不该再推一步」这一句若写成
+        // 「goal 或 压缩」，停止条件就会取并集的补——判据漂起来时，两边都看不出是谁错了。
+        //
+        // ⚠️ **没有这一条会怎样**：`session.compact` 下发指令时用户并没有发新消息，
+        // 模型很可能先回一句「好的，我先把相关文件看一下」就结束了——而普通工具循环在
+        // 「没调工具、队列空」时就停。指令会**一直躺在盘上**，直到用户下一次说话，
+        // 而头那边看起来是「点了压缩，什么都没发生」。
+        //
+        // ⚠️ 与 goal 那条**共用同一个推进器**（`ContinueGoalAsync` 的形状：空队列 + `explicitStart`），
+        // 因为它做的正是同一件事——「没有新输入，但还没结束，再走一步」。
+        // ⚠️ **不往队列里塞假消息**：记录里出现的每一条用户消息都必须是用户真的说过的话。
+        if (handle.InterruptEpoch == interruptEpoch
+            && handle.State.PendingCompact
+            && !reply.Refused
+            && reply.Blocks.Count > 0
+            && !reply.Blocks.OfType<Kernel.Block.ToolUseBlock>().Any())
+            return await ContinueGoalAsync(handle, throwOnFailure);
 
         // ---- goal 循环：模型停回合、而目标还没收（`01` §3.5 的 goal 档）----
         //

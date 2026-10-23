@@ -67,7 +67,16 @@ public static class Json
     //      `prompt_cache_hit_tokens`——旧行里那些调用记的是「缓存读取未报告」，不是 0。
     //   ⇒ 这正是版本号要终结的那类事：老核心读新行，**同一个键、同一个数、不同的意思**，
     //      而且它会照旧把「输入 + 缓存读取」当成两次独立输入去理解。
-    public const int FormatVersion = 8;
+    //
+    // 9（2026-10-22，压缩改成工具）：两处一起动，所以不是「纯加字段所以顺手 +1」——
+    //   ① `state.json` 加了 `pendingCompact`（压缩指令）。老程序会**静默忽略**这个键
+    //      ⇒ 一条刚下发的压缩指令在重启之后消失，而**双方都不知道**（用户看到的是
+    //      「点了压缩，没反应」）；这正是上面那段说的「静默地按旧含义解释新数据」。
+    //   ② `compaction.jsonl` 的检查点**不再写 `summary`**（摘要只在 `compact` 调用的参数里）。
+    //      同一个文件里，新行少一个键；老程序按旧形态读它，会看到一个没有摘要的检查点。
+    //      ⚠️ 本版之前写下的那些行**仍带 `summary`**（字段改成可空、没删）——它们是旧检查点的
+    //      回落来源，渲染时只在「记录里找不到对应调用」时用（见 `ContextCompaction.SummaryOf`）。
+    public const int FormatVersion = 9;
 
     public static readonly JsonSerializerOptions Options = new()
     {

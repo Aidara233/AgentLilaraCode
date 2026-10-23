@@ -766,7 +766,29 @@
 - 写入口是 WS 的 `network.configure`；`network.test` 是同步试搜。
 - 证据：`ControlServer.cs` 的 `/network-config`；键集守卫 `ControlServerTests.Snapshot_NetworkConfig_CarriesExactlyTheseKeys`。
 
-### 3.19 不存在的端点
+### 3.19 `GET /shell-config`
+
+shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。它不控制「这个会话能不能跑命令」——
+那是权限轴（`shell` 是**高危**类：`standard` 及以下硬拒、`authorized` 询问、`trusted` 直接放行）。
+
+```jsonc
+{
+  "enabled": true,                 // 默认开：真正的闸是权限轴，这里只回答「这台机器跑不跑得了」
+  "timeoutSeconds": 120,           // 1..600；越界在 shell.configure 里被拒、手改文件则夹紧
+  "sh": {
+    "found": true,
+    "path": "D:\\Program Files\\Git\\bin\\sh.exe",
+    "reason": ""                   // ⚠️ 两个键**永远在**（空串 = 没有）：路径与原因二者有且只有一个
+  }
+  // "executable": "…"            // 只在配置点名了路径时出现（WhenWritingNull）
+}
+```
+
+- `sh` 是**这一刻解析出来的**那份：配置点名 → 环境变量 `LILARA_SH` → Windows 注册表 `HKLM\SOFTWARE\GitForWindows\InstallPath` → 两个惯例位置（`C:\Program Files\Git` / `(x86)`）→ Unix 的 `/bin/sh`。
+- 写入口是 WS 的 `shell.configure`；`shell.test` 会**真的起一个 sh** 跑 `echo`（不只是看文件在不在）。
+- 证据：`ControlServer.cs` 的 `/shell-config`；键集守卫 `ControlServerTests.Snapshot_ShellConfig_CarriesExactlyTheseKeys`。
+
+### 3.20 不存在的端点
 
 | 路径 | 状态 |
 |---|---|
@@ -778,7 +800,7 @@
 
 ## 4. WS 命令
 
-⚠️ 一共 **21** 条（`ControlServer.ParseCommand` 的 `kind`）。
+⚠️ 一共 **23** 条（`ControlServer.ParseCommand` 的 `kind`）。
 **对照 `03` §3 那张设计全集**：`project.setConfig` · `tool.setEnabled` · `session.continue` 不存在；
 `claim.acquire` 有 dispatcher 与控制台解析，**线上没有**（刻意的，用户裁定）。
 
@@ -1051,6 +1073,33 @@
 
 用**已保存的**配置发一次最小搜索（**同步**，最多 10 秒）。与 `provider.test` 同形：
 业务失败也是 `accepted:true`，结果在 `note`：`✓ 通（N 条结果）` / `✗ 不通：原因`。
+
+#### `shell.configure`
+
+```jsonc
+{ "kind": "shell.configure", "enabled": true, "timeoutSeconds": 120,
+  "executable": "D:\\Program Files\\Git\\bin\\sh.exe" }
+```
+
+| 键 | 必给 | 语义 |
+|---|---|---|
+| `enabled` | 否 | 总开关；省略 = 保留 |
+| `executable` | 否 | 省略 = 保留；**空串 = 清掉、回到自动探测**（与 `apiKey` 同一条「空串不是 no-op」） |
+| `timeoutSeconds` | 否 | 1..600；越界 ⇒ rejected |
+
+- ⚠️ 它**不控制**「这个会话能不能跑命令」——那是权限轴（`shell` 是高危类）。
+- 成功后 `note` 说明「已启用 / 已关闭」与解析到的路径或「自动探测」、超时。
+- 证据：`CoreCommand.ShellConfigure` · `CommandDispatcher.HandleShellConfigure`。
+
+#### `shell.test`
+
+```jsonc
+{ "kind": "shell.test" }
+```
+
+用**已保存的**配置定位 `sh` 并**真的起一个进程**跑 `echo lilara-sh-ok`（**同步**，最多 10 秒）。
+与 `network.test` 同形：业务失败（关着 / 找不到 sh / 起不来）也是 `accepted:true`，
+结果在 `note`：`✓ 通（<路径>）` / `✗ <原因>`。
 证据：`CommandDispatcher.HandleNetworkTestAsync`。
 
 #### `approval.respond`
@@ -1106,7 +1155,7 @@
 | 位置 | 写的 | 实际 |
 |---|---|---|
 | `03` §6 `/history`「分页未实现」、§11「零个 `Request.Query`」 | 无分页 | 有 `limit` / `before` / `hasMore` / `nextCursor`（§3.8） |
-| `03` §6 端点清单 | 缺 4 条 usage / context | 实际共 **18** 个 `MapGet`（§3.14–§3.17 是 usage / context；§3.18 是 `/network-config`） |
+| `03` §6 端点清单 | 缺 4 条 usage / context | 实际共 **19** 个 `MapGet`（§3.14–§3.17 是 usage / context；§3.18 是 `/network-config`；§3.19 是 `/shell-config`） |
 | `03` §4.2 事件载荷表 | 缺新事件 | 缺 `session.reclaimed`、`release.recorded`、`tool.result.appended`、`usage.updated`、`session.compaction.completed`，缺 `message.appended.historyId` |
 | `03` §4「已上线」表 | 20 个事件名 | 20 个类型（`WireEvent.cs:8-28`）✅ 数对，但 §4.2 载荷表没跟上 |
 | `03` §7「hello(lastSeq)」 | 有这个帧 | ❌ 不存在（§2.2） |

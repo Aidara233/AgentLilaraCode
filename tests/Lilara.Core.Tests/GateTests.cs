@@ -32,6 +32,34 @@ public class GateTests
     }
 
     /// <summary>
+    /// **`GatedByPermission == false` 的工具不看档位**（2026-10-22，`compact`）。
+    ///
+    /// <para>它最要紧的那一格是 `off`：按类别判时 `off` 拒一切（见上表），而压缩是底层机制
+    /// ——真压不了时连这次会话本身都会撑爆。⚠️ 判据是**那个声明**，不是类别：
+    /// 同类别（`ReadOnly`）的 `Stub` 在 `off` 档照样被拒。</para>
+    /// </summary>
+    [Fact]
+    public void UngatedTool_IsAllowedEvenAtOff_WhileASameClassGatedToolIsDenied()
+    {
+        var ungated = new UngatedStub();
+
+        Assert.Equal(Verdict.Allow, Gate.Decide(ungated, "off"));
+        Assert.Equal(Verdict.Allow, Gate.Decide(ungated, null));      // 未知档位也放行
+        Assert.Equal(Verdict.Deny, Gate.Decide(new Stub(PermissionClass.ReadOnly), "off"));
+    }
+
+    private sealed class UngatedStub : ITool
+    {
+        public PermissionClass PermissionClass => PermissionClass.ReadOnly;
+        public bool GatedByPermission => false;
+        public string Name => "ungated";
+        public string Description => "测试替身：不归闸门管";
+        public string ParametersSchemaJson => """{"type":"object","properties":{}}""";
+        public Task<ToolOutcome> RunAsync(ToolCall call, IToolContext context, CancellationToken ct) =>
+            Task.FromResult(new ToolOutcome { Content = [new Block.TextBlock("跑了")] });
+    }
+
+    /// <summary>
     /// ⚠️ **照抄 `01` §3.5 那张表**，逐格钉住。表是**唯一来源**，`Gate` 里不许自己推。
     ///
     /// <para>⚠️ <b>那两格「问」在 2026-10-08（询问批）落地了</b>——在那之前它们被

@@ -102,8 +102,18 @@ public static class TimelineRender
 
         // ⚠️ 摘要事件的 id 是合成 id（`compaction:{id}`），**从不出现在记录里**——
         // 它和尾块合成对一样，是「只活在这份渲染产物里」的东西。
-        if (projection.Checkpoint is { } checkpoint)
-            result.Insert(0, ContextCompaction.SummaryEvent(checkpoint));
+        //
+        // ⚠️ **只给「摘要不在记录里」的检查点插**（2026-10-22，压缩改成工具）：
+        // 新检查点的摘要在那条 `compact` 调用的参数里，而那条调用就在 `visible` 末尾——
+        // 模型带着它去请求，再插一条 `From = Speaker.User` 的合成消息就是同一段话说两遍。
+        // 旧检查点（那一行里还带着 `summary`）与「记录里找不到那条调用」的异常形态 ⇒ 照旧插。
+        //
+        // ⚠️ **摘要取不到就不插**：一个只有包边、中间空着的「历史摘要」会让模型去猜
+        // 那里被吃掉了什么（`SystemBlock.Wrap` 的同一条判据）——那不重建历史，只多一条假信息。
+        if (projection.Checkpoint is { } checkpoint
+            && !ContextCompaction.SummarySitsInCall(checkpoint, visible)
+            && ContextCompaction.SummaryOf(checkpoint, raw) is { Length: > 0 } summary)
+            result.Insert(0, ContextCompaction.SummaryEvent(checkpoint, summary));
 
         return result;
     }

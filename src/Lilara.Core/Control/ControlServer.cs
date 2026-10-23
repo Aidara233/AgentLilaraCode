@@ -5,6 +5,7 @@ using System.Text.Json;
 using Lilara.Core.Hosting;
 using Lilara.Core.Kernel;
 using Lilara.Core.Network;
+using Lilara.Core.Shell;
 using Lilara.Core.Protocol;
 using Lilara.Core.Storage;
 using Lilara.Core.Session;
@@ -620,6 +621,31 @@ public sealed class ControlServer(
                 },
             }, WireJson.Options);
         });
+
+        // shell 配置（2026-10-23）。⚠️ 除了「存了什么」，还交**这一刻解析出来的 sh**
+        // ——头据此显示「可用 / 找不到」，而不用自己猜 PATH 上有没有。
+        // ⚠️ 与 `/network-config` 同一条纪律：端点之外的设备事实都由核心算，头只显示。
+        app.MapGet("/shell-config", () =>
+        {
+            var config = new ShellStore(host.DataRoot).Load();
+            var found = Session.Tools.ShellTool.TryLocateForTest(
+                config.Executable, out var executable, out var reason);
+
+            return Results.Json(new
+            {
+                config.Enabled,
+                config.Executable,
+                config.TimeoutSeconds,
+                Sh = new
+                {
+                    Found = found,
+                    // ⚠️ 两个键**永远在**（空串 = 没有）：`WhenWritingNull` 会把 null 键整个省掉，
+                    // 而头要根据它们画「可用 / 为什么不可用」——键有时在有时不在就成了两种形状。
+                    Path = found ? executable : "",
+                    Reason = found ? "" : reason ?? "",
+                },
+            }, WireJson.Options);
+        });
     }
 
     // 一条事件的可渲染形态（核心渲染，头只显示）。
@@ -1103,6 +1129,14 @@ public sealed class ControlServer(
                 ToInt(OptNumber(payload, "maxBytes")),
                 OptStringList(payload, "allowDomains")),
             "network.test" => new CoreCommand.NetworkTest(),
+            // shell 配置（2026-10-23）。全部走 Opt：**键缺失 = 保留旧值**。
+            // ⚠️ `executable` 的空串是**有意义的值**（清掉路径、回到自动探测），
+            // 所以不能折进「没给」——dispatcher 按「null = 保留 / "" = 清掉」判。
+            "shell.configure" => new CoreCommand.ShellConfigure(
+                OptBool(payload, "enabled"),
+                Opt(payload, "executable"),
+                ToInt(OptNumber(payload, "timeoutSeconds"))),
+            "shell.test" => new CoreCommand.ShellTest(),
             // 预设：系统的系统提示词从哪来。三条同 `provider.*` 一族（id 闸也在 dispatcher）。
             // ⚠️ `content` 走 GetProperty（**必给**）——`preset.set` 没有别的字段，
             // 所以「没给 content」只可能是发命令的程序写错了；而「给了空串」是**合法值**（纯 chat）。

@@ -77,6 +77,25 @@ public abstract record CoreCommand
     public sealed record NetworkTest : CoreCommand;
 
     /// <summary>
+    /// **配置 shell 能力**（`&lt;数据根&gt;/shell.json`，2026-10-23）。除下面说明外，
+    /// **null = 本次没提到 = 保留旧值**（与 <see cref="ProviderUpsert"/> 同一条语义）。
+    ///
+    /// <para>⚠️ <b>它管的是「这台机器跑不跑得了」</b>：总开关、`sh` 的路径、超时。
+    /// 「这个会话能不能跑命令」归权限轴（`shell` 是高危类 ⇒ 只在 `trusted` 档直接放行）——
+    /// 两件事分开，否则每次要跑命令都得先动设备配置。</para>
+    ///
+    /// <para>⚠️ <b>空串是有意义的值</b>：`Executable == ""` = **清掉路径、回到自动探测**
+    /// （与「没提到」不同）。反方向（想保留）就别发这个键。</para>
+    /// </summary>
+    public sealed record ShellConfigure(bool? Enabled, string? Executable, int? TimeoutSeconds) : CoreCommand;
+
+    /// <summary>
+    /// 用**已保存的** shell 配置定位 `sh` 并真的跑一次（`echo`），回答「能不能用 + 在哪」。
+    /// 与 <see cref="NetworkTest"/> 同形：业务失败走 <c>Ack.Accepted.Note</c>，不是 rejected。
+    /// </summary>
+    public sealed record ShellTest : CoreCommand;
+
+    /// <summary>
     /// 写一份预设（`&lt;数据根&gt;/presets/&lt;id&gt;.md`）。<b>内容就是那段系统提示词</b>。
     ///
     /// <para>⚠️ <b>空 <paramref name="Content"/> 是合法且有意义的值</b>（= 纯聊天），

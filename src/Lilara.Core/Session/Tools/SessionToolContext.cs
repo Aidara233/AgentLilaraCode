@@ -25,7 +25,8 @@ namespace Lilara.Core.Session.Tools;
 /// 省略 = 空串（没有浮动块，或调用方确实不需要它）。</param>
 public sealed class SessionToolContext(
     string workingDirectory, BlobStore blobs, IReadOnlyList<TimelineEvent>? timeline = null,
-    string? floatingContext = null, NetworkAccess? network = null, bool goalActive = false)
+    string? floatingContext = null, NetworkAccess? network = null, bool goalActive = false,
+    bool compactRequested = false, ShellAccess? shell = null)
     : IToolContext
 {
     private readonly string _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workingDirectory));
@@ -136,6 +137,15 @@ public sealed class SessionToolContext(
     /// <summary>见 <see cref="IToolContext.Network"/>：步开始时冻住的那份配置 + 轴值快照。</summary>
     public NetworkAccess? Network { get; } = network;
 
+    /// <summary>见 <see cref="IToolContext.Shell"/>：步开始时冻住的那份 `shell.json` 快照。</summary>
+    public ShellAccess? Shell { get; } = shell;
+
     /// <summary>见 <see cref="IToolContext.GoalActive"/>：步开始时的主动性轴快照。</summary>
     public bool GoalActive { get; } = goalActive;
+
+    /// <summary>
+    /// 见 <see cref="IToolContext.CompactRequested"/>：步开始时 `state.json` 里那条压缩指令的快照。
+    /// ⚠️ **冻结在步开始**，与权限档位 / 联网配置同一条：一步之内两条 `compact` 调用必须按同一份指令判。
+    /// </summary>
+    public bool CompactRequested { get; } = compactRequested;
 }

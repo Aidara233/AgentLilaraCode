@@ -32,6 +32,11 @@ public class CommandSurfaceTests
         (typeof(CoreCommand.NetworkConfigure), "network.configure", "network set --enabled on"),
         (typeof(CoreCommand.NetworkTest),      "network.test",      "network test"),
 
+        // shell（2026-10-23）：设备级配置 + 自检。⚠️ 这两条在本批落地时就漏进了这张矩阵
+        // （矩阵是「类型 → 四条线」的守卫，漏一行 = 那条命令**没有任何检查**），收尾时补上。
+        (typeof(CoreCommand.ShellConfigure),   "shell.configure",   "shell set --enabled on"),
+        (typeof(CoreCommand.ShellTest),        "shell.test",        "shell test"),
+
         // 预设：系统提示词的存放（预设批）。三条**都有线上形态**——
         // 连 `preset list` 也有（它走线，不像 `provider list` 是控制台本地查询：
         // 头只有一个入口，而它要用这个做下拉）。

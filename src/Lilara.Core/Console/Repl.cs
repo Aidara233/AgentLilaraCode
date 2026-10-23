@@ -165,7 +165,9 @@ public sealed class Repl(
                     break;
 
                 case CoreCommand.SessionCompact compact:
-                    _out.WriteLine($"✓ {compact.SessionId} 的上下文已压缩（{accepted.Note}）。");
+                    // ⚠️ 2026-10-22 起它只**下发指令**，压缩本身发生在模型的下一步里
+                    // ⇒ 文案不能说「已压缩」（那句在检查点落地之前是假话）。
+                    _out.WriteLine($"✓ {compact.SessionId}：{accepted.Note}");
                     break;
 
                 default:

@@ -102,6 +102,29 @@ internal static class ToolArgs
             return null;
         }
     }
+
+    /// <summary>取一个**布尔**字段（`compact` 的 `requested`）。缺失 / 不是布尔 / 整段不是 JSON ⇒ <c>false</c>。
+    ///
+    /// <para>⚠️ <b>这一格和上面几个不一样：它只服务「这一次调用算不算数」这个问题，而回答只能是是 / 否</b>。
+    /// 缺失与「写成了字符串 `"true"`」都归到「否」——猜一个 `true` 等于替模型决定
+    /// 「这一次真的压缩」，而猜错的后果是**一段历史被摘要顶掉**（不可逆）。
+    /// 这正是 <see cref="Number"/> 那条「只认它说的话，不猜」的方向。</para>
+    /// </summary>
+    public static bool Bool(string argumentsJson, string key)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(argumentsJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
+            return doc.RootElement.TryGetProperty(key, out var v)
+                   && v.ValueKind is JsonValueKind.True or JsonValueKind.False
+                   && v.GetBoolean();
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
 }
 
 /// <summary>

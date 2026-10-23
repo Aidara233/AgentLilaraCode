@@ -45,6 +45,11 @@ public sealed class CompactionStore
     public CompactionCheckpoint? LatestValid(
         string projectKey, string sessionId, IReadOnlyList<TimelineEvent> history)
     {
+        // ⚠️ **空历史 ⇒ 没有可用的检查点**（2026-10-22）：`ToDictionary` 对空序列给的是空字典，
+        // 下面那条 `ContainsKey` 永远假 —— 结果虽然一样，但那是在一条**已知为空**的记录上
+        // 做「找边界」，而调用含义已经不同了（压缩后保留区可以暂时为空）。
+        if (history.Count == 0) return null;
+
         var byId = history.ToDictionary(e => e.Id, StringComparer.Ordinal);
         foreach (var checkpoint in ReadAll(projectKey, sessionId).OrderByDescending(c => c.CreatedAt))
         {
@@ -69,7 +74,14 @@ public sealed record CompactionCheckpoint
     public required string CheckpointId { get; init; }
     public required string CoveredThroughEventId { get; init; }
     public required string HistoryDigest { get; init; }
-    public required string Summary { get; init; }
+
+    /// <summary>
+    /// ⚠️ **2026-10-22 起，新写下的检查点<b>不再</b>填这一格**——摘要只在 `compact` 调用的参数里
+    /// （模型自己写的那一份、历史里的原文）。字段<b>没删</b>：本版之前写下的行里有它，
+    /// 而那是旧检查点唯一的摘要来源（回查见 `ContextCompaction.SummaryOf`）。<c>null</c> ⇒ 盘上键整个不出现。
+    /// </summary>
+    public string? Summary { get; init; }
+
     public required DateTimeOffset CreatedAt { get; init; }
     public required string SourceCallId { get; init; }
     public long? SummaryTokens { get; init; }

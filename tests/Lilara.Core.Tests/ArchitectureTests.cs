@@ -27,7 +27,8 @@ public class ArchitectureTests
         // 19 → 20（2026-10-15 统计批）：加了 `TokenUsage.cs`（跨层共享的 token 事实）。
         // 20 → 21（2026-10-17 回收窗口批）：加了 `ReclaimEvent.cs`（窗口记录：回收只在窗口里发生）。
         // 21 → 22（2026-10-22 联网批）：加了 `Network.cs`（联网配置 / 能力 / 传输契约）。
-        Assert.Equal(22, files.Length);
+        // 22 → 23（2026-10-23 shell 批）：加了 `Shell.cs`（shell 的设备级配置 / 访问快照）。
+        Assert.Equal(23, files.Length);
 
         var offenders = files
             .SelectMany(f => ExternalUsings(f).Select(u => $"{Path.GetFileName(f)}:{u.Line}  {u.Text}"))

@@ -120,6 +120,27 @@ public sealed record SessionState
 
     /// <summary>插件轴的当前规范值；未知插件的值也保留，避免卸载时静默丢配置。</summary>
     public IReadOnlyDictionary<string, string>? PluginAxes { get; init; }
+
+    /// <summary>
+    /// **用户下发、尚未被 `compact` 消费的压缩指令**（2026-10-22，压缩改成工具那一批）。
+    ///
+    /// <para>⚠️ <b>它为什么必须是持久化的状态</b>：指令下发之后、模型真正调用 `compact` 之前，
+    /// 核心可能崩掉；而重启后工具表恢复正常、模型接着跑——若指令只活在内存里，
+    /// 这个会话就<b>永远压不成</b>，而且没有任何报错。这正是 `01` §11.5 给
+    /// `pendingDirectives` 写的理由，本字段是它的第一个落点。</para>
+    ///
+    /// <para>⚠️ <b>为什么是 <c>bool</c> 而不是一个指令对象</b>：今天的指令只有一种、没有参数、
+    /// 也没有「第几条」。多一个外壳就等于多一格没人读的字段（判据 8：能派生的就不要持久化）。</para>
+    ///
+    /// <para>⚠️ <b>它是布尔值、带默认值、不是 `required`</b>：今天有六处直接
+    /// `new SessionState { … }`（`SessionHandle.Create` 一处，`DiskFormatGoldenTests` 三处、
+    /// `SessionHandleTests` / `SessionStoreTests` 各一处），把它们全设成必填是一次无关的连锁改动
+    /// ——而 `Json.FormatVersion` 那条规则管的是「下次有人<b>写</b>这些初始化时顺手加」，
+    /// 不是「加一个字段就顺手改六处」。
+    /// 代价是漏填的那一处会静默地变成 `false`：它只会让一次压缩不被执行（可见），
+    /// 不会让一次不该发生的压缩发生（不可见）。</para>
+    /// </summary>
+    public bool PendingCompact { get; init; }
 }
 
 /// <summary>

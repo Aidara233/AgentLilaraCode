@@ -60,6 +60,13 @@ namespace Lilara.Core.Session.Tools;
 /// 合成一对 <c>tool_use</c> + <c>tool_result</c>——那条合成的调用引用的就是这个**声明过的名字**。
 /// ⚠️ 合成本身**不经过执行器**；本表里的实例只在模型**自己**真调一次时执行（兜底）。
 /// 它仍然算「机制」：开的是「模型能看见核心每步注入的那块状态」这扇门。</para>
+///
+/// <para>⚠️ <b><see cref="CompactTool"/>（2026-10-22）是「核心特权工具」那一族的第一个实例</b>
+/// （`01` §11.2 第 1 条：「压缩工具是核心特权工具，插件不能实现——它改变加载边界」）：
+/// 它只说出「用这段摘要截断此前的历史」，而**真正的截断**（检查点 / 清指令 / 开窗）在推进器里
+/// ——同 `release` 的「线落盘在推进器」与 `finish_goal` 的「拨轴在推进器」。
+/// ⚠️ 它是这几个里唯一**不归闸门管**的（`ITool.GatedByPermission == false`）：它不改变世界，
+/// 而它只在用户下发的指令期内生效（`pendingCompact`）——指令就是授权。</para>
 /// </summary>
 public static class BuiltInTools
 {
@@ -69,8 +76,15 @@ public static class BuiltInTools
         new UpdateTool(), new WriteTool(), new ReleaseTool(),
         new MakeDirectoryTool(), new DeleteTool(), new PathTool(), new SystemInfoTool(), new GitReadTool(), new GitWriteTool(),
         new DotnetBuildTool(), new DotnetTestTool(), new FloatingContextTool(),
+        // 2026-10-23：shell。⚠️ 它是**高危**类（与 `delete` 同级）——在工作目录里跑任意命令，
+        // 后果核心事后挽不回来；边界只有权限轴、设备开关、超时与输出上限。
+        // ⚠️ 它常驻：找不到 sh 时也照样声明（工具表不动），调用只回一句人话。
+        new ShellTool(),
         // 2026-10-22：联网与 goal 收尾。三个都常驻——配置和轴值**不进工具声明**，
         // 因此拨轴 / 改配置不会破前缀；关着时它们只回一句人话。
         new WebSearchTool(), new WebFetchTool(), new FinishGoalTool(),
+        // 2026-10-22：压缩从「核心自己跑一次模型调用」改成工具。常驻的理由与上面同源
+        // （工具表不动、指令走尾块），而它只在用户下发过指令时才生效。
+        new CompactTool(),
     ];
 }

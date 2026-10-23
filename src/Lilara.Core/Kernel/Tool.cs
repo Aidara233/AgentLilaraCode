@@ -271,6 +271,18 @@ public interface IToolContext
     string FloatingContext { get; }
 
     /// <summary>
+    /// **用户下发过、而 `compact` 还没消费的压缩指令**（2026-10-22）。
+    ///
+    /// <para>⚠️ <b>它是那份<b>持久化</b>指令在工具这一侧的唯一入口</b>（`SessionState.PendingCompact`）。
+    /// `compact` 据此判「这次调用算不算数」——没指令时它是<b>一句人话 + 什么都不做</b>。</para>
+    ///
+    /// <para>⚠️ <b>它不是「留位」用的</b>（那条「别为了留位先加没人用的成员」）：消费者今天就有两个
+    /// ——`CompactTool`（判生效）与尾块指令（`Stepper` 每步注入的那句「用户要求压缩」）。
+    /// 两份都读<b>同一个</b>判据，而判据本身只有 `SessionState.PendingCompact` 一处。</para>
+    /// </summary>
+    bool CompactRequested { get; }
+
+    /// <summary>
     /// 这个会话**这一刻的联网能力快照**（`network.json` + `network` 轴值），2026-10-22。
     ///
     /// <para>⚠️ <b>`null` = 没有联网上下文</b>（纯单测手工构造的句柄）。联网工具据此回一句
@@ -281,6 +293,16 @@ public interface IToolContext
     /// 配置与同一个轴值判定（同权限档位那条）。</para>
     /// </summary>
     NetworkAccess? Network { get; }
+
+    /// <summary>
+    /// 这个会话**这一刻的 shell 能力快照**（`shell.json`），2026-10-23。
+    ///
+    /// <para>⚠️ <b>`null` = 没有 shell 上下文</b>（纯单测手工构造的句柄）——工具据此回一句
+    /// 说人话的「这里没有 shell 配置」，而不是猜一个「开着」。
+    /// ⚠️ 它在**权限闸之后**才被读：能不能跑由 `permission` 轴判（`shell` 是
+    /// <see cref="PermissionClass.Destructive"/>），这份配置只回答「这台机器跑不跑得了」。</para>
+    /// </summary>
+    ShellAccess? Shell { get; }
 
     /// <summary>
     /// 这个会话此刻是否处于 goal 模式（主动性轴 = `goal`）。
@@ -328,6 +350,25 @@ public interface ITool
     /// <para>⚠️ <b>判据是「不可逆」</b>（`01` §3.5）：`Destructive` 是最后一个被自动放行的东西。</para>
     /// </summary>
     PermissionClass PermissionClass { get; }
+
+    /// <summary>
+    /// **这个工具要不要过权限闸门**（2026-10-22）。
+    ///
+    /// <para>⚠️ <b>默认 <c>true</c>，而默认值的方向是「受管」</b>——与 <see cref="AsksBeforeRunning"/>
+    /// 同一条理由：一个忘了表态的工具被多拦一次（可见），好过它静默地绕过闸门（不可见）。</para>
+    ///
+    /// <para>⚠️ <b>今天只有 `compact` 声明 `false`</b>，判据是「它不改变世界」：
+    /// 它只动<b>加载边界</b>（哪些记录还给模型看），不碰工作目录、不联网、不进库；
+    /// 而它<b>本来就只在用户下发的指令期内生效</b>（`IToolContext.CompactRequested`）。
+    /// ⇒ 指令就是授权。再拿一个档位去拦它，只会造出「`off` 档下压缩压不了」——
+    /// 而 `off` 档的语义是「别动我的东西」，不是「不许整理你自己的上下文」；
+    /// 真压不了时连这次会话本身都会撑爆。</para>
+    ///
+    /// <para>⚠️ <b>别把它当成「这个类别是安全的」的快捷方式</b>：闸门按<b>工具</b>放行，
+    /// 而不是往 <see cref="PermissionClass"/> 里加一档——加一档会让 `Gate` 那两张表的
+    /// 每一行都移动边界（`Gate` 的类型注释写明了那是静默错位的来源）。</para>
+    /// </summary>
+    bool GatedByPermission => true;
 
     /// <summary>
     /// 给模型看的说明。⚠️ <b>这是唯一教它的地方</b>（`00` §2.2：能进工具描述的，
