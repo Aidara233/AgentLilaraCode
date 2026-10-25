@@ -227,6 +227,9 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("provider test ", StringComparison.Ordinal))
             return ParseProviderTest(trimmed);
 
+        if (trimmed.StartsWith("provider models ", StringComparison.Ordinal))
+            return ParseProviderModels(trimmed);
+
         // 联网配置（2026-10-22）：`network set …` / `network test`。
         // ⚠️ 交**归一化后**的行（与 `provider set` 一致）：Tab / NBSP 分隔必须与空格等价。
         if (StartsWithToken(trimmed, "network")) return ParseNetwork(trimmed);
@@ -261,6 +264,9 @@ public static class CoreCommandParser
 
         if (string.Equals(trimmed, "provider test", StringComparison.Ordinal))
             return (null, "用法：provider test <id>");
+
+        if (string.Equals(trimmed, "provider models", StringComparison.Ordinal))
+            return (null, "用法：provider models <id>");
 
         // 光一个 `session configure` 不能落回「当成消息」——用户以为在改绑，实际烧了一次模型调用。
         if (string.Equals(trimmed, "session configure", StringComparison.Ordinal))
@@ -818,6 +824,14 @@ public static class CoreCommandParser
         return parts.Length == 3
             ? (new CoreCommand.ProviderTest(parts[2]), null)
             : (null, "用法：provider test <id>");
+    }
+
+    private static (CoreCommand?, string?) ParseProviderModels(string line)
+    {
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length == 3
+            ? (new CoreCommand.ProviderModels(parts[2]), null)
+            : (null, "用法：provider models <id>");
     }
 
     // `session configure <会话 id> [--provider <pid>] [--model <m>] [--ask-timeout <分钟>]`

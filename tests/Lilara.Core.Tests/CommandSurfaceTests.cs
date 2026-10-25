@@ -27,6 +27,7 @@ public class CommandSurfaceTests
         (typeof(CoreCommand.ProviderUpsert),   "provider.upsert",   "provider set p --key k"),
         (typeof(CoreCommand.ProviderDelete),   "provider.delete",   "provider delete p"),
         (typeof(CoreCommand.ProviderTest),     "provider.test",     "provider test p"),
+        (typeof(CoreCommand.ProviderModels),   "provider.models",   "provider models p"),
 
         // 联网（2026-10-22）：`network set` / `network test`。
         (typeof(CoreCommand.NetworkConfigure), "network.configure", "network set --enabled on"),

@@ -1068,7 +1068,7 @@ public sealed class ControlServer(
             await send(result.Ack switch
             {
                 Ack.Rejected r => new WireFrame.Ack(id, false, null, r.Reason, null),
-                Ack.Accepted a => new WireFrame.Ack(id, true, a.SessionId, null, a.Note),
+                Ack.Accepted a => new WireFrame.Ack(id, true, a.SessionId, null, a.Note) { Data = a.Data },
                 _ => new WireFrame.Ack(id, false, null, "认不出的回执", null),
             });
         }
@@ -1166,6 +1166,8 @@ public sealed class ControlServer(
                 payload.GetProperty("id").GetString()!),
             // 连通性自检。与 provider.delete 同形（只带 id）。
             "provider.test" => new CoreCommand.ProviderTest(
+                payload.GetProperty("id").GetString()!),
+            "provider.models" => new CoreCommand.ProviderModels(
                 payload.GetProperty("id").GetString()!),
             // 联网配置（2026-10-22）。全部走 Opt：**键缺失 = 保留旧值**。
             // ⚠️ `apiKey` 的空串是**有意义的值**（清掉 key），所以不能把它折进「没给」——

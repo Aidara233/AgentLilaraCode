@@ -60,6 +60,9 @@ public abstract record CoreCommand
     /// </summary>
     public sealed record ProviderTest(string Id) : CoreCommand;
 
+    /** 临时从上游读取模型目录；查询结果不写入提供商配置。 */
+    public sealed record ProviderModels(string Id) : CoreCommand;
+
     /// <summary>
     /// **配置联网能力**（`&lt;数据根&gt;/network.json`，2026-10-22）。除下面说明外，
     /// **null = 本次没提到 = 保留旧值**（与 <see cref="ProviderUpsert"/> 同一条语义）。
@@ -365,6 +368,9 @@ public abstract record Ack
         /// **它不是协议的一部分**——头不该依赖它，它只是省得前端重读一遍存储。
         /// </summary>
         public string? Note { get; init; }
+
+        /** 机器可读的业务结果（例如 provider.models 返回的模型 ID 列表）。 */
+        public object? Data { get; init; }
     }
 
     /// <summary>

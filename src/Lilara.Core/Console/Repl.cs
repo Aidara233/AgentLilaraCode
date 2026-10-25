@@ -151,6 +151,11 @@ public sealed class Repl(
                     _out.WriteLine(accepted.Note ?? $"提供商 '{test.Id}' 已测试。");
                     break;
 
+                case CoreCommand.ProviderModels models:
+                    _out.WriteLine(accepted.Note ?? "模型目录查询完成。");
+                    if (accepted.Data is not null) _out.WriteLine(System.Text.Json.JsonSerializer.Serialize(accepted.Data, WireJson.Options));
+                    break;
+
                 // 预设三条：结果**全在 Note 里**（`Reply` 是 null）。
                 // ⚠️ **不接这三条就是一声不吭**——与 `provider.delete` 那条注释里写的是同一个坑
                 //（「不加这条 case 会落进 default 一声不吭」）。本批实测踩到了：

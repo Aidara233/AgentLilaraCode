@@ -1050,6 +1050,19 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 结果在 `note` 里：`✓ 通（model @ url（来源））` / `✗ 不通（url（来源））：原因`。
 证据：`CommandDispatcher.cs:478-566`。
 
+#### `provider.models`
+
+```jsonc
+{ "kind": "provider.models", "id": "local" }
+```
+
+从已保存的提供商配置调用上游模型目录（GET `/v1/models`；Claude 与 OpenAI 兼容协议使用各自认证方式），最多等待 10 秒，不调用模型生成接口、不重试，也不写入配置。
+
+- 成功：`accepted:true`，模型 ID 在结构化字段 `data.models` 中；`note` 仅供人读。空列表也是成功。
+- 上游失败、目录接口不支持或响应格式异常：`accepted:true`，`data.models` 为空数组，原因放在 `note`。
+- 提供商不存在 / id 不合法：`rejected`。
+- 请求只读已保存配置；拉取到的列表不会替换 provider 的 `models` 或 `defaultModel`。
+
 #### `network.configure`
 
 ```jsonc
