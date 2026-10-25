@@ -6,7 +6,7 @@
     <RootNamespace>Lilara.Core</RootNamespace>
     <AssemblyName>Lilara.Core</AssemblyName>
     <PackageId>Lilara.Core</PackageId>
-    <Version>0.1.0</Version>
+    <Version>1.0.0</Version>
     <PackageVersion>$(Version)</PackageVersion>
     <Authors>Agent Lilara</Authors>
     <Description>Reusable Agent Lilara execution and context kernel.</Description>
