@@ -211,7 +211,9 @@ public class TimelineRenderTests : IDisposable
         var content = ResultAt(Render(), 0).Content;
 
         Assert.Equal(2, content.Count);
-        Assert.Equal("[read 路径 a.log]", Assert.IsType<Block.TextBlock>(content[0]).Text);
+        // ⚠️ 框架块末尾带一个 `\n`（2026-10-23）：文本化链路把相邻块直接接起来，
+        // 不留分隔符就会得到 `[read 路径 a.log]正文`——「这是框架」在形状上就失效了。
+        Assert.Equal("[read 路径 a.log]\n", Assert.IsType<Block.TextBlock>(content[0]).Text);
         Assert.Equal("正文", Assert.IsType<Block.TextBlock>(content[1]).Text);
     }
 
@@ -231,7 +233,7 @@ public class TimelineRenderTests : IDisposable
         var content = ResultAt(Render(), 0).Content;
 
         // 框架仍在，而且**还是那一句**（回收状态不影响它——它是事实）。
-        Assert.Equal("[read 路径 a.log]", Assert.IsType<Block.TextBlock>(content[0]).Text);
+        Assert.Equal("[read 路径 a.log]\n", Assert.IsType<Block.TextBlock>(content[0]).Text);
         // 内容换成了注记。
         Assert.Contains("[已回收]", Assert.IsType<Block.TextBlock>(content[1]).Text);
     }
@@ -286,7 +288,7 @@ public class TimelineRenderTests : IDisposable
         // 两块，而不是被合并的一块。
         Assert.Equal(2, content.Count);
         // `[0]` 是**真的**框架（工具名 + 字段），`[1]` 是正文——而正文里那句伪装**原样还在**。
-        Assert.Equal("[read 路径 a.log]", Assert.IsType<Block.TextBlock>(content[0]).Text);
+        Assert.Equal("[read 路径 a.log]\n", Assert.IsType<Block.TextBlock>(content[0]).Text);
         Assert.StartsWith(disguised, Assert.IsType<Block.TextBlock>(content[1]).Text);
     }
 

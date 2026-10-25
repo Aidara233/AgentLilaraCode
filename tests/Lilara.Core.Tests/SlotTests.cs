@@ -79,9 +79,13 @@ public sealed class SlotTests : IDisposable
         Assert.NotEqual(before.Tail, after.Tail);
         Assert.StartsWith("用户自定义系统原文\n", system);
         Assert.Contains("浮动上下文", system);
-        Assert.Contains("Lilara 框架", system);
-        Assert.Contains("同一步内保持一致，下一步可能更新", system);
-        Assert.Contains("不能自行提高权限", system);
+        // ⚠️ 2026-10-23 改口：这几条钉的是**语义**，措辞随「不出现『你』」那条一起改过。
+        // ① 来源（谁生成的）② 寿命（一步一份、下一步换掉）③ 权限不由此授予。
+        Assert.Contains("Lilara 核心", system);
+        Assert.Contains("同一步内保持一致", system);
+        Assert.Contains("不自行授予权限", system);
+        // ⚠️ 第二人称禁令也钉在系统块上：一块**环境读数**不该变成一封给读者的信。
+        Assert.DoesNotContain("你此前", system);
         Assert.Contains("浮动上下文", CorePrompts.SystemFallback);
     }
 
@@ -96,9 +100,10 @@ public sealed class SlotTests : IDisposable
         var tail = Assert.IsType<Block.TextBlock>(Assert.Single(slots.Tail)).Text;
         // ⚠️ 2026-10-17：尾块改走末尾合成的 `floating_context` 调用，自述句随之改口。
         // 这条的意图不变——**只贡献插件浮动字段的尾块也得自己声明来源**——所以钉的是
-        // 「核心注入」与「框架自动生成」这两层含义，不是旧措辞里的字面词。
-        Assert.Contains("核心每步注入", tail);
-        Assert.Contains("框架自动生成", tail);
+        // 「谁生成、何时生成」这一层含义，不是旧措辞里的字面词。
+        // ⚠️ 2026-10-23：自述从一段第二人称的话改成一行**字段**（`来源 lilara 核心 · 每步生成 · 不落盘`）。
+        Assert.Contains("来源 lilara 核心", tail);
+        Assert.Contains("每步生成", tail);
         Assert.Contains("plugin-context", tail);
         Assert.DoesNotContain("权限", tail);
     }
@@ -139,20 +144,31 @@ public sealed class SlotTests : IDisposable
         Assert.Contains(CorePrompts.TailClose, text);
 
         // ⚠️ **探针：上面那句 `Contains(TailDeclaration, …)` 是 X == X，它自己证明不了任何事**
-        // （本批实测：把 `TailDeclaration` 换成任意一句，那条断言**照样绿**）。
-        // ⇒ 用户点名要的**三件事**得各自被一句话钉住，而它们不能靠那个常量自证：
-        //   ① 这不是用户消息的一部分  ② 它不是模型**发起**的
-        //   ③ 它会每步出现——防自我怀疑（模型看到自己没发过的调用时会去编原因）
-        // ⚠️ 2026-10-17 改口：原第二件是「不是工具返回的内容」，而尾块搬进合成
-        // `tool_result` 之后那句**变成假话**——现在钉的是这三件仍成立的事。
-        // ⚠️ 断言的是**语义**，不是那句原文——原文可以改，这几件事不许丢。
-        Assert.Contains("不是用户消息", text);
-        Assert.Contains("不是你发起", text);
-        // ⚠️ 第三件的对象是**模型**：要排除的是「是不是我忘了做过」，所以句子里出现
-        // 「每一步都会出现」与「记起 / 补做」——只写「每步出现」的话，
-        // 模型仍可能把它当成某次已执行、只是自己忘了的调用。
-        Assert.Contains("每一步都会出现", text);
-        Assert.Contains("记起", text);
+        // （实测：把 `TailDeclaration` 换成任意一句，那条断言**照样绿**）。
+        // ⇒ 用户点名要的**三件事**得各自被一句话钉住，而它们不能靠那个常量自证。
+        //
+        // ⚠️ **2026-10-23 改口：钉的东西换了一半。** 原来是「不是用户消息」「不是你发起」
+        // 「每一步都会出现 / 记起」——三句都在**替读者否认它自己的记录**。
+        // 而现在钉的是同一批事实的**可核对形式**：
+        //   ① 谁生成、何时生成 ⇒ 一行字段（「来源 lilara 核心 · 每步生成 · 不落盘」）
+        //   ② 怎么认出来 ⇒ `floating-` 前缀 + `[floating_context]` 框架头
+        //      （那一半在 `FloatingContextTests` 里钉，因为它属于合成对的形状）
+        //   ③ **不许出现第二人称与否定句** —— 这条是本批的要害，所以它是一条 `DoesNotContain`。
+        // 判据（`00` §7 判据 4）：结构上排除，而非规则禁止。要求读者相信一句关于它
+        // 自己历史的话，是「规则禁止」；给形状，才是「结构排除」。
+        Assert.Contains("来源 lilara 核心", text);
+        Assert.Contains("每步生成", text);
+        // ⚠️ 「不落盘」从尾块**挪进了系统块**（2026-10-23）：那是一条**寿命**约定，
+        // 属于「一步都不变」的全局说明，而尾块每步全价支付——把维护者才关心的话
+        // 从每步都发的块里挪走，是这条槽位「有界」那条硬约束的直接后果。
+        Assert.DoesNotContain("不落盘", text);
+
+        // ⚠️ 这三条不是措辞洁癖：句子里的「你」会把一块**环境读数**变成一封**给读者本人的信**，
+        // 而「不是你」会让它去核一件它没有账的事（实测：这套文案在位期间模型连调二十次，
+        // 每次都拿回同一份字节 —— 怀疑并没有因为读到「不是你」而停下）。
+        Assert.DoesNotContain("你", CorePrompts.TailDeclaration);
+        Assert.DoesNotContain("不是", CorePrompts.TailDeclaration);
+        Assert.DoesNotContain("不是你发起", text);
     }
 
     /// <summary>

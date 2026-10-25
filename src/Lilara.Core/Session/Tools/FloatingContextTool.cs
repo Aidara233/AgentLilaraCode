@@ -35,29 +35,49 @@ public sealed class FloatingContextTool : ITool
     /// </summary>
     public const string NameOf = "floating_context";
 
+    /// <summary>
+    /// **这一条结果自己的框架头**——署名与节律都在这里，且**只有这一处**。
+    ///
+    /// <para>⚠️ <b>为什么要抽成一个常量</b>：这条框架头有<b>两个</b>渲染点——
+    /// ① 模型自己调出来的那份走 <c>ToolFraming</c> 字段，由 <c>TimelineRender.WithFraming</c> 加；
+    /// ② 核心每步合成的那个走 <see cref="Session.Stepper.FloatingContextPair"/>，现渲染。
+    /// 两处各写一遍就会漂，而漂的表现是「核心注入的」与「模型自己要来的」**在形状上分叉**
+    /// （`TheToolReturnsTheSameTextTheCoreInjected` 钉的就是不分叉）。</para>
+    ///
+    /// <para>⚠️ <b>字段必须是恒定的</b>：「每步」说的是节律，不是「第几步」。带上步号会让
+    /// 同一个值在不同步渲染成不同字节，而这条结果虽然不落盘、不破前缀，却会让
+    /// 「同一步里渲染两次逐字节相同」这条（`00` §5 铁律 1）在**答复路径**上没法保证。</para>
+    ///
+    /// <para>⚠️ <b>字段不许为空</b>：别的工具结果是 <c>[read path foo · 第 1–40 · 共 1200]</c>，
+    /// 而一个零字段的头读起来像「这次调用没有元数据」，甚至像一次空调用——
+    /// 那正是「空的不能长得像有内容」的反面（`SystemBlock.Wrap` 同一条判据）。</para>
+    /// </summary>
+    public static readonly ToolFraming Framing =
+        new(NameOf, [new ToolFramingField("节律", "每步")]);
+
     public string Name => NameOf;
 
     public PermissionClass PermissionClass => PermissionClass.ReadOnly;
 
     /// <summary>
-    /// ⚠️ **描述里要写三件模型看不出来的事**（`00` §2.2：能进工具描述的绝不进系统提示词）：
-    /// ① 它返回的是什么 ② 核心已经每步自动注入过一次，所以**不需要调**
-    /// ③ **上下文末尾那次调用不是你发起的**——模型会在历史里看到一条自己没发过的
-    /// `tool_use`，而它对「我没做过的事」的典型反应是编一段解释（自我怀疑 / 自我指控）。
-    /// ⇒ 这一句是给那份推理一个正确的出口，不是请求它别想。
-    /// ⚠️ 再加上那条**机械后果**：「调用会进历史、之后每一步都会重放」——
-    /// 它比「别当刷新按钮用」这种请求靠得住，因为它是一个会被验证的预言。
+    /// ⚠️ **描述里只写三件模型看不出来的事**（`00` §2.2：能进工具描述的绝不进系统提示词）：
+    /// ① 它返回的是什么 ② 核心已经每步自动注入过一次 ③ 怎么**认出来**（署名在形状上）。
+    ///
+    /// <para>⚠️ <b>2026-10-23 改口：删掉了「不是你发起的」「不需要为它找原因」「不需要补调一次」</b>。
+    /// 那三句是对读者做工作（请它相信、请它别想），而它没有可用来核对的东西——
+    /// 它的全部证据就是这份上下文，而上下文里那条消息的角色就是 <c>assistant</c>。
+    /// ⇒ 现在给它两样**能自己核**的东西：<c>floating-</c> 前缀的 id、结果首块的
+    /// <c>[floating_context]</c> 框架头；再给它一条**机械后果**（再调一次不会带来新信息，
+    /// 因为返回的就是同一份字节）。能被验证的预言比任何安抚都管用。</para>
     /// </summary>
     public string Description =>
         "读回核心此刻注入的「浮动上下文」：当前的行为轴（主动性、权限、安全、验证强度等）"
         + "与插件贡献的字段。"
-        + "核心每一步都会在上下文末尾自动注入一次对它的调用和结果——那块内容通常已经在你的上下文里，"
-        + "**你不需要调用它**。"
-        + "你在上下文末尾看到的那次 floating_context 调用（以及它上面那条 assistant 消息）"
-        + "是核心自动生成的，**不是你发起的**：不需要为它找原因，也不需要补调一次。"
-        + "只有当你确实没有看到那一块时，再调一次重新读取。"
-        + "它返回的是**此刻**的值，不是历史快照。"
-        + "调用会像任何工具结果一样进入历史、之后每一步都会被重放，所以别把它当刷新按钮用。";
+        + "核心每一步都会在时间线末尾自动注入一次对它的调用和结果——id 以 floating- 开头，"
+        + "结果的首块是 [floating_context] 框架头；那块内容通常已经在你的上下文里。"
+        + "它返回的是**此刻**的值（不是历史快照），与你已经看到的那一份逐字节相同："
+        + "再调一次不会带来新信息，只会让这条记录进入历史、并在之后每一步被重放。"
+        + "所以只在确实没有看到那一块时，才需要用一次。";
 
     /// <summary>
     /// 无参数。⚠️ **不给它加任何参数**：加一个「要哪一段」就等于把「浮动块长什么样」
@@ -71,11 +91,23 @@ public sealed class FloatingContextTool : ITool
         """;
 
     public Task<ToolOutcome> RunAsync(ToolCall call, IToolContext context, CancellationToken ct) =>
-        Task.FromResult(ToolText.Of(
-            context.FloatingContext is { Length: > 0 } text
-                ? text
-                // ⚠️ **空要有一种说得清的说法**（不是空串、也不是一句编出来的默认内容）：
-                // 没有进上下文的轴时尾块**本来就不存在**（`SystemBlock.Wrap` 那条判据），
-                // 所以这里如实说「这一刻没有浮动内容」——而不是伪造一个只有包边的块。
-                : "这一刻没有浮动上下文：没有轴进上下文，也没有插件贡献浮动字段。"));
+        Task.FromResult(new ToolOutcome
+        {
+            // ⚠️ **署名与合成的那一份逐字相同**：同一条 `[floating_context]` 框架头，由
+            // `ToolFraming.Render` 一处给。⚠️ 两边若各写一遍，模型自己调出来的那份与核心注入
+            // 的那份就会**在形状上分叉**——而 `TheToolReturnsTheSameTextTheCoreInjected`
+            // 钉的正是「不分叉」。合成那边写不到 `Framing` 字段（它追加在渲染之后），
+            // 所以它在正文首块里现渲染一次；两处都只借这一个 Render 方法。
+            Framing = new ToolFraming(NameOf, []),
+            Content =
+            [
+                new Block.TextBlock(
+                    context.FloatingContext is { Length: > 0 } text
+                        ? text
+                        // ⚠️ **空要有一种说得清的说法**（不是空串、也不是一句编出来的默认内容）：
+                        // 没有进上下文的轴时尾块**本来就不存在**（`SystemBlock.Wrap` 那条判据），
+                        // 所以这里如实说「这一刻没有浮动内容」——而不是伪造一个只有包边的块。
+                        : "这一刻没有浮动上下文：没有轴进上下文，也没有插件贡献浮动字段。"),
+            ],
+        });
 }

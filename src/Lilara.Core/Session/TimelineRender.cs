@@ -196,10 +196,16 @@ public static class TimelineRender
     ///
     /// <para>⚠️ <b>没有 <c>Framing</c> 的记录原样返回</b>（老记录、以及不需要框架的工具）
     /// ⇒ 逐字节与今天相同。</para>
+    ///
+    /// <para>⚠️ <b>末尾那个 <c>\n</c> 是判据的一部分，不是排版</b>（2026-10-23 实测）：
+    /// 文本化链路（Chat 的 <c>string.Concat</c>、Claude 的拼串）把相邻块直接接起来，
+    /// 不留分隔符就会得到 <c>[read path foo]正文</c> 甚至 <c>[floating_context][lilara 上下文]</c>
+    /// ——两个方括号贴在一起，「一个块套另一个块」在形状上当场失效（`01` §3.3）。
+    /// ⚠️ 合成对那边（`Stepper.FloatingContextPair`）逐字加同一个换行，否则两份分叉。</para>
     /// </summary>
     private static TimelineEvent WithFraming(TimelineEvent evt) =>
         evt is TimelineEvent.ToolResultEvent { Framing: { } framing } r
-            ? r with { Content = [new Block.TextBlock(framing.Render()), .. r.Content] }
+            ? r with { Content = [new Block.TextBlock(framing.Render() + "\n"), .. r.Content] }
             : evt;
 
     /// <summary>

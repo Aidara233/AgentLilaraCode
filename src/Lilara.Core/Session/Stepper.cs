@@ -894,14 +894,6 @@ public sealed class Stepper(
     /// <param name="tail">尾槽位的块（<see cref="SystemBlock.Render"/> 的产物）。空 ⇒ 不合成。</param>
     /// <param name="at">步开始冻结的时刻（`now`）。</param>
     /// <param name="turn">这一步的 `Turn`——做成 id 的一部分，让不同步的合成对互不相等。</param>
-    ///
-    /// <para>⚠️ <b>工具表里没有 `floating_context` 时整对不合成</b>（含纯 chat 会话）：
-    /// 客户端（测试替身、未来的纯 chat 预设）刻意构造的无工具对话**行为逐字节不变**，
-    /// 而「名字没声明就发一条调用」会在部分上游变成 400。</para>
-    /// </summary>
-    /// <param name="tail">尾槽位的块（<see cref="SystemBlock.Render"/> 的产物）。空 ⇒ 不合成。</param>
-    /// <param name="at">步开始冻结的时刻（`now`）。</param>
-    /// <param name="turn">这一步的 `Turn`——做成 id 的一部分，让不同步的合成对互不相等。</param>
     /// <summary>工具表里有没有 <see cref="FloatingContextTool.NameOf"/>（`_tools` 构造后不变，逐次查表够用）。</summary>
     private bool HasFloatingContextTool =>
         _tools.Any(t => string.Equals(t.Name, FloatingContextTool.NameOf, StringComparison.Ordinal));
@@ -914,6 +906,22 @@ public sealed class Stepper(
 
         var text = string.Concat(tail.OfType<Block.TextBlock>().Select(b => b.Text));
         if (text.Length == 0) return timeline;
+
+        // ⚠️ **署名放在形状上，不放在正文里**（2026-10-23）：这一对与模型自己调出来的
+        // 工具结果**同形**——首块是 `[floating_context]` 框架头。于是「这是谁给的」由形状回答
+        // （`00` §7 判据 5：模型认位置与形状，不认语义），而正文里不再有任何一句
+        // 「不是你发起的」。⚠️ 旧文案在正文里否认归属，而这条消息在协议上的角色就是
+        // `assistant`——让读者否认自己的记录，只会把它推去**再调一次看看**（实测十二次）。
+        //
+        // ⚠️ **这一行是现渲染的，不是 `Framing` 字段**：合成对追加在 `RenderForModel` **之后**，
+        // 走不到 `WithFraming`。形状与字段由 `FloatingContextTool.Framing` 一处给，
+        // 两边都只借那一个常量 + `ToolFraming.Render`——两处各拼一遍就会漂。
+        //
+        // ⚠️ **末尾的 `\n` 不是排版**（2026-10-23 实测）：两个文本块在「文本化」链路上是
+        // `string.Concat` 拼的，不留分隔符就会得到 `[floating_context][lilara 上下文]`——
+        // 两个方括号贴在一起，**形状当场失效**（`01` §3.3：起止两行必须独立，
+        // 一个块套另一个块时才分得开）。`TimelineRender.WithFraming` 那边同步加了同一个换行。
+        var framing = FloatingContextTool.Framing.Render() + "\n";
 
         return
         [
@@ -930,7 +938,7 @@ public sealed class Stepper(
                 Id = $"floating-{turn}-result",
                 At = at,
                 CallId = $"floating-{turn}-result",
-                Content = [new Block.TextBlock(text)],
+                Content = [new Block.TextBlock(framing), new Block.TextBlock(text)],
             },
         ];
     }

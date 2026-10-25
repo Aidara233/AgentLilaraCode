@@ -105,6 +105,14 @@ public sealed class FloatingContextTests : IDisposable
         Assert.Equal(use.CallId, result.CallId);
         Assert.Contains(CorePrompts.TailOpen, TextOf(result));
         Assert.Contains(CorePrompts.TailDeclaration, TextOf(result));
+
+        // ⚠️ **形状：框架头独占一行，包边在下一行**（2026-10-23 实测）。
+        // 两个文本块在文本化链路上是 `string.Concat` 拼的，中间没有换行就会得到
+        // `[floating_context][lilara 上下文]`——两个方括号贴成一个复合 token，
+        // 「一个块套另一个块」当场失效（`01` §3.3）。这条断言是那个 bug 的哨兵。
+        Assert.StartsWith(
+            FloatingContextTool.Framing.Render() + "\n" + CorePrompts.TailOpen + "\n",
+            TextOf(result));
         Assert.Contains(Axes.LabelOf(Axes.Permission), TextOf(result));
 
         // 尾块**只有一份**：它在这条结果里，不在别的任何地方。
@@ -262,11 +270,20 @@ public sealed class FloatingContextTests : IDisposable
         _adapter.ReplyWith(_ => Say("好"));
         await _stepper.StepAsync(handle, "读一下", default);
 
-        var injected = TextOf(Results(_adapter.Calls[0]).Last());
+        // ⚠️ 2026-10-23：注入的那一份**多一个首块**（`[floating_context]` 框架头，署名在形状上），
+        // 所以这里比的是**正文**——「核心注入的」与「模型自己要来的」不许分叉的是那段字。
+        // ⚠️ 别改成比整份文本：框架头由合成对现渲染（它追加在渲染之后，走不到 `WithFraming`），
+        // 而模型自己调回来的那条靠 `Framing` 字段在渲染期加——两者在**落盘的记录**里本来就不等长。
+        var injected = Results(_adapter.Calls[0]).Last();
+        var injectedBody = Assert.IsType<Block.TextBlock>(injected.Content[^1]).Text;
         var executed = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
             .OfType<TimelineEvent.ToolResultEvent>().Single(r => r.CallId == "c1");
 
-        Assert.Equal(injected, TextOf(executed));
+        Assert.Equal(injectedBody, TextOf(executed));
+        // 署名在形状上：合成那份的首块是框架头（连同换行），而模型自调那份由 `Framing` 字段
+        // 在渲染期加同一个字串——两处只借 `FloatingContextTool.Framing` 一个常量。
+        Assert.Equal(FloatingContextTool.Framing.Render() + "\n",
+            Assert.IsType<Block.TextBlock>(injected.Content[0]).Text);
     }
 
     /// <summary>
