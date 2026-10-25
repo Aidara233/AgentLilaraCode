@@ -46,10 +46,20 @@ public static class TimelineRender
     /// 同一步里渲染两次必须逐字节相同（`00` §5 铁律 1）。</para>
     /// </summary>
     public static IReadOnlyList<TimelineEvent> RenderForModel(
-        SessionStore store, SessionHandle handle)
+        SessionStore store, SessionHandle handle, IReadOnlyList<TimelineEvent>? extra = null)
     {
         var raw = store.ReadTimeline(handle.ProjectKey, handle.SessionId);
-        return Render(store, handle, raw, truncateForDelivery: true);
+        var rendered = Render(store, handle, raw, truncateForDelivery: true);
+
+        // ⚠️ **浮动读数从自己的文件来**（`floating.jsonl`，2026-10-23）：它是环境状态，
+        // 不是对话事件 ⇒ 不进 `history.jsonl`。合并之后**统一做一次取代**：
+        // 除最新那一份之外，旧的整对去掉，并在最新那份里插一行「第 a–b 步的读数已取代」。
+        var floating = store.ReadFloating(handle.ProjectKey, handle.SessionId);
+        var all = extra is { Count: > 0 }
+            ? new List<TimelineEvent>([.. rendered, .. floating, .. extra])
+            : new List<TimelineEvent>([.. rendered, .. floating]);
+
+        return all.Count == 0 ? all : SupersedeFloating(all);
     }
 
     /// <summary>
@@ -203,6 +213,72 @@ public static class TimelineRender
     /// ——两个方括号贴在一起，「一个块套另一个块」在形状上当场失效（`01` §3.3）。
     /// ⚠️ 合成对那边（`Stepper.FloatingContextPair`）逐字加同一个换行，否则两份分叉。</para>
     /// </summary>
+    /// <summary>
+    /// **旧浮动读数 → 一行注记；最新那一份原样留着**（2026-10-23 用户裁定）。
+    ///
+    /// <para>⚠️ <b>为什么必须「整对去掉」而不是「只换结果的内容」</b>：一条 <c>tool_result</c>
+    /// 必须紧跟它的 <c>tool_use</c>。留下结果、删掉调用 ⇒ 上游直接 400。</para>
+    ///
+    /// <para>⚠️ <b>注记写在最新那一份的首块之前</b>（而不是单独造一条事件）：单独造一条
+    /// <c>tool_result</c> 就又变成上面那个孤儿问题；写成一条 <c>user</c> 消息又会让模型
+    /// 以为用户说了句话。⇒ 挂在最新读数里，是唯一不新增协议形状的位置。</para>
+    ///
+    /// <para>⚠️ <b>注记必须给「步段 + 次数感」</b>：只说「已取代」的话，模型看到的是
+    /// 「我上一步做过一件事，被抹掉了」——那是**新的怀疑源**；说「第 a–b 步各一次，均已取代」
+    /// 才是把它读成**例行**。⚠️ 合并成一行，所以它的体积**不随步数增长**（O(1)）。</para>
+    /// </summary>
+    private static IReadOnlyList<TimelineEvent> SupersedeFloating(IReadOnlyList<TimelineEvent> events)
+    {
+        var results = events.OfType<TimelineEvent.ToolResultEvent>()
+            .Where(r => r.Id.StartsWith("floating-", StringComparison.Ordinal))
+            .ToList();
+
+        // 0 或 1 份：没有可取代的（第一条读数永远原样留着）。
+        if (results.Count <= 1) return events;
+
+        var newest = results[^1];
+        var older = results.Take(results.Count - 1).ToList();
+
+        var turns = older
+            .Select(r => r.Id.Split('-') is [_, var middle, ..] && int.TryParse(middle, out var n) ? n : 0)
+            .Where(n => n > 0)
+            .ToList();
+
+        var note = turns.Count == 0
+            ? "[floating_context · 此前的读数均已取代]"
+            : turns.Min() == turns.Max()
+                ? $"[floating_context · 第 {turns.Min()} 步的读数已取代]"
+                : $"[floating_context · 第 {turns.Min()}–{turns.Max()} 步的读数已取代]";
+
+        var dropResults = new HashSet<string>(older.Select(r => r.Id), StringComparer.Ordinal);
+        var dropCalls = new HashSet<string>(
+            older.Select(r => r.Id.Replace("-result", "-call", StringComparison.Ordinal)), StringComparer.Ordinal);
+
+        return
+        [
+            .. events
+                .Where(e => e is not TimelineEvent.ToolResultEvent r || !dropResults.Contains(r.Id))
+                .Where(e => e is not TimelineEvent.MessageEvent m || !dropCalls.Contains(m.Id))
+                .Select(e => ReferenceEquals(e, newest)
+                    ? e is TimelineEvent.ToolResultEvent r
+                        // ⚠️ 注记排在**框架头之后**（框架头是这一条结果自己的形状，必须打头），
+                        // 且末尾带 `\n`——否则两个方括号会粘成
+                        // `[...已取代][floating_context 节律 每步]`，形状当场失效
+                        // （与 `WithFraming` 那条同一个实测教训，2026-10-23）。
+                        ? r with
+                        {
+                            Content =
+                            [
+                                .. r.Content.Take(1),
+                                new Block.TextBlock(note + "\n"),
+                                .. r.Content.Skip(1),
+                            ],
+                        }
+                        : e
+                    : e),
+        ];
+    }
+
     private static TimelineEvent WithFraming(TimelineEvent evt) =>
         evt is TimelineEvent.ToolResultEvent { Framing: { } framing } r
             ? r with { Content = [new Block.TextBlock(framing.Render() + "\n"), .. r.Content] }

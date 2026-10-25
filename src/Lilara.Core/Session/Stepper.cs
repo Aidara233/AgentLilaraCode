@@ -220,11 +220,7 @@ public sealed class Stepper(
                 // ⚠️ **但喂模型的那一份多一条投递截断**（2026-10-17）：超过
                 // `ToolLimits.MaxResultBytes` 的结果只喂开头，尾部的注记给出稳定 id 与下一个偏移
                 // ⇒ 模型用 `fetch(id, offset)` 接着看，不必重跑那个工具。
-                Timeline = FloatingContextPair(
-                    TimelineRender.RenderForModel(_store, handle), slots.Tail, at,
-                    // ⚠️ **`Turn + 1` 是「这一步的编号」**（与 `PendingIntent` 给「那一步的 Turn」用的
-                    // 同一个约定）：`State.Turn` 数的是**已完成**的步，进行中的这一步是下一号。
-                    handle.State.Turn + 1),
+                Timeline = TimelineRender.RenderForModel(_store, handle, StepFloatingPair(handle, slots, at)),
             };
 
             // 调用（抛异常时直接传播——这一步没完成，Turn 不动）。
@@ -448,6 +444,13 @@ public sealed class Stepper(
 
         // 一次落盘 = 一个原子。⚠️ 空批次**不写**（拒答且没有工具的那一步就是空的），
         // 而 `AppendEvents` 对空批次是 no-op、不抛——见它的注释。
+        // ⚠️ 浮动对**跟着这一步一起落盘**（2026-10-23）：排在模型消息与工具结果之后，
+        // 配对完整（`tool_use` 紧跟 `tool_result`）。没变化时它是空的 ⇒ 记录里不新增，
+        // 也就是「每步一份」改成「变了一份」。
+        // ⚠️ **2026-10-23：浮动对落进 `floating.jsonl`**（不是 `history.jsonl`）——
+        // 它是**环境状态**，混进对话记录会让所有「记录里有几条事件」的断言与统计重算，
+        // 也会让 `fetch`/压缩把它当成可取回的对话内容（而旧读数的档位不能复活）。
+        _store.AppendFloating(handle.ProjectKey, handle.SessionId, StepFloatingPair(handle, slots, at));
         _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
 
         // ② + ③ + ④：检查点 → 清指令 → 回收窗口（见上面那段次序）。
@@ -941,6 +944,58 @@ public sealed class Stepper(
                 Content = [new Block.TextBlock(framing), new Block.TextBlock(text)],
             },
         ];
+    }
+
+    /// <summary>
+    /// 尾槽位的块 → **正文**（不含框架头）。⚠️ 落在记录里的那一份，正文永远是**末块**：
+    /// 合成对的内容是 `[框架头, 正文]`（`FloatingContextPair`），所以「取末块」就是判据的形状。
+    /// <para>⚠️ 它同时是「变没变」的判据：尾块是轴值与插件字段的**纯函数**，
+    /// 正文逐字相同 ⇔ 这一份读数仍然准确。⇒ 判据只有一处，别另比轴字典。</para>
+    /// </summary>
+    private static string? FloatingBodyOf(IReadOnlyList<Block> tail)
+    {
+        var text = string.Concat(tail.OfType<Block.TextBlock>().Select(b => b.Text));
+        return text.Length == 0 ? null : text;
+    }
+
+    /// <summary>
+    /// **记录里最近一次落盘的浮动读数正文**（没有就是 <c>null</c>）。
+    ///
+    /// <para>⚠️ 只读记录、不读内存：判据的对象是「模型上一次真的看到过什么」，
+    /// 而那是记录里那一份 —— 内存里留一份影子迟早会和盘面分叉（同 `Reclaim` 那条
+    /// 「不缓存判定」）。</para>
+    /// </summary>
+    private string? LastFloatingBody(SessionHandle handle) =>
+        _store.ReadFloating(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .LastOrDefault(r => r.Id.StartsWith("floating-", StringComparison.Ordinal))
+            ?.Content.OfType<Block.TextBlock>().LastOrDefault()?.Text;
+
+    /// <summary>
+    /// **这一步的浮动读数**：没有变化就返回空（既不进请求，也不落盘）。
+    ///
+    /// <para>⚠️ <b>它是纯的</b>：同样的 <paramref name="handle"/> / <paramref name="slots"/> /
+    /// <paramref name="at"/> ⇒ 逐字节相同的输出（`00` §5 铁律 1）。⇒ 可以在「装配请求」与
+    /// 「落盘」两处各调一次，而不会得到两份不同的东西——这也是为什么它不写成局部变量：
+    /// 那两处在两个作用域里，变量会被迫跨作用域，而跨作用域的东西迟早会被人改成可变状态。</para>
+    ///
+    /// <para>⚠️ <b>变化才注入的判据</b>：尾块正文（= 轴值 + 插件字段的纯函数）与记录里
+    /// 最近一份逐字相同 ⇒ 那一份仍然准确 ⇒ 不产生新的一份。判据只有这一处，
+    /// 不要在别处另比轴字典。</para>
+    /// </summary>
+    private IReadOnlyList<TimelineEvent> StepFloatingPair(
+        SessionHandle handle, PromptSlots slots, DateTimeOffset at)
+    {
+        var pair = FloatingContextPair([], slots.Tail, at, handle.State.Turn + 1);
+        if (pair.Count == 0) return pair;
+
+        // ⚠️ **变化才注入**：与 `floating.jsonl` 里最近一份的正文逐字相同 ⇒ 不产生新的一份。
+        // 判据只有这一处；不要另比轴字典（那是第二份判据，迟早漂）。
+        if (FloatingBodyOf(slots.Tail) is { } body
+            && string.Equals(LastFloatingBody(handle), body, StringComparison.Ordinal))
+            return [];
+
+        return pair;
     }
 
     /// <summary>

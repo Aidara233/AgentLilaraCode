@@ -150,13 +150,20 @@ public sealed class FloatingContextTests : IDisposable
     public async Task Step_DoesNotPersistTheSyntheticPair()
     {
         var handle = NewSession();
-        _adapter.ReplyWith(_ => Say("好"));
-        await _stepper.StepAsync(handle, "你好", default);
+        _adapter.ReplyWith(_ => Say("一")).ReplyWith(_ => Say("二"));
+        await _stepper.StepAsync(handle, "a", default);
+        await _stepper.StepAsync(handle, [], default);
 
         var timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
-        Assert.Equal(2, timeline.Count);
-        Assert.Empty(timeline.OfType<TimelineEvent.MessageEvent>().SelectMany(m => m.Blocks.OfType<Block.ToolUseBlock>()));
+
+        // ⚠️ **2026-10-23：落盘试过又退回了**（理由见 `Stepper` 落盘点那条注释与
+        // `docs/superpowers/plans/2026-10-23-floating-as-history.md`）：它让 19 条
+        // 「记录里的事件条数」断言当场红，而那是成规模的改写，不该顺手做。
+        // ⇒ 今天仍然是「不进记录」：记录里既没有浮动结果，也没有浮动调用。
         Assert.Empty(timeline.OfType<TimelineEvent.ToolResultEvent>());
+        Assert.DoesNotContain(
+            timeline.OfType<TimelineEvent.MessageEvent>().SelectMany(m => m.Blocks.OfType<Block.ToolUseBlock>()),
+            u => u.Name == FloatingContextTool.NameOf);
     }
 
     /// <summary>
@@ -168,7 +175,7 @@ public sealed class FloatingContextTests : IDisposable
     /// 那是另一处的契约，钉死只会腐。
     /// </summary>
     [Fact]
-    public async Task SyntheticIdsAreDeterministic_AndChangeBetweenSteps()
+    public async Task SyntheticIdsAreDeterministic_AndStayTheSameWhileAxesDoNotChange()
     {
         var handle = NewSession();
         _adapter.ReplyWith(_ => Say("一")).ReplyWith(_ => Say("二"));
@@ -178,17 +185,19 @@ public sealed class FloatingContextTests : IDisposable
         var firstMsg = _adapter.Calls[0].Timeline.OfType<TimelineEvent.MessageEvent>()
             .Single(m => m.Blocks.OfType<Block.ToolUseBlock>().Any(u => u.Name == FloatingContextTool.NameOf));
         var first = Assert.Single(firstMsg.Blocks.OfType<Block.ToolUseBlock>());
-        var second = Assert.Single(Uses(_adapter.Calls[1]), u => u.Name == FloatingContextTool.NameOf && u.CallId != first.CallId);
         var tailFirst = Results(_adapter.Calls[0]).Last(r => r.CallId == first.CallId);
 
-        // ⚠️ `ToolUseBlock` 自己没有 id（协议 id 是它那一格 `CallId`）——记录 id 在**包含它的消息**上。
-        // ⚠️ **号段不钉具体数字**：第一步的 `Turn + 1` 是几取决于 `SessionHandle` 的初始 `Turn`，
-        // 那是另一处的契约。这里钉的是「同一号段里的 call / result 成对、且下一步换了一段」。
+        // ① 成对：记录 id 在**包含调用的那条消息**上，结果那条与 `CallId` 同号。
         Assert.EndsWith("-call", firstMsg.Id);
         Assert.EndsWith("-result", first.CallId);
         Assert.Equal(first.CallId, tailFirst.Id);
-        Assert.NotEqual(first.CallId, second.CallId);
-        Assert.Equal(second.CallId, Assert.IsType<TimelineEvent.ToolResultEvent>(_adapter.Calls[1].Timeline[^1]).Id);
+
+        // ⚠️ **2026-10-23 改口：下一步不该换一段**。轴没变 ⇒ 不注入新的一份，
+        // 于是第二步看到的是**同一条**（它是历史，不是新造的）。⇒ id 必须相同。
+        // 旧断言钉的是「每步换一段」，那正是「每步一份」的化石，而那个节律已经被降频删掉了。
+        var second = Assert.Single(Uses(_adapter.Calls[1]), u => u.Name == FloatingContextTool.NameOf);
+        Assert.Equal(first.CallId, second.CallId);
+        Assert.Single(Results(_adapter.Calls[1]), r => r.CallId == first.CallId);
     }
 
     // ---- 下一步能接上 ----
@@ -212,14 +221,15 @@ public sealed class FloatingContextTests : IDisposable
         var old = Assert.Single(Uses(_adapter.Calls[0]), u => u.Name == FloatingContextTool.NameOf);
         var second = _adapter.Calls[1].Timeline;
 
-        // ① 恰好一条（新的），且在末尾。
-        var newest = Assert.Single(Uses(_adapter.Calls[1]), u => u.Name == FloatingContextTool.NameOf);
-        Assert.NotEqual(old.CallId, newest.CallId);
-        Assert.Equal(newest.CallId, Assert.IsType<TimelineEvent.ToolResultEvent>(second[^1]).CallId);
+        // ⚠️ **2026-10-23 改口（整条反转）**：旧契约是「下一步不带旧的那一对，换新的」——
+        // 那是「浮动 = 不落盘的状态」时代的判据。现在它**落盘**，而注入是「变化才发生」：
+        // ⇒ 轴没变时，下一步看到的就是**同一对**（作为历史被重放），且**不新增**。
+        // 这正是「上下文里的浮动块不随步数增长」的可观测形态。
+        var same = Assert.Single(Uses(_adapter.Calls[1]), u => u.Name == FloatingContextTool.NameOf);
+        Assert.Equal(old.CallId, same.CallId);
 
-        // ② 旧的那条 id 一个都不在——没有「上一份浮动」被当作历史重放。
-        Assert.DoesNotContain(second, e => e.Id == old.CallId);
-        Assert.DoesNotContain(second, e => e is TimelineEvent.ToolResultEvent r && r.CallId == old.CallId);
+        // ② 恰好一份：没有第二对（没有重复注入，也没有孤儿结果）。
+        Assert.Single(Results(_adapter.Calls[1]), r => r.CallId.StartsWith("floating-", StringComparison.Ordinal));
     }
 
     /// <summary>
