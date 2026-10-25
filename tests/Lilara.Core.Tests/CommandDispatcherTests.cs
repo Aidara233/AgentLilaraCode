@@ -669,9 +669,10 @@ public class CommandDispatcherTests : IDisposable
         var kinds = new List<string>();
         while (sub.Reader.TryRead(out var p)) kinds.Add(p.Payload.GetType().Name);
 
-        // 顺序固定：用户消息（send 时就发）→ 步开始 → 模型消息 → 步结束 → 状态。
+        // 顺序固定：用户消息（send 时就发）→ 步开始 → 相位（Generating）→ 模型消息
+        // → 步结束 → 状态 → 相位（Idle，循环真的停了才发）。
         Assert.Equal(
-            ["MessageAppended", "StepBegin", "MessageAppended", "StepEnd", "StateChanged"],
+            ["MessageAppended", "StepBegin", "PhaseChanged", "MessageAppended", "StepEnd", "StateChanged", "PhaseChanged"],
             kinds);
 
         // 且 seq 严格递增（同一把锁分配的）
@@ -1542,5 +1543,36 @@ public class CommandDispatcherTests : IDisposable
         var saved = host.Providers.Load("p")!;
         Assert.Equal("http://x.invalid", saved.Endpoint);
         Assert.Equal(["a", "b"], saved.Models);   // 没被静默清掉
+    }
+    [Fact]
+    public async Task ProviderModels_ReturnsTemporaryDataWithoutChangingSavedProvider()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "lilara-models-" + Guid.NewGuid().ToString("N"));
+        var work = Path.Combine(Path.GetTempPath(), "lilara-models-work-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var host = new CoreHost(root, work);
+            host.Providers.Save(new ProviderDefinition
+            {
+                Id = "p", Protocol = Protocols.OpenAiChat, ApiKey = "secret",
+                DefaultModel = "manual-model", Modality = "text", Models = ["configured-only"],
+            });
+            var dispatcher = new CommandDispatcher(
+                host, new EventBus(), _ => new Stepper(host.Store, new Fakes.FakeAdapter()),
+                listProviderModels: (_, _) => Task.FromResult<IReadOnlyList<string>>(["fetched-a", "fetched-b"]));
+
+            var result = await dispatcher.DispatchAsync(new CoreCommand.ProviderModels("p"), "m1", true, CancellationToken.None);
+            var ack = Assert.IsType<Ack.Accepted>(result.Ack);
+            Assert.Equal(new[] { "fetched-a", "fetched-b" }, Assert.IsAssignableFrom<IReadOnlyList<string>>(
+                ack.Data!.GetType().GetProperty("Models")!.GetValue(ack.Data)));
+            var saved = host.Providers.Load("p")!;
+            Assert.Equal("manual-model", saved.DefaultModel);
+            Assert.Equal(["configured-only"], saved.Models);
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+            if (Directory.Exists(work)) Directory.Delete(work, true);
+        }
     }
 }

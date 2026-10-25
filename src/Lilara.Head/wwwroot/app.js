@@ -1897,6 +1897,15 @@ function handleEvent(p) {
       }
       break;
 
+    // ⚠️ 活动相位（2026-10-25）：四态由核心判（Generating / Tools / Waiting / Idle），
+    // 头只把字换掉——`session.state` 是磁盘镜像，每步结束都会落回 Idle，照它画会一步一闪。
+    case "session.phase":
+      if (p.sessionId === current) {
+        const zh = { Generating: "模型生成", Tools: "工具处理", Waiting: "等你", Idle: "闲置" }[p.phase] || p.phase;
+        setStatus(zh, null);
+      }
+      break;
+
     case "session.state":
       if (p.sessionId === current) {
         setStatus(p.status, p.turn);

@@ -27,6 +27,7 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(Error), "error")]
 [JsonDerivedType(typeof(UsageUpdated), "usage.updated")]
 [JsonDerivedType(typeof(CompactionCompleted), "session.compaction.completed")]
+[JsonDerivedType(typeof(PhaseChanged), "session.phase")]
 public abstract record WireEvent
 {
     public sealed record SessionCreated(string SessionId, string ProjectKey) : WireEvent;
@@ -254,6 +255,19 @@ public abstract record WireEvent
     public sealed record CompactionCompleted(
         string SessionId, string CheckpointId, string CoveredThroughEventId, long? SummaryTokens) : WireEvent;
 
+    /// <summary>
+    /// 会话**活动相位**变了（四态）。头只读这一条来显示「模型生成 / 工具处理 / 等你 / 闲置」。
+    ///
+    /// <para>⚠️ <b>它和 <see cref="StateChanged"/> 答的不是同一个问题</b>：`session.state` 是
+    /// 磁盘/内存的状态镜像（`Running` 只进内存、从不落盘），**每步结束都会发一条**——
+    /// 照它画，头会在每步之间看到一次 `Idle`，一步一闪。相位只在真的换了活计时才变，
+    /// 判据只在核心（`Stepper` 看得见模型调用的边界、`CommandDispatcher` 看得见续推与否）。</para>
+    ///
+    /// <para>⚠️ 取值的判据见 <see cref="SessionPhase"/>。⚠️ 只在**真的变了**才发（与 `axis.changed`
+    /// 同一条约定）——同值重复发会让头的相位动画无谓地重放。</para>
+    /// </summary>
+    public sealed record PhaseChanged(string SessionId, string Phase, int Turn) : WireEvent;
+
     // 参数类型必须是 WireEvent（基类）：泛型版在静态类型推断成子类时会静默丢掉判别式。
     public static string StableSerialize(WireEvent value) =>
         System.Text.Json.JsonSerializer.Serialize(value, WireJson.Options);
@@ -271,7 +285,10 @@ public abstract record WireFrame
     public sealed record Event(string Topic, long Seq, WireEvent Payload) : WireFrame;
 
     // 回执：只有 ack / rejected 两类。id 由头生成、核心原样带回，头靠它对上。
-    public sealed record Ack(string Id, bool Accepted, string? SessionId, string? Reason, string? Note) : WireFrame;
+    public sealed record Ack(string Id, bool Accepted, string? SessionId, string? Reason, string? Note) : WireFrame
+    {
+        public object? Data { get; init; }
+    }
 
     // 该流的补发起点已不在缓冲里 ⇒ 请拉快照重建。这是唯一的降级路径，别发明「部分合并」。
     public sealed record ResyncRequired(string Topic) : WireFrame;

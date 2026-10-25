@@ -95,7 +95,7 @@ public sealed class Stepper(
     /// </summary>
     public async Task<StepOutcome> StepAsync(
         SessionHandle handle, IReadOnlyList<Kernel.Block> blocks, CancellationToken ct,
-        bool explicitStart = false)
+        bool explicitStart = false, Action<string>? onPhase = null)
     {
         // 「now 冻结在步开始」（00 §2.5）——同一步内重复渲染必须逐字节相同
         var at = CoreClock.Now();
@@ -236,6 +236,9 @@ public sealed class Stepper(
             // 不碰记录、不碰 `Turn`、不碰工具副作用。⚠️ **每一次失败各记一行账**——被限流后重试成功
             // 的那一步，上游实际被打了好几次，账本只记最后一次会让统计看起来比实际便宜。
             // （成功那一行由下面补记：只有这里知道「这个回复能不能用」。）
+            // 相位：请求发出去、回复还没回来（含重试等待）。判据只在核心里，头不许自己推。
+            onPhase?.Invoke(SessionPhase.Generating);
+
             var outcome = await RetryPolicy.CallAsync(_adapter, request, ct,
                 delay: _retryDelay,
                 onFailedAttempt: failed =>
@@ -352,6 +355,9 @@ public sealed class Stepper(
                 // ⚠️ **用步开始冻住的那一份**（2026-10-24）：与尾块同一份字节，
                 // 两处各算一次会让「模型从尾块看到的」与「工具判定的」分叉。
                 subagents);
+
+            // 相位：回复里有 tool_use，接下来是工具执行。
+            onPhase?.Invoke(SessionPhase.Tools);
 
             var batch = await executor.ExecuteAsync(toolCalls, context, ct);
             pending = batch.Pending;
@@ -801,7 +807,7 @@ public sealed class Stepper(
     /// <param name="reply">用户对那次询问的答复（盖住哪几条、答了什么）。</param>
     public async Task<StepOutcome> ResumeAsync(
         SessionHandle handle, IReadOnlyList<Block.ToolUseBlock> calls,
-        ToolExecutor.Reply reply, CancellationToken ct, PausedAsk paused)
+        ToolExecutor.Reply reply, CancellationToken ct, PausedAsk paused, Action<string>? onPhase = null)
     {
         var events = new List<TimelineEvent>();
         var releasedClaims = new List<Claim>();
@@ -834,6 +840,9 @@ public sealed class Stepper(
                 handle.State.PendingCompact,
                 ShellFor(),
                 subagents);
+
+            // 相位：答复之后真正跑掉的那批工具。
+            onPhase?.Invoke(SessionPhase.Tools);
 
             var batch = await executor.ExecuteAsync(calls, context, ct, reply);
             events.AddRange(batch.Results);
@@ -1352,7 +1361,7 @@ public sealed class Stepper(
     /// ⇒ 生产者路径（dispatcher）走「追加 + 入队 + 取空队列」，
     /// 这个壳子给「我就想跑一步」的调用方用。</para>
     /// </summary>
-    public Task<StepOutcome> StepAsync(SessionHandle handle, string userText, CancellationToken ct)
+    public Task<StepOutcome> StepAsync(SessionHandle handle, string userText, CancellationToken ct, Action<string>? onPhase = null)
     {
         var blocks = new List<Kernel.Block> { new Kernel.Block.TextBlock(userText) };
 
@@ -1366,6 +1375,6 @@ public sealed class Stepper(
         });
         handle.Enqueue(blocks);
 
-        return StepAsync(handle, handle.DrainQueue(), ct);
+        return StepAsync(handle, handle.DrainQueue(), ct, onPhase: onPhase);
     }
 }

@@ -25,10 +25,13 @@ public sealed class CommandDispatcher(
     EventBus bus,
     Func<SessionHandle, Stepper> resolveStepper,
     Func<ProviderDefinition, IModelAdapter>? createAdapter = null,
-    INetworkTransport? networkTestTransport = null)
+    INetworkTransport? networkTestTransport = null,
+    Func<ProviderDefinition, CancellationToken, Task<IReadOnlyList<string>>>? listProviderModels = null)
 {
     private readonly CoreHost _host = host;
     private readonly EventBus _bus = bus;
+    // 上一次发出的相位：只在真的变了才发（与 axis.changed 同一条约定）。
+    private readonly Dictionary<string, string> _lastPhase = new();
 
     // ⚠️ **包装一次 `resolveStepper`，让这个实例解析出的每一个推进器都接上「重试上报」。**
     //
@@ -65,6 +68,9 @@ public sealed class CommandDispatcher(
     /// </summary>
     private readonly INetworkTransport _networkTestTransport =
         networkTestTransport ?? new HttpNetworkTransport();
+
+    private readonly Func<ProviderDefinition, CancellationToken, Task<IReadOnlyList<string>>> _listProviderModels =
+        listProviderModels ?? ((provider, ct) => new ProviderModelCatalog().ListAsync(provider, ct));
 
     /// <summary>
     /// **「启动」那个推进出口**——§6.1 三条判据的第二次落点，也是**收尾之后接着走**
@@ -191,6 +197,9 @@ public sealed class CommandDispatcher(
 
                 case CoreCommand.ProviderTest t:
                     return await HandleProviderTestAsync(t, commandId, ct);
+
+                case CoreCommand.ProviderModels m:
+                    return await HandleProviderModelsAsync(m, commandId, ct);
 
                 // ---- 联网（2026-10-22）----
                 case CoreCommand.NetworkConfigure nc: return HandleNetworkConfigure(nc, commandId);
@@ -516,6 +525,32 @@ public sealed class CommandDispatcher(
                 ? "还没有预设。`preset set <id> <内容>` 建一个；不建的话会话用核心内置的那份。"
                 : string.Join(" / ", ids),
         });
+    }
+
+    private async Task<DispatchResult> HandleProviderModelsAsync(
+        CoreCommand.ProviderModels command, string id, CancellationToken ct)
+    {
+        if (!IsSafeProviderId(command.Id))
+            return Reject(id, UnsafeProviderIdReason(command.Id));
+        var provider = _host.Providers.Load(command.Id);
+        if (provider is null)
+            return Reject(id, $"没有提供商 '{command.Id}'。");
+        try
+        {
+            var models = await _listProviderModels(provider, ct);
+            return new DispatchResult(new Ack.Accepted
+            {
+                CommandId = id,
+                Note = models.Count == 0 ? "上游没有返回模型。" : $"已查询到 {models.Count} 个模型。",
+                Data = new { Models = models },
+            });
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            return new DispatchResult(new Ack.Accepted
+            { CommandId = id, Note = $"查询模型列表失败：{ex.Message}", Data = new { Models = Array.Empty<string>() } });
+        }
     }
 
     /// <summary>
@@ -1577,7 +1612,8 @@ public sealed class CommandDispatcher(
                 // ——这正是它**不另开一条路**的理由：另开一条会把这些一条条抄一遍，
                 // 而抄漏一条的表现是「答复之后那个会话看起来正常，而它推不动了」。
                 step = await ResolveStepperWithReports(handle).ResumeAsync(
-                    handle, pending.Calls, pending.Reply, stepCts.Token, pending.Paused);
+                    handle, pending.Calls, pending.Reply, stepCts.Token, pending.Paused,
+                    onPhase: phase => PublishPhase(handle, phase));
 
                 // ⚠️ 恢复步本身不发模型消息；它先落工具结果，随后由循环尾部安排模型消费结果。
                 reply = step.Reply;
@@ -1592,7 +1628,8 @@ public sealed class CommandDispatcher(
                 // ⇒ 收尾的 ① 那一支也认它（否则那条命令在**唯一需要它的时候**是空的）。
                 var blocks = handle.DrainQueue();
                 step = await ResolveStepperWithReports(handle).StepAsync(
-                    handle, blocks, stepCts.Token, explicitStart: explicitStart);
+                    handle, blocks, stepCts.Token, explicitStart: explicitStart,
+                    onPhase: phase => PublishPhase(handle, phase));
                 reply = step.Reply;
                 replyForLoop = step.Reply;
                 goalEnded = step.GoalEnded;
@@ -1623,6 +1660,9 @@ public sealed class CommandDispatcher(
                 // 而人那边本来就看得到（`approvals` 是全局流）。⚠️ `Permission` 类**不叫**
                 // ——让父批孩子的危险操作是剧场（`01` §10.3），那一路只上提到头。
                 EscalateAsk(handle, asked);
+
+                // 相位：挂起在一条询问上——「等你」不是「闲置」。
+                PublishPhase(handle, SessionPhase.Waiting);
             }
 
             // ⚠️ **工具结果也要告诉头**（2026-10-17，用户实测）：此前只有 `message.appended`
@@ -1691,7 +1731,10 @@ public sealed class CommandDispatcher(
         {
             // 中断不是失败：用户消息已落盘、Turn 不递增 ⇒ 发 `state` 回到 Idle，不发 `error`。
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                new WireEvent.StateChanged(handle.SessionId, SessionStatus.Idle, handle.State.Turn));
+                            new WireEvent.StateChanged(handle.SessionId, SessionStatus.Idle, handle.State.Turn));
+
+            // 中断 = 没有下一步了。
+            PublishPhase(handle, SessionPhase.Idle);
 
             if (throwOnFailure) throw new DispatchException("这一步被中断了。");
             return null;
@@ -1701,6 +1744,9 @@ public sealed class CommandDispatcher(
             // 真失败走事件，不走回执。
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                 new WireEvent.Error(handle.SessionId, ex.Message));
+
+            // 失败 = 没有下一步了。
+            PublishPhase(handle, SessionPhase.Idle);
 
             // 后台路必须吞掉异常：自 .NET 4.5 起未观测的任务异常默认被吞、不终结进程
             // （`TaskScheduler.UnobservedTaskException` 只记日志）——它只是到一个没人看的地方去了。
@@ -1861,6 +1907,8 @@ public sealed class CommandDispatcher(
             // **唯一**一处（下面那个 `return reply` 是「还没拿到标志 / 还要接着推」，
             // 而上面几条早退都是别的语义）。把回报挂在这里 = 一个跑 20 步的子只叫父一次
             // （`01` §10.2：「中间步骤是子自己的事」）。
+            // 循环真正停在这里（没工具调用、队列也空）——这才是「闲置」。
+            PublishPhase(handle, SessionPhase.Idle);
             ReportSettled(handle, reply);
             return reply;
         }
@@ -1883,6 +1931,15 @@ public sealed class CommandDispatcher(
     /// 拒答也走这一步（`Turn` 照样加一）；挂在「模型消息之后」会漏掉拒答，
     /// 头看着一次拒答像「什么都没发生」，而且永远等不到 `step.end`。
     /// </summary>
+    /// <summary>相位发布：判据在核心，头只显示。同值不重发。</summary>
+    private void PublishPhase(SessionHandle handle, string phase)
+    {
+        if (_lastPhase.TryGetValue(handle.SessionId, out var last) && last == phase) return;
+        _lastPhase[handle.SessionId] = phase;
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.PhaseChanged(handle.SessionId, phase, handle.State.Turn));
+    }
+
     private void PublishStepEnd(SessionHandle handle, ModelReply reply)
     {
         _bus.Publish(EventBus.SessionTopic(handle.SessionId),
