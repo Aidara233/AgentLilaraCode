@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ⚠️ **这个项目刻意不拿 InternalsVisibleTo**：它存在的唯一目的，就是从**外部宿主**的视角
+    证明「建会话 → 推进一步 → 读时间线」整条路只靠 public API 走得通。
+    一旦某个宿主门面需要 internal 才能用，这里会编译失败——那正是要抓的回归。
+    （`Lilara.Core.csproj` 只把 internals 开给 `Lilara.Core.Tests`。）
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>Lilara.Core.Contract.Tests</AssemblyName>
+    <RootNamespace>Lilara.Core.Contract.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Lilara.Core\Lilara.Core.csproj" />
+  </ItemGroup>
+
+</Project>

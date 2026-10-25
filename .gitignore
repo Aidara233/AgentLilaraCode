@@ -22,3 +22,8 @@ obj/
 # publish.ps1 的产物（单文件可执行 + 压缩包）。校验和 SHA256SUMS 单独跟踪。
 publish/*
 !publish/SHA256SUMS
+
+# `dotnet pack -o artifacts/packages` 的本地 feed（S1b）。⚠️ 这是**产物**不是源码：
+# 内核版本由 csproj 的 <Version> 固定，feed 里放的是 `Lilara.Core.<version>.nupkg`；
+# 上面的 `*.nupkg` 已经挡住包本身，这一条挡住目录里的其余残留。
+artifacts/
