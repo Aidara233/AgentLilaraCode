@@ -29,6 +29,16 @@ public abstract record CoreCommand
         /// 都写一个它并不关心的 `null`，而那种「为了编译而写的参数」正是最容易写错的地方。</para>
         /// </summary>
         public IReadOnlyList<string>? Models { get; init; }
+
+        /// <summary>
+        /// **一次模型调用的超时**（秒）。`null` = 本次没提到 = 保留旧值（同 <see cref="Models"/> 的语义）。
+        ///
+        /// <para>⚠️ 它是**按提供商**的配置，不是全局的：上游速度差得多，而一个全局数字要么把快的
+        /// 那边拖成「挂死」，要么把慢的那边砍成「超时」。界限在
+        /// <see cref="Lilara.Core.Kernel.ProviderLimits"/>，越界在这里被拒（不是静默夹紧——
+        /// 配置写错了要让人看见）。</para>
+        /// </summary>
+        public int? TimeoutSeconds { get; init; }
     }
 
     /// <summary>

@@ -28,7 +28,8 @@ public class ArchitectureTests
         // 20 → 21（2026-10-17 回收窗口批）：加了 `ReclaimEvent.cs`（窗口记录：回收只在窗口里发生）。
         // 21 → 22（2026-10-22 联网批）：加了 `Network.cs`（联网配置 / 能力 / 传输契约）。
         // 22 → 23（2026-10-23 shell 批）：加了 `Shell.cs`（shell 的设备级配置 / 访问快照）。
-        Assert.Equal(23, files.Length);
+        // 23 → 24（2026-10-24 子 agent 批）：加了 `Subagent.cs`（派生关系的词汇层）。
+        Assert.Equal(24, files.Length);
 
         var offenders = files
             .SelectMany(f => ExternalUsings(f).Select(u => $"{Path.GetFileName(f)}:{u.Line}  {u.Text}"))

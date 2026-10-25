@@ -220,7 +220,7 @@ public sealed class ControlServer(
 
                     if (activated.TryGetValue(sid, out var live))
                     {
-                        rows.Add(Row(sid, pk, active: true, live.State, spec.Title));
+                        rows.Add(Row(sid, pk, active: true, live.State, spec.Title, spec.ParentSessionId));
                         continue;
                     }
 
@@ -234,13 +234,15 @@ public sealed class ControlServer(
                         // 跳过。
                     }
 
-                    if (disk is not null) rows.Add(Row(sid, pk, active: false, disk, spec.Title));
+                    if (disk is not null) rows.Add(Row(sid, pk, active: false, disk, spec.Title, spec.ParentSessionId));
                 }
             }
 
             return Results.Json(rows, WireJson.Options);
 
-            static object Row(string sid, string pk, bool active, SessionState state, string? title) => new
+            static object Row(
+                string sid, string pk, bool active, SessionState state, string? title,
+                string? parentSessionId) => new
             {
                 SessionId = sid,
                 ProjectKey = pk,
@@ -250,6 +252,11 @@ public sealed class ControlServer(
                 state.Status,
                 state.Turn,
                 Title = title,
+                // ⚠️ **派生关系**（2026-10-24）：头靠它把子会话挂在父下面。
+                // `null` = 顶层。⚠️ 这里交的是 spec 里的**出生事实**，不是「父还在不在」——
+                // 父被删掉之后这个 id 仍然指着它（`01` §10.3「父停：子停止推进，记录保留」），
+                // 而头的处理是「挂不上就按顶层画」，不是「当作没这回事」。
+                ParentSessionId = parentSessionId ?? "",
                 // ⚠️ **待办的那次询问**：头据此在列表上标出「哪个会话在等我」，
                 // 不必再去逐个 `GET /approvals`。
                 //
@@ -578,6 +585,8 @@ public sealed class ControlServer(
                 p.Endpoint, p.AuthScheme, p.Modality,
                 // 模型清单：会话视图把模型画成下拉，选项就从这里来。null = 没声明（头退回文本框）。
                 p.Models,
+                // 一次模型调用的超时（秒）。null = 没配（由协议自己的默认值管）。
+                p.TimeoutSeconds,
                 // key 只回 HasApiKey（能改不能看）：表单能显示「已配置」而不是空框。
                 HasApiKey = p.HasApiKey,
             }), WireJson.Options));
@@ -700,7 +709,13 @@ public sealed class ControlServer(
             handle.Spec.PremierPrompt,
             values, contribution,
             // 与 `Stepper.StepAsync` 同一来源：头看到的浮动槽也要带目标线。
-            Session.GoalMode.IsActive(handle.State) ? CorePrompts.GoalDirective : null);
+            Session.GoalMode.IsActive(handle.State) ? CorePrompts.GoalDirective : null,
+            // 压缩指令同理：不给它的话，用户下发指令后头里那块浮动槽会「忽然没有压缩请求」
+            // ——而指令明明还在（`Stepper.FloatingTextAt` 那条注释的同一个理由）。
+            handle.State.PendingCompact ? CorePrompts.CompactDirective : null,
+            // 子会话那一行同理（2026-10-24）：头看到的浮动槽与模型收到的必须是同一份
+            // ——否则「头显示我有两个孩子」而模型眼里一个都没有，两边都以为自己对。
+            SubagentView.Line(SubagentScopeOf(handle)));
 
         return new
         {
@@ -713,6 +728,38 @@ public sealed class ControlServer(
             // 早就按 `floating` 读了，改名会让那一格**静默变空**。
             Floating = slots.Tail,
         };
+    }
+
+    /// <summary>
+    /// **这一刻的派生关系快照**（给浮动槽里那一行用，2026-10-24）。
+    ///
+    /// <para>⚠️ 与 `Stepper.SubagentScopeFor` **同一件事、同一处来源**（`SessionStore.ChildrenOf`
+    /// + 每个孩子的 `state.json`）：头看到的与模型收到的必须是同一份，否则两边都以为自己对。
+    /// ⚠️ 它**不** Activate 任何会话（与 `/sessions` 那条同一条纪律）——一个只读端点不该
+    /// 产生副作用，而 `ReadState` 是纯读。</para>
+    /// </summary>
+    private Kernel.SubagentScope SubagentScopeOf(SessionHandle handle)
+    {
+        var children = new List<Kernel.SubagentChild>();
+
+        foreach (var (projectKey, spec) in host.Store.ChildrenOf(handle.SessionId))
+        {
+            // ⚠️ 读不出来就跳过（坏文件不该让整个 /state 500），代价是那个 id 从快照里消失
+            // ——**可见**，不是静默（同 `/sessions` 那条）。
+            try { children.Add(new Kernel.SubagentChild(spec.SessionId, host.Store.ReadState(projectKey, spec.SessionId).Status)); }
+            catch (Exception ex) when (ex is IOException or FileNotFoundException
+                                          or UnauthorizedAccessException or Storage.FileFormatException)
+            {
+                continue;
+            }
+        }
+
+        return new Kernel.SubagentScope(
+            handle.SessionId,
+            handle.Spec.ParentSessionId,
+            handle.Spec.Depth ?? 0,
+            handle.Spec.MaxDepth ?? Kernel.Subagent.DefaultMaxDepth,
+            children);
     }
 
     /// <summary>
@@ -1110,6 +1157,9 @@ public sealed class ControlServer(
                 // 模型清单是**数组**，Opt 只认字符串 ⇒ 单独一个助手。
                 // 键缺失 / 不是数组 / 数组里有非字符串 ⇒ null（= 保留旧清单），与兄弟字段同一条语义。
                 Models = OptStringList(payload, "models"),
+                // 同 network.configure：数字走 OptNumber → ToInt（`Opt` 只收字符串）。
+                // 键缺失 ⇒ null = 保留旧值；区间判据在 dispatcher（两个前端共用同一道闸）。
+                TimeoutSeconds = ToInt(OptNumber(payload, "timeoutSeconds")),
             },
             // 同 provider.upsert / claim.release：线上解析是第三条线。
             "provider.delete" => new CoreCommand.ProviderDelete(

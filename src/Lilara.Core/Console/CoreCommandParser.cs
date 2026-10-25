@@ -583,7 +583,8 @@ public static class CoreCommandParser
         return i;
     }
 
-    // `provider set <id> [--key <k>] [--model <m>] [--protocol <p>] [--endpoint <u>] [--auth <a>] [--models a,b,c]`
+    // `provider set <id> [--key <k>] [--model <m>] [--protocol <p>] [--endpoint <u>] [--auth <a>]
+    //                     [--models a,b,c] [--timeout <秒>]`
     // 这里只管拆词：省略 --key ⇒ null，语义是「保留旧 key」；
     // 「新 provider 省 key 要拒」的守卫在 dispatcher，不在这里。
     private static (CoreCommand?, string?) ParseProviderSet(string line)
@@ -593,6 +594,7 @@ public static class CoreCommandParser
 
         string? key = null, model = null, protocol = null, endpoint = null, auth = null;
         IReadOnlyList<string>? models = null;
+        int? timeout = null;
 
         // 从 3 起每次跳两格（标志与值成对；parts[1] == "set"）。
         // 守卫是「值长得像标志位」而非「位置上像」：--key --model m 里 key 缺值必须报错，
@@ -622,13 +624,26 @@ public static class CoreCommandParser
                     models = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
                     break;
 
+                // 一次模型调用的超时（秒）。与 `--ask-timeout` 同一条分工：**数字在这一层解析**
+                // （「不是数字」是文本错误，控制台说得出人话），而区间判据在 dispatcher——
+                // 线上那一头也必须被同一道闸挡住。
+                case "--timeout":
+                    if (!int.TryParse(value, out var seconds))
+                        return (null, $"`--timeout` 要一个整数（秒，给的是 '{value}'）。");
+                    timeout = seconds;
+                    break;
+
                 // 未知标志必须拒绝：拼错的 --protcol 会被静默吞掉、照常保存并回 ✓，协议悄悄落成默认。
                 default: return (null, $"未知参数 '{parts[i]}'。");
             }
         }
 
         // 这里不要求 --key：「新 provider 省 key 要拒」的语义在 dispatcher，别在这里再写一遍。
-        return (new CoreCommand.ProviderUpsert(id, key, model, protocol, endpoint, auth) { Models = models }, null);
+        return (new CoreCommand.ProviderUpsert(id, key, model, protocol, endpoint, auth)
+        {
+            Models = models,
+            TimeoutSeconds = timeout,
+        }, null);
     }
 
     // `network set [--enabled on|off] [--key <k> | --clear-key] [--endpoint <u>]

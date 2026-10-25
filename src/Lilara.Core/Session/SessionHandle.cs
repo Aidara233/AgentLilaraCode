@@ -202,7 +202,8 @@ public sealed record SessionHandle
     public static SessionHandle Create(
         SessionStore store, string workingDirectory, ModelSelection model, string? title = null,
         string? systemPromptPreset = null, string? sessionId = null, TimeSpan? askTimeout = null,
-        PluginHost? plugins = null)
+        PluginHost? plugins = null, SessionSpec? parent = null,
+        IReadOnlyDictionary<string, string>? axes = null)
     {
         // ⚠️ **一次取绝对路径，三处共用同一个值**：算 key、写 spec、定目录。
         // 改之前是**两次独立的** `GetFullPath`（`ProjectKey.FromPath` 内部一次、
@@ -232,6 +233,15 @@ public sealed record SessionHandle
             // 这里**不再判一次**——两处判据就是漂的温床（`01` §8.0.2 那条老毛病）。
             AskTimeout = askTimeout,
             Plugins = bindings is { Count: > 0 } ? bindings : null,
+            // ⚠️ **派生关系是出生事实**（`01` §10.4）：它有父才有值，此后没有任何命令能改。
+            // ⚠️ **项目归属不跟着父走** —— 子会话的 `ProjectKey` 由它自己的 cwd 算出来
+            // （默认与父同一个目录，所以恰好相同；调用方给别处的 cwd 就不同）。
+            // 「归属」与「派生」正交，别在这里替调用方决定。
+            ParentSessionId = parent?.SessionId,
+            Depth = parent is null ? 0 : (parent.Depth ?? 0) + 1,
+            // ⚠️ **上限沿树继承**：`parent.MaxDepth ?? DefaultMaxDepth` —— 顶层会话用它播种，
+            // 子会话原样继承。⇒ 改常量不影响已经在跑的树（理由见 `MaxDepth` 的注释）。
+            MaxDepth = parent is null ? Subagent.DefaultMaxDepth : parent.MaxDepth ?? Subagent.DefaultMaxDepth,
         };
         var state = new SessionState
         {
@@ -251,7 +261,7 @@ public sealed record SessionHandle
             // 住**同一份** <see cref="SessionState"/>，多留一份副本就是多一个能分叉的地方。
             // 顺带的好处：下面那次 `WriteState` 把默认值一并落了盘——磁盘上「没设过」
             // 与「设成了默认值」从此可分辨，将来改默认值不会让老会话**静默改变行为**。
-            Axes = CompleteAxes(stored: null, spec.Model.Effort),
+            Axes = CompleteAxes(stored: axes, spec.Model.Effort),
             PluginAxes = CompletePluginAxes(spec.Plugins, null),
         };
 

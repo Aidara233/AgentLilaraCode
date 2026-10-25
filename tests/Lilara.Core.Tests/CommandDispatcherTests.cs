@@ -17,18 +17,55 @@ public class CommandDispatcherTests : IDisposable
         Path.Combine(Path.GetTempPath(), "lilara-disp-" + Guid.NewGuid().ToString("N"));
     private readonly string _work =
         Path.Combine(Path.GetTempPath(), "lilara-dispwork-" + Guid.NewGuid().ToString("N"));
+    private CoreHost? _host;
 
     private readonly FakeAdapter _adapter = new();
 
     public void Dispose()
     {
-        if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
-        if (Directory.Exists(_work)) Directory.Delete(_work, recursive: true);
+        // ⚠️ **删临时根之前，先停掉所有仍在后台跑的会话**（2026-10-24 实测）：
+        // `spawn` 之后子会话由 `Start` 走 `Task.Run` 在后台推进，测试方法返回时它可能
+        // **还在写 `spec.json` / `history.jsonl` / `floating.jsonl`**。Windows 上一个
+        // `FileShare.Read` 句柄就足以让整棵 `Directory.Delete` 抛 `IOException`，
+        // 而那会把一条无关的回归测试打红（全量并发实测复现）。⇒ 先对所有激活会话
+        // 做 `StopSubtree` 同形的取消 + epoch，再退避删（与 `SessionStore.DeleteSession`）。
+        if (_host is { } host)
+        {
+            foreach (var handle in host.Activated)
+            {
+                handle.NoteInterrupt();
+                try { host.CtsFor(handle.SessionId)?.Cancel(); }
+                catch (ObjectDisposedException) { /* 步已结束；句柄已摘。 */ }
+            }
+        }
+
+        Remove(_root);
+        Remove(_work);
+
+        static void Remove(string path)
+        {
+            for (var attempt = 0; ; attempt++)
+            {
+                if (!Directory.Exists(path)) return;
+
+                try
+                {
+                    Directory.Delete(path, recursive: true);
+                    return;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                              && attempt < 20)
+                {
+                    Thread.Sleep(10 * (attempt + 1));
+                }
+            }
+        }
     }
 
     private (CoreHost Host, CommandDispatcher Dispatcher) NewHarness()
     {
         var host = new CoreHost(_root, _work);
+        _host = host;
         return (host, new CommandDispatcher(
             host, new EventBus(), _ => new Stepper(host.Store, _adapter), _ => _adapter));
     }
@@ -738,6 +775,64 @@ public class CommandDispatcherTests : IDisposable
 
         Assert.IsType<Ack.Rejected>(r.Ack);
         Assert.Contains("没有提供商", ((Ack.Rejected)r.Ack).Reason);
+    }
+
+    // ---- provider.upsert：一次模型调用的超时（按提供商） ----
+
+    // 超时必须真的落盘：只改内存的话，重启后悄悄回到默认，而用户以为「我调长过了」。
+    [Fact]
+    public async Task ProviderUpsert_WithTimeout_PersistsIt()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.ProviderUpsert("p", null, null, null, null, null) { TimeoutSeconds = 600 },
+            "t", true, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        Assert.Equal(600, host.Providers.Load("p")!.TimeoutSeconds);
+    }
+
+    // 省略 ⇒ 保留旧值（`null` 在这条命令里是「本次没提到」，不是「清回默认」）——
+    // 与 key / endpoint / models 同一条语义。只改 key 一次就把超时抹掉会很意外。
+    [Fact]
+    public async Task ProviderUpsert_WithoutTimeout_KeepsTheExistingOne()
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+        await d.DispatchAsync(
+            new CoreCommand.ProviderUpsert("p", null, null, null, "http://x.invalid", null) { TimeoutSeconds = 300 },
+            "t1", true, CancellationToken.None);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.ProviderUpsert("p", "k2", null, null, null, null), "t2", true, CancellationToken.None);
+
+        Assert.IsType<Ack.Accepted>(r.Ack);
+        var loaded = host.Providers.Load("p")!;
+        Assert.Equal(300, loaded.TimeoutSeconds);
+        Assert.Equal("k2", loaded.ApiKey);   // 同一次里改的那一格照常生效
+    }
+
+    // 越界 ⇒ 拒绝，**不夹紧**：夹紧会把「我设了 0 秒」静默变成「1 秒」，
+    // 而配置写错了没有人会知道。拒绝之后盘上不许留下半成品。
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    [InlineData(1801)]
+    [InlineData(99999)]
+    public async Task ProviderUpsert_WithATimeoutOutOfRange_IsRejected(int seconds)
+    {
+        var (host, d) = NewHarness();
+        SaveProvider(host);
+
+        var r = await d.DispatchAsync(
+            new CoreCommand.ProviderUpsert("p", null, null, null, "http://x.invalid", null) { TimeoutSeconds = seconds },
+            "t", true, CancellationToken.None);
+
+        Assert.IsType<Ack.Rejected>(r.Ack);
+        // 被拒 ⇒ 别的字段也不许落盘（拒绝要挡在 Save 之前）。
+        Assert.Null(host.Providers.Load("p")!.Endpoint);
     }
 
     // 同一个闸：坏 id 在任何网络动作之前就被挡下（它本可以是 providers/ 之外的路径）。

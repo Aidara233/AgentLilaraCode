@@ -98,6 +98,23 @@ public class HeadAssetsTests
             .Select(a => (string)a.TypeDiscriminator!)
             .ToHashSet(StringComparer.Ordinal);
 
+    [Fact]
+    public void SubagentSessionListUsesParentAndIndentFields()
+    {
+        var js = Read("app.js");
+
+        // ⚠️ **核心 `/sessions` 行加了 `parentSessionId`，头也必须真的读取它**：
+        // 一个只出现在注释里的字段不算接线——漏掉映射的结果就是「API 说它是孩子，
+        // UI 仍然把它画成顶层」，且没有任何 C# 测试会红。
+        Assert.Contains("parentSessionId: r.parentSessionId", js, StringComparison.Ordinal);
+
+        // 结构的两半都必须在：按 parentSessionId 分组、在左栏缩进。只钉一个名字的话，
+        // 另一半漏掉会让「有关系，但画不出来」静默发生。
+        Assert.Contains("const pid = (sessions.get(id) || {}).parentSessionId", js, StringComparison.Ordinal);
+        Assert.Contains("row.style.paddingLeft", js, StringComparison.Ordinal);
+        Assert.Contains("for (const id of ordered)", js, StringComparison.Ordinal);
+    }
+
     /// <summary>
     /// ⚠️ **`app.js` 里用 `$("…")` 抓的每一个 id，`index.html` 里都得有**——
     /// 否则那行（或那段函数）在运行时**静默什么都不做**。

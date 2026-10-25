@@ -26,7 +26,7 @@ namespace Lilara.Core.Session.Tools;
 public sealed class SessionToolContext(
     string workingDirectory, BlobStore blobs, IReadOnlyList<TimelineEvent>? timeline = null,
     string? floatingContext = null, NetworkAccess? network = null, bool goalActive = false,
-    bool compactRequested = false, ShellAccess? shell = null)
+    bool compactRequested = false, ShellAccess? shell = null, SubagentScope? subagents = null)
     : IToolContext
 {
     private readonly string _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workingDirectory));
@@ -139,6 +139,9 @@ public sealed class SessionToolContext(
 
     /// <summary>见 <see cref="IToolContext.Shell"/>：步开始时冻住的那份 `shell.json` 快照。</summary>
     public ShellAccess? Shell { get; } = shell;
+
+    /// <summary>见 <see cref="IToolContext.Subagents"/>：步开始时算好的派生关系快照。</summary>
+    public SubagentScope? Subagents { get; } = subagents;
 
     /// <summary>见 <see cref="IToolContext.GoalActive"/>：步开始时的主动性轴快照。</summary>
     public bool GoalActive { get; } = goalActive;

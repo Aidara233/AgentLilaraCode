@@ -13,10 +13,21 @@ public sealed class OpenAiHttp
     /// <summary>OpenAI 兼容协议的官方兜底地址。绝不能兜底到 Anthropic 的地址——那是两个不同的 API。</summary>
     public const string OfficialUrl = "https://api.openai.com";
 
-    /// <summary>全类共用一个：核心是常驻进程，每会话新建会泄漏 socket。本类不写 DefaultRequestHeaders，共用安全。</summary>
-    private static readonly HttpClient Client = new();
+    /// <summary>
+    /// 全类共用一个：核心是常驻进程，每会话新建会泄漏 socket。本类不写 DefaultRequestHeaders，共用安全。
+    /// ⚠️ <b>它自己的 `Timeout` 必须显式关掉</b>（`InfiniteTimeSpan`）：共用客户端的超时是一个
+    /// 「谁也没配过、却对每个提供商都生效」的上限——用户按提供商调 `timeoutSeconds` 时，
+    /// 它会在 100 秒处先到，而那一句「超时」看起来像是上游的问题。超时改成**每次请求自己的 CTS**管。
+    /// </summary>
+    private static readonly HttpClient Client = new() { Timeout = Timeout.InfiniteTimeSpan };
 
     private readonly string _key;
+
+    /// <summary>
+    /// 这一次请求最多等多久（来自 provider 的 `timeoutSeconds`；没配 ⇒
+    /// <see cref="ProviderLimits.DefaultTimeoutSeconds"/>，也就是这条链路一直以来的 100 秒）。
+    /// </summary>
+    private readonly TimeSpan _timeout;
 
     public string AuthScheme { get; }
     public ResolvedEndpoint Endpoint { get; }
@@ -42,6 +53,11 @@ public sealed class OpenAiHttp
         // 参数必须按名传：getEnv 是第 2 个形参。
         Endpoint = EndpointResolver.Resolve(provider.Endpoint, officialUrl: OfficialUrl, envVar: null);
         _key = provider.ApiKey;
+
+        // 没配 ⇒ 沿用这条链路一直以来的 100 秒（见 ProviderLimits 的注释：那是 .NET 的隐式默认，
+        // 现在被显式写出来）；配了就按配置来，手改 provider 文件写进的越界值在这里收进合法区间。
+        _timeout = TimeSpan.FromSeconds(
+            provider.EffectiveTimeoutSeconds ?? ProviderLimits.DefaultTimeoutSeconds);
     }
 
     public async Task<string> PostAsync(
@@ -59,12 +75,17 @@ public sealed class OpenAiHttp
         using var oneOff = transport is null ? null : new HttpClient(transport, disposeHandler: false);
         var client = oneOff ?? Client;
 
+        // ⚠️ 超时是**这一次请求**的（provider 的 `timeoutSeconds`），所以走链接令牌而不是
+        // 客户端的 `Timeout`——后者是共用的，一旦设过就变成对所有提供商生效的一个隐式上限。
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(_timeout);
+
         try
         {
             LastStatus = null;
-            using var response = await client.SendAsync(request, ct);
+            using var response = await client.SendAsync(request, deadline.Token);
             LastStatus = response.StatusCode;
-            var text = await response.Content.ReadAsStringAsync(ct);
+            var text = await response.Content.ReadAsStringAsync(deadline.Token);
 
             if (!response.IsSuccessStatusCode)
                 throw new ModelCallFailedException(Describe(response.StatusCode, text))
@@ -84,8 +105,17 @@ public sealed class OpenAiHttp
         {
             // ⚠️ **这里的一切都是瞬态**：没拿到响应（连不上 / DNS / 超时），或者拿到了一个读不动的响应。
             // 调用方自己的取消已经在 `ShouldWrap` 那一关被放行了，所以走到这里的一定是「这一次没成」。
-            throw new ModelCallFailedException($"模型调用失败：{ex.Message}", ex) { Transient = true };
+            throw new ModelCallFailedException(Why(ex), ex) { Transient = true };
         }
+
+        // 超时与「真失败」分开说：前者原话里只有一句 `The request was canceled due to the
+        // configured HttpClient.Timeout…`（而我们恰恰**没有**配那个 Timeout），
+        // 照着它去查只会查错方向。判据是两把令牌谁被取消了。
+        string Why(Exception ex) =>
+            deadline.IsCancellationRequested && !ct.IsCancellationRequested
+                ? $"模型调用超时（{_timeout.TotalSeconds:0} 秒）。"
+                  + "慢模型可以给该提供商调大 timeoutSeconds（`provider set <id> --timeout <秒>`）。"
+                : $"模型调用失败：{ex.Message}";
     }
 
     // 转发到 Cancellation.ShouldWrap——判据只有一份，别在这里加逻辑。

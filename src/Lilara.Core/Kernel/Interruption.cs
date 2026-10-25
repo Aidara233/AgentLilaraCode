@@ -118,7 +118,7 @@ public static class Interruption
         // 同名 `callId`（它在一次会话里会**重复出现**）会变成假证据。
         for (var j = from - 1; j >= 0; j--)
         {
-            if (timeline[j] is TimelineEvent.ReleaseEvent) continue;
+            if (IgnoresPairing(timeline[j])) continue;
             if (timeline[j] is not TimelineEvent.ToolResultEvent earlier) break;
 
             // ⚠️ **这里没有「补丁不算配对」那一半**（2026-10-12 删掉的）——它当时配的是
@@ -145,7 +145,7 @@ public static class Interruption
         // ⇒ 它落在 `tool_use` 与它的结果**中间**是**正常**的（`release` 就是与别的调用同批发生的）。
         for (var i = from + 1; i < timeline.Count; i++)
         {
-            if (timeline[i] is TimelineEvent.ReleaseEvent) continue;
+            if (IgnoresPairing(timeline[i])) continue;
 
             if (timeline[i] is TimelineEvent.ToolResultEvent r
                 && string.Equals(r.CallId, callId, StringComparison.Ordinal))
@@ -158,4 +158,27 @@ public static class Interruption
         // 走到记录末尾 ⇒ **末尾那一条永远是断裂**（那正是「重启之后接着跑」要用的钩子）。
         return true;
     }
+
+    /// <summary>
+    /// **这条记录参与配对判定吗？** ——`false` = 它夹在调用与结果之间也**不算「另一个回合」**。
+    ///
+    /// <para>⚠️ <b>它原来是一个内联的 `is ReleaseEvent`，在下面两处各写了一遍</b>
+    /// （往前扫一处、往后扫一处）。2026-10-24 加第二类被忽略的记录（`subagent-` 前缀的
+    /// 合成对）时，若继续内联就会变成**四处各判一遍**——而漂了的后果是静默的：
+    /// 一类记录被一处忽略、被另一处当成回合，于是同一条调用在两处得到两个结论。</para>
+    ///
+    /// <para>⚠️ <b>两类被忽略的记录，理由各不同但结论同一个</b>：</para>
+    /// <list type="bullet">
+    ///   <item><b><see cref="TimelineEvent.ReleaseEvent"/></b>：它是**给我们自己**看的锚
+    ///   （`TimelineRender` 把它挡在模型之外），模型的语言里根本没有它 ⇒ 它落在
+    ///   `tool_use` 与它的结果中间是**正常**的（`release` 就是与别的调用同批发生的）。</item>
+    ///   <item><b><see cref="Subagent.InjectedIdPrefix"/> 前缀的那些</b>：它们是核心在
+    ///   **别的时机**（子会话回报、子会话提问）追加进来的合成对，与这一步的工具调用
+    ///   **毫无关系**。⚠️ 不跳过的话：父正挂着一次询问时收到子的回报，那条挂着的调用
+    ///   会被判成**断裂**，于是 `Recovery.BeforeStep` 补一条「上一次这一步被打断了」
+    ///   ——而用户只是在想怎么回答。</item>
+    /// </list>
+    /// </summary>
+    private static bool IgnoresPairing(TimelineEvent evt) =>
+        evt is TimelineEvent.ReleaseEvent || Subagent.IsInjected(evt);
 }

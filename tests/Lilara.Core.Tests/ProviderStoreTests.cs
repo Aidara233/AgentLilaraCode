@@ -43,6 +43,27 @@ public class ProviderStoreTests : IDisposable
         Assert.Equal("https://gateway.example.com/anthropic", _store.Load("claude")!.Endpoint);
     }
 
+    // 一次模型调用的超时是按提供商的配置，必须落盘再读回（重试靠它，重启后要还在）。
+    [Fact]
+    public void RoundTrip_PreservesTimeout()
+    {
+        _store.Save(Def() with { TimeoutSeconds = 600 });
+
+        Assert.Equal(600, _store.Load("claude")!.TimeoutSeconds);
+    }
+
+    // 老 providers/*.json 没有 timeoutSeconds ⇒ 读回来是 null（= 没配 = 用协议默认），
+    // 不是 0（0 会被当成「立刻超时」的一次真实配置）。
+    [Fact]
+    public void Timeout_IsOptional_OldFilesStillLoad()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "providers"));
+        File.WriteAllText(Path.Combine(_root, "providers", "old.json"),
+            """{"id":"old","protocol":"claude-messages","apiKey":"k","defaultModel":"m","modality":"vision"}""");
+
+        Assert.Null(_store.Load("old")!.TimeoutSeconds);
+    }
+
     // 加法式改动：既有 providers/*.json 没有 endpoint 字段，必须照旧反序列化（Endpoint 为 null）。
     [Fact]
     public void Load_ToleratesFileWithoutEndpointField()
@@ -201,16 +222,17 @@ public class ProviderStoreTests : IDisposable
                 .ToArray();
 
         Assert.Equal(
-            ["ApiKey:String", "AuthScheme:String", "DefaultModel:String", "Endpoint:String",
+            ["ApiKey:String", "AuthScheme:String", "DefaultModel:String", "EffectiveTimeoutSeconds:Nullable`1",
+             "Endpoint:String",
              "HasApiKey:Boolean", "Id:String", "Modality:String", "Models:IReadOnlyList`1",
-             "Protocol:String", "Version:Int32"],
+             "Protocol:String", "TimeoutSeconds:Nullable`1", "Version:Int32"],
             DeclaredShape(typeof(ProviderDefinition)));
 
-        // HasApiKey 刻意不在这条里——它带 [JsonIgnore]。
+        // HasApiKey / EffectiveTimeoutSeconds 刻意不在这条里——它们带 [JsonIgnore]。
         Assert.Equal(
             ["ApiKey:String", "AuthScheme:String", "DefaultModel:String", "Endpoint:String",
              "Id:String", "Modality:String", "Models:IReadOnlyList`1",
-             "Protocol:String", "Version:Int32"],
+             "Protocol:String", "TimeoutSeconds:Nullable`1", "Version:Int32"],
             PersistedShape(typeof(ProviderDefinition)));
     }
 }

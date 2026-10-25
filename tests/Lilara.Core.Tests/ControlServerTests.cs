@@ -54,8 +54,33 @@ public class ControlServerTests : IAsyncLifetime
     {
         await _app.StopAsync(CancellationToken.None);
         await _app.DisposeAsync();
-        if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
-        if (Directory.Exists(_work)) Directory.Delete(_work, recursive: true);
+        Remove(_root);
+        Remove(_work);
+
+        // ⚠️ **删不掉要重试，别让它把一条无关的用例打红**（2026-10-24 实测）：
+        // `session.send` 的后台步是 `Task.Run` 起的，它可能**还在写** `history.jsonl`
+        // 或 `state.json`，而 Windows 上一旦有别的句柄开着（哪怕只是 `FileShare.Read`），
+        // `Directory.Delete` 就抛 `IOException`。⇒ 与 `SessionStore.DeleteSession`
+        // 同一条处置（三次退避），而不是在这里发明第二套。
+        // ⚠️ **这不是把失败藏起来**：真的删不掉时它照样抛（最后一次不等了）。
+        static void Remove(string dir)
+        {
+            for (var attempt = 0; ; attempt++)
+            {
+                if (!Directory.Exists(dir)) return;
+
+                try
+                {
+                    Directory.Delete(dir, recursive: true);
+                    return;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                              && attempt < 20)
+                {
+                    Thread.Sleep(10 * (attempt + 1));
+                }
+            }
+        }
     }
 
     private string Http(string path) => $"http://127.0.0.1:{_port}{path}";
@@ -1128,7 +1153,7 @@ public class ControlServerTests : IAsyncLifetime
         // 这条不是我推出来的，是这条守卫头一次跑就抓出来的（我原先按七个字段写）。
         // ⇒ 头的判据必须是 `r.title` 而不是「`title` 一定在」。
         Assert.Equal(
-            ["active", "ask", "goal", "projectKey", "sessionId", "status", "turn"],
+            ["active", "ask", "goal", "parentSessionId", "projectKey", "sessionId", "status", "turn"],
             row.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray());
     }
 
@@ -1386,7 +1411,11 @@ public class ControlServerTests : IAsyncLifetime
 
         Assert.Equal(
             ["ArchivedAt:Nullable`1", "AskTimeout:Nullable`1", "CreatedAt:DateTimeOffset",
-             "Model:ModelSelection", "Plugins:IReadOnlyList`1", "PremierPrompt:String", "ProjectKey:String", "SessionId:String",
+             // 2026-10-24（子 agent 批）：派生关系那三格。⚠️ 它们**不是凭据**，
+             // 但这条守卫钉的是「属性集」，所以加字段就得在这里表态一次——那正是它存在的意义。
+             "Depth:Nullable`1", "MaxDepth:Nullable`1",
+             "Model:ModelSelection", "ParentSessionId:String",
+             "Plugins:IReadOnlyList`1", "PremierPrompt:String", "ProjectKey:String", "SessionId:String",
              "SystemPromptPreset:String", "Title:String",
              "Version:Int32", "WorkingDirectory:String"],
             Shape(typeof(SessionSpec)));

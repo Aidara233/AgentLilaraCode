@@ -346,6 +346,12 @@ public sealed class CommandDispatcher(
             && p.Auth != AuthSchemes.ApiKey && p.Auth != AuthSchemes.Bearer)
             return Reject(id, $"未知认证方式 '{p.Auth}'。支持：{AuthSchemes.ApiKey} / {AuthSchemes.Bearer}");
 
+        // 超时的区间在这里判，不夹紧：配置写错了要让人看见（夹紧会让「我设了 5 秒」变成
+        // 「它按 1 秒在跑」而没人知道）。手改 providers/*.json 写进的越界值由调用方收进区间。
+        if (p.TimeoutSeconds is { } seconds
+            && (seconds < ProviderLimits.MinTimeoutSeconds || seconds > ProviderLimits.MaxTimeoutSeconds))
+            return Reject(id, $"`--timeout` 要在 {ProviderLimits.MinTimeoutSeconds}..{ProviderLimits.MaxTimeoutSeconds} 秒之间（给的是 {seconds}）。");
+
         // 先读旧定义，保留本次没提到的字段（Endpoint / Modality / DefaultModel / Protocol 都是操作者配置）。
         var existing = _host.Providers.Load(p.Id);
 
@@ -374,6 +380,8 @@ public sealed class CommandDispatcher(
             AuthScheme = string.IsNullOrEmpty(p.Auth) ? existing?.AuthScheme : p.Auth,
             // 加法式清单：没提到就保留旧的那份（与其余字段同一条「省略 = 保留」）。
             Models = p.Models ?? existing?.Models,
+            // 同上：没提到就保留旧的（`null` 在这里是「本次没提到」，不是「清回默认」）。
+            TimeoutSeconds = p.TimeoutSeconds ?? existing?.TimeoutSeconds,
         });
 
         // 失效点必须在这里，不能挂在控制台的字符串判据 `IsProviderSetCommand` 上——
@@ -934,6 +942,364 @@ public sealed class CommandDispatcher(
         return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = a.SessionId });
     }
 
+    // ---- 子 agent 的落地（`01` §10，2026-10-24）----
+    //
+    // ⚠️ **这一族为什么住在 `CommandDispatcher` 而不是 `Stepper`**：建会话要 `PluginHost`
+    // （绑定插件）、要事件总线（`session.created`）、要 `Start`（推进一步）——三样都在这层。
+    // `Stepper` 只交出「要建什么 / 要说给谁」（`StepOutcome.Spawns` / `.Tells`），
+    // 与 `release` 的线、`finish_goal` 的轴同一分工。
+    //
+    // ⚠️ **本族的每一处都跑在「一步已经落盘之后」**：所以它们做的事**只追加**，
+    // 不改那一步的任何字节。崩在中间最坏是「子会话建了、但没收到任务」——可见（头的列表里多一条空的）。
+
+    /// <summary>
+    /// **兑现本步的派生与注入**。调用点在 `RunStepAsync` 的工具结果事件之后、`step.end` 之前。
+    ///
+    /// <para>⚠️ 次序：先派生、后注入。父在同一步里既 spawn 又 tell 时，那个 tell 的收件人
+    /// 必须是**已经存在**的孩子——反过来（先注入）会「转达给一个还没建的会话」。</para>
+    /// </summary>
+    private void DeliverSubagents(SessionHandle handle, Stepper.StepOutcome step)
+    {
+        foreach (var spawn in step.Spawns ?? [])
+            SpawnChild(handle, spawn);
+
+        foreach (var tell in step.Tells ?? [])
+            DeliverTell(handle, tell);
+    }
+
+    /// <summary>
+    /// **建一个子会话并把任务交给它**。
+    ///
+    /// <para>⚠️ <b>它用工具预分配的那个 id</b>（<see cref="SpawnRequest.ChildSessionId"/>）——
+    /// 因为工具结果里已经说了「已派出 &lt;id&gt;」，而那条结果**已经落盘改不了**。
+    /// 这里换一个 id 就等于让记录说谎。</para>
+    ///
+    /// <para>⚠️ <b>四件必做的事，缺一件就是坏状态</b>：① `Create`（写盘）、
+    /// ② `Register`（激活表，快照端点靠它不读盘上的旧 Idle）、③ 发 `session.created`
+    /// （头的全局列表是派生的 —— 不发它，用户看不到这个新会话）、
+    /// ④ 首条任务**先追加再入队**（`sampling.send` 的那条次序铁律），然后 `Start`。</para>
+    /// </summary>
+    private void SpawnChild(SessionHandle parent, SpawnRequest request)
+    {
+        // ⚠️ **越界的请求直接丢**：工具那一侧已经用 `SubagentScope.CanSpawn` 判过，
+        // 而这里再判一次不是因为不信它 —— 是因为 `MaxDepth` 可能在这两步之间被改过
+        // （手改 spec），而「建出来一个超深的会话」是不可逆的。
+        if (!Kernel.Subagent.CanSpawnFrom(
+                parent.Spec.Depth ?? 0, parent.Spec.MaxDepth ?? Kernel.Subagent.DefaultMaxDepth))
+            return;
+
+        SessionHandle child;
+        try
+        {
+            child = SessionHandle.Create(
+                _host.Store,
+                // ⚠️ **默认共享父的工作目录**（`01` §10.3）：同一个项目、同一批文件。
+                // worktree 隔离是可选能力，今天没有。
+                parent.Spec.WorkingDirectory,
+                // ⚠️ 模型选择**继承父的那一份**（包括 protocol 快照）：子会话干的是同一件事，
+                // 换一个模型会让「谁跑的那一步」在账本上无故分叉。
+                parent.Spec.Model,
+                request.Title,
+                request.Preset,
+                sessionId: request.ChildSessionId,
+                askTimeout: parent.Spec.AskTimeout,
+                plugins: _host.Plugins,
+                parent: parent.Spec,
+                // ⚠️ **权限只能更窄**（`Subagent.NarrowerPermission`）：这是「委托不是分身」
+                // 那条硬约束在代码里的唯一落点。
+                axes: parent.State.Axes is { } parentAxes
+                    ? Kernel.Subagent.InheritAxes(parentAxes, request.Permission)
+                    : null);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // ⚠️ **失败要说出来，不能沉默**：那条工具结果已经说了「已派出」，
+            // 而这里建不出来 —— 用户与模型都得知道。走 `error` 事件（业务失败那条路）。
+            _bus.Publish(EventBus.SessionTopic(parent.SessionId),
+                new WireEvent.Error(parent.SessionId,
+                    $"子会话 {request.ChildSessionId} 建不出来：{ex.Message}"));
+            return;
+        }
+
+        _host.Register(child);
+
+        // ⚠️ **两份投递**（项目流 + 会话流），与 `session.create` 逐字相同：
+        // 项目流那份是头真正用的（它订的是项目流，那时还不知道新会话的 id）。
+        _bus.Publish(EventBus.ProjectTopic(child.ProjectKey),
+            new WireEvent.SessionCreated(child.SessionId, child.ProjectKey));
+        _bus.Publish(EventBus.SessionTopic(child.SessionId),
+            new WireEvent.SessionCreated(child.SessionId, child.ProjectKey));
+
+        // ⚠️ **先追加、再入队**（与 `session.send` 同一条次序铁律）：
+        // 分开会产生「已落盘未入队」/「已入队未落盘」两种中间态，各自丢消息。
+        var task = new List<Block> { new Block.TextBlock(request.Task) };
+        var at = CoreClock.Now();
+        var historyId = Ids.New();
+
+        _host.Store.AppendEvent(child.ProjectKey, child.SessionId, new TimelineEvent.MessageEvent
+        {
+            Id = historyId,
+            At = at,
+            From = Speaker.User,
+            Blocks = task,
+        });
+        child.Enqueue(task);
+
+        _bus.Publish(EventBus.SessionTopic(child.SessionId),
+            new WireEvent.MessageAppended(child.SessionId, "user", task, at) { HistoryId = historyId });
+
+        // ⚠️ 拿不到那把标志 = 已经有东西在推它（刚建出来时不可能）⇒ 队列会带它走。
+        Start(child);
+    }
+
+    /// <summary>
+    /// 兑现一次注入——**父 → 子**或**子 → 父**，两个方向各走一条，因为形状不同。
+    ///
+    /// <para>⚠️ <b>父 → 子：写成一条用户消息</b>。子那边「用户」就是驱动它的人，
+    /// 而父正是那个人 ⇒ 不需要新 `Speaker` 取值。⚠️ 若子正挂着一次询问，先走
+    /// `Supersede`（与 `session.send` 完全同一条路：那条 `tool_use` 必须有配对，
+    /// 而「用户没有回答这个问题，而是说了别的」是**事实**——父不是用户，
+    /// 但**对子会话而言它就是驱动者**，这句话在这里仍然成立）。</para>
+    ///
+    /// <para>⚠️ <b>子 → 父：<b>不能</b>写成用户消息</b>——那会让父的记录谎报「用户说过话」。
+    /// ⇒ 落成一对**合成的工具对**（`subagent_report`），与 `floating_context` 同一个形状。
+    /// 这条路的三个白拿（截断 / `fetch(offset)` / 三个适配器零改动）见
+    /// `SubagentReportTool` 的类型注释。</para>
+    /// </summary>
+    private void DeliverTell(SessionHandle from, TellRequest tell)
+    {
+        if (!TryFind(tell.TargetSessionId, out var target, out _))
+        {
+            // ⚠️ 收件人没了（父被删、子被删）⇒ 静默丢弃。
+            // 这条跑在一步的收尾路径上，抛会把那一步已经算好的结果整个丢掉
+            // （同 `Stepper.UnlockReleased` 的失败方向）。而「说了但没人听」是可见的：
+            // 工具结果里那句「已转达」之后，对方那边什么都不会发生。
+            return;
+        }
+
+        if (string.Equals(target.SessionId, from.SessionId, StringComparison.Ordinal)) return;
+
+        var blocks = new List<Block> { new Block.TextBlock(tell.Text) };
+
+        // ---- 子 → 父：合成对 ----
+        if (string.Equals(from.Spec.ParentSessionId, target.SessionId, StringComparison.Ordinal))
+        {
+            ReportToParent(from, tell.Text, "note");
+            return;
+        }
+
+        // ---- 父 → 子：一条用户消息（走 `session.send` 同一套）----
+        // ⚠️ 只允许「它真的是我的孩子」——模型给了一个别的会话 id 时**不动**，
+        // 而这条判据在工具那一侧已经判过一次（`SubagentScope.Children`）。
+        // 这里再判是因为**这一步与那一步之间**那个孩子可能已经被删/被过继。
+        if (!string.Equals(target.Spec.ParentSessionId, from.SessionId, StringComparison.Ordinal)) return;
+
+        DeliverToSession(target, blocks);
+    }
+
+    /// <summary>
+    /// **把一条消息交给某个会话**：顶替挂起的询问 → 追加 → 入队 → 启动。
+    ///
+    /// <para>⚠️ 它与 `HandleSessionSendAsync` 是同一套动作，但**不是同一段代码**：
+    /// 那条路还要处理「命令回执 / awaitCompletion / 事件里带 sessionId」等命令层的事，
+    /// 而这一条只做投递。⚠️ 两者的次序完全一致（先追加、后入队、再启动）——
+    /// 那条次序列是两处各写一遍就会漂的东西，所以这里把注释指回 `session.send`。</para>
+    /// </summary>
+    private void DeliverToSession(SessionHandle target, IReadOnlyList<Block> blocks)
+    {
+        // ⚠️ **撞上「正在等回答」⇒ 先顶替**（`01` §3.8）。不顶替的话，那条悬空的
+        // `tool_use` 会让下一步请求当场 400（`HandleSessionSendAsync` 那条注释有实测记录）。
+        if (target.State.Status == SessionStatus.WaitingForInput && target.State.Ask is { } superseded)
+        {
+            _host.Store.AppendEvent(target.ProjectKey, target.SessionId, Stepper.Supersede(
+                superseded, string.Concat(blocks.OfType<Block.TextBlock>().Select(b => b.Text))));
+
+            target.AwaitingInput = null;
+            target.UpdateStateAndPersist(_host.Store, st => st with
+            {
+                Status = SessionStatus.Idle,
+                Ask = null,
+            }, diskStatus: SessionStatus.Idle);
+
+            _bus.Publish(EventBus.ApprovalsTopic,
+                new WireEvent.ApprovalResolved(target.SessionId, superseded.AskId, "superseded"));
+            _bus.Publish(EventBus.SessionTopic(target.SessionId),
+                new WireEvent.ApprovalResolved(target.SessionId, superseded.AskId, "superseded"));
+        }
+
+        var at = CoreClock.Now();
+        var historyId = Ids.New();
+
+        _host.Store.AppendEvent(target.ProjectKey, target.SessionId, new TimelineEvent.MessageEvent
+        {
+            Id = historyId,
+            At = at,
+            From = Speaker.User,
+            Blocks = blocks,
+        });
+        target.Enqueue(blocks);
+
+        _bus.Publish(EventBus.SessionTopic(target.SessionId),
+            new WireEvent.MessageAppended(target.SessionId, "user", blocks, at) { HistoryId = historyId });
+
+        Start(target);
+    }
+
+    /// <summary>
+    /// **子会话 → 父会话的一条回报**：一对合成的工具对，追加进父的记录并入队。
+    ///
+    /// <para>⚠️ <b>为什么是「一对」而不是一条</b>：上游要求 `tool_result` 紧跟它的
+    /// `tool_use`（悬空的任一半都是 400）。而这一对**必须是合成的**——父并没有真的调用过
+    /// `subagent_report`，但要让模型读到一段**不是用户说的话**，只有 tool 位置是干净的
+    /// （写成 user 消息会谎报发言者；写成新事件类型则三样白拿全丢，见 `SubagentReportTool`）。</para>
+    ///
+    /// <para>⚠️ <b>id 全部带 `Subagent.InjectedIdPrefix`</b>：<see cref="Interruption"/>
+    /// 靠它把这一对排除在配对判定之外。没有那个前缀，父挂着询问时收到回报会被判成
+    /// 「上一次这一步被打断了」——而用户只是在想怎么回答。</para>
+    ///
+    /// <para>⚠️ <b>一次 `AppendEvents` 写整对</b>：那是「配对不会被撕开」的唯一保证。
+    /// 分两次写，崩在中间就留下半对——而半对比没有更坏（它让下一步 400）。</para>
+    /// </summary>
+    private void ReportToParent(SessionHandle child, string text, string status)
+    {
+        if (child.Spec.ParentSessionId is not { } parentId) return;
+        if (!TryFind(parentId, out var parent, out _)) return;   // 父没了 ⇒ 静默丢弃（同 `DeliverTell`）
+
+        var at = CoreClock.Now();
+        var token = Ids.New();
+        var callId = $"{Kernel.Subagent.InjectedIdPrefix}{token}";
+
+        // ⚠️ **参数也落进去**（`child`）：模型读那条 `tool_use` 时能看见「这是哪个孩子说的」，
+        // 而它是逐字 JSON（与模型自己发的调用同形，见 `Block.ToolUseBlock.Arguments`）。
+        var args = $"{{\"child\":\"{child.SessionId}\"}}";
+
+        TimelineEvent[] pair =
+        [
+            new TimelineEvent.MessageEvent
+            {
+                Id = $"{callId}-call",
+                At = at,
+                From = Speaker.Model,
+                Blocks = [new Block.ToolUseBlock(callId, SubagentReportTool.NameOf, args)],
+            },
+            new TimelineEvent.ToolResultEvent
+            {
+                Id = $"{callId}-result",
+                At = at,
+                CallId = callId,
+                Content = [new Block.TextBlock(text)],
+                // ⚠️ 框架放进 `Framing` 那一格（不是拼进内容）：回收/截断换的是 `Content`，
+                // 而框架是**事实**——混进去会让它被一起吃掉（`ToolResultEvent.Framing` 的注释）。
+                // ⚠️ 它也进了**投递预算**：`Truncate` 按 `MaxResultBytes` 砍的是 `Content`，
+                // 超出部分由模型用 `fetch(id, offset)` 自己取——那正是用户要的那套。
+                Framing = new ToolFraming(SubagentReportTool.NameOf,
+                [
+                    new ToolFramingField("from", child.SessionId),
+                    new ToolFramingField("status", status),
+                ]),
+            },
+        ];
+
+        _host.Store.AppendEvents(parent.ProjectKey, parent.SessionId, pair);
+
+        // ⚠️ **两条活事件**（模型消息 + 工具结果），与 `RunStepAsync` 里那两段同形：
+        // 头按到达次序画，而记录里的次序就是「调用、然后它的结果」。
+        _bus.Publish(EventBus.SessionTopic(parent.SessionId),
+            new WireEvent.MessageAppended(parent.SessionId, "model", pair[0] is TimelineEvent.MessageEvent m ? m.Blocks : [], at)
+            {
+                HistoryId = pair[0].Id,
+            });
+
+        foreach (var result in pair.OfType<TimelineEvent.ToolResultEvent>())
+            _bus.Publish(EventBus.SessionTopic(parent.SessionId),
+                new WireEvent.ToolResultAppended(
+                    parent.SessionId, result.Id, result.CallId, result.Content, result.At));
+
+        // ⚠️ 队列里放一段**非空**的块：它是「有事要它动」的凭据（`Recovery.BeforeStep`
+        // 的 `hasNewInput`），而**不是**一条会追加进记录的用户消息——记录已经由上面那对写好了。
+        // ⇒ 别在这里 `AppendEvent`，那会让父的时间线多一条它没说过的话。
+        parent.Enqueue([new Block.TextBlock(text)]);
+
+        Start(parent);
+    }
+
+    /// <summary>
+    /// **子会话停下时的回报**（`01` §10.2 的「我落定了」那一类）。
+    ///
+    /// <para>⚠️ 调用点只有一处：`RunStepAsync` 的驱动循环**决定不再续推**的那一刻。
+    /// 别把它挂到「每一步结束」上——那会让一个跑 20 步的子叫父 20 次（§10.2 的原话）。</para>
+    /// </summary>
+    private void ReportSettled(SessionHandle handle, ModelReply? reply)
+    {
+        if (handle.Spec.ParentSessionId is null) return;
+        if (handle.State.Status == SessionStatus.WaitingForInput) return;   // 它在问，另一条路已经报过了
+
+        // ⚠️ **没有正文就不报**：拒答 / 空回复时，核心手上没有任何「它说了什么」——
+        // 编一句「它跑完了」是**假信息**（子可能一次都没跑成）。
+        var text = reply is null ? "" : string.Concat(reply.Blocks.OfType<Kernel.Block.TextBlock>().Select(b => b.Text));
+        if (text.Length == 0) return;
+
+        ReportToParent(handle, text, "done");
+    }
+
+    /// <summary>
+    /// **子会话在提问 ⇒ 让父知道**（`01` §10.2 的「要我决策」那一类，2026-10-24 用户裁定）。
+    ///
+    /// <para>⚠️ <b>只对 <see cref="AskKind.Question"/> 发</b>：`Permission` 类的询问
+    /// **不经父**（`01` §10.3：让父批孩子的危险操作是剧场——模型批模型不是安全边界）。
+    /// 那一路**已经上提到头了**：`approvals` 是全局流，载荷带 `sessionId`，
+    /// 所以人天然看得见（`Ask` 的类型注释写着「子会话上提不是第三个 Kind」）。</para>
+    ///
+    /// <para>⚠️ <b>父能回答（`tell_child`），但答不了也没关系</b>：那条询问仍然挂在子身上，
+    /// 人随时可以在头里回答它。两个回答者不冲突——先到的那个赢，后到的会拿到
+    /// 「这个询问已经结束了」（`HandleApprovalRespond` 的既有判据）。</para>
+    /// </summary>
+    private void EscalateAsk(SessionHandle handle, AskRequest ask)
+    {
+        if (handle.Spec.ParentSessionId is null) return;
+        if (ask.Kind != AskKind.Question) return;
+
+        var text = string.Join("\n", ask.Items.Select(i => $"· {i.Question}"));
+        ReportToParent(handle, $"我卡在一个问题上，需要你回答：\n{text}\n"
+            + "（也可以让人在界面上直接回答——那条路同样生效。）", "asking");
+    }
+
+    /// <summary>
+    /// **级联停止**（用户 2026-10-24 裁定）：把这个会话**以及它整棵子树**的推进停掉。
+    ///
+    /// <para>⚠️ <b>两件事都要做，只做一件是坏的</b>：</para>
+    /// <list type="number">
+    ///   <item><b>取消在飞的那一步</b>（`CtsFor`）——它立刻停。</item>
+    ///   <item><b>提高 `InterruptEpoch`</b>——否则一个 `goal` 模式的子会话会在这一步跑完之后
+    ///   **自动续跑**（`RunStepAsync` 尾部的判据就是「序号变没变」）。只取消不提高的话，
+    ///   父停了、子还在烧钱，而界面上看不出区别。</item>
+    /// </list>
+    ///
+    /// <para>⚠️ **递归**（虽然默认只有一层）：多层的开关只是把 `MaxDepth` 调大，
+    /// 而这条代码不该在那天跟着改。</para>
+    ///
+    /// <para>⚠️ **它不写盘、不删记录**：`01` §10.3「父停：子停止推进，<b>记录保留</b>」。</para>
+    /// </summary>
+    private void StopSubtree(SessionHandle handle)
+    {
+        handle.NoteInterrupt();
+        _host.CtsFor(handle.SessionId)?.Cancel();
+
+        foreach (var (projectKey, spec) in _host.Store.ChildrenOf(handle.SessionId))
+        {
+            // ⚠️ 孩子可能没在内存里（没激活）⇒ `Activate` 载入它，只为了拿那两样内存账。
+            // 这不是「顺手捡」的副作用：级联停止**必须**作用到那些盘上的孩子。
+            SessionHandle child;
+            try { child = _host.Activate(projectKey, spec.SessionId); }
+            catch (Exception ex) when (ex is IOException or System.Text.Json.JsonException or FileFormatException)
+            {
+                continue;   // 坏 spec 的会话停不了，但它也推不动（`Start` 要 spec）
+            }
+
+            StopSubtree(child);
+        }
+    }
+
     /// <summary>
     /// **开一次回收窗口**（`01` §8.0.2 / §11.7）：解析判据 → 落一条
     /// <see cref="ReclaimEvent"/>（窗口记录）→ 发事件。
@@ -1252,6 +1618,11 @@ public sealed class CommandDispatcher(
 
                 _bus.Publish(EventBus.ApprovalsTopic, requested);
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId), requested);
+
+                // ⚠️ **子会话问意见 ⇒ 也叫父一声**（2026-10-24）：父可能答得了，
+                // 而人那边本来就看得到（`approvals` 是全局流）。⚠️ `Permission` 类**不叫**
+                // ——让父批孩子的危险操作是剧场（`01` §10.3），那一路只上提到头。
+                EscalateAsk(handle, asked);
             }
 
             // ⚠️ **工具结果也要告诉头**（2026-10-17，用户实测）：此前只有 `message.appended`
@@ -1262,6 +1633,12 @@ public sealed class CommandDispatcher(
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                     new WireEvent.ToolResultAppended(
                         handle.SessionId, result.Id, result.CallId, result.Content, result.At));
+
+            // ⚠️ **派生与注入在结果事件之后兑现**（2026-10-24）：此后它们只追加、不改这一步
+            // 的任何字节（`SpawnChild` 写的都是**别的会话**）。
+            // ⚠️ 次序在 `DeliverSubagents` 里（先建、后说）——同一步里既 spawn 又 tell 时，
+            // 收件人必须是已经存在的那个。
+            DeliverSubagents(handle, step);
 
             // ⚠️ **模型侧 `release` 摘掉的锁要告诉头**（2026-10-17）：摘锁只改 `claims.json`，
             // 而头右栏的「谁在动哪些文件」靠 `claim.released` 刷新——不发的话，
@@ -1478,7 +1855,15 @@ public sealed class CommandDispatcher(
         // 时只入队（`TryEnterStep` 失败），它指望这一条链把它拿走。若这里因为
         // 「这一步没调工具」就停，那条用户消息会**一直躺在队列里**，直到下一次 send / start
         // ——用户看到的是「发出了，模型没反应」。判据是队列深度，不是「有没有工具调用」。
-        if (!calledTools && handle.QueueDepth == 0) return reply;
+        if (!calledTools && handle.QueueDepth == 0)
+        {
+            // ⚠️ **子会话走到这里才叫「落定」**（2026-10-24）：它是循环真正停下来的
+            // **唯一**一处（下面那个 `return reply` 是「还没拿到标志 / 还要接着推」，
+            // 而上面几条早退都是别的语义）。把回报挂在这里 = 一个跑 20 步的子只叫父一次
+            // （`01` §10.2：「中间步骤是子自己的事」）。
+            ReportSettled(handle, reply);
+            return reply;
+        }
 
         if (!handle.TryEnterStep()) return reply;
 
@@ -1551,26 +1936,16 @@ public sealed class CommandDispatcher(
     {
         if (!TryFind(i.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
-        // ⚠️ **先记一笔「有人叫停」**，再去找 CTS：goal 的自动续跑在步与步之间有一个窄窗口，
-        // 那时 CTS 已经摘掉、而续跑还没起来——只靠 Cancel 的话这一下是 no-op，
-        // 续跑会照样起来。序号让续跑那一侧能看见它。
-        handle.NoteInterrupt();
-
-        // 两个条件都必需：该会话确实在跑（否则是在打断还没开始的步）、且 CTS 非空
-        // （它是「当前那个步」的句柄，空说明步刚结束、还没来得及摘）。
-        // 只有「在跑 且 有句柄」时才 Cancel；空闲时的 interrupt 是 no-op，但**仍然回 ack**
-        // （命令本身合法，语义上等于「停下」，而没在跑就是已经停下了）。
-        if (handle.IsRunning && _host.CtsFor(i.SessionId) is { } cts)
-        {
-            try
-            {
-                cts.Cancel();
-            }
-            catch (ObjectDisposedException)
-            {
-                // 竞态：步刚好在这一瞬间结束并释放了它。不是错误——我们要的就是「让它停」，它已经停了。
-            }
-        }
+        // ⚠️ **级联停止**（2026-10-24 用户裁定）：父被叫停时，**整棵子树一起停**。
+        // 判据与理由都在 `StopSubtree` 里（两件事都要做：Cancel + NoteInterrupt
+        // ——只 Cancel 的话，一个 goal 模式的子会话会在这一步之后**自动续跑**）。
+        //
+        // ⚠️ **原注释里那条知识仍然成立、并搬进了 `StopSubtree`**：先记一笔「有人叫停」
+        // 再去找 CTS，因为 goal 的自动续跑在步与步之间有一个窄窗口（CTS 已摘、续跑未起）。
+        //
+        // ⚠️ **空闲时的 interrupt 仍然是 no-op 但照样回 ack**：命令本身合法，
+        // 语义上等于「停下」，而没在跑就是已经停下了。
+        StopSubtree(handle);
 
         return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = i.SessionId });
     }
@@ -1789,7 +2164,10 @@ public sealed class CommandDispatcher(
 
         if (IsRunning(live)) return Reject(id, RunningRefusal(c.SessionId));
 
-        // `Archived` 三态：null=归档、false=取消。**不要**写成 `c.Archived == true`——
+        // ⚠️ **归档前先级联停子**（2026-10-24 用户裁定）：归档是「原地标记」，但一个
+        // 还在跑的子树不该越过它继续烧钱。⚠️ 只对**已激活**的走这条：未激活的会话
+        // 进程内没有东西在推它（`Running` / 队列 / goal 续跑都是内存账），停也无从停。
+        if (live is not null) StopSubtree(live);
         // 那会把「没给」与「给定 false」混成同一个分支（本记录的注释里有完整理由）。
         var archive = c.Archived != false;
         var wanted = archive ? CoreClock.Now() : (DateTimeOffset?)null;
@@ -1863,6 +2241,13 @@ public sealed class CommandDispatcher(
 
         var live = _host.TryGetActivated(c.SessionId, out var h) ? h : null;
         if (IsRunning(live)) return Reject(id, RunningRefusal(c.SessionId));
+
+        // ⚠️ **删之前先级联停子**（2026-10-24 用户裁定）：子树**不跟着删**
+        // （`01` §10.3「父停：子停止推进，记录保留」），但绝不能让它们在父消失之后
+        // 继续跑——那会是一批没有父的会话在往虚空里回报。⚠️ 它们会变成**孤儿**
+        // （`parentSessionId` 指着一个查不到的会话），而 `ReportToParent` 对那种情况
+        // 是**静默丢弃**（可见：工具结果说了「已转达」，对面什么都没发生）。
+        if (live is not null) StopSubtree(live);
 
         // 声明全在**它自己的工作目录**里（`ClaimStore` 按工作目录分区、`claim.acquire`
         // 用的就是 `handle.Spec.WorkingDirectory`）⇒ 只需要建**一个** store。

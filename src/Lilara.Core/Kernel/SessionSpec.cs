@@ -129,6 +129,41 @@ public sealed record SessionSpec
 
     /// <summary>建会话时绑定的插件版本与默认值。旧文件缺省为无绑定，不自动启用新插件。</summary>
     public IReadOnlyList<SessionPluginBinding>? Plugins { get; init; }
+
+    /// <summary>
+    /// **父会话 id**（`01` §10）。`null` = 顶层会话。
+    ///
+    /// <para>⚠️ <b>它是<b>出生事实</b>，与 <see cref="ProjectKey"/> 同一类</b>：建出来之后
+    /// 没有任何命令能改它。「归属」与「派生」是两个正交的结构（`01` §10.4）——
+    /// 子会话归属于**父所在的项目**（所以 `ProjectKey` 一样），但在派生树上是子节点。</para>
+    ///
+    /// <para>⚠️ **可空是<b>语义</b>**（`null` = 没有父），不是「为了老字节不变」——
+    /// 那件事由格式版本承担（见 <see cref="Version"/>）。</para>
+    /// </summary>
+    public string? ParentSessionId { get; init; }
+
+    /// <summary>
+    /// **这个会话在派生树里的深度**：顶层 = 0，子 = 1 …
+    ///
+    /// <para>⚠️ <b>它<b>本可以</b>从父链数出来，而这里选择落盘</b>（判据 8「能派生的就不要
+    /// 持久化」在这里**不适用**）：数出来要求「父会话还在盘上」，而父被删掉之后那棵树
+    /// 就断了 —— 一个孤儿子的深度会**变**（从 1 变成 0），于是它突然能再派生一层。
+    /// ⇒ 深度是**出生事实**，不是派生量。</para>
+    ///
+    /// <para>⚠️ <b>可空 = 0</b>：老文件的 `spec.json` 里没有这个键，而它们都是顶层会话
+    /// （这个字段与派生关系是同一批出现的）。用 <c>int?</c> 而不是 <c>int</c> 的唯一理由
+    /// 是**不往老文件里多写一个 `"depth":0`**（`WhenWritingNull` 让 `null` 整个键不出现）。</para>
+    /// </summary>
+    public int? Depth { get; init; }
+
+    /// <summary>
+    /// **这棵树最多能有多深**（建树那一刻定，沿树继承）。`null` = <see cref="Subagent.DefaultMaxDepth"/>。
+    ///
+    /// <para>⚠️ <b>它落盘而不是每次读常量</b>：改常量不该让**已经在跑的树**中途换规则
+    /// ——那会让同一棵树里两棵子树按两个上限判，而模型看到的是「同一个工具、不同的答案」。
+    /// ⇒ 出生时冻一份，此后不变。</para>
+    /// </summary>
+    public int? MaxDepth { get; init; }
 }
 
 public sealed record SessionPluginBinding(

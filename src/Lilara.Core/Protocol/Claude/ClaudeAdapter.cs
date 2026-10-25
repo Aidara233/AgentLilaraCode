@@ -10,6 +10,12 @@ public sealed class ClaudeAdapter : IModelAdapter
 
     private readonly AnthropicClient _client;
 
+    /// <summary>
+    /// 一次调用的时限（provider 的 `timeoutSeconds`）。⚠️ <c>null</c> = 没配 = **不给 SDK 加任何东西**
+    /// （沿用它的默认值）；有值 ⇒ 用链接令牌包住这一次调用。
+    /// </summary>
+    private readonly TimeSpan? _timeout;
+
     // 解析出来的端点（含来源）。暴露出来是为了能显示——命令面启动时必须把它印出来。
     public ResolvedEndpoint? Endpoint { get; }
 
@@ -41,21 +47,39 @@ public sealed class ClaudeAdapter : IModelAdapter
             : new AnthropicClient { ApiKey = provider.ApiKey, BaseUrl = endpoint.Url };
 
         Endpoint = endpoint;
+
+        // ⚠️ **没配就不设**（`null`）：这条链路一直交给 SDK 的默认值，替它定一个数字
+        // 只会让「本来跑得完的推理」悄悄变短（见 `ProviderDefinition.TimeoutSeconds` 的注释）。
+        // 配了就由我们自己的链接令牌管——见 `CallAsync`。
+        _timeout = provider.EffectiveTimeoutSeconds is { } seconds
+            ? TimeSpan.FromSeconds(seconds)
+            : null;
     }
 
     public async Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct)
     {
+        // ⚠️ 配了时限才包一层链接令牌；没配就是原来的 `ct`（SDK 的默认值管超时）。
+        using var deadline = _timeout is { } limit ? CancellationTokenSource.CreateLinkedTokenSource(ct) : null;
+        if (deadline is not null) deadline.CancelAfter(_timeout!.Value);
+        var token = deadline?.Token ?? ct;
+
         // Build 必须在 try 里面：它的三处 ArgumentException（时间线为空 / 消息为空 / 未知 effort）
         // 都是「这次调用失败了」的一种，逃出包装会以未捕获异常崩掉，而不是给用户一句能读懂的话。
         try
         {
             var parameters = ClaudeRequestBuilder.Build(request);
-            var response = await _client.Messages.Create(parameters, cancellationToken: ct);
+            var response = await _client.Messages.Create(parameters, cancellationToken: token);
             return ClaudeResponseMapper.Map(response);
         }
         catch (Exception ex) when (ShouldWrap(ex, ct))
         {
-            throw new ModelCallFailedException(Describe(ex), ex) { Transient = IsTransient(ex) };
+            // 超时与「真失败」分开说：SDK 抛出来的原话里没有「这是我们自己设的时限」这件事，
+            // 照着它去查只会查到上游。判据是两把令牌谁被取消了（调用方取消已在 ShouldWrap 放行）。
+            var why = deadline is { IsCancellationRequested: true } && !ct.IsCancellationRequested
+                ? $"模型调用超时（{_timeout!.Value.TotalSeconds:0} 秒）。"
+                  + "慢模型可以给该提供商调大 timeoutSeconds（`provider set <id> --timeout <秒>`）。"
+                : Describe(ex);
+            throw new ModelCallFailedException(why, ex) { Transient = IsTransient(ex) };
         }
     }
 

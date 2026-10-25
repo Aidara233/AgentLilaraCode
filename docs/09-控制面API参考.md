@@ -356,6 +356,7 @@
     "status": "Running",        // "Idle" | "Running" | "WaitingForInput"
     "turn": 3,
     "title": "重构",             // 可空 ⇒ 键可能整个不存在
+    "parentSessionId": "",      // 顶层会话 = 空串；子会话 = 父的 sessionId
     "ask": {                    // 没在等的时候是 {}
       "askId": "…",
       "toolName": "write",
@@ -1006,7 +1007,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 ```jsonc
 { "kind": "provider.upsert", "id": "local", "apiKey": "sk-…", "model": "deepseek-flash",
   "protocol": "claude-messages", "endpoint": "http://127.0.0.1:15721", "auth": "bearer",
-  "models": ["deepseek-flash", "deepseek-pro"] }
+  "models": ["deepseek-flash", "deepseek-pro"], "timeoutSeconds": 600 }
 ```
 
 | 键 | 必给 | 语义 |
@@ -1018,12 +1019,18 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 | `endpoint` | 否 | 空 = 官方地址；省略 = 保留 |
 | `auth` | 否 | `api-key` / `bearer`（**小写**）；省略 = 保留 |
 | `models` | 否 | 字符串数组；省略 = 保留 |
+| `timeoutSeconds` | 否 | **一次模型调用**的超时（秒，1..1800）；省略 = 保留。⚠️ 它**不是**一步的超时，也不管询问等待（那是 `askTimeoutMinutes`） |
 
 - id 不合法（含路径语法、Windows 设备名）⇒ rejected。
-- 未知协议 / 认证方式 ⇒ rejected。
+- 未知协议 / 认证方式 / 超时越界 ⇒ rejected（**不夹紧**：夹紧会把写错的配置静默改成一个别的数）。
 - 新 provider 不给 key ⇒ rejected；已有 provider 省略 key ⇒ 保留。
 - 成功 `note` 是**生效的协议名**。
-- 证据：`ControlServer.cs:907-918`；`CommandDispatcher.cs:287-341`。
+- ⚠️ **`timeoutSeconds` 缺省（`null`）= 交给协议自己的默认**，两条链路不同：
+  OpenAI 兼容链路沿用 .NET `HttpClient` 的 100 秒（`ProviderLimits.DefaultTimeoutSeconds`），
+  Claude 链路交给 SDK 的默认值。⚠️ 重试是另一层（`RetryPolicy`，最多再试 10 次）⇒
+  最坏总时长 ≈ (超时 × 11) + 35.6 秒。
+- 证据：`ControlServer.cs` 的 `provider.upsert`；`CommandDispatcher.HandleProviderUpsert`；
+  `Kernel/ProviderDefinition.cs` 的 `ProviderLimits`。
 
 #### `provider.delete`
 

@@ -163,6 +163,35 @@ public sealed record ToolOutcome
     /// 行为**逐字节不变**。</para>
     /// </summary>
     public AskRequest? Ask { get; init; }
+
+    /// <summary>
+    /// **这次执行其实是一次派生**（`01` §10，2026-10-24）。非 null ⇒ 工具**没有建会话**
+    /// ——它只把「要建什么」说清楚，真正的 `SessionHandle.Create` 在
+    /// `CommandDispatcher`（那里才有 `PluginHost` / 事件总线 / `Start`）。
+    ///
+    /// <para>⚠️ <b>它是 <see cref="Ask"/> 的同族，理由也同源</b>：两者都是「工具够不着、
+    /// 但它必须说出来」的事，都走「<b>返回</b>而不是「等」」（`AskRequest` 的类型注释：
+    /// 让执行器去 await 一个将来，等于把推进权借出去）。</para>
+    ///
+    /// <para>⚠️ <b>子会话 id 由工具预分配</b>（`Ids.New()`）：结果正文里那个 id 因此是
+    /// **将来真的会存在**的那一个，模型下一步拿它调 `tell_child` 不会指向空气。
+    /// 代价如实记：若创建失败（深度到顶、目录没了），那条结果已经说了「已派出」——
+    /// 所以**校验必须先于产出**（工具里 `SubagentScope.CanSpawn` 一次判完），
+    /// 而创建那一侧只可能因 IO 失败。</para>
+    /// </summary>
+    public SpawnRequest? Spawn { get; init; }
+
+    /// <summary>
+    /// **这次执行其实是一次注入**——父对子说一句，或子对父说一句（`01` §10.1）。
+    ///
+    /// <para>⚠️ 与 <see cref="Spawn"/> 同一个形状、同一条理由：工具只声明，
+    /// 追加记录 + 入队 + 启动都在 `CommandDispatcher`（`Stepper` 刻意不碰事件总线）。</para>
+    ///
+    /// <para>⚠️ <b>父 → 子那一半要能被 Stepper 认出来</b>（好让
+    /// <see cref="TellRequest.TargetSessionId"/> 走一次「是不是我的孩子」的校验），
+    /// 所以它也走这条结构化通道，而不是让工具自己闷头写。</para>
+    /// </summary>
+    public TellRequest? Tell { get; init; }
 }
 
 /// <summary>
@@ -311,6 +340,22 @@ public interface IToolContext
     /// 而不是假装收尾。真正的「把轴拨回 standard」在推进器那一侧做（工具没有改状态的手）。</para>
     /// </summary>
     bool GoalActive { get; }
+
+    /// <summary>
+    /// 这一刻的**派生关系快照**（`01` §10，2026-10-24）。`null` = 这里没有派生上下文
+    /// （手工构造的句柄、纯单测）——`spawn` / `tell_child` 据此**如实说**「这里不能派生」，
+    /// 而不是猜「大概是顶层会话吧」。
+    ///
+    /// <para>⚠️ <b>它是一份快照，不是「让工具现查」</b>：与 `Network` / `Shell` 同一条理由
+    /// ——工具在**不碰 store** 的前提下要能回答「我还能不能派生」「我有哪些孩子」，
+    /// 而这两件事都要读盘。冻结在建设点，步内一致。</para>
+    ///
+    /// <para>⚠️ <b>`Children` 里的状态是<b>盘上那份</b></b>：`Running` 只写内存
+    /// （`SessionStatus` 的类型注释），而句柄这里够不着 `CoreHost`。⇒ 子会话正在跑时
+    /// 这里读到的是 `Idle`。**别在这一层假装知道它在跑**——那需要给句柄开一个
+    /// 「内存状态」的口子，而那是另一件事（且它会让句柄不再是纯数据的投影）。</para>
+    /// </summary>
+    SubagentScope? Subagents { get; }
 }
 
 /// <summary>

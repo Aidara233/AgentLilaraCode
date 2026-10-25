@@ -235,7 +235,6 @@ public sealed class SessionStore(string dataRoot)
 
     // 读不到返回 null，不抛。两种「读不到」都吞：文件不存在，和文件损坏——
     // 只判 File.Exists 不够，损坏的 spec.json 会抛 JsonException 炸掉整个启动。
-    //
     // ⚠️ **第三种「读不到」刻意不吞在那里：版本比本程序新。** 见 `ReadSpec` 的注释——
     // 那个不是「这份文件坏了」，重写它会丢数据。扫盘这条路吞掉它（一个太新的会话
     // 不该让整个列表打不开），但它**必须**在读得出来的地方说出来，否则用户再也看不到。
@@ -288,4 +287,30 @@ public sealed class SessionStore(string dataRoot)
             return "文件损坏";
         }
     }
+
+    /// <summary>
+    /// **一个会话的全部子会话**（按 id 序数升序，只含**直接**孩子）。
+    ///
+    /// <para>⚠️ <b>它扫全盘，而且这是刻意的</b>：`parentSessionId` 住在每个会话自己的
+    /// `spec.json` 里，盘上没有反向索引（`01` §8 那张表记着这件事：`sessions.json` 从来没做过）。
+    /// 加索引等于引入**第二个真相来源**，而它会与删会话、搬目录、手改 spec 三种操作脱钩。
+    /// ⇒ 项目数与会话数都是个位数到几十，扫一遍的代价可忽略。</para>
+    ///
+    /// <para>⚠️ <b>排序是契约</b>（同 `ListProjects` / `ListSessions` 那条）：调用方会把它
+    /// 拼进**尾块**（浮动上下文按正文逐字比决定要不要新的一份），而
+    /// `Directory.GetDirectories` 的顺序由文件系统决定 ⇒ 不排序的话，**同一份状态
+    /// 会渲染出两个不同的尾块**，于是每一步都「变化了」、每一步都写一份新的浮动读数。
+    /// 这就是那次「必须显式 ordinal」的同一个教训（`Axes.RenderOrder`）。</para>
+    ///
+    /// <para>⚠️ **只返回直接孩子**，不递归：级联停止要递归，但那个递归由调用方做
+    /// （它需要知道每一层，而不是一个拍平的列表）。深度默认只有一层，递归今天最多走一步。</para>
+    /// </summary>
+    public IReadOnlyList<(string ProjectKey, SessionSpec Spec)> ChildrenOf(string parentSessionId) =>
+        [.. ListProjects()
+            .SelectMany(pk => ListSessions(pk)
+                .Select(sid => TryReadSpec(pk, sid))
+                .OfType<SessionSpec>()
+                .Where(spec => string.Equals(spec.ParentSessionId, parentSessionId, StringComparison.Ordinal))
+                .Select(spec => (ProjectKey: spec.ProjectKey, Spec: spec)))
+            .OrderBy(x => x.Spec.SessionId, StringComparer.Ordinal)];
 }

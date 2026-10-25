@@ -640,4 +640,37 @@ public class ParserTests
 
         Assert.Null(((CoreCommand.ProviderUpsert)cmd!).Models);
     }
+
+    // `--timeout <秒>` → 一次模型调用的超时（按提供商）。上游快慢差很多，这一格必须能按 provider 调。
+    [Fact]
+    public void ProviderSet_WithTimeout_ParsesTheSeconds()
+    {
+        var (cmd, err) = CoreCommandParser.Parse("provider set p --timeout 600");
+
+        Assert.Null(err);
+        Assert.Equal(600, Assert.IsType<CoreCommand.ProviderUpsert>(cmd).TimeoutSeconds);
+    }
+
+    // 省略 ⇒ null（= 保留旧值 / 没配），与其余标志同一条语义。
+    [Fact]
+    public void ProviderSet_WithoutTimeout_LeavesItNull()
+    {
+        var (cmd, _) = CoreCommandParser.Parse("provider set p --key k");
+
+        Assert.Null(((CoreCommand.ProviderUpsert)cmd!).TimeoutSeconds);
+    }
+
+    // ⚠️ 不是整数 ⇒ 报错，不许静默当成「没给」：那会让一次写错的参数变成一次
+    // 「保留旧值」的静默保存（并回 ✓），而用户以为自己改了——同 `--ask-timeout` 那条。
+    [Theory]
+    [InlineData("600s")]
+    [InlineData("十分钟")]
+    [InlineData("1.5")]
+    public void ProviderSet_WithANonIntegerTimeout_IsAnError(string value)
+    {
+        var (cmd, err) = CoreCommandParser.Parse($"provider set p --timeout {value}");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
 }

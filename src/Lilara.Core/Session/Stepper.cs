@@ -121,6 +121,12 @@ public sealed class Stepper(
         // （`SessionToolContext.FloatingContext`）——若执行时另渲染一遍，
         // 「核心合成注入的那份」与「模型自己要来的那份」会在同一步里分叉。
         // ⚠️ 冻结的时点与原来逐字相同（步开始、`at` 已取）；跨步实时、步内逐字节稳定。
+        // ⚠️ 冻结的时点与原来逐字相同（步开始、`at` 已取）；跨步实时、步内逐字节稳定。
+        // ⚠️ **派生关系也在这一刻冻一次**（2026-10-24）：它进尾块（子会话那一行），
+        // 而尾块必须步内逐字节稳定。⚠️ 它与下面执行相位交给工具的那份**是同一份**
+        // ——两处各算一次会分叉（尾块说 A 在等回答，而工具眼里 A 已经空闲）。
+        var subagents = SubagentScopeFor(handle);
+
         var slots = SystemBlock.Render(
             new PresetStore(_store.DataRoot, PresetStore.SystemDir),
             new PresetStore(_store.DataRoot, PresetStore.PremierDir),
@@ -130,7 +136,9 @@ public sealed class Stepper(
             GoalMode.IsActive(stepState) ? CorePrompts.GoalDirective : null,
             // 压缩指令同源：它也是状态（`state.json` 的 `pendingCompact`），不是事件。
             // ⚠️ 文本由解析器交进来（`StepperResolver`），推进器不碰预设——两条路给出同一句话。
-            stepState.PendingCompact ? _pendingCompactText : null);
+            stepState.PendingCompact ? _pendingCompactText : null,
+            // ⚠️ **这一行只在真有派生关系时出现**（`SubagentView.Line` 对空关系给 null）。
+            SubagentView.Line(subagents));
 
         // ⚠️ **引擎租约**：所有 `StepAsync` 调用都在 **_stepper 的会话内串行** 之内
         // （`CommandDispatcher` 的会话闸），所以这里不需要再同步。
@@ -279,6 +287,11 @@ public sealed class Stepper(
         // 同理：落下的线（头要据它的 id 画分隔线，而线本身被 `IsRenderable` 挡在模型之外）。
         var releasedLines = new List<TimelineEvent.ReleaseEvent>();
 
+        // ⚠️ **本步执行出来的派生 / 注入请求**（2026-10-24）：与 `releasedClaims` 同一条分工
+        // ——工具只声明，`CommandDispatcher` 落地（它才有 PluginHost / 事件总线 / Start）。
+        IReadOnlyList<SpawnRequest> spawns = [];
+        IReadOnlyList<TellRequest> tells = [];
+
         // ⚠️ **记录那一份**（未经回收、未经解引用）——`fetch` 取地址必须从它算，
         // 理由见 `SessionToolContext` 的构造参数注释。
         var recorded = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
@@ -335,13 +348,18 @@ public sealed class Stepper(
                 // 所以「谁算数」只有 `CompactTool.Parse` 一个答案。
                 handle.State.PendingCompact,
                 // ⚠️ shell 配置与联网同形：执行这一刻现读（浮动字段），步内冻结。
-                ShellFor());
+                ShellFor(),
+                // ⚠️ **用步开始冻住的那一份**（2026-10-24）：与尾块同一份字节，
+                // 两处各算一次会让「模型从尾块看到的」与「工具判定的」分叉。
+                subagents);
 
             var batch = await executor.ExecuteAsync(toolCalls, context, ct);
             pending = batch.Pending;
             events.AddRange(batch.Results);
             toolResults = batch.Results;
             executedCallIds = batch.ExecutedCallIds;
+            spawns = batch.Spawns;
+            tells = batch.Tells;
             goalEnded = GoalMode.IsActive(handle.State) && EndedGoal(batch, toolCalls);
 
             // ⚠️ **`release` 的线在这里落盘**（`01` §12.4，2026-10-11）：
@@ -492,7 +510,7 @@ public sealed class Stepper(
 
         return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id,
             ReleasedClaims: releasedClaims, ReleasedLines: releasedLines, ToolResults: toolResults,
-            GoalEnded: goalEnded, Compacted: compaction);
+            GoalEnded: goalEnded, Compacted: compaction, Spawns: spawns, Tells: tells);
     }
 
     /// <summary>
@@ -791,10 +809,16 @@ public sealed class Stepper(
         // 答复之后真正跑掉的那批结果——**给头的活事件**（与 `StepAsync` 同一个出口）。
         IReadOnlyList<TimelineEvent.ToolResultEvent> toolResults = [];
         var goalEnded = false;
+        // ⚠️ 派生 / 注入请求（2026-10-24）：与 `StepAsync` 同一条分工，走同一个出口。
+        IReadOnlyList<SpawnRequest> spawns = [];
+        IReadOnlyList<TellRequest> tells = [];
 
         if (calls.Count > 0)
         {
             var blobs = new BlobStore(_store.DataRoot);
+            // ⚠️ **派生关系在这一刻算一次**（2026-10-24）：尾块与工具拿到的是同一份，
+            // 两处各算一次会分叉（同 `StepAsync` 那条）。
+            var subagents = SubagentScopeFor(handle);
             var executor = new ToolExecutor(
                 _tools, blobs, handle.State.Axes![Axes.Permission],
                 new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId));
@@ -804,15 +828,18 @@ public sealed class Stepper(
                 // ⚠️ **答复路径没有步开始的槽位快照**：`floating_context` 要说的话是
                 // 「答复这一刻」的那份（与头的 `/state` 同一个时间轴），所以在这里现装配一次。
                 // ⚠️ 它与上面那次模型调用无关——那条路**不调模型**。
-                FloatingTextAt(handle, CoreClock.Now()),
+                FloatingTextAt(handle, CoreClock.Now(), subagents),
                 NetworkFor(handle),
                 GoalMode.IsActive(handle.State),
                 handle.State.PendingCompact,
-                ShellFor());
+                ShellFor(),
+                subagents);
 
             var batch = await executor.ExecuteAsync(calls, context, ct, reply);
             events.AddRange(batch.Results);
             toolResults = batch.Results;
+            spawns = batch.Spawns;
+            tells = batch.Tells;
             goalEnded = GoalMode.IsActive(handle.State) && EndedGoal(batch, calls);
 
             // ⚠️ **`release` 的线在这里也要落**（2026-10-17）——原先只在 `StepAsync` 有一半：
@@ -853,7 +880,7 @@ public sealed class Stepper(
 
                 return new StepOutcome(NoReply, again, handle.State.Ask?.DeadlineAt,
                     ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
-                    GoalEnded: goalEnded);
+                    GoalEnded: goalEnded, Spawns: spawns, Tells: tells);
             }
         }
 
@@ -867,7 +894,7 @@ public sealed class Stepper(
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
-            ToolResults: toolResults, GoalEnded: goalEnded);
+            ToolResults: toolResults, GoalEnded: goalEnded, Spawns: spawns, Tells: tells);
     }
 
     /// <summary>
@@ -1007,7 +1034,7 @@ public sealed class Stepper(
     /// 而为了一句尾块去读两份预设既无必要，也会把「文件在不在」的副作用引进来。
     /// ⚠️ 装配判据仍然只有 <see cref="SystemBlock"/> 一处。</para>
     /// </summary>
-    private string? FloatingTextAt(SessionHandle handle, DateTimeOffset now)
+    private string? FloatingTextAt(SessionHandle handle, DateTimeOffset now, SubagentScope subagents)
     {
         var state = handle.State;
         var axes = _plugins.Freeze(PluginSessionView.Values(state), now, handle.Spec.Plugins ?? []);
@@ -1017,7 +1044,10 @@ public sealed class Stepper(
             GoalMode.IsActive(state) ? CorePrompts.GoalDirective : null,
             // 压缩指令同理：答复路径上也必须看得到它，否则用户下发指令后去批准一次询问，
             // 那条尾块会「忽然没有压缩请求」——而指令明明还在。
-            state.PendingCompact ? _pendingCompactText : null);
+            state.PendingCompact ? _pendingCompactText : null,
+            // 子会话那一行同理：答复路径不给它的话，用户批准一次询问之后
+            // 模型会以为自己没有孩子——而它其实有一堆。
+            SubagentView.Line(subagents));
         return FloatingTextOf(slots);
     }
 
@@ -1042,6 +1072,43 @@ public sealed class Stepper(
     /// **每步读一次配置**，步内冻结。「能不能跑」不在这里——那是权限轴的事。
     /// </summary>
     private ShellAccess ShellFor() => new(new ShellStore(_store.DataRoot).Load());
+
+    /// <summary>
+    /// 这一刻的**派生关系快照**（`01` §10，2026-10-24）。⚠️ 与 <see cref="ShellFor"/> 同一条：
+    /// **执行那一刻现算一次**，步内冻结。
+    ///
+    /// <para>⚠️ <b>孩子的状态取盘上那份</b>（`Store.ReadState`），不取内存：`Running` 只写内存，
+    /// 而这一层够不着 `CoreHost`。⇒ 一个正在跑的子在工具看来是 `Idle`——**如实如此**，
+    /// 不假装（假装要知道内存状态，那需要给句柄开一个口子，而那是另一件事）。</para>
+    ///
+    /// <para>⚠️ **读不出来就跳过那个孩子**，不抛：一个坏 `state.json` 不该让父这一步整个失败
+    /// （同 `/sessions` 那条「坏文件不让它打死核心」）。代价是那个 id 会从快照里消失 ⇒
+    /// 模型调 `tell_child` 会得到「不是你的子会话」——**可见**，不是静默。</para>
+    /// </summary>
+    private SubagentScope SubagentScopeFor(SessionHandle handle)
+    {
+        var children = new List<SubagentChild>();
+
+        foreach (var (projectKey, spec) in _store.ChildrenOf(handle.SessionId))
+        {
+            string status;
+            try { status = _store.ReadState(projectKey, spec.SessionId).Status; }
+            catch (Exception ex) when (ex is IOException or FileNotFoundException
+                                          or UnauthorizedAccessException or FileFormatException)
+            {
+                continue;
+            }
+
+            children.Add(new SubagentChild(spec.SessionId, status));
+        }
+
+        return new SubagentScope(
+            handle.SessionId,
+            handle.Spec.ParentSessionId,
+            handle.Spec.Depth ?? 0,
+            handle.Spec.MaxDepth ?? Subagent.DefaultMaxDepth,
+            children);
+    }
 
     /// <summary>
     /// 这一批里有没有**真的执行过** `finish_goal`。⚠️ 走 `ExecutedCallIds`（`release` 的先例）：
@@ -1155,7 +1222,19 @@ public sealed class Stepper(
         /// <see cref="ReleasedLines"/> 同一条分工（`Stepper` 不碰事件总线）。
         /// 而**发不发得出去不影响已经落盘的检查点**：那是事实。</para>
         /// </summary>
-        CompactionCheckpoint? Compacted = null);
+        CompactionCheckpoint? Compacted = null,
+        /// <summary>
+        /// 本步执行出来的**派生请求**（`spawn`，2026-10-24）。⚠️ 交回去是为了让
+        /// `CommandDispatcher` 真正建会话：它才有 `PluginHost` / 事件总线 / `Start`，
+        /// 而 `Stepper` 刻意不碰那些（同 <see cref="ReleasedLines"/> 的分工）。
+        /// ⚠️ **条目与结果一一对应、同序**（都是按调用序产出的）。
+        /// </summary>
+        IReadOnlyList<SpawnRequest>? Spawns = null,
+        /// <summary>
+        /// 本步执行出来的**注入请求**（`tell_child` / `tell_parent`，2026-10-24）。
+        /// ⚠️ 与 <see cref="Spawns"/> 同一条分工：追加记录 + 入队 + 启动都在调用方。
+        /// </summary>
+        IReadOnlyList<TellRequest>? Tells = null);
 
     /// <summary>
     /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。

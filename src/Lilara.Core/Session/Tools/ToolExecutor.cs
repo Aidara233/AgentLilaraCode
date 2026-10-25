@@ -196,6 +196,11 @@ public sealed class ToolExecutor(
 
         var results = new List<TimelineEvent.ToolResultEvent>(calls.Count);
 
+        // ⚠️ **工具声明、核心落地**的两族（2026-10-24）：`spawn` 派生、`tell_*` 注入。
+        // 与 `Ask` 同一条判据——工具没有 store 的手，而这两件事都要碰会话。
+        var spawns = new List<SpawnRequest>();
+        var tells = new List<TellRequest>();
+
         // ⚠️ **只有走到下面那个 `RunAsync` 的调用才进来**——「名字在批里」不足以说明
         // 「它执行过」（见 `Batch.ExecutedCallIds`）。`release` 的线按这份名单画。
         var executed = new List<string>(calls.Count);
@@ -236,6 +241,13 @@ public sealed class ToolExecutor(
                     new ToolCall(plan.Call.CallId, plan.Call.Name, plan.Call.Arguments), context, ct)
                 : new ToolOutcome { Content = [new Block.TextBlock(plan.Says!)] };
 
+            // ⚠️ **两个「工具够不着、但它必须说出来」的出口**（2026-10-24）：与 `Ask`
+            // 同一条判据——工具没有 store 的手，落地在核心。⚠️ **只收真正执行过的那些**
+            // （`willRun` 那一支）：被闸门拒的调用不产出 `Spawn` / `Tell`，那是它
+            // **一次都没跑**的自然结果，不需要额外守卫。
+            if (outcome.Spawn is { } spawn) spawns.Add(spawn);
+            if (outcome.Tell is { } tell) tells.Add(tell);
+
             results.Add(new TimelineEvent.ToolResultEvent
             {
                 // ⚠️ 本记录的稳定 id（与协议 id `CallId` **不是一回事**）。见 `01` §8.0.2 第七节。
@@ -252,7 +264,12 @@ public sealed class ToolExecutor(
             });
         }
 
-        return new Batch(results, null) { ExecutedCallIds = executed };
+        return new Batch(results, null)
+        {
+            ExecutedCallIds = executed,
+            Spawns = spawns,
+            Tells = tells,
+        };
     }
 
     /// <summary>
@@ -266,7 +283,7 @@ public sealed class ToolExecutor(
         IReadOnlyList<TimelineEvent.ToolResultEvent> Results, AskRequest? Pending)
     {
         /// <summary>
-        /// 真正跑过 <see cref="ITool.RunAsync"/> 的调用 id（`01` §12.4 的线要它）。
+        /// 本批**真的执行过**的调用 id（`01` §12.4 的线要它）。
         ///
         /// <para>⚠️ <b>它存在，是因为「名字相同」与「真的执行了」不是一回事</b>：
         /// 一条 `release` 可能被闸门硬拒、可能落在挂起的那批里、也可能只配了
@@ -281,6 +298,22 @@ public sealed class ToolExecutor(
         /// （答案由核心拼，工具没跑）**一律为空**。</para>
         /// </summary>
         public IReadOnlyList<string> ExecutedCallIds { get; init; } = [];
+
+        /// <summary>
+        /// 本批执行出来的**派生请求**（`spawn`，2026-10-24）。
+        ///
+        /// <para>⚠️ 与 <see cref="ExecutedCallIds"/> 同一条纪律：只有**真的跑过**的工具
+        /// 才产出它（被闸门拒的那条不打这条通道）。⇒ 推进器不需要再判一次「它跑没跑」。</para>
+        /// </summary>
+        public IReadOnlyList<SpawnRequest> Spawns { get; init; } = [];
+
+        /// <summary>
+        /// 本批执行出来的**注入请求**（`tell_child` / `tell_parent`，2026-10-24）。
+        ///
+        /// <para>⚠️ 按**产出序**（= 调用序）排：父对同一个孩子连说两句时，那两句的次序
+        /// 就是记录里的次序——而记录里的次序是事实（`01` §4）。</para>
+        /// </summary>
+        public IReadOnlyList<TellRequest> Tells { get; init; } = [];
     }
 
     /// <summary>

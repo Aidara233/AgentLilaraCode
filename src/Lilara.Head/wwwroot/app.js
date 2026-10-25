@@ -313,7 +313,7 @@ async function loadSessions() {
   projects.clear();
   for (const r of rows) {
     if (currentProject === null) currentProject = r.projectKey;
-    sessions.set(r.sessionId, { projectKey: r.projectKey, ...r });
+    sessions.set(r.sessionId, { projectKey: r.projectKey, parentSessionId: r.parentSessionId, ...r });
 
     const p = projects.get(r.projectKey) || { count: 0, dir: null, asks: 0 };
     p.count += 1;
@@ -403,6 +403,33 @@ function renderSessions() {
     cnt.textContent = visible.length;
     head.append(nm, key, cnt);
 
+    // ⚠️ **子会话挂在父后面**（2026-10-24）：`parentSessionId` 是 spec 里的**出生事实**，
+    // 而 `ListSessions` 按 `CreatedAt` **降序**排（新的在前）⇒ 子会话（更晚创建）
+    // 会排在父**前面**。这里按「父 → 它的孩子们」重排一次。
+    // ⚠️ **只认「父也在这一栏里」**：父被删掉的孤儿子照顶层画（它的 `depth` 是 0），
+    // 而不是画成一个缩进着、却指不到谁的孤儿。
+    // ⚠️ **顺序是确定的**：`visible` 本身有序（`ListSessions` 的既有次序），
+    // 而这里只做一次稳定的深度优先展开，不重新排序。
+    const kids = new Map();
+    const roots = [];
+    for (const id of visible) {
+      const pid = (sessions.get(id) || {}).parentSessionId;
+      if (pid && visible.includes(pid)) {
+        if (!kids.has(pid)) kids.set(pid, []);
+        kids.get(pid).push(id);
+      } else {
+        roots.push(id);
+      }
+    }
+    const ordered = [];
+    const depth = new Map();
+    const walk = (id, d) => {
+      ordered.push(id);
+      depth.set(id, d);
+      for (const c of kids.get(id) || []) walk(c, d + 1);
+    };
+    for (const r of roots) walk(r, 0);
+
     if (archived.length) {
       const toggle = document.createElement("button");
       toggle.className = "archtoggle";
@@ -412,13 +439,22 @@ function renderSessions() {
     }
     g.appendChild(head);
 
-    for (const id of visible) {
+    for (const id of ordered) {
       const v = info.get(id) || {};
 
       const row = document.createElement("div");
       row.className = "srow" + (id === current ? " active" : "") + (v.spec?.archivedAt ? " archived" : "");
       row.title = id + (v.status ? ` · ${v.status}` : "");
       if (v.spec?.archivedAt) row.title += ` · 已归档 ${shortTime(v.spec.archivedAt)}`;
+
+      // ⚠️ **子会话缩进一格**（2026-10-24）：判据是 `depth`（重排时算出来的），
+      // 而它来自 spec 里那个**出生事实** `parentSessionId`——父被删掉的孤儿子
+      // 在这里 depth 是 0（`walk` 只从根走），于是它**照顶层画**，不会凭空缩进。
+      if (depth.get(id)) {
+        row.classList.add("child");
+        row.style.paddingLeft = `${depth.get(id) * 1.2}em`;
+        row.title += ` · 子会话（父 ${(sessions.get(id) || {}).parentSessionId || ""}）`;
+      }
 
       // 刻度：横杠的高度 = 这一步数 / 本栏最大步数。
       const gauge = document.createElement("span");
@@ -947,6 +983,8 @@ function providerCard(p) {
       ["模型清单", p.models && p.models.length ? p.models.join("、") : "(未声明)", !p.models || !p.models.length],
       ["端点", p.endpoint],
       ["认证", p.authScheme],
+      // 一次模型调用的超时：没配 = 由协议自己的默认值管（OpenAI 100 秒 / Claude 由 SDK 定）。
+      ["调用超时", p.timeoutSeconds ? `${p.timeoutSeconds} 秒` : "(默认)"],
       ["密钥", p.hasApiKey ? "已配置" : "未配置", !p.hasApiKey],
     ]);
     card.appendChild(dl);
@@ -983,6 +1021,13 @@ function providerCard(p) {
   const fModels = field("models", "模型清单（逗号分隔）",
     isNew ? "" : (p.models || []).join(","), "mono");
   fModels.input.placeholder = "deepseek-flash,gpt-4o（留空 = 不声明，头退回文本框）";
+  // 一次模型调用的超时（秒）。⚠️ 留空 = 「没配」= **不发这个键**（= 保留旧值），
+  // 与密钥同一条语义——别发一个 `null` 或 `0` 去表达「默认」，那会被读成一次真的配置。
+  const fTimeout = field("timeout", "调用超时（秒）",
+    isNew || !p.timeoutSeconds ? "" : String(p.timeoutSeconds), "mono");
+  fTimeout.input.type = "number";
+  fTimeout.input.min = "1";
+  fTimeout.input.placeholder = "留空 = 协议默认（OpenAI 100 秒；Claude 由 SDK 定）";
   const fEndpoint = field("endpoint", "端点", isNew ? "" : (p.endpoint || ""), "mono");
   fEndpoint.input.placeholder = "留空 = 官方地址";
   const fAuth = selectField("auth", "认证方式", SCHEMA.authSchemes,
@@ -997,6 +1042,7 @@ function providerCard(p) {
   form.append(fModel.wrap, fAuth.wrap);
   form.append(fEndpoint.wrap);
   form.append(fModels.wrap);
+  form.append(fTimeout.wrap);
   form.append(fKey.wrap);
   card.appendChild(form);
 
@@ -1020,6 +1066,19 @@ function providerCard(p) {
       // ⚠️ 密钥留空 ⇒ **整个键都不发**（= 保留旧 key），不是发一个空串。
       const key = fKey.input.value;
       if (key !== "") payload.apiKey = key;
+
+      // 超时同一条语义：留空 ⇒ 不发这个键（= 保留旧值）。
+      // ⚠️ 这里先判「是不是整数」：核心把非数字读成「没给」，于是 `30s` 会被静默当成
+      // 「保留旧值」并回 ✓ —— 用户以为改了，实际的数字谁也没见过。
+      const timeoutRaw = fTimeout.input.value.trim();
+      if (timeoutRaw !== "") {
+        const seconds = Number(timeoutRaw);
+        if (!Number.isInteger(seconds)) {
+          showCardError(card, "调用超时要是整数秒（留空 = 用协议默认）。");
+          return;
+        }
+        payload.timeoutSeconds = seconds;
+      }
 
       const r = await commandNow(crypto.randomUUID().slice(0, 8), payload);
       if (!r.accepted) { showCardError(card, r.reason); return; }
