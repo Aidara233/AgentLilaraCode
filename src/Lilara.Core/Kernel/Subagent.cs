@@ -190,6 +190,26 @@ public sealed record SpawnRequest(
     string ChildSessionId, string Task, string? Title, string? Preset, string? Permission);
 
 /// <summary>
+/// **一次归档请求**——父会话把某个孩子**收起**（2026-10-26）。
+///
+/// <para>⚠️ <b>归档是「可逆标记」，不是「删除」，也不是「搬走」</b>：它落在
+/// <see cref="SessionSpec.ArchivedAt"/> 上——目录不动、记录一条不少、`ListSessions` 照列。
+/// 取消归档 = 把那个字段写回 <c>null</c>（控制台 `session archive &lt;id&gt; --unarchive`）。
+/// ⇒ 它的唯一效果是**从视野里消失**：父的尾块行、`tell_child` 的名单、控制面的子会话视图
+/// （判据只有一处，见 `SessionStore.ChildrenOf`）。</para>
+///
+/// <para>⚠️ <b>形状与 <see cref="TellRequest"/> 同族</b>：工具**不改 spec**（它没有那支笔），
+/// 只把「收起哪一个」说清楚，落地在 `CommandDispatcher`（同 `release` 的线、`spawn` 的建会话）。
+/// 而**「它是不是我的孩子」必须在工具那一侧先判**——结果一落盘就改不了，
+/// 一句「已归档」配上一个别人的会话是一条假话。</para>
+/// </summary>
+/// <param name="ChildSessionId">
+/// 要收起的子会话 id。⚠️ 只可能是**本会话自己的孩子**（`SubagentScope.Children`）：
+/// 归档不是一条跨会话的权限通道，模型不可能借它让别人的会话消失。
+/// </param>
+public sealed record ArchiveRequest(string ChildSessionId);
+
+/// <summary>
 /// **一次注入**——父对子说一句，或子对父说一句（`01` §10.1 的「纯注入，双向对称」）。
 ///
 /// <para>⚠️ <b>两个方向共用这一个形状</b>，差别只在 <see cref="TargetSessionId"/> 是子还是父。

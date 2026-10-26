@@ -67,6 +67,12 @@ namespace Lilara.Core.Session.Tools;
 /// ——同 `release` 的「线落盘在推进器」与 `finish_goal` 的「拨轴在推进器」。
 /// ⚠️ 它是这几个里唯一**不归闸门管**的（`ITool.GatedByPermission == false`）：它不改变世界，
 /// 而它只在用户下发的指令期内生效（`pendingCompact`）——指令就是授权。</para>
+///
+/// <para>⚠️ <b><see cref="ArchiveChildTool"/>（2026-10-26）是子 agent 那一族的第五个</b>：
+/// 它把「派生关系能被收起」这扇门打开——一个已经落定、结论也收下的子会话**不必**每步
+/// 都在尾块里占一行。⚠️ 收起是**可逆标记**（`SessionSpec.ArchivedAt`），不是删除：
+/// 记录一条不少，控制台 `session archive &lt;id&gt; --unarchive` 就把它放回来。
+/// ⇒ 它与 `release` 同一条判据：工具只说一句话，落地在核心。</para>
 /// </summary>
 public static class BuiltInTools
 {
@@ -91,6 +97,9 @@ public static class BuiltInTools
         // ⚠️ `tell_parent` 与 `subagent_report` 在顶层会话里会回一句「你没有父会话」/
         // 「没有待读的回报」：**工具表不动**（它属于前缀最前端，改它最贵），
         // 关着时只说人话——与 web_search / finish_goal 同一条做法。
+        // 2026-10-26：`archive_child` 进这一族——它开的是「派生关系能被收起」这扇门
+        // （可逆标记，`SessionSpec.ArchivedAt`），与 `release` 画线的判据同源。
         new SpawnTool(), new TellChildTool(), new TellParentTool(), new SubagentReportTool(),
+        new ArchiveChildTool(),
     ];
 }

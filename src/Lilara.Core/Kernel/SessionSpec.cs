@@ -70,6 +70,12 @@ public sealed record SessionSpec
     ///
     /// <para>⚠️ 可空是**语义**（`null` = 没归档），不再是「为了让老文件逐字节不变」——
     /// 那件事现在由**格式版本**承担。</para>
+    ///
+    /// <para>⚠️ <b>「谁滤、谁不滤」是一条容易读错的边界</b>（2026-10-26 补）：
+    /// 归档会话**仍然是完整的会话**，所以 `ListSessions` / `/sessions` / `/claims` 都**照列**
+    /// （账不能少一条）。滤的只有**派生关系那一份**——`SessionStore.ChildrenOf` 不列归档的孩子，
+    /// 于是父的尾块行、`tell_child` 的名单、控制面的子会话视图同时看不见它。
+    /// ⇒ 一句话：**账照记，视野里消失**。两处判据各自只有一处，谁都不许再抄一遍。</para>
     /// </summary>
     public DateTimeOffset? ArchivedAt { get; init; }
 

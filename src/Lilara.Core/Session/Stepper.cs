@@ -315,6 +315,8 @@ public sealed class Stepper(
         // ——工具只声明，`CommandDispatcher` 落地（它才有 PluginHost / 事件总线 / Start）。
         IReadOnlyList<SpawnRequest> spawns = [];
         IReadOnlyList<TellRequest> tells = [];
+        // 2026-10-26：同一条分工的第三族——`archive_child` 只说一句话，写 spec 在分派器。
+        IReadOnlyList<ArchiveRequest> archives = [];
 
         // ⚠️ **记录那一份**（未经回收、未经解引用）——`fetch` 取地址必须从它算，
         // 理由见 `SessionToolContext` 的构造参数注释。
@@ -397,6 +399,7 @@ public sealed class Stepper(
             executedCallIds = batch.ExecutedCallIds;
             spawns = batch.Spawns;
             tells = batch.Tells;
+            archives = batch.Archives;
         // T0 本身是固定目标；普通计划全部完成且不在 iterate 时，finish_goal 可以收尾当前 goal。
         // ⚠️ iterate 下即使普通计划暂时为空也不能收尾；它由下面那条自动切回 plan 续规划。
         var canFinishGoal = handle.State.Axes![Axes.Initiative] == "goal"
@@ -588,6 +591,7 @@ public sealed class Stepper(
         return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id,
             ReleasedClaims: releasedClaims, ReleasedLines: releasedLines, ToolResults: toolResults,
             GoalEnded: goalEnded, Compacted: compaction, Spawns: spawns, Tells: tells,
+            Archives: archives,
             PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
             ExecutedCallIds: executedCallIds);
     }
@@ -897,6 +901,7 @@ public sealed class Stepper(
         // ⚠️ 派生 / 注入请求（2026-10-24）：与 `StepAsync` 同一条分工，走同一个出口。
         IReadOnlyList<SpawnRequest> spawns = [];
         IReadOnlyList<TellRequest> tells = [];
+        IReadOnlyList<ArchiveRequest> archives = [];
         IReadOnlyList<string> executedCallIds = [];
 
         if (calls.Count > 0)
@@ -935,6 +940,7 @@ public sealed class Stepper(
             toolResults = batch.Results;
             spawns = batch.Spawns;
             tells = batch.Tells;
+            archives = batch.Archives;
             var canFinishGoal = handle.State.Axes![Axes.Initiative] == "goal"
                 && PlanTree.Current(handle.State.Plan) is null;
             goalEnded = GoalMode.IsActive(handle.State) && canFinishGoal && EndedGoal(batch, calls);
@@ -993,7 +999,7 @@ public sealed class Stepper(
 
                 return new StepOutcome(NoReply, again, handle.State.Ask?.DeadlineAt,
                     ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
-                    GoalEnded: goalEnded, Spawns: spawns, Tells: tells,
+                    GoalEnded: goalEnded, Spawns: spawns, Tells: tells, Archives: archives,
                     PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
                     ExecutedCallIds: executedCallIds);
             }
@@ -1011,6 +1017,7 @@ public sealed class Stepper(
 
         return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
             ToolResults: toolResults, GoalEnded: goalEnded, Spawns: spawns, Tells: tells,
+            Archives: archives,
             PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
             ExecutedCallIds: executedCallIds);
     }
@@ -1259,6 +1266,11 @@ public sealed class Stepper(
     /// <para>⚠️ **读不出来就跳过那个孩子**，不抛：一个坏 `state.json` 不该让父这一步整个失败
     /// （同 `/sessions` 那条「坏文件不让它打死核心」）。代价是那个 id 会从快照里消失 ⇒
     /// 模型调 `tell_child` 会得到「不是你的子会话」——**可见**，不是静默。</para>
+    ///
+    /// <para>⚠️ <b>归档的孩子同样不在这里</b>（2026-10-26）：过滤发生在
+    /// <see cref="SessionStore.ChildrenOf"/> 一处，所以这一层**不用**再判一次
+    /// ——`archive_child` 的效果（尾块那一行少一格、`tell_child` 不再认它）正是从这里来的。
+    /// 别在这加一个 `spec.ArchivedAt` 判断：判据抄第二遍就会与那一处漂。</para>
     /// </summary>
     internal SubagentScope SubagentScopeFor(SessionHandle handle)
     {
@@ -1511,6 +1523,13 @@ public sealed class Stepper(
         /// ⚠️ 与 <see cref="Spawns"/> 同一条分工：追加记录 + 入队 + 启动都在调用方。
         /// </summary>
         IReadOnlyList<TellRequest>? Tells = null,
+        /// <summary>
+        /// 本步执行出来的**归档请求**（`archive_child`，2026-10-26）。
+        /// ⚠️ 与 <see cref="Spawns"/> / <see cref="Tells"/> 同一条分工：写
+        /// <see cref="SessionSpec.ArchivedAt"/> 与发 `session.archived` 都在调用方
+        /// （`Stepper` 不碰 store 的 spec，也不碰事件总线）。
+        /// </summary>
+        IReadOnlyList<ArchiveRequest>? Archives = null,
         /// <summary>
         /// 本步**真的改过计划**（`plan` / `advance_plan` 执行过、且落地成功）。
         /// ⚠️ 与 <see cref="GoalEnded"/> 同一条分工：交回去是为了让调用方发 `plan.updated`。

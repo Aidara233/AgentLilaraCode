@@ -238,6 +238,8 @@ public sealed class ToolExecutor(
         // 与 `Ask` 同一条判据——工具没有 store 的手，而这两件事都要碰会话。
         var spawns = new List<SpawnRequest>();
         var tells = new List<TellRequest>();
+        // 2026-10-26：第三族——`archive_child` 收起。同上：工具只说一句话，写 spec 在分派器。
+        var archives = new List<ArchiveRequest>();
 
         // ⚠️ **只有走到下面那个 `RunAsync` 的调用才进来**——「名字在批里」不足以说明
         // 「它执行过」（见 `Batch.ExecutedCallIds`）。`release` 的线按这份名单画。
@@ -285,6 +287,7 @@ public sealed class ToolExecutor(
             // **一次都没跑**的自然结果，不需要额外守卫。
             if (outcome.Spawn is { } spawn) spawns.Add(spawn);
             if (outcome.Tell is { } tell) tells.Add(tell);
+            if (outcome.Archive is { } archive) archives.Add(archive);
 
             results.Add(new TimelineEvent.ToolResultEvent
             {
@@ -307,6 +310,7 @@ public sealed class ToolExecutor(
             ExecutedCallIds = executed,
             Spawns = spawns,
             Tells = tells,
+            Archives = archives,
         };
     }
 
@@ -352,6 +356,15 @@ public sealed class ToolExecutor(
         /// 就是记录里的次序——而记录里的次序是事实（`01` §4）。</para>
         /// </summary>
         public IReadOnlyList<TellRequest> Tells { get; init; } = [];
+
+        /// <summary>
+        /// 本批执行出来的**归档请求**（`archive_child`，2026-10-26）。
+        ///
+        /// <para>⚠️ 与 <see cref="Spawns"/> / <see cref="Tells"/> 同一条纪律：只有**真的跑过**
+        /// 的工具才产出它——被闸门拒的那条调用不打这条通道，所以分派器不需要再判一次
+        /// 「它跑没跑」。⚠️ 按产出序（= 调用序）排：同一步里先后收起两个孩子的次序是事实。</para>
+        /// </summary>
+        public IReadOnlyList<ArchiveRequest> Archives { get; init; } = [];
     }
 
     /// <summary>

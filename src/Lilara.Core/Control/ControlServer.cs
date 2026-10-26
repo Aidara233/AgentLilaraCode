@@ -240,7 +240,8 @@ public sealed class ControlServer(
 
                     if (activated.TryGetValue(sid, out var live))
                     {
-                        rows.Add(Row(sid, pk, active: true, live.State, spec.Title, spec.ParentSessionId));
+                        rows.Add(Row(sid, pk, active: true, live.State, spec.Title, spec.ParentSessionId,
+                            spec.ArchivedAt));
                         continue;
                     }
 
@@ -254,7 +255,8 @@ public sealed class ControlServer(
                         // 跳过。
                     }
 
-                    if (disk is not null) rows.Add(Row(sid, pk, active: false, disk, spec.Title, spec.ParentSessionId));
+                    if (disk is not null) rows.Add(Row(sid, pk, active: false, disk, spec.Title,
+                        spec.ParentSessionId, spec.ArchivedAt));
                 }
             }
 
@@ -262,7 +264,7 @@ public sealed class ControlServer(
 
             static object Row(
                 string sid, string pk, bool active, SessionState state, string? title,
-                string? parentSessionId) => new
+                string? parentSessionId, DateTimeOffset? archivedAt) => new
             {
                 SessionId = sid,
                 ProjectKey = pk,
@@ -277,6 +279,14 @@ public sealed class ControlServer(
                 // 父被删掉之后这个 id 仍然指着它（`01` §10.3「父停：子停止推进，记录保留」），
                 // 而头的处理是「挂不上就按顶层画」，不是「当作没这回事」。
                 ParentSessionId = parentSessionId ?? "",
+                // ⚠️ **归档态**（2026-10-26）：交出去，头的折叠才真的生效。
+                // 那个折叠逻辑（`app.js` 的 `showArchived` / 每项目计数）**早就在**，
+                // 而这个端点一直没给这个字段、头上又把它硬填成 `null`
+                // ⇒ 归档会话一直混在列表与计数里，两边都看着正常。
+                // ⚠️ 这里**不过滤**：`/sessions` 回答的是「项目下有哪些会话」，
+                // 与 `ListSessions` 同一条取舍（见 `SessionSpec.ArchivedAt`）；
+                // 滤掉的那一份是**派生关系**（`SessionStore.ChildrenOf`）。
+                ArchivedAt = archivedAt,
                 // ⚠️ **待办的那次询问**：头据此在列表上标出「哪个会话在等我」，
                 // 不必再去逐个 `GET /approvals`。
                 //

@@ -283,13 +283,27 @@ public sealed class SessionStore(string dataRoot)
     ///
     /// <para>⚠️ **只返回直接孩子**，不递归：级联停止要递归，但那个递归由调用方做
     /// （它需要知道每一层，而不是一个拍平的列表）。深度默认只有一层，递归今天最多走一步。</para>
+    ///
+    /// <para>⚠️⚠️ <b>已经归档的孩子不在里面</b>（2026-10-26 加）：这是「归档 = 从视野里消失」
+    /// 的**唯一判据**。它必须在这里、而不是在三个调用点各判一次——
+    /// 那三处正是同一件事的三张脸：父的尾块行（`Stepper.SubagentScopeFor`）、
+    /// 模型能对话的名单（`tell_child` / `archive_child` 都查 `SubagentScope.Children`）、
+    /// 控制面的子会话视图（`ControlServer.SubagentScopeOf`）。三处各写一个
+    /// `spec.ArchivedAt is null` 就是本仓反复栽的「两层判据必须共用一个谓词」，
+    /// 而漂了的表现是**模型看得见、人看不见**（或反过来）——两边都看着正常。</para>
+    ///
+    /// <para>⚠️ <b>它与 `ListSessions` 的取舍不是一回事，别弄混</b>：`ListSessions` 照列归档
+    /// 会话（理由见 <see cref="SessionSpec.ArchivedAt"/>：`/claims` 也走它，滤掉会让
+    /// 「归档会话仍占着路径」这件事从那个端点上消失）。那说的是**「项目下有哪些会话」**；
+    /// 这里说的是**「这一刻的派生关系里，谁还在台面上」**。前者是账，后者是视野。</para>
     /// </summary>
     public IReadOnlyList<(string ProjectKey, SessionSpec Spec)> ChildrenOf(string parentSessionId) =>
         [.. ListProjects()
             .SelectMany(pk => ListSessions(pk)
                 .Select(sid => TryReadSpec(pk, sid))
                 .OfType<SessionSpec>()
-                .Where(spec => string.Equals(spec.ParentSessionId, parentSessionId, StringComparison.Ordinal))
+                .Where(spec => spec.ArchivedAt is null
+                               && string.Equals(spec.ParentSessionId, parentSessionId, StringComparison.Ordinal))
                 .Select(spec => (ProjectKey: spec.ProjectKey, Spec: spec)))
             .OrderBy(x => x.Spec.SessionId, StringComparer.Ordinal)];
 }

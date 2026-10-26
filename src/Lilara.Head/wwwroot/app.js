@@ -325,8 +325,10 @@ async function loadSessions() {
     // ⚠️ **`spec` 的形状不能改**：`renderSessions` 读 `spec.title` / `spec.archivedAt`，
     // 而这两件事在这个端点里是**顶级字段**。在这里补一次映射，
     // 比让两个渲染点各判一次「这份数据是从哪来的」要好（两处判据必漂）。
+    // ⚠️ `archivedAt` 必须**真的**取自那一行（2026-10-26 修）：这里曾经硬写 `null`
+    // ⇒ 核心明明交了这个字段，而折叠与计数永远看不见归档会话（两边都看着正常）。
     info.set(r.sessionId, {
-      spec: { title: r.title, archivedAt: null, projectKey: r.projectKey },
+      spec: { title: r.title, archivedAt: r.archivedAt ?? null, projectKey: r.projectKey },
       turn: r.turn,
       status: r.status,
       ask: r.ask,

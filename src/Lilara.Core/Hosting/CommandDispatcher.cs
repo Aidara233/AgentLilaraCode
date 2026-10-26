@@ -1004,10 +1004,12 @@ public sealed class CommandDispatcher(
     // 不改那一步的任何字节。崩在中间最坏是「子会话建了、但没收到任务」——可见（头的列表里多一条空的）。
 
     /// <summary>
-    /// **兑现本步的派生与注入**。调用点在 `RunStepAsync` 的工具结果事件之后、`step.end` 之前。
+    /// **兑现本步的派生、注入与归档**。调用点在 `RunStepAsync` 的工具结果事件之后、`step.end` 之前。
     ///
-    /// <para>⚠️ 次序：先派生、后注入。父在同一步里既 spawn 又 tell 时，那个 tell 的收件人
-    /// 必须是**已经存在**的孩子——反过来（先注入）会「转达给一个还没建的会话」。</para>
+    /// <para>⚠️ 次序：先派生、后注入、**最后归档**。两条理由：① 父在同一步里既 spawn 又 tell 时，
+    /// 那个 tell 的收件人必须是**已经存在**的孩子——反过来（先注入）会「转达给一个还没建的会话」；
+    /// ② 同一批里既 tell 又 archive 时，那句话必须**送得出去**——先归档的话，
+    /// 收件人已经从视野里消失（`ChildrenOf` 不再列它），而工具结果里那句「已转达」就成了假话。</para>
     /// </summary>
     private void DeliverSubagents(SessionHandle handle, Stepper.StepOutcome step)
     {
@@ -1016,6 +1018,54 @@ public sealed class CommandDispatcher(
 
         foreach (var tell in step.Tells ?? [])
             DeliverTell(handle, tell);
+
+        foreach (var archive in step.Archives ?? [])
+            ArchiveChild(handle, archive);
+    }
+
+    /// <summary>
+    /// **把一个孩子从视野里收起**（`archive_child`，2026-10-26）。
+    ///
+    /// <para>⚠️ <b>它写的就是 `session archive` 那个字段</b>（<see cref="SessionSpec.ArchivedAt"/>），
+    /// 一条判据两处入口——模型说「收起」与人敲 `session archive` 必须落成同一件事，
+    /// 否则「归档了没有」会有两个自相矛盾的答案（而头的折叠只看这一个字段）。</para>
+    ///
+    /// <para>⚠️ <b>它<b>不</b>停止那个孩子</b>（与 `HandleSessionArchive` 的级联停止不同，而这是
+    /// 有意的）：归档在这里只改「父看得见什么」。一个还在跑的孩子归档之后照样跑完、
+    /// 照样把回报送进父的记录——停止推进有它自己的入口（父中断 = 整棵子树停），
+    /// 让「收起」顺手扼杀一份在飞的工作会把两件事的语义搅在一起。</para>
+    ///
+    /// <para>⚠️ <b>判据里那两条都是「静默不动 louder than 猜」</b>：不是自己的孩子（可能在这两步
+    /// 之间被过继 / 被删）、已经归档——都把这一条**丢掉**，不抛。它跑在一步的收尾路径上，
+    /// 抛会把那一步已经算好的结果整个丢掉（同 <see cref="DeliverTell"/> 的失败方向）。
+    /// 而「说了已收起、其实没动」在模型那边是**可见**的：那个 id 会继续出现在尾块那一行。</para>
+    /// </summary>
+    private void ArchiveChild(SessionHandle parent, Kernel.ArchiveRequest request)
+    {
+        var found = _host.Store.FindSession(request.ChildSessionId);
+        if (found is not { } hit) return;
+
+        var (projectKey, spec) = hit;
+        if (!string.Equals(spec.ParentSessionId, parent.SessionId, StringComparison.Ordinal)) return;
+        if (spec.ArchivedAt is not null) return;      // 已经收起过（幂等：不重复发事件）
+
+        var now = CoreClock.Now();
+
+        // ⚠️ 与 `HandleSessionArchive` 同一条两条路：激活着走句柄（同一把 `_gate`，
+        // 与 `configure` / `session.archive` 互斥），没激活就直接写盘（没有 handle
+        // 就没有别的东西在改它）。⚠️ **不为了改一个字段去 `Activate`**。
+        var patched = _host.TryGetActivated(spec.SessionId, out var live)
+            ? live.UpdateSpecAndPersist(_host.Store, s => s with { ArchivedAt = now })
+            : Direct(spec with { ArchivedAt = now });
+
+        PublishDestruction(projectKey, patched.SessionId,
+            new WireEvent.SessionArchived(patched.SessionId, projectKey, now), toSessionTopic: true);
+
+        SessionSpec Direct(SessionSpec patched)
+        {
+            _host.Store.WriteSpec(projectKey, patched);
+            return patched;
+        }
     }
 
     /// <summary>

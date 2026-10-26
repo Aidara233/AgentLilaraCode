@@ -17,6 +17,11 @@ namespace Lilara.Core.Session;
 ///
 /// <para>⚠️ <b>排序由 <c>SessionStore.ChildrenOf</c> 保证（ordinal 按 id）</b>，
 /// 这里不再排一次：两处各排一遍的话，一处改了另一处不红。</para>
+///
+/// <para>⚠️ <b>归档的孩子不在 <see cref="SubagentScope.Children"/> 里</b>（2026-10-26）：
+/// 过滤发生在 `SessionStore.ChildrenOf` 一处，所以这一层一个字都不用改——
+/// 而它的效果正是要的那个：孩子全被收起之后 <see cref="Line"/> 回 <c>null</c>，
+/// **那一行整行不出现**（连「子会话：」这样的空壳都不留）。</para>
 /// </summary>
 public static class SubagentView
 {

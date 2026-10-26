@@ -417,4 +417,142 @@ public class SubagentTests : IDisposable
         Assert.True(child.InterruptEpoch > before,
             "父被叫停之后，子的停止计数必须也变——否则 goal 循环会接着跑。");
     }
+
+    /// <summary>
+    /// **归档 = 从视野里消失**（2026-10-26）。四件事一起钉：
+    /// ① 标记真的落进 `spec.json`（可逆：非空 = 已归档）；
+    /// ② `ChildrenOf` 不再列它（「看不见」的唯一判据）；
+    /// ③ 下一次请求的尾块里**没有那个 id**（那一行整行不出现）；
+    /// ④ `tell_child` 不再认它——**说的是实话**，不是静默失败。
+    ///
+    /// <para>⚠️ <b>它同时钉住「不删任何东西」</b>：那条记录与那个会话目录都还在
+    /// （`TryReadSpec` 读得出来），归档只是一个字段。</para>
+    /// </summary>
+    [Fact]
+    public async Task ArchiveChild_RemovesTheChildFromTheTailLineAndFromTellChild()
+    {
+        var parent = new LoopAdapter()
+            .Script(new Block.ToolUseBlock("c1", SpawnTool.NameOf, """{"task":"一件事"}"""));
+        var (host, _, dispatcher) = Harness(parent, new LoopAdapter());
+
+        var parentId = await CreateAsync(dispatcher);
+        await SendAsync(dispatcher, parentId, "派一个");
+
+        var child = Assert.Single(host.Store.ChildrenOf(parentId)).Spec;
+
+        // 父把它收起（这段脚本落在父的下一步上——子有自己的适配器，抢不走它）。
+        parent.Script(new Block.ToolUseBlock(
+            "c2", ArchiveChildTool.NameOf, $$"""{"child":"{{child.SessionId}}"}"""));
+        await SendAsync(dispatcher, parentId, "把它收起");
+
+        // ⚠️ **等它落盘，不假设 `awaitCompletion` 就等到了这一步**：`session.send` 在
+        // 「已有一步在飞」时只**入队**就回执（`TryEnterStep` 那条启动去重），而子会话落定
+        // 的回报完全可能刚好把父推起来 ⇒ 直接断言会变成投骰子（实测过一次）。
+        await WaitUntil(
+            () => host.Store.TryReadSpec(child.ProjectKey, child.SessionId)?.ArchivedAt is not null,
+            "归档标记落盘");
+
+        // ① 标记落盘，会话一条不少。
+        var marked = host.Store.TryReadSpec(child.ProjectKey, child.SessionId);
+        Assert.NotNull(marked);
+        Assert.True(marked!.ArchivedAt is not null,
+            $"归档标记没落盘。父这次的结果：{ParentResults(host, parentId)}");
+
+        // ② 视野里没了。
+        Assert.Empty(host.Store.ChildrenOf(parentId));
+
+        // ③ 再走一步：尾块里不该再有它的 id。
+        parent.Script(new Block.ToolUseBlock(
+            "c3", TellChildTool.NameOf, $$"""{"child":"{{child.SessionId}}","text":"喂"}"""));
+        await SendAsync(dispatcher, parentId, "再跟它说话");
+        await WaitUntil(
+            () => ParentResults(host, parentId).Contains("不是你的子会话", StringComparison.Ordinal),
+            "`tell_child` 那句拒绝的结果");
+
+        var tail = string.Concat(parent.Calls[^1].Slots.Tail
+            .OfType<Block.TextBlock>().Select(b => b.Text));
+        Assert.DoesNotContain(child.SessionId, tail, StringComparison.Ordinal);
+
+        // ④ `tell_child` 说的是一句实话（而不是「已转达」）。
+        // ⚠️ 判据取**整份结果正文**再看两句在不在：每轮末尾都会由核心合成一对
+        // `floating_context` 占位结果（2026-10-26 的裁定），所以「最后一条结果」
+        // 不是模型那句话——按位置取会在那一对上打空。
+        var said = ParentResults(host, parentId);
+        Assert.Contains("不是你的子会话", said, StringComparison.Ordinal);
+        Assert.DoesNotContain("已转达", said, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// **`archive_child` 只认自己的孩子**：一个别人的（或已经不存在的）id ⇒ 一句人话 + 什么都不做。
+    ///
+    /// <para>⚠️ 这条判据必须在**工具**这一侧（结果一落盘就改不了），而它的失败模式很难看出来：
+    /// 若只判「id 非空」，模型就能把**任何**会话从它父亲的视野里抹掉，
+    /// 而重复归档也会落成一句「已收起」的假话。</para>
+    /// </summary>
+    [Fact]
+    public async Task ArchiveChild_RefusesAnIdThatIsNotYourChild()
+    {
+        var tool = new ArchiveChildTool();
+        var context = new SessionToolContext(_work, new BlobStore(_root),
+            subagents: new SubagentScope("p", null, 0, 1, [new SubagentChild("mine", SessionStatus.Idle)]));
+
+        var notMine = await tool.RunAsync(
+            new ToolCall("t1", ArchiveChildTool.NameOf, """{"child":"someone-else"}"""),
+            context, CancellationToken.None);
+
+        Assert.Null(notMine.Archive);
+        var said = string.Concat(notMine.Content.OfType<Block.TextBlock>().Select(b => b.Text));
+        Assert.Contains("不是你的子会话", said, StringComparison.Ordinal);
+        // ⚠️ 名单要如实交出来——模型据此才知道该用哪个 id。
+        Assert.Contains("mine", said, StringComparison.Ordinal);
+
+        // 自己的孩子 ⇒ 真的产出请求（而**工具自己不写任何东西**）。
+        var mine = await tool.RunAsync(
+            new ToolCall("t2", ArchiveChildTool.NameOf, """{"child":"mine"}"""), context, CancellationToken.None);
+        Assert.Equal("mine", mine.Archive?.ChildSessionId);
+    }
+
+    /// <summary>
+    /// **`ChildrenOf` 不列归档的孩子**（2026-10-26）——它是「看不见」的唯一判据，
+    /// 所以这一条盯的是**判别式本身**：两个活孩子 + 一个归档孩子 ⇒ 只列两个，
+    /// 而 `ListSessions` 仍然三个都在（账照记，视野里消失）。
+    /// </summary>
+    [Fact]
+    public void ChildrenOf_HidesArchivedChildren_ButListSessionsStillCountsThem()
+    {
+        var store = new SessionStore(_root);
+        var model = new ModelSelection
+        {
+            ProviderId = "p", ModelId = "m", Protocol = Protocols.ClaudeMessages,
+            Effort = "medium", MaxTokens = 1024,
+        };
+
+        SessionSpec Spec(string id, DateTimeOffset? archivedAt = null) => new()
+        {
+            SessionId = id,
+            ProjectKey = "pk",
+            WorkingDirectory = _work,
+            CreatedAt = DateTimeOffset.UnixEpoch,
+            ParentSessionId = "parent",
+            ArchivedAt = archivedAt,
+            Model = model,
+        };
+
+        store.WriteSpec("pk", Spec("a"));
+        store.WriteSpec("pk", Spec("b"));
+        store.WriteSpec("pk", Spec("c", DateTimeOffset.UnixEpoch));
+
+        // 视野：归档的那个不在。
+        Assert.Equal(["a", "b"], store.ChildrenOf("parent").Select(x => x.Spec.SessionId));
+
+        // 账：三个都还在（`ListSessions` 的取舍没被这一条改掉）。
+        Assert.Equal(["a", "b", "c"], store.ListSessions("pk"));
+    }
+
+    /// <summary>父记录里**全部**工具结果的正文（上面那条断言用它）。</summary>
+    private static string ParentResults(CoreHost host, string parentId) =>
+        string.Concat(host.Store.ReadTimeline(
+                host.Store.FindSession(parentId)!.Value.ProjectKey, parentId)
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .SelectMany(r => r.Content).OfType<Block.TextBlock>().Select(b => b.Text));
 }

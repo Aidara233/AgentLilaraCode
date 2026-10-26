@@ -192,6 +192,20 @@ public sealed record ToolOutcome
     /// 所以它也走这条结构化通道，而不是让工具自己闷头写。</para>
     /// </summary>
     public TellRequest? Tell { get; init; }
+
+    /// <summary>
+    /// **这次执行其实是一次归档**——父会话把某个孩子从视野里收起（2026-10-26）。
+    ///
+    /// <para>⚠️ 与 <see cref="Spawn"/> / <see cref="Tell"/> 同一个形状、同一条理由：
+    /// 工具没有改 spec 的笔，也没打算有。⇒ 它只声明「收起哪一个」，
+    /// 写 <see cref="SessionSpec.ArchivedAt"/> 与发 `session.archived` 都在
+    /// `CommandDispatcher`（同 `release` 的线）。</para>
+    ///
+    /// <para>⚠️ <b>它是一种<b>可逆</b>标记</b>：不删记录、不搬目录，取消归档就把字段写回 <c>null</c>。
+    /// ⇒ 工具的 <see cref="ITool.PermissionClass"/> 是 <see cref="PermissionClass.ReadOnly"/>
+    /// ——与 `release` 同一条判据：它做的唯一一件事是**说出一句话**。</para>
+    /// </summary>
+    public ArchiveRequest? Archive { get; init; }
 }
 
 /// <summary>
