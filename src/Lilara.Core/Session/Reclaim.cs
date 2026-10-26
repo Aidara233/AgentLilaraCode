@@ -148,9 +148,20 @@ public static class Reclaim
     /// 窗口里记下的 id 在渲染时仍要过这一条——库对象后来没了的结果不许换成注记，
     /// 那会是一句「fetch 取回」的假话。</para>
     /// </summary>
+    /// <summary>
+    /// **占位结果的 id**（`floating-` 前缀）：这类结果**永远不进回收候选**。
+    ///
+    /// <para>⚠️ 它没有可收的内容——正文就是一句「读数不在这里」；而把它换成回收注记，
+    /// 那句话当场被吃掉，占位就从「指向读数」退化成「一条无意义的痕迹」。
+    /// 判据只有这一处：<see cref="Decide"/> 与 <see cref="Resolve"/> 都调它。</para>
+    /// </summary>
+    private static bool IsFloatingPlaceholder(string id) =>
+        id.StartsWith("floating-", StringComparison.Ordinal);
+
     public static IReadOnlySet<string> Decide(IReadOnlyList<TimelineEvent> timeline, BlobStore blobs)
     {
         var byId = timeline.OfType<TimelineEvent.ToolResultEvent>()
+            .Where(r => !IsFloatingPlaceholder(r.Id))
             .ToDictionary(r => r.Id, StringComparer.Ordinal);
 
         var result = new HashSet<string>(StringComparer.Ordinal);
@@ -169,7 +180,7 @@ public static class Reclaim
         // 而「释放过就是释放过」是**单调的** ⇒ 回收集合只增不减，前缀只往前走。
         // ⇒ 把**所有**释放事件的作用域并起来（不是只看最后一条）。
         foreach (var r in LineCovers(timeline))
-            if (Recoverable(r.Content, blobs)) result.Add(r.Id);
+            if (!IsFloatingPlaceholder(r.Id) && Recoverable(r.Content, blobs)) result.Add(r.Id);
 
         return result;
     }
@@ -192,7 +203,8 @@ public static class Reclaim
         var result = new HashSet<string>(StringComparer.Ordinal);
 
         // ---- 距离：末尾 ProtectedRecentResults 条是保护带，不动 ----
-        var candidates = timeline.OfType<TimelineEvent.ToolResultEvent>().ToList();
+        var candidates = timeline.OfType<TimelineEvent.ToolResultEvent>()
+            .Where(r => !IsFloatingPlaceholder(r.Id)).ToList();
         for (var i = 0; i < candidates.Count - ProtectedRecentResults; i++)
         {
             var r = candidates[i];

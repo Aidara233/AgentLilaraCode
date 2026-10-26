@@ -113,7 +113,7 @@ public class StaleTests : IDisposable
         await _stepper.StepAsync(_handle, "看一眼", default);
 
         var readId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal)).Id;
 
         // 第 2 步：模型调用**期间**世界变了，然后模型**再读一次**（同一趟里就能看出差别）。
         _adapter.ReplyWith(_ =>
@@ -162,7 +162,7 @@ public class StaleTests : IDisposable
         await _stepper.StepAsync(_handle, "看一眼", default);
 
         var readId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal)).Id;
 
         File.WriteAllText(Path.Combine(_work, "a.txt"), "换过的内容");
 
@@ -195,7 +195,7 @@ public class StaleTests : IDisposable
         await _stepper.StepAsync(_handle, "看一眼", default);
 
         var readId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal)).Id;
 
         // 世界**没变**，再正经开一次窗——证明「不收」是判据的结果，不是「没开窗」。
         OpenWindow();
@@ -229,7 +229,7 @@ public class StaleTests : IDisposable
         await _stepper.StepAsync(_handle, "看一眼", default);
 
         var readId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal)).Id;
 
         File.WriteAllText(Path.Combine(_work, "a.txt"), "换过的内容");
 
@@ -277,7 +277,7 @@ public class StaleTests : IDisposable
         await _stepper.StepAsync(_handle, "列一下", default);
 
         var lsId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal)).Id;
 
         // 目录**真的**变了（多了一个文件）——再开窗，证明不收是判据的结果。
         File.WriteAllText(Path.Combine(_work, "b.txt"), "y");

@@ -84,12 +84,13 @@ public class StepperToolTests : IDisposable
         // ⚠️ `StepAsync(handle, string)` 这个壳子**会先追加用户那条**（`01` §6.1 的次序），
         // 所以盘上是 [user][model][result][result] = 4 条。
         // 关键是**后三条挨着**：模型消息与它那批结果**一次落盘**（`01` §3.6 ④）。
-        Assert.Equal(4, timeline.Count);
+        Assert.Equal(6, timeline.Count);
         Assert.IsType<TimelineEvent.MessageEvent>(timeline[0]);   // 用户
         var model = Assert.IsType<TimelineEvent.MessageEvent>(timeline[1]);
         Assert.Equal(2, model.Blocks.OfType<Block.ToolUseBlock>().Count());
 
-        var results = timeline.OfType<TimelineEvent.ToolResultEvent>().ToList();
+        var results = timeline.OfType<TimelineEvent.ToolResultEvent>()
+            .Where(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal)).ToList();
         Assert.Equal(2, results.Count);
         // ⚠️ **顺序 = 调用序**（`01` §4）——不是完成序。
         Assert.Equal(["c1", "c2"], results.Select(r => r.CallId));
@@ -110,7 +111,7 @@ public class StepperToolTests : IDisposable
         // 用户那条是**上一次**追加的（`StepAsync(handle, string)` 的壳子），
         // 所以盘上是 [user][model+result]——关键是后两条**挨着**。
         var timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
-        Assert.Equal(3, timeline.Count);
+        Assert.Equal(5, timeline.Count);
         Assert.IsType<TimelineEvent.MessageEvent>(timeline[1]);
         Assert.IsType<TimelineEvent.ToolResultEvent>(timeline[2]);
     }
@@ -138,7 +139,7 @@ public class StepperToolTests : IDisposable
         var raw = string.Join("\n", timeline.Select(TimelineEvent.StableSerialize));
 
         Assert.DoesNotContain("LEAKED-CONTENT", raw);
-        Assert.Contains("工作目录之外", TextOf(timeline.OfType<TimelineEvent.ToolResultEvent>().Single()));
+        Assert.Contains("工作目录之外", TextOf(timeline.OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal))));
     }
 
     /// <summary>
@@ -159,7 +160,7 @@ public class StepperToolTests : IDisposable
         var raw = string.Join("\n", timeline.Select(TimelineEvent.StableSerialize));
 
         Assert.DoesNotContain("LEAKED-ABS", raw);
-        Assert.Contains("工作目录之外", TextOf(timeline.OfType<TimelineEvent.ToolResultEvent>().Single()));
+        Assert.Contains("工作目录之外", TextOf(timeline.OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal))));
     }
 
     // 兄弟目录（前缀相同但不是子目录）——「以根开头」那个洞的具体形状。
@@ -197,7 +198,7 @@ public class StepperToolTests : IDisposable
         await _stepper.StepAsync(handle, "读", default);
 
         var result = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Single();
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal));
 
         var store = Assert.IsType<Block.StoreBlock>(Assert.Single(result.Content));
         // 大对象真的在库里，而且**内容一致**。
@@ -231,7 +232,7 @@ public class StepperToolTests : IDisposable
 
         // 确认前提：盘上那条结果**确实**是个地址（不然这条测试测的是别的东西）。
         var stored = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Single();
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal));
         Assert.IsType<Block.StoreBlock>(Assert.Single(stored.Content));
 
         // 第二步：请求里的那条结果必须是**解引用之后的文本**。

@@ -533,28 +533,15 @@ public sealed class Stepper(
 
         // 一次落盘 = 一个原子。⚠️ 空批次**不写**（拒答且没有工具的那一步就是空的），
         // 而 `AppendEvents` 对空批次是 no-op、不抛——见它的注释。
-        // ⚠️ 浮动对**跟着这一步一起落盘**（2026-10-23）：排在模型消息与工具结果之后，
-        // 配对完整（`tool_use` 紧跟 `tool_result`）。没变化时它是空的 ⇒ 记录里不新增，
-        // 也就是「每步一份」改成「变了一份」。
-        // ⚠️ **2026-10-23：浮动对落进 `floating.jsonl`**（不是 `history.jsonl`）——
-        // 它是**环境状态**，混进对话记录会让所有「记录里有几条事件」的断言与统计重算，
-        // 也会让 `fetch`/压缩把它当成可取回的对话内容（而旧读数的档位不能复活）。
-        // ⚠️ **读数取「写这一刻」的子会话状态**（2026-10-26）：`slots` 是**步开始**冻的那份，
-        // 而一步可能跑几分钟——子会话在这期间跑完 / 开口，照冻的那份写读数，就会把
-        // 「运行中」永久留在盘上，而它早就停了。⇒ 写之前现算一次那一行，变了就用新的。
-        // ⚠️ 只换子会话那一行：重建时系统 / 首要两块传空（尾块本就不含它们），
-        // 所以不会因为重读预设把别的东西也带歪。
-        // ⚠️ 请求里那份**不动**（步内逐字节稳定是另一条不变量）：读数记「此刻」，
-        // 请求记「模型这一刻看到的那份」，两者本来就该允许不同。
-        var freshSubagentLine = SubagentView.Line(SubagentScopeFor(handle));
-        var readingSlots = string.Equals(freshSubagentLine, SubagentView.Line(subagents), StringComparison.Ordinal)
-            ? slots
-            : SystemBlock.Build(null, null, pluginAxes.Values, pluginPrompt,
-                GoalMode.IsActive(stepState) ? CorePrompts.GoalDirective : null,
-                stepState.PendingCompact ? _pendingCompactText : null,
-                freshSubagentLine, stepState.Plan, iterateReplan);
-
-        _store.AppendFloating(handle.ProjectKey, handle.SessionId, StepFloatingPair(handle, readingSlots, at));
+        // ⚠️ **浮动每一轮都在记录里留一对**（2026-10-26 用户裁定）：一次调用 + 一句已回收占位，
+        // 无论模型这一轮真的调了没有。两个理由：
+        //   ① 模型下一步看到的历史形状始终一致——不会出现「上一轮我没调」这种缺口，
+        //      而缺口正是它去补调一次的动因；
+        //   ② 真实读数不落库 ⇒ 记录里永远只有占位，旧读数的档位不可能被当成此刻的。
+        // ⚠️ **不许出现第二对**：模型真调了就把那一条结果的内容换写成占位，而不是另补一对；
+        // 否则同一轮里会有两条 `floating_context` 调用，配对与「一步几条事件」都跟着歪。
+        // ⚠️ 它与模型消息、那批结果**同一次** `AppendEvents` 落盘 ⇒ 「一步 = 一个原子」没被拆开。
+        events.AddRange(SealFloatingCall(events, handle.State.Turn + 1, at));
         _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
 
         // ② + ③ + ④：检查点 → 清指令 → 回收窗口（见上面那段次序）。
@@ -1105,6 +1092,75 @@ public sealed class Stepper(
     }
 
     /// <summary>
+    /// **把这一轮的浮动调用钉进记录**：恰好一对，内容恒为已回收占位（`01` §3.2，2026-10-26）。
+    ///
+    /// <para>⚠️ <b>「模型调没调」都要有这一对</b>：模型下一步看到的历史必须形状一致。
+    /// 某一轮缺了它，下一步就会看到「上一轮我没调用」——而描述要求每轮都调用，
+    /// 那个缺口唯一可行的补救动作就是补调一次，而补的那一次仍然只拿到占位
+    /// （<see cref="FloatingContextTool.ReclaimedBody"/>）。</para>
+    ///
+    /// <para>⚠️ <b>真调了就改写那一条，不再补一对</b>：一条结果就地换成占位，
+    /// 而不是追加第二条同名调用——「一组调用里出现两个块」正是这次改动要防的形态。</para>
+    /// </summary>
+    /// <returns>要追加的事件：没调时是一对占位；真调了就重写了那一份，返回空。</returns>
+    private IReadOnlyList<TimelineEvent> SealFloatingCall(
+        List<TimelineEvent> events, int turn, DateTimeOffset at)
+    {
+        if (!HasFloatingContextTool) return [];
+
+        var callId = events
+            .OfType<TimelineEvent.MessageEvent>()
+            .SelectMany(m => m.Blocks.OfType<Block.ToolUseBlock>())
+            .FirstOrDefault(u => string.Equals(u.Name, FloatingContextTool.NameOf, StringComparison.Ordinal))
+            ?.CallId;
+
+        if (callId is not null)
+        {
+            for (var i = 0; i < events.Count; i++)
+            {
+                if (events[i] is TimelineEvent.ToolResultEvent r
+                    && string.Equals(r.CallId, callId, StringComparison.Ordinal))
+                {
+                    events[i] = r with
+                    {
+                        Content = [new Block.TextBlock(FloatingContextTool.ReclaimedBody)],
+                    };
+                }
+            }
+
+            return [];
+        }
+
+        // ⚠️ **id 与顶上那个真实块不同号**：它们说的是两件事（这条是「调用已记账」的占位，
+        // 那条是「此刻的读数」）。同号会让下一步的去重判据把真实块整条挡掉。
+        return
+        [
+            new TimelineEvent.MessageEvent
+            {
+                Id = $"floating-{turn}-reclaim-call",
+                At = at,
+                From = Speaker.Model,
+                Blocks =
+                [
+                    new Block.ToolUseBlock(
+                        $"floating-{turn}-reclaim-result", FloatingContextTool.NameOf, "{}"),
+                ],
+            },
+            new TimelineEvent.ToolResultEvent
+            {
+                Id = $"floating-{turn}-reclaim-result",
+                At = at,
+                CallId = $"floating-{turn}-reclaim-result",
+                Content =
+                [
+                    new Block.TextBlock(FloatingContextTool.ReclaimedFraming.Render() + "\n"),
+                    new Block.TextBlock(FloatingContextTool.ReclaimedBody),
+                ],
+            },
+        ];
+    }
+
+    /// <summary>
     /// 尾槽位的块 → **正文**（不含框架头）。⚠️ 落在记录里的那一份，正文永远是**末块**：
     /// 合成对的内容是 `[框架头, 正文]`（`FloatingContextPair`），所以「取末块」就是判据的形状。
     /// <para>⚠️ 它同时是「变没变」的判据：尾块是轴值与插件字段的**纯函数**，
@@ -1116,6 +1172,7 @@ public sealed class Stepper(
         return text.Length == 0 ? null : text;
     }
 
+
     /// <summary>
     /// **记录里最近一次落盘的浮动读数正文**（没有就是 <c>null</c>）。
     ///
@@ -1123,11 +1180,6 @@ public sealed class Stepper(
     /// 而那是记录里那一份 —— 内存里留一份影子迟早会和盘面分叉（同 `Reclaim` 那条
     /// 「不缓存判定」）。</para>
     /// </summary>
-    private string? LastFloatingBody(SessionHandle handle) =>
-        _store.ReadFloating(handle.ProjectKey, handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>()
-            .LastOrDefault(r => r.Id.StartsWith("floating-", StringComparison.Ordinal))
-            ?.Content.OfType<Block.TextBlock>().LastOrDefault()?.Text;
 
     /// <summary>
     /// **这一步的浮动读数**：没有变化就返回空（既不进请求，也不落盘）。
@@ -1142,19 +1194,11 @@ public sealed class Stepper(
     /// 不要在别处另比轴字典。</para>
     /// </summary>
     private IReadOnlyList<TimelineEvent> StepFloatingPair(
-        SessionHandle handle, PromptSlots slots, DateTimeOffset at)
-    {
-        var pair = FloatingContextPair([], slots.Tail, at, handle.State.Turn + 1);
-        if (pair.Count == 0) return pair;
-
-        // ⚠️ **变化才注入**：与 `floating.jsonl` 里最近一份的正文逐字相同 ⇒ 不产生新的一份。
-        // 判据只有这一处；不要另比轴字典（那是第二份判据，迟早漂）。
-        if (FloatingBodyOf(slots.Tail) is { } body
-            && string.Equals(LastFloatingBody(handle), body, StringComparison.Ordinal))
-            return [];
-
-        return pair;
-    }
+        SessionHandle handle, PromptSlots slots, DateTimeOffset at) =>
+        // ⚠️ **每步都插，而且只活在这一次请求里**（2026-10-26 用户裁定）：不落库、
+        // 也不比较「变了没有」——那套判据只在读数要落盘时才有意义。
+        // ⇒ 这里没有第二份判据可漂，模型每步看到的都是「此刻这一份」。
+        FloatingContextPair([], slots.Tail, at, handle.State.Turn + 1);
 
     /// <summary>
     /// **这一刻的尾块文本**——答复路径与控制面的探测点用（`01` §3.2）。

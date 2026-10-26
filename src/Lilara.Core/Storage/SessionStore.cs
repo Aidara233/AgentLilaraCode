@@ -150,27 +150,6 @@ public sealed class SessionStore(string dataRoot)
     public IReadOnlyList<TimelineEvent> ReadTimeline(string projectKey, string sessionId) =>
         HistoryLog.ReadAll(Path.Combine(SessionDirectory(projectKey, sessionId), "history.jsonl"));
 
-    /// <summary>
-    /// **浮动读数单独落一份**（`floating.jsonl`，2026-10-23）。
-    ///
-    /// <para>⚠️ <b>为什么不写进 `history.jsonl`</b>：那是**对话记录**，而浮动读数是**环境状态**
-    /// （§3.3「状态进槽位、事件进时间线」）。混进去有两个具体后果：① 所有「记录里有几条事件」
-    /// 的断言与统计都要重算（实测：19 条测试当场红）；② `fetch` / 压缩会顺手把它当成
-    /// 可取回、可摘要的对话内容——而旧读数**恰恰不能被取回**（里面的权限/安全档位是旧的）。</para>
-    ///
-    /// <para>⚠️ 但它**必须真的落盘**：只有留下痕迹，「这一步我确实读到过环境」才是一件事实；
-    /// 活在请求里的那一份在记录中查无此事，模型只能靠说明去相信——而说明永远输给记录。</para>
-    /// </summary>
-    public void AppendFloating(string projectKey, string sessionId, IReadOnlyList<TimelineEvent> events) =>
-        HistoryLog.AppendMany(Path.Combine(SessionDirectory(projectKey, sessionId), "floating.jsonl"), events);
-
-    /// <summary>**浮动读数的全部历史**（旧的在渲染期被取代成一行，见 `TimelineRender`）。</summary>
-    public IReadOnlyList<TimelineEvent> ReadFloating(string projectKey, string sessionId)
-    {
-        var path = Path.Combine(SessionDirectory(projectKey, sessionId), "floating.jsonl");
-        return File.Exists(path) ? HistoryLog.ReadAll(path) : [];
-    }
-
     // 该项目下的全部会话 id，按 spec.json 里的 CreatedAt 降序。
     // 顺序必须确定（调用方取 [0] 当当前会话），而 Directory.GetDirectories 顺序未定义；
     // 不按目录 mtime（脆弱），也不按 id（Guid 是随机的，做不了时间代理）。

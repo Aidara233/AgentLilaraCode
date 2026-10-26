@@ -141,7 +141,7 @@ public class StepLagTests : IDisposable
 
         // ⚠️ 这一条不是装饰：没有它，下面那条会被**内容也可能丢了**的失败混淆。
         var readId = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal)).Id;
 
         // ⚠️ **再真读四次小文件**，而这几步是**这条测试成立的前提**：
         // 保护带保的是「最近的 N 条**工具结果**」（`Reclaim.ProtectedRecentResults`），

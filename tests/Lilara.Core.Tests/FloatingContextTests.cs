@@ -12,21 +12,22 @@ using Block = Lilara.Core.Kernel.Block;
 namespace Lilara.Core.Tests;
 
 /// <summary>
-/// **`floating_context`：核心每步在时间线末尾合成一对调用 + 结果**（`01` §3.2，2026-10-17）。
+/// **`floating_context`：真实读数在对话最上面，历史里每步只留一条已回收占位**（2026-10-26 用户裁定）。
 ///
-/// <para>⚠️ 本文件钉四件事，每件都对应一个会被「看起来能用」掩盖的失败：</para>
+/// <para>⚠️ 这套契约四句话，每句都对应一个会被「看起来能用」掩盖的失败：</para>
 /// <list type="number">
-///   <item><b>旧内容逐字节不动</b>：用户消息里**不再**混进尾块——Claude 那条链路原先
-///     把尾块拼进那条 user 消息，合成对上线的同时必须确认那个拼法真的消失了。</item>
-///   <item><b>不落盘</b>：记录只追加，一条合成调用写进去就永久在；它必须只在请求里活着。</item>
-///   <item><b>下一步能接上</b>：从前一步的合成对末尾，接到下一步请求的**历史**里——
-///     形状是「assistant `tool_use` + `tool_result`」，配对照样完整。</item>
-///   <item><b>没有该工具时不合成</b>：纯 chat 会话请求逐字节与加它之前相同
-///     （`04` §1.3 推论 1；同时避免「名字没声明就发一条调用」在上游 400）。</item>
+///   <item><b>真实读数插在最前面</b>：它是「此刻的状态」，不是历史里的一段——追加在末尾会随对话
+///     增长越走越远，也会与「最上面就是当前状态」的位置直觉相反。</item>
+///   <item><b>记录里每步恰好一对占位</b>：无论模型这一轮真的调了没有，记录里都有「一次调用 +
+///     一句已回收」。缺口会让下一步看到「上一轮我没调用」，而补那个缺口唯一可行的动作就是再调一次。</item>
+///   <item><b>一组调用里不许出现两个块</b>：真实那对的 id 由 turn 决定，占位那对用另一个号段；
+///     同一轮里更不能出现两条同名调用（配对会歪）。</item>
+///   <item><b>没有该工具时不合成，尾块退回尾槽位</b>：纯 chat 会话（`04` §1.3 推论 1）
+///     与测试替身推进器都走这条路，内容不许丢。</item>
 /// </list>
 ///
 /// <para>⚠️ 这里走**真推进器**（真执行器、真句柄、真盘面），与 `StepperToolTests` 同一个理由：
-/// 假适配器脚本模型回复，但合成注入发生在**核心自己的装配**里，只有真 `Stepper` 才走到它。</para>
+/// 假适配器脚本模型回复，但注入发生在**核心自己的装配**里，只有真 `Stepper` 才走到它。</para>
 /// </summary>
 public sealed class FloatingContextTests : IDisposable
 {
@@ -77,53 +78,50 @@ public sealed class FloatingContextTests : IDisposable
     private static IEnumerable<Block.ToolUseBlock> Uses(ModelRequest request) =>
         request.Timeline.OfType<TimelineEvent.MessageEvent>().SelectMany(m => m.Blocks.OfType<Block.ToolUseBlock>());
 
-    // ---- 合成对本身 ----
+    // ---- 真实读数在哪 ----
 
     /// <summary>
-    /// ⚠️ **请求末尾恰好一对**：`tool_use(floating_context)` 且**紧跟着**配对的 `tool_result`。
-    /// 「紧挨着」不是排版：Claude 要求 `tool_result` **immediately after** 它的调用，
-    /// 中间插一条任何消息都是 400。
+    /// ⚠️ **真实读数在请求的最前面，而且恰好一对**：`tool_use(floating_context)` 紧跟着
+    /// 配对的 `tool_result`。位置与配对两条都要钉——
+    /// 「紧挨着」不是排版：Claude 要求 `tool_result` **immediately after** 它的调用。
     /// </summary>
     [Fact]
-    public async Task Step_AppendsExactlyOnePairedFloatingCallAtTheEnd()
+    public async Task Step_InsertsTheRealPairAtTheVeryTop()
     {
         var handle = NewSession();
         _adapter.ReplyWith(_ => Say("好"));
         await _stepper.StepAsync(handle, "你好", default);
 
         var request = Assert.Single(_adapter.Calls);
-        var n = request.Timeline.Count;
-        Assert.True(n >= 2);
+        Assert.True(request.Timeline.Count >= 3);
 
-        var call = Assert.IsType<TimelineEvent.MessageEvent>(request.Timeline[n - 2]);
+        var call = Assert.IsType<TimelineEvent.MessageEvent>(request.Timeline[0]);
         Assert.Equal(Speaker.Model, call.From);
         var use = Assert.Single(call.Blocks.OfType<Block.ToolUseBlock>());
         Assert.Equal(FloatingContextTool.NameOf, use.Name);
         Assert.Equal("{}", use.Arguments);
 
-        var result = Assert.IsType<TimelineEvent.ToolResultEvent>(request.Timeline[n - 1]);
+        var result = Assert.IsType<TimelineEvent.ToolResultEvent>(request.Timeline[1]);
         Assert.Equal(use.CallId, result.CallId);
         Assert.Contains(CorePrompts.TailOpen, TextOf(result));
         Assert.Contains(CorePrompts.TailDeclaration, TextOf(result));
 
-        // ⚠️ **形状：框架头独占一行，包边在下一行**（2026-10-23 实测）。
-        // 两个文本块在文本化链路上是 `string.Concat` 拼的，中间没有换行就会得到
-        // `[floating_context][lilara 上下文]`——两个方括号贴成一个复合 token，
-        // 「一个块套另一个块」当场失效（`01` §3.3）。这条断言是那个 bug 的哨兵。
+        // ⚠️ **形状：框架头独占一行，包边在下一行**。两个文本块在文本化链路上是
+        // `string.Concat` 拼的，中间没有换行就会得到 `[floating_context][lilara 上下文]`——
+        // 两个方括号贴成一个复合 token，「一个块套另一个块」当场失效（`01` §3.3）。
         Assert.StartsWith(
             FloatingContextTool.Framing.Render() + "\n" + CorePrompts.TailOpen + "\n",
             TextOf(result));
         Assert.Contains(Axes.LabelOf(Axes.Permission), TextOf(result));
 
-        // 尾块**只有一份**：它在这条结果里，不在别的任何地方。
+        // 真实读数**只有一份**，而且**不在末尾**（末尾是这一步的记录，不是读数）。
         Assert.Equal(1, Results(request).Count(r => TextOf(r).Contains(CorePrompts.TailOpen, StringComparison.Ordinal)));
+        Assert.Same(result, request.Timeline[1]);
     }
 
     /// <summary>
-    /// ⚠️ **用户消息里不再有尾块**（本次改动的**因**）：Claude 那条链路原先把尾块拼进
-    /// 末尾那条 user 消息 ⇒ 用户输入与核心注入在同一个 content 数组里，
-    /// 而下一步按记录重渲染时那条消息**不带尾块**，前缀当场分叉。
-    /// 这里直接看**请求的时间线本身**：用户那条的块只有它自己写的话。
+    /// ⚠️ **用户消息里没有尾块**：用户输入与核心注入不许住在同一个 content 数组里，
+    /// 否则下一步按记录重渲染时那条消息**不带尾块**，前缀当场分叉。
     /// </summary>
     [Fact]
     public async Task Step_LeavesTheUserMessageUntouched()
@@ -137,17 +135,19 @@ public sealed class FloatingContextTests : IDisposable
             m => m.From == Speaker.User);
 
         Assert.Equal("你好", Assert.IsType<Block.TextBlock>(Assert.Single(user.Blocks)).Text);
-        // 槽位里尾块是空的——尾块只走合成那一对。
+        // 槽位里尾块是空的——它整块搬去了顶上那一对。
         Assert.Empty(_adapter.Calls[0].Slots.Tail);
     }
 
+    // ---- 记录里留什么 ----
+
     /// <summary>
-    /// ⚠️ **合成对不落盘**。判据不是「盘上没有 `floating_context` 这个**字符串**」——
-    /// 工具表里的描述本来就会带上它；判据是**盘上一条 `tool_use` 都没有**，
-    /// 且记录条数 == 用户 + 模型（模型那条没有工具调用）。
+    /// ⚠️ **记录里只剩占位**：一步落下**恰好一对**，内容是 `ReclaimedBody`；
+    /// 记录里**绝不出现真实读数**（`TailOpen` 那一段）。判据两条缺一不可：
+    /// 只钉「有一对占位」的话，把真实读数一起写进去照样绿——而那会让旧档位复活。
     /// </summary>
     [Fact]
-    public async Task Step_DoesNotPersistTheSyntheticPair()
+    public async Task Step_PersistsExactlyOneReclaimedPair()
     {
         var handle = NewSession();
         _adapter.ReplyWith(_ => Say("一")).ReplyWith(_ => Say("二"));
@@ -156,86 +156,97 @@ public sealed class FloatingContextTests : IDisposable
 
         var timeline = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
 
-        // ⚠️ **2026-10-23：落盘试过又退回了**（理由见 `Stepper` 落盘点那条注释与
-        // `docs/superpowers/plans/2026-10-23-floating-as-history.md`）：它让 19 条
-        // 「记录里的事件条数」断言当场红，而那是成规模的改写，不该顺手做。
-        // ⇒ 今天仍然是「不进记录」：记录里既没有浮动结果，也没有浮动调用。
-        Assert.Empty(timeline.OfType<TimelineEvent.ToolResultEvent>());
-        Assert.DoesNotContain(
-            timeline.OfType<TimelineEvent.MessageEvent>().SelectMany(m => m.Blocks.OfType<Block.ToolUseBlock>()),
-            u => u.Name == FloatingContextTool.NameOf);
+        // ① 每一步各一对，共两对。
+        var results = timeline.OfType<TimelineEvent.ToolResultEvent>()
+            .Where(r => r.CallId.StartsWith("floating-", StringComparison.Ordinal)).ToList();
+        Assert.Equal(2, results.Count);
+        Assert.All(results, r => Assert.EndsWith("-reclaim-result", r.Id, StringComparison.Ordinal));
+
+        // ② 内容恒为占位，且点出了读数在哪。
+        Assert.All(results, r => Assert.Contains(FloatingContextTool.ReclaimedBody, TextOf(r)));
+        Assert.All(results, r => Assert.Contains(FloatingContextTool.ReclaimedFraming.Render(), TextOf(r)));
+
+        // ③ 记录里**没有**真实读数。
+        Assert.DoesNotContain(results, r => TextOf(r).Contains(CorePrompts.TailOpen, StringComparison.Ordinal));
+        Assert.DoesNotContain(results, r => TextOf(r).Contains(Axes.LabelOf(Axes.Permission), StringComparison.Ordinal));
+
+        // ④ 每条占位调用都有配对的结果（悬空的调用会让下一步请求非法）。
+        var uses = timeline.OfType<TimelineEvent.MessageEvent>()
+            .SelectMany(m => m.Blocks.OfType<Block.ToolUseBlock>())
+            .Where(u => u.Name == FloatingContextTool.NameOf).ToList();
+        Assert.Equal(2, uses.Count);
+        Assert.All(uses, u => Assert.Contains(results, r => r.CallId == u.CallId));
     }
 
     /// <summary>
-    /// ⚠️ **合成对的 id 是确定性的，而且每一步换一段**：若用 `Ids.New()` 现造，
-    /// 同一步内重复渲染会给出不同字节（`00` §5 铁律 1 里唯一真会出事的那条）。
-    /// 这里钉两件：① 同一步里 call / result 的 id 成对（`…-call` / `…-result`）；
-    /// ② 下一步的 id **与上一步不同**（否则两次渲染撞成同一条，配对会串）。
-    /// ⚠️ **号段里的数字不钉**：`State.Turn` 是几由 `SessionHandle` 的初始值决定，
-    /// 那是另一处的契约，钉死只会腐。
+    /// ⚠️ **两条号段互不相干**：真实那对是 `floating-{turn}-call/result`，由 turn 决定；
+    /// 占位那对是 `floating-{turn}-reclaim-…`。它们说的是两件事，**同号会让下一步的
+    /// 去重判据把真实块整条挡掉**。这里钉 ① 成对、② 逐步变化。
+    /// ⚠️ **号段里的数字不钉死**：`State.Turn` 从几开始是另一处的契约，钉死只会腐。
     /// </summary>
     [Fact]
-    public async Task SyntheticIdsAreDeterministic_AndStayTheSameWhileAxesDoNotChange()
+    public async Task RealIdsAreDeterministic_AndFollowTheTurn()
     {
         var handle = NewSession();
         _adapter.ReplyWith(_ => Say("一")).ReplyWith(_ => Say("二"));
         await _stepper.StepAsync(handle, "a", default);
         await _stepper.StepAsync(handle, [], default);
 
-        var firstMsg = _adapter.Calls[0].Timeline.OfType<TimelineEvent.MessageEvent>()
-            .Single(m => m.Blocks.OfType<Block.ToolUseBlock>().Any(u => u.Name == FloatingContextTool.NameOf));
+        var firstMsg = Assert.IsType<TimelineEvent.MessageEvent>(_adapter.Calls[0].Timeline[0]);
         var first = Assert.Single(firstMsg.Blocks.OfType<Block.ToolUseBlock>());
-        var tailFirst = Results(_adapter.Calls[0]).Last(r => r.CallId == first.CallId);
-
-        // ① 成对：记录 id 在**包含调用的那条消息**上，结果那条与 `CallId` 同号。
         Assert.EndsWith("-call", firstMsg.Id);
         Assert.EndsWith("-result", first.CallId);
-        Assert.Equal(first.CallId, tailFirst.Id);
+        Assert.Equal(first.CallId, Assert.IsType<TimelineEvent.ToolResultEvent>(_adapter.Calls[0].Timeline[1]).CallId);
 
-        // ⚠️ **2026-10-23 改口：下一步不该换一段**。轴没变 ⇒ 不注入新的一份，
-        // 于是第二步看到的是**同一条**（它是历史，不是新造的）。⇒ id 必须相同。
-        // 旧断言钉的是「每步换一段」，那正是「每步一份」的化石，而那个节律已经被降频删掉了。
-        var second = Assert.Single(Uses(_adapter.Calls[1]), u => u.Name == FloatingContextTool.NameOf);
-        Assert.Equal(first.CallId, second.CallId);
-        Assert.Single(Results(_adapter.Calls[1]), r => r.CallId == first.CallId);
+        // ② 下一步换号：同一步内重复渲染要逐字节相同（`00` §5 铁律 1），
+        // 而跨步必须不同——否则两步的读数会撞成同一条，配对会串。
+        // ⚠️ 挑的时候要**排除占位那条**（它同名，只是号段不同）。
+        var second = Assert.Single(Uses(_adapter.Calls[1]),
+            u => u.Name == FloatingContextTool.NameOf
+                 && !u.CallId.Contains("-reclaim-", StringComparison.Ordinal));
+        Assert.NotEqual(first.CallId, second.CallId);
     }
 
-    // ---- 下一步能接上 ----
-
     /// <summary>
-    /// ⚠️ **前一步的合成对不会进下一步**——浮动是**状态**，每步一份、旧的作废
-    /// （`00` §2.4「替换而非追加」）。判据两条，缺一都不成立：
-    /// ① 下一步请求里**恰好一条** `floating_context` 调用（新造的那条）；
-    /// ② 上一步那条的 id **根本没出现**（它没落盘，也就不可能作为历史被重放）。
-    /// ⚠️ 而我第一版写的断言是反的——我以为「下一步会看到旧的那一对」，
-    /// 实测直接红了：合成对只活在**生成它的那一次请求**里。
+    /// ⚠️ **下一步：顶上一条新的真实读数 + 历史里一条占位**，形状固定在这个数目上。
+    /// 三条判据：① 真实那条在最前面；② 占位那条来自上一轮；③ **没有同号重复**——
+    /// 「一组调用里出现两个块」正是这次改动要防的形态。
     /// </summary>
     [Fact]
-    public async Task NextStep_DoesNotCarryThePreviousPair_AndGetsAFreshOne()
+    public async Task NextStep_PutsTheFreshReadingOnTop_AndKeepsOneReclaimedPairInHistory()
     {
         var handle = NewSession();
         _adapter.ReplyWith(_ => Say("一")).ReplyWith(_ => Say("二"));
         await _stepper.StepAsync(handle, "a", default);
         await _stepper.StepAsync(handle, [], default);
 
-        var old = Assert.Single(Uses(_adapter.Calls[0]), u => u.Name == FloatingContextTool.NameOf);
-        var second = _adapter.Calls[1].Timeline;
+        var request = _adapter.Calls[1];
+        var floating = Uses(request).Where(u => u.Name == FloatingContextTool.NameOf).ToList();
 
-        // ⚠️ **2026-10-23 改口（整条反转）**：旧契约是「下一步不带旧的那一对，换新的」——
-        // 那是「浮动 = 不落盘的状态」时代的判据。现在它**落盘**，而注入是「变化才发生」：
-        // ⇒ 轴没变时，下一步看到的就是**同一对**（作为历史被重放），且**不新增**。
-        // 这正是「上下文里的浮动块不随步数增长」的可观测形态。
-        var same = Assert.Single(Uses(_adapter.Calls[1]), u => u.Name == FloatingContextTool.NameOf);
-        Assert.Equal(old.CallId, same.CallId);
+        // 真实那条 + 上一轮的占位，恰好两条。
+        Assert.Equal(2, floating.Count);
+        Assert.Equal(floating.Count, floating.Select(u => u.CallId).Distinct(StringComparer.Ordinal).Count());
 
-        // ② 恰好一份：没有第二对（没有重复注入，也没有孤儿结果）。
-        Assert.Single(Results(_adapter.Calls[1]), r => r.CallId.StartsWith("floating-", StringComparison.Ordinal));
+        // ① 真实那条在最前面。
+        var top = Assert.IsType<TimelineEvent.MessageEvent>(request.Timeline[0]);
+        var topUse = Assert.Single(top.Blocks.OfType<Block.ToolUseBlock>());
+        Assert.Equal(FloatingContextTool.NameOf, topUse.Name);
+        Assert.DoesNotContain("-reclaim-", topUse.CallId);
+
+        // ② 占位那条来自上一轮，且读的是占位。
+        var reclaimed = Assert.Single(floating, u => u.CallId.Contains("-reclaim-", StringComparison.Ordinal));
+        Assert.Contains(Results(request), r => r.CallId == reclaimed.CallId
+            && TextOf(r).Contains(FloatingContextTool.ReclaimedBody, StringComparison.Ordinal));
+
+        // ③ 每条调用都有配对结果。
+        Assert.All(floating, u => Assert.Contains(Results(request), r => r.CallId == u.CallId));
     }
 
     /// <summary>
-    /// ⚠️ **三条协议都收得下这一对**：形状是「模型消息里一条 `tool_use` + 紧接着一条
+    /// ⚠️ **三条协议都收得下这一对**：形状是「assistant 消息里一条 `tool_use` + 紧接着一条
     /// `ToolResultEvent`」，与模型自己调工具时**逐字相同**——所以适配器一个都不用改。
-    /// 这里用三条真实的构造器各跑一遍，确认没有一条在该形状上抛。
+    /// ⚠️ 这里只钉「这条形状出现在产物里」，**不钉位置**：位置由 `01` §3.2 管，
+    /// 而三条链路的容器形状不同（Chat 是 `role:"tool"`，Responses 是 `function_call_output`）。
     /// </summary>
     [Fact]
     public async Task EveryProtocolAcceptsTheSyntheticPair()
@@ -245,55 +256,47 @@ public sealed class FloatingContextTests : IDisposable
         await _stepper.StepAsync(handle, "你好", default);
         var body = _adapter.Calls[0];
 
-        // Claude：合并进末尾那条 user 消息的 tool_result 块（**不是**再起一条 user 消息）。
         var claude = ClaudeRequestBuilder.Build(body);
-        var last = claude.Messages[^1];
-        Assert.Equal(AnthropicRole.User, last.Role.Value());
-        Assert.True(last.Content.TryPickContentBlockParams(out var blocks));
-        Assert.Contains(blocks!, b => b.TryPickToolResult(out _));
+        Assert.Contains(claude.Messages, m =>
+            m.Content.TryPickContentBlockParams(out var blocks) && blocks!.Any(b => b.TryPickToolResult(out _)));
 
-        // 两条 OpenAI 链路：工具结果在自己的位置（Chat = role:"tool"，Responses = function_call_output）。
-        // ⚠️ `messages` / `input` 是 `JsonArray`，没有 `Index` 索引器 ⇒ 用 `Count - 1`。
         var chat = JsonDocument.Parse(Protocol.OpenAi.OpenAiChatRequest.Build(body)).RootElement;
         var chatMessages = chat.GetProperty("messages");
-        Assert.Equal("tool", chatMessages[chatMessages.GetArrayLength() - 1].GetProperty("role").GetString());
+        Assert.Contains(Enumerable.Range(0, chatMessages.GetArrayLength()),
+            i => chatMessages[i].GetProperty("role").GetString() == "tool");
 
         var responses = JsonDocument.Parse(Protocol.OpenAi.OpenAiResponsesRequest.Build(body)).RootElement;
         var input = responses.GetProperty("input");
-        Assert.Equal("function_call_output", input[input.GetArrayLength() - 1].GetProperty("type").GetString());
+        Assert.Contains(Enumerable.Range(0, input.GetArrayLength()),
+            i => input[i].GetProperty("type").GetString() == "function_call_output");
 
         // ⚠️ 三条都必须**显式声明**这个工具，否则部分上游在 `tool_use` 引用了未声明的名字时 400。
         Assert.Contains(body.Tools, t => t.Name == FloatingContextTool.NameOf);
     }
 
-    // ---- 工具本身（兜底路径）----
+    // ---- 工具本身 ----
 
     /// <summary>
-    /// ⚠️ **模型自己真调一次时，返回的就是注入的那份**——这是 `IToolContext.FloatingContext`
-    /// 存在的全部理由：另渲染一遍会让「核心注入的」与「模型自己要来的」在同一步里分叉。
+    /// ⚠️ **模型自己调，拿到的也只是占位**：读数每轮重建在顶上，工具返回值不含它。
+    /// 这条是「调用不会带来新信息」的**机械保证**——不是靠描述里的一句劝。
     /// </summary>
     [Fact]
-    public async Task TheToolReturnsTheSameTextTheCoreInjected()
+    public async Task TheToolReturnsTheReclaimedPlaceholder()
     {
         var handle = NewSession();
         _adapter.ReplyWith(_ => Calls(("c1", FloatingContextTool.NameOf, "{}")));
         _adapter.ReplyWith(_ => Say("好"));
         await _stepper.StepAsync(handle, "读一下", default);
 
-        // ⚠️ 2026-10-23：注入的那一份**多一个首块**（`[floating_context]` 框架头，署名在形状上），
-        // 所以这里比的是**正文**——「核心注入的」与「模型自己要来的」不许分叉的是那段字。
-        // ⚠️ 别改成比整份文本：框架头由合成对现渲染（它追加在渲染之后，走不到 `WithFraming`），
-        // 而模型自己调回来的那条靠 `Framing` 字段在渲染期加——两者在**落盘的记录**里本来就不等长。
-        var injected = Results(_adapter.Calls[0]).Last();
-        var injectedBody = Assert.IsType<Block.TextBlock>(injected.Content[^1]).Text;
         var executed = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
             .OfType<TimelineEvent.ToolResultEvent>().Single(r => r.CallId == "c1");
 
-        Assert.Equal(injectedBody, TextOf(executed));
-        // 署名在形状上：合成那份的首块是框架头（连同换行），而模型自调那份由 `Framing` 字段
-        // 在渲染期加同一个字串——两处只借 `FloatingContextTool.Framing` 一个常量。
-        Assert.Equal(FloatingContextTool.Framing.Render() + "\n",
-            Assert.IsType<Block.TextBlock>(injected.Content[0]).Text);
+        Assert.Equal(FloatingContextTool.ReclaimedBody, TextOf(executed));
+
+        // 而真实读数仍在本次请求的最前面，一个字都没少。
+        var injected = Assert.IsType<TimelineEvent.ToolResultEvent>(_adapter.Calls[0].Timeline[1]);
+        Assert.Contains(CorePrompts.TailOpen, TextOf(injected));
+        Assert.Contains(Axes.LabelOf(Axes.Permission), TextOf(injected));
     }
 
     /// <summary>
@@ -319,22 +322,19 @@ public sealed class FloatingContextTests : IDisposable
     }
 
     /// <summary>
-    /// ⚠️ **答复路径（`ResumeAsync`）没有步开始的槽位快照**：`floating_context` 要说的话
-    /// 是「答复那一刻」的那份。这里只钉「拿得到、而且是有内容的那份」——
-    /// 具体内容随预设与轴走，不在这里重复钉（那是 `SlotTests` 的职责）。
+    /// ⚠️ **答复路径不重复注入**：`ResumeAsync` 之后那一次请求里，真实读数仍然只有一份。
+    /// 这条挡的是「两条装配路径各插一次」——那正是「一组调用里两个块」的另一种来源。
     /// </summary>
     [Fact]
-    public async Task ResumePath_ContextCarriesTheFloatingText()
+    public async Task ResumePath_DoesNotInsertASecondRealBlock()
     {
         var handle = NewSession();
         _adapter.ReplyWith(_ => Calls(("c1", FloatingContextTool.NameOf, "{}")));
         _adapter.ReplyWith(_ => Say("好"));
         await _stepper.StepAsync(handle, "读一下", default);
 
-        var executed = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Single(r => r.CallId == "c1");
-
-        Assert.Contains(CorePrompts.TailOpen, TextOf(executed));
-        Assert.Contains(Axes.LabelOf(Axes.Permission), TextOf(executed));
+        var second = _adapter.Calls[^1];
+        Assert.Equal(1, Results(second)
+            .Count(r => TextOf(r).Contains(CorePrompts.TailOpen, StringComparison.Ordinal)));
     }
 }

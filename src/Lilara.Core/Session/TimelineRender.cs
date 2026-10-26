@@ -51,16 +51,37 @@ public static class TimelineRender
         var raw = store.ReadTimeline(handle.ProjectKey, handle.SessionId);
         var rendered = Render(store, handle, raw, truncateForDelivery: true);
 
-        // ⚠️ **浮动读数从自己的文件来**（`floating.jsonl`，2026-10-23）：它是环境状态，
-        // 不是对话事件 ⇒ 不进 `history.jsonl`。合并之后**统一做一次取代**：
-        // 除最新那一份之外，旧的整对去掉，并在最新那份里插一行「第 a–b 步的读数已取代」。
-        var floating = store.ReadFloating(handle.ProjectKey, handle.SessionId);
-        var all = extra is { Count: > 0 }
-            ? new List<TimelineEvent>([.. rendered, .. floating, .. extra])
-            : new List<TimelineEvent>([.. rendered, .. floating]);
+        // ⚠️ **浮动块不经过这里**（2026-10-26 用户裁定）：它由推进器在**装配请求时**现插
+        // （`Stepper.FloatingContextPair`），不落库、也不从任何文件读回来。
+        // ⇒ 渲染层只管记录：少一条来源，就少一条会漂的判据。
+        if (extra is not { Count: > 0 }) return rendered;
 
-        return all.Count == 0 ? all : SupersedeFloating(all);
+        // ⚠️ **插在最前面**（2026-10-26 用户裁定）：这块是「此刻的读数」，不是历史里的一段——
+        // 追加在末尾会让它随对话增长越走越远，也与「最上面就是当前状态」的直觉相反。
+        //
+        // ⚠️ **一次请求里只许出现一个真实块**：这一对的 id 由 turn 决定，记录里若已有同号
+        // （崩溃后重放、或核心在步末补过占位），插进去就是**两条同 `CallId` 的 `tool_use`**
+        // ⇒ 上游按 `call_id` 配对时会撞车，正是「一组调用里出现两个块」那种形态。
+        // ⇒ 只要占用了同一个 id，这一条就不插。
+        var taken = rendered.SelectMany(IdsOf).ToHashSet(StringComparer.Ordinal);
+        var fresh = extra.Where(e => IdsOf(e).All(id => !taken.Contains(id))).ToList();
+        return fresh.Count == 0 ? rendered : [.. fresh, .. rendered];
     }
+
+    /// <summary>
+    /// 一条事件在**配对**意义上占用的 id：消息自己的 id 与它里面每个 `tool_use` 的 `CallId`；
+    /// 结果的事件 id 与 `CallId`（同号是常态，但别处不保证，两个都算）。
+    ///
+    /// <para>⚠️ 它只有 <see cref="RenderForModel"/> 一个用途：判断「这块插进去会不会撞上已有的那一对」。
+    /// 判据必须比「事件 id 相同」更宽——撞车真正发生在上游按 `CallId` 配对那一步。</para>
+    /// </summary>
+    private static IEnumerable<string> IdsOf(TimelineEvent evt) => evt switch
+    {
+        TimelineEvent.MessageEvent m =>
+            [evt.Id, .. m.Blocks.OfType<Block.ToolUseBlock>().Select(u => u.CallId)],
+        TimelineEvent.ToolResultEvent r => [evt.Id, r.CallId],
+        _ => [evt.Id],
+    };
 
     /// <summary>
     /// 两条入口（外加压缩那一次加载）共用的那几步：**压缩投影** → 解库引用 → 按记录 id 回收

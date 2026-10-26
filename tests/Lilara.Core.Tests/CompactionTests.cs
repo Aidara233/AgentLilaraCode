@@ -93,7 +93,8 @@ public sealed class CompactionTests : IDisposable
         Assert.Null(Latest());
         Assert.False(_handle.State.PendingCompact);
         var result = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Last();
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .Last(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal));
         Assert.Contains("没有压缩指令", string.Concat(result.Content.OfType<Block.TextBlock>().Select(b => b.Text)));
         // 投影仍然看得到全部历史。
         Assert.Null(ContextCompaction.Project(_store, _handle).Checkpoint);
@@ -143,7 +144,8 @@ public sealed class CompactionTests : IDisposable
         Assert.Single(new CompactionStore(_store).ReadAll(_handle.ProjectKey, _handle.SessionId));
 
         var timeline = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId);
-        Assert.Equal(2, timeline.OfType<TimelineEvent.ToolResultEvent>().Count());
+        Assert.Equal(2, timeline.OfType<TimelineEvent.ToolResultEvent>()
+            .Count(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal)));
 
         // 第一步（边界 = `user-1`）只覆盖那条用户消息；两条调用都在保留区里。
         var suffix = ContextCompaction.Project(_store, _handle).Suffix;

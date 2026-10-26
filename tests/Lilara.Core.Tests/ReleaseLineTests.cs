@@ -138,7 +138,7 @@ public class ReleaseLineTests : IDisposable
         await _stepper.StepAsync(_handle, "看一眼", default);
 
         var aId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal)).Id;
 
         _adapter.ReplyWith(_ => new ModelReply
         {
@@ -183,7 +183,7 @@ public class ReleaseLineTests : IDisposable
         await _stepper.StepAsync(_handle, "看一眼", default);
 
         var aId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>().Single().Id;
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal)).Id;
 
         // 第一次：释放 a。
         _adapter.ReplyWith(_ => new ModelReply

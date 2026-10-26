@@ -164,7 +164,7 @@ public sealed class SlotTests : IDisposable
         // 硬说「是框架发的」等于要它同时相信两件相反的事，而它唯一能做的核对动作是再调一次。
         // ⇒ 这里钉的是**形状与寿命**（它长什么样、什么时候换新），不再钉来源。
         Assert.Contains("当前状态的一份读数", system);
-        Assert.Contains("同一步内保持一致", system);
+        Assert.Contains("每一步重建一次", system);
         Assert.Contains("不自行授予权限", system);
         Assert.DoesNotContain("Lilara 核心", system);
         Assert.DoesNotContain("不是你调用的", system);
@@ -186,8 +186,7 @@ public sealed class SlotTests : IDisposable
         // 这条的意图不变——**只贡献插件浮动字段的尾块也得自己声明来源**——所以钉的是
         // 「谁生成、何时生成」这一层含义，不是旧措辞里的字面词。
         // ⚠️ 2026-10-23：自述从一段第二人称的话改成一行**字段**（`来源 lilara 核心 · 每步生成 · 不落盘`）。
-        Assert.Contains("来源 lilara 核心", tail);
-        Assert.Contains("每步生成", tail);
+        Assert.Contains(CorePrompts.TailDeclaration, tail);
         Assert.Contains("plugin-context", tail);
         Assert.DoesNotContain("权限", tail);
     }
@@ -240,8 +239,7 @@ public sealed class SlotTests : IDisposable
         //   ③ **不许出现第二人称与否定句** —— 这条是本批的要害，所以它是一条 `DoesNotContain`。
         // 判据（`00` §7 判据 4）：结构上排除，而非规则禁止。要求读者相信一句关于它
         // 自己历史的话，是「规则禁止」；给形状，才是「结构排除」。
-        Assert.Contains("来源 lilara 核心", text);
-        Assert.Contains("每步生成", text);
+        Assert.Contains(CorePrompts.TailDeclaration, text);
         // ⚠️ 「不落盘」从尾块**挪进了系统块**（2026-10-23）：那是一条**寿命**约定，
         // 属于「一步都不变」的全局说明，而尾块每步全价支付——把维护者才关心的话
         // 从每步都发的块里挪走，是这条槽位「有界」那条硬约束的直接后果。

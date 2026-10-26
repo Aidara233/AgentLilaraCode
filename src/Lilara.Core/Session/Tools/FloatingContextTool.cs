@@ -10,17 +10,22 @@ namespace Lilara.Core.Session.Tools;
 /// **合成一对** `tool_use(floating_context)` + 配对的 `tool_result`。合成的那条 `tool_use`
 /// 引用一个工具名 ⇒ 某些上游会检查「这个名字在工具表里吗」。它在这里，那个问题就不存在。</para>
 ///
-/// <para>⚠️ <b>它不被任何人执行</b>：合成的那一对只进请求、不进执行器
-/// （`ToolExecutor` 永远看不到它，`ExecutedCallIds` 里也不会有它）。本类的
-/// <see cref="RunAsync"/> 只在模型**自己**真的调用一次时跑——而那是一个兜底：
-/// 某条链路丢了注入，模型还能自己要一份。</para>
+/// <para>⚠️ <b>2026-10-26 改口：它每轮都被调用，而返回值只是一句占位</b>（用户裁定）。
+/// 原来的设计是「核心合成一对、模型不必调」——实测那套失败得很难看：注入的 `tool_use`
+/// 让「上下文里有没有这份读数」永远为真，于是描述里那句「看不到才调」的前置条件永远为假，
+/// 而模型手上唯一可执行的动作就是**再调一次**（同一位用户会话里连调十余次，每次同一份字节）。</para>
 ///
-/// <para>⚠️ <b>返回的是「这一刻」的浮动块，不是历史快照</b>：它经
-/// <see cref="IToolContext.FloatingContext"/> 读的是推进器/答复路径在**执行时刻**冻住的那份
-/// （`StepAsync` 是步开始、`ResumeAsync` 是答复那一刻）。⇒ 与头的 `/state` 快照端点
-/// 同一个时间轴，而不是「某一步当时发出去的那一份」。
-/// ⚠️ 它**不落盘**、也不该落盘：浮动是状态（`00` §2.4「状态进槽位、事件进时间线」），
-/// 存进记录就变成了一条它本来不是的「事件」。</para>
+/// <para>⚠️ <b>所以职责反过来</b>：真实读数由推进器插在**对话最前面**（`Stepper.FloatingContextPair`
+/// → `TimelineRender.RenderForModel`），而本类的 <see cref="RunAsync"/> 只回一句
+/// <see cref="ReclaimedBody"/>——「读数不在这里，在最前面」。调用变成一次**记账动作**：
+/// 它不会带来新信息，这条由机械保证（返回值本身就是占位），不靠描述里的一句劝。</para>
+///
+/// <para>⚠️ <b>记录里每步留一对占位</b>（`Stepper.SealFloatingCall`）：模型这一步真调了，
+/// 就把那条结果改写成占位；没调，由核心补一对。⇒ 下一步看到的历史形状始终一致，
+/// 不会出现「上一轮我没调用」这种它自己解释不了的缺口。</para>
+///
+/// <para>⚠️ <b>占位结果不进回收候选</b>（`Reclaim.IsFloatingPlaceholder`）：它没有内容可收，
+/// 而换成回收注记会把「读数在最前面」那句话吃掉。</para>
 ///
 /// <para>⚠️ <b>权限是 <see cref="PermissionClass.ReadOnly"/></b>：它只读会话状态，
 /// 不改任何东西。挂成别的档位会让模型真调它时在 `standard` 档弹一次授权——
@@ -55,6 +60,23 @@ public sealed class FloatingContextTool : ITool
     public static readonly ToolFraming Framing =
         new(NameOf, [new ToolFramingField("节律", "每步")]);
 
+    /// <summary>
+    /// **占位那一份的框架头**——与 <see cref="Framing"/> 分开，因为这一段**不是读数**：
+    /// 它只是记录里「这一轮的调用已经记过账」的痕迹，读起来必须与真实读数一眼可分。
+    /// </summary>
+    public static readonly ToolFraming ReclaimedFraming =
+        new(NameOf, [new ToolFramingField("状态", "已回收")]);
+
+    /// <summary>
+    /// **占位正文**：模型自己要来的那一份、以及核心每步补进记录的那一份，内容都是这一句。
+    ///
+    /// <para>⚠️ **它必须点出真实读数在哪**：只说「已回收」会让模型去找一段不存在的产出，
+    /// 而那份读数此刻就在对话最前面。⚠️ 也不能什么都不说——空的工具结果读起来像一次空调用，
+    /// 而「空的不能长得像有内容」是本仓的反面判据（<c>SystemBlock.Wrap</c> 同一条）。</para>
+    /// </summary>
+    public const string ReclaimedBody =
+        "本轮读数不在这里：真实读数在对话最前面那条 id 以 floating- 开头的结果里。这条只是占位。";
+
     public string Name => NameOf;
 
     public PermissionClass PermissionClass => PermissionClass.ReadOnly;
@@ -81,8 +103,10 @@ public sealed class FloatingContextTool : ITool
     /// 十二次同一份字节）。⇒ 现在只说**它返回什么**，不说谁发起的。</para>
     /// </summary>
     public string Description =>
-        "读回当前的浮动上下文：生效中的行为轴（主动性、权限、安全、验证强度等）与插件贡献的字段。"
-        + "返回的是**此刻**的值（按会话状态现算，不是历史快照），与你上下文里那一份逐字节相同。";
+        "每一轮都调用一次：它是每轮的固定动作，不需要理由，也不必等到「需要它」的时候才调。"
+        + "本轮的浮动上下文（生效中的行为轴与插件贡献的字段）已经在对话最前面那条 id 以 floating- 开头的结果里——"
+        + "调这个工具只是为了在记录里留下这一轮的调用。"
+        + "返回值是一句占位（已回收）：它不含任何读数，调它不会带来新信息。";
 
     /// <summary>
     /// 无参数。⚠️ **不给它加任何参数**：加一个「要哪一段」就等于把「浮动块长什么样」
@@ -103,16 +127,7 @@ public sealed class FloatingContextTool : ITool
             // 的那份就会**在形状上分叉**——而 `TheToolReturnsTheSameTextTheCoreInjected`
             // 钉的正是「不分叉」。合成那边写不到 `Framing` 字段（它追加在渲染之后），
             // 所以它在正文首块里现渲染一次；两处都只借这一个 Render 方法。
-            Framing = new ToolFraming(NameOf, []),
-            Content =
-            [
-                new Block.TextBlock(
-                    context.FloatingContext is { Length: > 0 } text
-                        ? text
-                        // ⚠️ **空要有一种说得清的说法**（不是空串、也不是一句编出来的默认内容）：
-                        // 没有进上下文的轴时尾块**本来就不存在**（`SystemBlock.Wrap` 那条判据），
-                        // 所以这里如实说「这一刻没有浮动内容」——而不是伪造一个只有包边的块。
-                        : "这一刻没有浮动上下文：没有轴进上下文，也没有插件贡献浮动字段。"),
-            ],
+            Framing = ReclaimedFraming,
+            Content = [new Block.TextBlock(ReclaimedBody)],
         });
 }
