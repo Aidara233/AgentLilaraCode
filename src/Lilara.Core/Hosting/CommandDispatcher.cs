@@ -46,6 +46,13 @@ public sealed class CommandDispatcher(
     private Stepper ResolveStepperWithReports(SessionHandle handle)
     {
         var stepper = resolveStepper(handle);
+
+        // ⚠️ **子会话状态要内存那份**（2026-10-26）：`Running` 只写内存、从不落盘，只喂盘面的
+        // `ReadState` 会让一个正在跑的子会话在父的尾块里恒显示「空闲」——而模型据此以为它做完了。
+        // 与 `OnRetry` 同一条纪律：**解析口接一次**，所有入口自动带上。
+        stepper.LiveStatus = sessionId =>
+            _host.TryGetActivated(sessionId, out var child) ? child.State.Status : null;
+
         stepper.OnRetry = notice => _bus.Publish(
             EventBus.SessionTopic(handle.SessionId),
             new WireEvent.RetryAttempt(

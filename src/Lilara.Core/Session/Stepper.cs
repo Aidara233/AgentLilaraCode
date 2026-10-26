@@ -59,6 +59,20 @@ public sealed class Stepper(
     public Action<RetryNotice>? OnRetry { get; set; }
 
     /// <summary>
+    /// **子会话的活状态**（2026-10-26）：id ⇒ <c>SessionStatus</c> 的一个值，或 <c>null</c>
+    /// （= 那一刻没激活 ⇒ 调用方回落到盘面那份）。
+    ///
+    /// <para>⚠️ <b>为什么不在这里自己读内存</b>：`Stepper` 只有 `SessionStore`，激活表在
+    /// `CoreHost` 上；为一句状态把它引进来会多一条依赖，单测还得造一个 host。
+    /// ⇒ 与 <see cref="OnRetry"/> 同一个形状：**解析口赋值一次**，所有入口自动带上。</para>
+    ///
+    /// <para>⚠️ <b>它不是「权威状态」，只是更及时的那一份</b>：盘面仍然是重启后的唯一真相
+    /// （`WaitingForInput` 落盘、`Running` 故意不落盘）。正因为如此——
+    /// 只读盘面的话，一个正在跑的子会话在父的尾块里**永远是「空闲」**。</para>
+    /// </summary>
+    public Func<string, string?>? LiveStatus { get; set; }
+
+    /// <summary>
     /// 工具表。⚠️ **默认空** = 纯 chat（`04` §1.3 推论 1：「没有任何插件」是完全合法的形态）。
     /// ⚠️ 可空是给既有测试的：它们构造的是「没有工具」的推进器，而那条路上的行为
     /// **逐字节不变**（工具相位整段跳过）。
@@ -1187,14 +1201,20 @@ public sealed class Stepper(
     /// （同 `/sessions` 那条「坏文件不让它打死核心」）。代价是那个 id 会从快照里消失 ⇒
     /// 模型调 `tell_child` 会得到「不是你的子会话」——**可见**，不是静默。</para>
     /// </summary>
-    private SubagentScope SubagentScopeFor(SessionHandle handle)
+    internal SubagentScope SubagentScopeFor(SessionHandle handle)
     {
         var children = new List<SubagentChild>();
 
         foreach (var (projectKey, spec) in _store.ChildrenOf(handle.SessionId))
         {
+            // ⚠️ **内存优先、盘面回退**（2026-10-26）：`Running` 只写内存，只读盘面的话
+            // 一个正在跑的子会话永远显示「空闲」——而模型据此以为它已经做完了。
             string status;
-            try { status = _store.ReadState(projectKey, spec.SessionId).Status; }
+            try
+            {
+                status = LiveStatus?.Invoke(spec.SessionId)
+                         ?? _store.ReadState(projectKey, spec.SessionId).Status;
+            }
             catch (Exception ex) when (ex is IOException or FileNotFoundException
                                           or UnauthorizedAccessException or FileFormatException)
             {

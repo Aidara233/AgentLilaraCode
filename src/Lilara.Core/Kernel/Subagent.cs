@@ -135,9 +135,11 @@ public static class Subagent
 /// </summary>
 /// <param name="SessionId">子会话 id（模型拿它去调 `tell_child`）。</param>
 /// <param name="Status">
-/// 它的状态。⚠️ **只取 <see cref="SessionStatus"/> 里那几个档**，且**必须是磁盘上读得到的**
-/// ——工具句柄够不着 `CoreHost`，而 `Running` 只写内存。⇒ 子会话「正在跑」在工具这一侧
-/// 看起来就是 `Idle`（它落在盘上的那一份），**不要**在这里假装知道它在跑。
+/// 它的状态，取值是 <see cref="SessionStatus"/> 那几档。
+/// ⚠️ **取的是「内存优先、盘面回退」那一份**（2026-10-26 改）：`Running` 只写内存、从不落盘，
+/// 所以装配快照的人**必须**把内存状态优先交进来（`Stepper.LiveStatus` / 控制面的
+/// `host.TryGetActivated`）。只喂盘面那份的话，一个正在跑的子会话恒显示 `Idle`——
+/// 上一版就是这样，模型据此以为它已经做完了。
 /// </param>
 public sealed record SubagentChild(string SessionId, string Status);
 

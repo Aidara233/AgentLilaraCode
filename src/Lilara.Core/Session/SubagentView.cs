@@ -43,11 +43,14 @@ public static class SubagentView
     }
 
     /// <summary>
-    /// 状态 → 一个词。⚠️ **只认磁盘上真有的那两个**（`SessionStatus` 的类型注释：
-    /// `Running` 只写内存，句柄这里够不着）——未知取值原样吐出，不编。
+    /// 状态 → 一个词。⚠️ **`Running` 也算一档**（2026-10-26）：它只写内存，
+    /// 所以调用方**必须**把内存那份优先交进来（`Stepper.LiveStatus`、`ControlServer` 的
+    /// `host.TryGetActivated`）。只喂盘面那份的话，这一档永远落不到——一个正在跑的子会话
+    /// 会恒显示「空闲」，而模型据此以为它已经做完了。
     /// </summary>
     private static string StatusWord(string status) => status switch
     {
+        SessionStatus.Running => "运行中",
         SessionStatus.WaitingForInput => "等你回答",
         SessionStatus.Idle => "空闲",
         _ => status,

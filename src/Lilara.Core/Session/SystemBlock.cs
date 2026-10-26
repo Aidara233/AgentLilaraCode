@@ -203,8 +203,11 @@ public static class SystemBlock
         // 而不是「此刻该做什么」。⇒ 与轴同一侧，不跟目标/压缩抢最后那个位置。
         // ⚠️ **计划树与它的那句说明排在目标/压缩线之前**（2026-10-24）：计划是**环境**
         // （这一批还剩什么），而目标/压缩是**此刻要动手的那件事**——后者仍然离模型最近。
+        // ⚠️ 子会话那两行**成对**出现（2026-10-26）：状态行 + 一条机制约定（回报会自动回来，
+        // 别去轮询、别催）。没有派生关系时两句都不出现——见 `SubagentNorm` 的注释。
+        var subagentNorm = string.IsNullOrEmpty(subagentLine) ? null : CorePrompts.SubagentNorm;
         var body = Join(table is null ? null : CorePrompts.TailAxesPrefix + table,
-            Join(descriptions.ToArray()), subagentLine,
+            Join(descriptions.ToArray()), subagentLine, subagentNorm,
             string.IsNullOrEmpty(planText) ? null : planText, planDirective, iterateDirective,
             goalDirective, compactDirective, plugin);
         return body is null ? null : $"{CorePrompts.TailDeclaration}\n{body}";

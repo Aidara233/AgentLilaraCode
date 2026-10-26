@@ -840,9 +840,18 @@ public sealed class ControlServer(
 
         foreach (var (projectKey, spec) in host.Store.ChildrenOf(handle.SessionId))
         {
-            // ⚠️ 读不出来就跳过（坏文件不该让整个 /state 500），代价是那个 id 从快照里消失
+            // ⚠️ **内存优先、盘面回退**（2026-10-26）：`Running` 只写内存，只读盘面的话
+            // 一个正在跑的子会话恒显示「空闲」——与 `Stepper.SubagentScopeFor` 同一份判据。
+            // 读不出来就跳过（坏文件不该让整个 /state 500），代价是那个 id 从快照里消失
             // ——**可见**，不是静默（同 `/sessions` 那条）。
-            try { children.Add(new Kernel.SubagentChild(spec.SessionId, host.Store.ReadState(projectKey, spec.SessionId).Status)); }
+            try
+            {
+                var status = host.TryGetActivated(spec.SessionId, out var child)
+                    ? child.State.Status
+                    : host.Store.ReadState(projectKey, spec.SessionId).Status;
+
+                children.Add(new Kernel.SubagentChild(spec.SessionId, status));
+            }
             catch (Exception ex) when (ex is IOException or FileNotFoundException
                                           or UnauthorizedAccessException or Storage.FileFormatException)
             {

@@ -45,6 +45,8 @@ public sealed class SpawnTool : ITool
         + "（做什么、在哪个目录、验收标准）。"
         + "它会自己跑，需要问你的时候会来问；你也可以用 tell_child 随时给它补话。"
         + "它落定（或者有事要问你）时，你会收到一条 subagent_report 结果。"
+        + "⚠️ 它在后台跑：**不要**为了看进度反复 tell_child，也不要一直去确认它的状态——"
+        + "回报会自动回来，而一次「看看进度」的催促只会打断它。"
         + "⚠️ 默认只能派生一层：子会话自己不能再派生。";
 
     public string ParametersSchemaJson => """
