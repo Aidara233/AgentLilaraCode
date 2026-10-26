@@ -539,7 +539,22 @@ public sealed class Stepper(
         // ⚠️ **2026-10-23：浮动对落进 `floating.jsonl`**（不是 `history.jsonl`）——
         // 它是**环境状态**，混进对话记录会让所有「记录里有几条事件」的断言与统计重算，
         // 也会让 `fetch`/压缩把它当成可取回的对话内容（而旧读数的档位不能复活）。
-        _store.AppendFloating(handle.ProjectKey, handle.SessionId, StepFloatingPair(handle, slots, at));
+        // ⚠️ **读数取「写这一刻」的子会话状态**（2026-10-26）：`slots` 是**步开始**冻的那份，
+        // 而一步可能跑几分钟——子会话在这期间跑完 / 开口，照冻的那份写读数，就会把
+        // 「运行中」永久留在盘上，而它早就停了。⇒ 写之前现算一次那一行，变了就用新的。
+        // ⚠️ 只换子会话那一行：重建时系统 / 首要两块传空（尾块本就不含它们），
+        // 所以不会因为重读预设把别的东西也带歪。
+        // ⚠️ 请求里那份**不动**（步内逐字节稳定是另一条不变量）：读数记「此刻」，
+        // 请求记「模型这一刻看到的那份」，两者本来就该允许不同。
+        var freshSubagentLine = SubagentView.Line(SubagentScopeFor(handle));
+        var readingSlots = string.Equals(freshSubagentLine, SubagentView.Line(subagents), StringComparison.Ordinal)
+            ? slots
+            : SystemBlock.Build(null, null, pluginAxes.Values, pluginPrompt,
+                GoalMode.IsActive(stepState) ? CorePrompts.GoalDirective : null,
+                stepState.PendingCompact ? _pendingCompactText : null,
+                freshSubagentLine, stepState.Plan, iterateReplan);
+
+        _store.AppendFloating(handle.ProjectKey, handle.SessionId, StepFloatingPair(handle, readingSlots, at));
         _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
 
         // ② + ③ + ④：检查点 → 清指令 → 回收窗口（见上面那段次序）。
