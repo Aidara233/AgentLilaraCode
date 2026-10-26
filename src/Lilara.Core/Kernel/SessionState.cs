@@ -141,6 +141,9 @@ public sealed record SessionState
     /// 不会让一次不该发生的压缩发生（不可见）。</para>
     /// </summary>
     public bool PendingCompact { get; init; }
+
+    /// <summary>Only the remaining plan tree is stored; completed leaves are removed.</summary>
+    public SessionPlan? Plan { get; init; }
 }
 
 /// <summary>

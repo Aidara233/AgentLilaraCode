@@ -193,6 +193,209 @@ public class CommandDispatcherTests : IDisposable
     }
 
     /// <summary>
+    /// **`plan.updated` 真的会发，形状与 `/state.plan` 同源**（2026-10-24）。
+    ///
+    /// <para>⚠️ 头靠这条事件重画面板：没有它，用户改完计划页面只在重开会话时才更新，
+    /// 而**没有任何东西会红**。`Plan_ToolCalls…` 那条只断言 `state`，事件这一格此前是空的。</para>
+    ///
+    /// <para>⚠️ <b>形状钉在这里，是因为它出过一次事故</b>：事件曾经交 `{nodes, updatedAt}`，
+    /// 而 `/state` 交 `{active, remaining, currentId, currentTitle, tree}` ⇒ 头的同一个渲染函数
+    /// 有一半路径把「有计划」画成「还没有计划」。两边都走 `PlanTree.Summary` 之后才一致。</para>
+    /// </summary>
+    [Fact]
+    public async Task PlanEdit_PublishesPlanUpdated_InTheSameShapeAsTheStateSnapshot()
+    {
+        var host = new CoreHost(_root, _work);
+        SaveProvider(host);
+        var bus = new EventBus();
+        var adapter = new FakeAdapter().Reply("seed");
+        var dispatcher = new CommandDispatcher(host, bus,
+            _ => new Stepper(host.Store, adapter, BuiltInTools.All), _ => adapter);
+        var sessionId = await CreateSessionAsync(dispatcher);
+        var projectKey = host.Store.FindSession(sessionId)!.Value.ProjectKey;
+
+        using var sub = bus.Subscribe(EventBus.SessionTopic(sessionId));
+        var r = await dispatcher.DispatchAsync(
+            new CoreCommand.SessionPlanEdit(sessionId, "overwrite",
+                [new PlanNode { Id = "a", Title = "读代码", Body = "读一遍" }]),
+            "p1", false, CancellationToken.None);
+        Assert.IsType<Ack.Accepted>(r.Ack);
+
+        WireEvent.PlanUpdated? evt = null;
+        await WaitUntil(() => sub.Reader.TryRead(out var p)
+            && (evt = p.Payload as WireEvent.PlanUpdated) is not null);
+        Assert.NotNull(evt);
+        Assert.Equal(sessionId, evt!.SessionId);
+        Assert.True(evt.Plan.Active);
+        Assert.Equal(1, evt.Plan.Remaining);
+        Assert.Equal("a", evt.Plan.CurrentId);
+        Assert.Equal("读代码", evt.Plan.CurrentTitle);
+        Assert.Equal(["a"], evt.Plan.Tree!.Select(n => n.Id));
+
+        // 与 `/state.plan` 同源：同样的四个标量 + 同一棵树。
+        // ⚠️ 逐格比，不比整个 record——`PlanSummary` 里那个列表按引用比较，
+        // 而这里一边是内存里那棵、一边是从盘上读回来的那棵，永远不会是同一个实例。
+        var summary = PlanTree.Summary(host.Store.ReadState(projectKey, sessionId).Plan);
+        Assert.Equal(summary.Active, evt.Plan.Active);
+        Assert.Equal(summary.Remaining, evt.Plan.Remaining);
+        Assert.Equal(summary.CurrentId, evt.Plan.CurrentId);
+        Assert.Equal(summary.CurrentTitle, evt.Plan.CurrentTitle);
+        Assert.Equal(summary.Tree!.Select(n => n.Id), evt.Plan.Tree!.Select(n => n.Id));
+    }
+
+    /// <summary>
+    /// **模型改的计划真的落在 state 上**（2026-10-24）。
+    ///
+    /// <para>⚠️ <b>这条钉的是此前唯一没人覆盖的一段</b>：`plan` / `advance_plan` 是**纯工具**
+    /// （它们只判参数、回一句话），真正改树是推进器的 `ApplyPlanCalls`。
+    /// 落地那段没有测过的话，「工具说已登记、而树纹丝不动」这种静默丢改动可以一直活着——
+    /// 而这正是本批开工时真实存在的 bug。</para>
+    ///
+    /// <para>⚠️ 走的是**真实的工具循环**（一批调用 → 续推下一步），不是直接调落地函数：
+    /// 「同一个调用被应用了两次」或「续推那一步把它丢了」都只有走完整条链才看得见。</para>
+    /// </summary>
+    [Fact]
+    public async Task Plan_ToolCalls_AreAppliedToTheSessionState()
+    {
+        var host = new CoreHost(_root, _work);
+        SaveProvider(host);
+
+        var adapter = new FakeAdapter()
+            .Reply("seed")
+            // ① 写一棵两叶子的树。
+            .ReplyBlocks(new Block.ToolUseBlock("c1", "plan",
+                """{"operation":"overwrite","nodes":[{"id":"a","title":"读代码","body":"先读一遍"},{"id":"b","title":"改代码","body":"改一处"}]}"""))
+            .Reply("写好了")
+            // ② 推进当前叶子。
+            .ReplyBlocks(new Block.ToolUseBlock("c2", "advance_plan", """{"currentId":"a"}"""))
+            .Reply("推进了");
+        // ⚠️ 工具表必须带内建工具：计划是模型调 `plan` / `advance_plan` 改的，
+        // 没有它们那一步只会得到一条「不存在的工具」的结果——而那**不会报错**。
+        var dispatcher = new CommandDispatcher(host, new EventBus(),
+            _ => new Stepper(host.Store, adapter, BuiltInTools.All),
+            _ => adapter);
+        var sessionId = await CreateSessionAsync(dispatcher);
+        var projectKey = host.Store.FindSession(sessionId)!.Value.ProjectKey;
+
+        // ⚠️ **每一步都要有人推**（`initiative=standard` 不会自己连跑）：
+        // 第一次 send 消费 `seed`，第二次 send 才轮到那条 `plan` 调用，
+        // 而它执行之后核心会**自动续推一步**（消费「写好了」）——工具循环本来就长这样。
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("seed")]),
+            "seed", true, CancellationToken.None);
+
+        // ① 推一步 ⇒ 模型在这一步调 `plan overwrite`。
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("写计划")]),
+            "plan", true, CancellationToken.None);
+
+        // ② `overwrite` 落地：两个节点都在，当前叶子是第一个。
+        await WaitUntil(() => host.Store.ReadState(projectKey, sessionId).Plan is not null);
+        var afterWrite = host.Store.ReadState(projectKey, sessionId).Plan!;
+        Assert.Equal(["a", "b"], afterWrite.Nodes.Select(n => n.Id));
+        Assert.Equal("a", PlanTree.Current(afterWrite)!.Id);
+
+        // ③ 再推一步 ⇒ 模型在这一步调 `advance_plan`。
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("推进")]),
+            "advance", true, CancellationToken.None);
+
+        // ④ `advance_plan` 落地：计划只存**剩余**的，被推进的那个叶子消失。
+        await WaitUntil(() => host.Store.ReadState(projectKey, sessionId).Plan?.Nodes.Count == 1);
+        var afterAdvance = host.Store.ReadState(projectKey, sessionId).Plan!;
+        Assert.Equal(["b"], afterAdvance.Nodes.Select(n => n.Id));
+        Assert.Equal("b", PlanTree.Current(afterAdvance)!.Id);
+    }
+
+    /// <summary>
+    /// **模式退出在任意权限档都询问；批准后才切 mode**（2026-10-24）。
+    ///
+    /// <para>⚠️ 这条测试走完整条路：模型工具调用 → Permission 挂起 → 用户批准 → 工具重跑 →
+    /// mode 步末写入 → `axis.changed`。只测 `PlanModeTool.RunAsync` 不够：它只能证明卡被造出来，
+    /// 证明不了批准后的 call id 真能通过恢复路径到推进器。</para>
+    /// </summary>
+    [Fact]
+    public async Task SwitchPlanMode_ExitAsksEvenInReadonly_AndApprovalChangesTheMode()
+    {
+        var host = new CoreHost(_root, _work);
+        SaveProvider(host);
+        var bus = new EventBus();
+        var adapter = new FakeAdapter()
+            .Reply("seed")
+            .ReplyBlocks(new Block.ToolUseBlock("switch-1", PlanModeTool.NameOf,
+                """{"mode":"act","reason":"需要编辑配置文件"}"""))
+            .Reply("恢复行动模式");
+        var dispatcher = new CommandDispatcher(host, bus,
+            _ => new Stepper(host.Store, adapter, BuiltInTools.All), _ => adapter);
+        var sessionId = await CreateSessionAsync(dispatcher);
+        var handle = host.Activate(host.Store.FindSession(sessionId)!.Value.ProjectKey, sessionId);
+        handle.UpdateStateAndPersist(host.Store,
+            s => s with { Axes = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal)
+                { [Axes.Permission] = "readonly", [Axes.Mode] = "plan", [Axes.Initiative] = "step" } },
+            diskStatus: SessionStatus.Idle);
+        using var sub = bus.Subscribe(EventBus.SessionTopic(sessionId));
+
+        await dispatcher.DispatchAsync(new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("开始")]),
+            "seed", true, CancellationToken.None);
+        await dispatcher.DispatchAsync(new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("申请退出规划模式")]),
+            "switch-plan", true, CancellationToken.None);
+        Assert.Equal(2, adapter.Calls.Count);
+
+        var waiting = host.Store.ReadState(handle.ProjectKey, sessionId);
+        Assert.Equal(SessionStatus.WaitingForInput, waiting.Status);
+        Assert.Equal("plan", waiting.Axes![Axes.Mode]);
+        var ask = Assert.IsType<SessionHandle.PendingAsk>(handle.AwaitingInput).Ask;
+        Assert.Equal(AskKind.Permission, ask.Kind);
+        Assert.Empty(ask.Remember);
+        Assert.Contains("需要编辑配置文件", ask.Items[0].Question, StringComparison.Ordinal);
+
+        var response = new CoreCommand.ApprovalRespond(sessionId, ask.Id, "submit",
+            new Dictionary<string, string>(StringComparer.Ordinal) { [ask.Items[0].Id] = "allow" });
+        var ack = await dispatcher.DispatchAsync(response, "approve-mode", true, CancellationToken.None);
+        Assert.IsType<Ack.Accepted>(ack.Ack);
+
+        // ⚠️ 判据读**内存句柄**而不是磁盘：`state.json` 正被后台那一步写，
+        // `ReadState` 会撞上文件锁（本仓既有的竞态，与本功能无关）；而句柄就是那一步写的那个对象。
+        await WaitUntil(() => handle.State.Axes![Axes.Mode] == "act"
+            && handle.State.Status == SessionStatus.Idle);
+        Assert.Equal("act", handle.State.Axes![Axes.Mode]);
+
+        // 头已经处理这个事件；它必须在实际状态变化后发布。
+        var modes = new List<string>();
+        while (sub.Reader.TryRead(out var published))
+            if (published.Payload is WireEvent.AxisChanged changed && changed.Axis == Axes.Mode)
+                modes.Add(changed.Value);
+        Assert.Contains("act", modes);
+    }
+
+    /// <summary>
+    /// **T0 是固定上下文，不是普通树的一片可推进叶子**（2026-10-24）。
+    /// </summary>
+    [Fact]
+    public void PlanTree_OrdinaryEditsAndAdvance_PreserveT0()
+    {
+        var t0 = new T0PlanNode { Title = "长期目标", Body = "维护服务" };
+        var initial = PlanTree.EnsureT0(null, t0.Title, t0.Body, DateTimeOffset.UnixEpoch);
+        var (plan, error) = PlanTree.Apply(initial, new PlanEdit("overwrite",
+            [new PlanNode { Id = "a", Title = "第一步", Body = "做一步" }]), DateTimeOffset.UnixEpoch.AddMinutes(1));
+        Assert.Null(error);
+        Assert.Equal(t0, plan!.T0);
+
+        var (empty, advanceError) = PlanTree.Advance(plan, "a", DateTimeOffset.UnixEpoch.AddMinutes(2));
+        Assert.Null(advanceError);
+        Assert.NotNull(empty);
+        Assert.Empty(empty!.Nodes);
+        Assert.Equal(t0, empty.T0);
+        Assert.Contains("T0（固定长期任务", PlanTree.Render(empty), StringComparison.Ordinal);
+        Assert.Contains("普通计划：空", PlanTree.Render(empty), StringComparison.Ordinal);
+
+        // 普通 overwrite 即使传空数组也只能清普通树，T0 仍在。
+        var (cleared, clearError) = PlanTree.Apply(empty, new PlanEdit("overwrite", []), DateTimeOffset.UnixEpoch.AddMinutes(3));
+        Assert.Null(clearError);
+        Assert.Equal(t0, cleared!.T0);
+    }
+
+    /// <summary>
     /// 请求里所有「核心注入的文字」。⚠️ **尾块通常不在 `Slots.Tail` 里**：
     /// 工具表有 `floating_context` 时它被挪进末尾那条合成调用/结果（`Stepper.FloatingContextPair`），
     /// 而两者对模型是同一件事——只看 `Slots.Tail` 会得到一个假阴性。

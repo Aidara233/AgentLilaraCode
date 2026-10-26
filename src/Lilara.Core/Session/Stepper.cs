@@ -138,7 +138,7 @@ public sealed class Stepper(
             // ⚠️ 文本由解析器交进来（`StepperResolver`），推进器不碰预设——两条路给出同一句话。
             stepState.PendingCompact ? _pendingCompactText : null,
             // ⚠️ **这一行只在真有派生关系时出现**（`SubagentView.Line` 对空关系给 null）。
-            SubagentView.Line(subagents));
+            SubagentView.Line(subagents), stepState.Plan);
 
         // ⚠️ **引擎租约**：所有 `StepAsync` 调用都在 **_stepper 的会话内串行** 之内
         // （`CommandDispatcher` 的会话闸），所以这里不需要再同步。
@@ -299,9 +299,10 @@ public sealed class Stepper(
         // 理由见 `SessionToolContext` 的构造参数注释。
         var recorded = _store.ReadTimeline(handle.ProjectKey, handle.SessionId);
 
-        // ⚠️ **真正执行过的调用**（`Batch.ExecutedCallIds`）要活过下面那个 `if`：
-        // 压缩的判据与 `release` 的画线同源——名字在批里 ≠ 它跑过（闸门拒掉的也在这批里）。
+        // 本批实际执行过的调用；核心效果（plan、finish_goal、mode）只依据此名单落地。
         IReadOnlyList<string> executedCallIds = [];
+        // 只有 Permission 获批续跑时才非空；初次模型调用一律为空。
+        IReadOnlyList<string> callIdsToExecute = [];
 
         // 拒答不写空模型消息（Review Focus #2）
         if (!reply.Refused && reply.Blocks.Count > 0)
@@ -322,8 +323,11 @@ public sealed class Stepper(
         // 这一批工具结果——**给头的活事件**（`StepOutcome.ToolResults`）。有问时恒空。
         IReadOnlyList<TimelineEvent.ToolResultEvent> toolResults = [];
 
-        // `finish_goal` 真的执行过 ⇒ 把主动性拨回 standard（见本方法末尾的状态写入）。
         var goalEnded = false;
+        SessionPlan? planAfter = null;
+        var planChanged = false;
+        string? modeAfter = null;
+        var modeChanged = false;
 
         // ⚠️ 工具调用是**模型消息的一部分** ⇒ 有调用就一定有那条模型消息（上面那个 if 通过）。
         // `events.Count > 0` 不是多余的守卫，它挡的是「凭空落一堆悬空结果」——而悬空的
@@ -334,9 +338,11 @@ public sealed class Stepper(
             // ⚠️ **权限档位在这里读一次，冻进这一趟**（与上面那个 `now` 同一个道理）：
             // 它是**浮动字段**（`01` §9.2：改它零前缀代价），而一步之内的判定必须一致——
             // 否则同一步里两条调用会按两个档位判，而记录里看不出为什么。
+            // ⚠️ **模式同一条纪律**：它喂给 `ToolExecutor` 的**模式硬闸**（规划模式下拦改文件的工具）。
             var executor = new ToolExecutor(
                 _tools, blobs, handle.State.Axes![Axes.Permission],
-                new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId));
+                new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId),
+                handle.State.Axes![Axes.Mode]);
             var context = new SessionToolContext(handle.Spec.WorkingDirectory, blobs, recorded,
                 // ⚠️ **与合成注入同一份字节**（`slots` 就是构造请求时用的那份尾块）：
                 // `floating_context` 若在这里现渲染，同一步里「核心注入的」与「模型自己要来的」
@@ -354,7 +360,11 @@ public sealed class Stepper(
                 ShellFor(),
                 // ⚠️ **用步开始冻住的那一份**（2026-10-24）：与尾块同一份字节，
                 // 两处各算一次会让「模型从尾块看到的」与「工具判定的」分叉。
-                subagents);
+                subagents,
+                handle.State.Plan,
+                handle.State.Axes![Axes.Mode],
+                callIdsToExecute,
+                handle.State.Axes![Axes.Initiative]);
 
             // 相位：回复里有 tool_use，接下来是工具执行。
             onPhase?.Invoke(SessionPhase.Tools);
@@ -366,7 +376,30 @@ public sealed class Stepper(
             executedCallIds = batch.ExecutedCallIds;
             spawns = batch.Spawns;
             tells = batch.Tells;
-            goalEnded = GoalMode.IsActive(handle.State) && EndedGoal(batch, toolCalls);
+        // T0 本身是固定目标；普通计划全部完成且不在 iterate 时，finish_goal 可以收尾当前 goal。
+        // ⚠️ iterate 下即使普通计划暂时为空也不能收尾；它由下面那条自动切回 plan 续规划。
+        var canFinishGoal = handle.State.Axes![Axes.Initiative] == "goal"
+            && PlanTree.Current(handle.State.Plan) is null;
+        goalEnded = GoalMode.IsActive(handle.State) && canFinishGoal && EndedGoal(batch, toolCalls);
+
+            // ---- 计划的落地（2026-10-24，与 `compact` / `release` 同一条分工）----
+            // 工具是**纯的**：`plan` / `advance_plan` 只判参数、回一句话，真正改树是这里。
+            // ⚠️ **按调用序逐条应用**：同一批里两条 `plan` 调用，后一条看到的是前一条的结果；
+            // 一次性从头算会让后一条盖掉前一条（静默丢改动，正是这条要防的）。
+            (planAfter, planChanged) = ApplyPlanCalls(batch.ExecutedCallIds, toolCalls, handle.State.Plan, at);
+
+            // ---- 工作模式的落地（2026-10-24）----
+            // ⚠️ 退出规划模式那一条**只会在批准之后**出现在 `ExecutedCallIds` 里（见 `ApplyModeCalls`）。
+            (modeAfter, modeChanged) = ApplyModeCalls(batch.ExecutedCallIds, toolCalls,
+                handle.State.Axes![Axes.Mode], planAfter ?? handle.State.Plan, handle.State.Axes![Axes.Initiative]);
+            // iterate 普通计划耗尽时强制回到 plan，避免同一批 mode=act 覆盖自动回切。
+            if (handle.State.Axes![Axes.Initiative] == Axes.Iterate
+                && planChanged && PlanTree.Current(planAfter) is null
+                && (planAfter?.T0 ?? handle.State.Plan?.T0) is not null)
+            {
+                modeAfter = Tools.PlanModeTool.Plan;
+                modeChanged = !string.Equals(handle.State.Axes[Axes.Mode], modeAfter, StringComparison.Ordinal);
+            }
 
             // ⚠️ **`release` 的线在这里落盘**（`01` §12.4，2026-10-11）：
             // 它和别的事件**不一样**——工具只跑出一次「成功」，而**记录上要留的那条不是结果**。
@@ -401,6 +434,14 @@ public sealed class Stepper(
         // 头靠它刷新「谁在动哪些文件」；不发的话，头会继续显示模型已经说用完了的锁。
         // ⇒ 与 `StepOutcome` 一起交回，由 `CommandDispatcher` 在落盘之后发。
 
+        if (handle.State.Axes![Axes.Initiative] == Axes.Iterate
+            && planChanged && PlanTree.Current(planAfter) is null
+            && (planAfter?.T0 ?? handle.State.Plan?.T0) is not null)
+        {
+            modeAfter = Tools.PlanModeTool.Plan;
+            modeChanged = !string.Equals(handle.State.Axes[Axes.Mode], modeAfter, StringComparison.Ordinal);
+        }
+
         // ⚠️ **有问 ⇒ 中止这一步的「执行」，但那条模型消息照样落盘**（`01` §3.8）。
         //
         // ⚠️ **这一格我第一版写反了**，记在这里：初稿写的是「这一步整个没发生」，
@@ -430,10 +471,17 @@ public sealed class Stepper(
                     ApprovalStore.HashArgs(toolCalls[0].Arguments),
                     DeadlineOf(handle.Spec.AskTimeout)),
                 Turn = s.Turn + 1,
+                // ⚠️ **挂起这条也要落计划**（2026-10-24）：同一批里「改计划 + 要问」是合法的，
+                // 而这条分支在压缩之前就返回了 ⇒ 不在这里写，那次编辑会**静默丢掉**
+                //（工具已经回答过「本步结束时生效」）。
+                Plan = planChanged ? planAfter : s.Plan,
+                Axes = WithMode(goalEnded ? WithStandardInitiative(s.Axes) : s.Axes, modeChanged ? modeAfter : null),
             }, diskStatus: SessionStatus.WaitingForInput);
 
             return new StepOutcome(reply, pending, handle.State.Ask?.DeadlineAt,
-                events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id, releasedClaims, releasedLines);
+                events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id, releasedClaims, releasedLines,
+                PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
+                ExecutedCallIds: executedCallIds);
         }
 
         // ---- 压缩（2026-10-22，`compact` 是一次普通工具调用）----
@@ -505,18 +553,24 @@ public sealed class Stepper(
             Status = SessionStatus.Idle,
             Turn = s.Turn + 1,
             PendingIntent = null,
+            // ⚠️ **计划只在真的改过时才写**：`planChanged` 是「本步有没有落地过计划编辑」，
+            // 不是「树现在是什么」。没有它，一次空手步会把 `Plan = null` 写回去（把计划抹掉），
+            // 而清空计划与没动计划在类型上是同一个 null。
+            Plan = planChanged ? planAfter : s.Plan,
             // ⚠️ **指令的清理在 `CommitCompaction` 里、排在检查点之后**（次序见那边）——
             // 这里不再碰它：先清指令后写检查点，崩在中间就是「指令丢了、历史没压」，
             // 而用户看到的「点过压缩」与盘面完全对不上。⚠️ 没有压缩时它原样保留。
             // ⚠️ **`finish_goal` 的效果就是这一行**：把主动性拨回 standard。
             // 拨回之后普通工具循环还会再走一步（它是一次工具调用）⇒ 模型有时间收尾总结。
             // 只在**真的执行过**且当时确实处于 goal 时才改（见 `goalEnded` 的算法）。
-            Axes = goalEnded ? WithStandardInitiative(s.Axes) : s.Axes,
+            Axes = WithMode(goalEnded ? WithStandardInitiative(s.Axes) : s.Axes, modeChanged ? modeAfter : null),
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id,
             ReleasedClaims: releasedClaims, ReleasedLines: releasedLines, ToolResults: toolResults,
-            GoalEnded: goalEnded, Compacted: compaction, Spawns: spawns, Tells: tells);
+            GoalEnded: goalEnded, Compacted: compaction, Spawns: spawns, Tells: tells,
+            PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
+            ExecutedCallIds: executedCallIds);
     }
 
     /// <summary>
@@ -815,9 +869,16 @@ public sealed class Stepper(
         // 答复之后真正跑掉的那批结果——**给头的活事件**（与 `StepAsync` 同一个出口）。
         IReadOnlyList<TimelineEvent.ToolResultEvent> toolResults = [];
         var goalEnded = false;
+        // 计划落地结果（见 `ApplyPlanCalls`）——与 `StepAsync` 同一对变量、同一条判据。
+        SessionPlan? planAfter = null;
+        var planChanged = false;
+        // 模式落地结果（见 `ApplyModeCalls`）。
+        string? modeAfter = null;
+        var modeChanged = false;
         // ⚠️ 派生 / 注入请求（2026-10-24）：与 `StepAsync` 同一条分工，走同一个出口。
         IReadOnlyList<SpawnRequest> spawns = [];
         IReadOnlyList<TellRequest> tells = [];
+        IReadOnlyList<string> executedCallIds = [];
 
         if (calls.Count > 0)
         {
@@ -827,7 +888,9 @@ public sealed class Stepper(
             var subagents = SubagentScopeFor(handle);
             var executor = new ToolExecutor(
                 _tools, blobs, handle.State.Axes![Axes.Permission],
-                new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId));
+                new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId),
+                // 同 `StepAsync`：模式硬闸按**答复这一刻**的模式值判。
+                handle.State.Axes![Axes.Mode]);
             var context = new SessionToolContext(
                 handle.Spec.WorkingDirectory, blobs,
                 _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
@@ -839,7 +902,11 @@ public sealed class Stepper(
                 GoalMode.IsActive(handle.State),
                 handle.State.PendingCompact,
                 ShellFor(),
-                subagents);
+                subagents,
+                handle.State.Plan,
+                handle.State.Axes![Axes.Mode],
+                reply.Kind is AskKind.Permission ? reply.CallIds : null,
+                handle.State.Axes![Axes.Initiative]);
 
             // 相位：答复之后真正跑掉的那批工具。
             onPhase?.Invoke(SessionPhase.Tools);
@@ -849,7 +916,25 @@ public sealed class Stepper(
             toolResults = batch.Results;
             spawns = batch.Spawns;
             tells = batch.Tells;
-            goalEnded = GoalMode.IsActive(handle.State) && EndedGoal(batch, calls);
+            var canFinishGoal = handle.State.Axes![Axes.Initiative] == "goal"
+                && PlanTree.Current(handle.State.Plan) is null;
+            goalEnded = GoalMode.IsActive(handle.State) && canFinishGoal && EndedGoal(batch, calls);
+
+            // ⚠️ **计划在答复这条路上也要落地**（2026-10-24）：一批里只要有一条要问，整批就挂起，
+            // 用户批准之后**全部执行**——`plan` / `advance_plan` 照样返回「本步结束时生效」。
+            // 这里不应用的话，那句话就是假的（同 `release` 那条线的理由）。
+            (planAfter, planChanged) = ApplyPlanCalls(batch.ExecutedCallIds, calls, handle.State.Plan, CoreClock.Now());
+
+            // 模式同理：答复这一批里也可能有 `switch_plan_mode`（退出的那一条**正是**从这里来的）。
+            (modeAfter, modeChanged) = ApplyModeCalls(batch.ExecutedCallIds, calls, handle.State.Axes![Axes.Mode],
+                planAfter ?? handle.State.Plan, handle.State.Axes![Axes.Initiative]);
+            if (handle.State.Axes![Axes.Initiative] == Axes.Iterate
+                && planChanged && PlanTree.Current(planAfter) is null
+                && (planAfter?.T0 ?? handle.State.Plan?.T0) is not null)
+            {
+                modeAfter = Tools.PlanModeTool.Plan;
+                modeChanged = !string.Equals(handle.State.Axes[Axes.Mode], modeAfter, StringComparison.Ordinal);
+            }
 
             // ⚠️ **`release` 的线在这里也要落**（2026-10-17）——原先只在 `StepAsync` 有一半：
             // 一批里只要有一条要问，整批就挂起；用户批准之后全部执行（`ToolExecutor` 的
@@ -884,12 +969,15 @@ public sealed class Stepper(
                         ApprovalStore.HashArgs(calls[0].Arguments),
                         DeadlineOf(handle.Spec.AskTimeout)),
                     Turn = s.Turn + 1,
-                    Axes = goalEnded ? WithStandardInitiative(s.Axes) : s.Axes,
+                    Axes = WithMode(goalEnded ? WithStandardInitiative(s.Axes) : s.Axes, modeChanged ? modeAfter : null),
+                    Plan = planChanged ? planAfter : s.Plan,
                 }, diskStatus: SessionStatus.WaitingForInput);
 
                 return new StepOutcome(NoReply, again, handle.State.Ask?.DeadlineAt,
                     ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
-                    GoalEnded: goalEnded, Spawns: spawns, Tells: tells);
+                    GoalEnded: goalEnded, Spawns: spawns, Tells: tells,
+                    PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
+                    ExecutedCallIds: executedCallIds);
             }
         }
 
@@ -899,11 +987,14 @@ public sealed class Stepper(
         {
             Status = SessionStatus.Idle,
             Turn = s.Turn + 1,
-            Axes = goalEnded ? WithStandardInitiative(s.Axes) : s.Axes,
+            Axes = WithMode(goalEnded ? WithStandardInitiative(s.Axes) : s.Axes, modeChanged ? modeAfter : null),
+            Plan = planChanged ? planAfter : s.Plan,
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
-            ToolResults: toolResults, GoalEnded: goalEnded, Spawns: spawns, Tells: tells);
+            ToolResults: toolResults, GoalEnded: goalEnded, Spawns: spawns, Tells: tells,
+            PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
+            ExecutedCallIds: executedCallIds);
     }
 
     /// <summary>
@@ -1120,6 +1211,102 @@ public sealed class Stepper(
     }
 
     /// <summary>
+    /// **本步 `plan` / `advance_plan` 的落地**（2026-10-24）。
+    ///
+    /// <para>⚠️ <b>为什么在推进器里、不写在工具里</b>：工具是**纯的**（`00` §5 铁律 1）——
+    /// 它没有改会话状态的手，只有 <see cref="Tools.SessionToolContext"/> 那支只读的笔。
+    /// 与 `compact`（`CommitCompaction`）、`release`（画线）同一条分工：
+    /// 工具判参数、回一句话，**落地在推进器这一步的收尾处**。</para>
+    ///
+    /// <para>⚠️ <b>按 <paramref name="executedCallIds"/> 的次序逐条应用</b>：
+    /// 同一批里两条 `plan` 调用必须**依序**生效（后一条看到前一条的结果）。
+    /// 每条都从初始树重算会让后一条盖掉前一条——那是静默丢改动，正是这一批要修的东西。</para>
+    ///
+    /// <para>⚠️ <b>应用失败就跳过那一条</b>（树保持上一次成功的样子）：工具那一侧已经用同一个
+    /// <see cref="PlanTree.Apply"/> 判过一次，走到这里还能失败只剩两种——同批里前面的调用改动了
+    /// 树（`advance_plan` 的 `currentId` 因此过期是**正常**的），或参数在工具那侧就不合法。
+    /// 两种都不该让整步失败：**这一步已经发生了**，能改的只有计划。</para>
+    /// </summary>
+    private static (SessionPlan? Plan, bool Changed) ApplyPlanCalls(
+        IReadOnlyList<string> executedCallIds, IReadOnlyList<Block.ToolUseBlock> calls,
+        SessionPlan? current, DateTimeOffset at)
+    {
+        var plan = current;
+        var changed = false;
+        foreach (var callId in executedCallIds)
+        {
+            if (calls.FirstOrDefault(c => string.Equals(c.CallId, callId, StringComparison.Ordinal)) is not { } call)
+                continue;
+
+            if (string.Equals(call.Name, Tools.PlanTool.NameOf, StringComparison.Ordinal))
+            {
+                var (edit, parseError) = Tools.PlanJson.ParseEdit(call.Arguments);
+                if (edit is null || parseError is not null) continue;
+                var (next, error) = PlanTree.Apply(plan, edit, at);
+                if (error is not null) continue;
+                plan = next;
+                changed = true;
+            }
+            else if (string.Equals(call.Name, Tools.AdvancePlanTool.NameOf, StringComparison.Ordinal))
+            {
+                if (ToolArgs.String(call.Arguments, "currentId") is not { Length: > 0 } expectedId) continue;
+                var (next, error) = PlanTree.Advance(plan, expectedId, at);
+                if (error is not null) continue;
+                plan = next;
+                changed = true;
+            }
+        }
+        return (plan, changed);
+    }
+
+    /// <summary>
+    /// **本步 `switch_plan_mode` 的落地**（2026-10-24）。与 <see cref="ApplyPlanCalls"/> 同形：
+    /// 工具只判（它没有写轴的手），真正改 `axes.mode` 的是这里。
+    ///
+    /// <para>⚠️ <b>退出那一条能走到这里，说明它<b>已经被批准过</b></b>：第一次调用时工具返回的是
+    /// `Ask`（`Permission`），那一批<b>一条都没执行</b>（`ExecutedCallIds` 为空）⇒ 这里根本不会跑；
+    /// 用户批准之后核心续跑那一条，它才进 `ExecutedCallIds`。⇒ 「退出必须问人」这条
+    /// **不靠这里再判一次**，而是靠「没批准就没有执行」这个结构。</para>
+    ///
+    /// <para>⚠️ <b>同值不落地</b>：工具那边已经回过「已经在 X 模式」了，这里再判一次是防
+    /// 「同一批里两条调用」互相抵消——`mode` 被中间的调用改过时，后一条的目标可能等于当前。</para>
+    /// </summary>
+    private static (string? Mode, bool Changed) ApplyModeCalls(
+        IReadOnlyList<string> executedCallIds, IReadOnlyList<Block.ToolUseBlock> calls,
+        string? current, SessionPlan? plan, string? initiative)
+    {
+        var mode = current ?? Tools.PlanModeTool.Act;
+        var changed = false;
+        foreach (var callId in executedCallIds)
+        {
+            if (calls.FirstOrDefault(c => string.Equals(c.CallId, callId, StringComparison.Ordinal)) is not { } call)
+                continue;
+            if (!string.Equals(call.Name, Tools.PlanModeTool.NameOf, StringComparison.Ordinal)) continue;
+            var target = ToolArgs.String(call.Arguments, "mode");
+            if (target is not (Tools.PlanModeTool.Plan or Tools.PlanModeTool.Act)) continue;
+            if (string.IsNullOrWhiteSpace(ToolArgs.String(call.Arguments, "reason"))) continue;
+            if (target == Tools.PlanModeTool.Act && initiative == Axes.Iterate) continue;
+            if (target == Tools.PlanModeTool.Act && initiative == "goal" && PlanTree.Current(plan) is not null) continue;
+            if (target == mode) continue;
+            mode = target;
+            changed = true;
+        }
+        return (mode, changed);
+    }
+
+    /// <summary>
+    /// 把 `mode` 写进轴字典——**复制一份新字典**，不原地改（同 <see cref="WithStandardInitiative"/>：
+    /// `Axes` 是只读视图，原地改会写到进程级静态表）。
+    /// <paramref name="mode"/> 为 <c>null</c> ⇒ 原样返回（= 本步没改模式）。
+    /// </summary>
+    private static IReadOnlyDictionary<string, string>? WithMode(
+        IReadOnlyDictionary<string, string>? axes, string? mode)
+    {
+        if (axes is null || mode is null) return axes;
+        return new Dictionary<string, string>(axes, StringComparer.Ordinal) { [Axes.Mode] = mode };
+    }
+
+    /// <summary>
     /// 这一批里有没有**真的执行过** `finish_goal`。⚠️ 走 `ExecutedCallIds`（`release` 的先例）：
     /// 被权限闸拒绝的调用也在 `toolCalls` 里，但**一次都没跑**——为它改轴等于让一次被拒绝的
     /// 操作改变控制面状态。
@@ -1243,7 +1430,18 @@ public sealed class Stepper(
         /// 本步执行出来的**注入请求**（`tell_child` / `tell_parent`，2026-10-24）。
         /// ⚠️ 与 <see cref="Spawns"/> 同一条分工：追加记录 + 入队 + 启动都在调用方。
         /// </summary>
-        IReadOnlyList<TellRequest>? Tells = null);
+        IReadOnlyList<TellRequest>? Tells = null,
+        /// <summary>
+        /// 本步**真的改过计划**（`plan` / `advance_plan` 执行过、且落地成功）。
+        /// ⚠️ 与 <see cref="GoalEnded"/> 同一条分工：交回去是为了让调用方发 `plan.updated`。
+        /// ⚠️ <b>它和 <see cref="Plan"/> 必须成对看</b>：计划可以被清空，那时 <see cref="Plan"/>
+        /// 是 <c>null</c>，而 <c>null</c> 也正是「没改」的默认值 ⇒ 单看计划分不出两者。
+        /// </summary>
+        bool PlanChanged = false,
+        SessionPlan? Plan = null,
+        bool ModeChanged = false,
+        string? Mode = null,
+        IReadOnlyList<string>? ExecutedCallIds = null);
 
     /// <summary>
     /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。

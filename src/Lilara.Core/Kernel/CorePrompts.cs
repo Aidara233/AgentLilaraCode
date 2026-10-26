@@ -40,6 +40,30 @@ public static class CorePrompts
         """;
 
     /// <summary>
+    /// **跨工具的工作流程规范**（2026-10-24）。⚠️ 与 <see cref="FloatingContextExplanation"/> 同一侧：
+    /// 这里只放**没法挂在单个工具上的**约定（先规划再动手、计划只存剩余、切换模式的意图边界）；
+    /// 「这个工具的参数怎么填」仍然只写在工具描述里（`00` §2.2：能进工具描述的绝不进系统提示词）。
+    ///
+    /// <para>⚠️ <b>它进系统块而不是尾块</b>：这些规范不随步变化，属于前缀的一部分——
+    /// 放进尾块会让每一步都重发一遍，而尾块的位置是留给「此刻该做什么」的。</para>
+    /// </summary>
+    public const string WorkflowNorm =
+        """
+        处理多步骤或方向未定的任务时，先用 plan 写下剩余计划，再按 ▶ 逐项执行；计划变了就改树，不要只记在回复里。
+        计划只表示还没做的事：一项真正完成之后才用 advance_plan 把它移除，不要在计划里保留已完成项。
+        进入 mode=plan 不需要许可，退出需要用户确认；只在确实需要改变工作方式时切换，不要用切换来汇报进度。
+        用户设置的 T0 是长期方向，推进普通计划不会删除它；制定与调整普通计划时以它为准。
+        每一步结束时说清做了什么、验证了什么、还剩什么；没有验证的部分要明说。
+        """;
+
+    /// <summary>
+    /// 系统块尾部那份**固定的框架说明**（回收机制 + 浮动上下文 + 工作流程规范）。
+    /// ⚠️ 两种来源共用它：没有预设文件时它整份拼在 <see cref="SystemFallback"/> 里；
+    /// 有预设文件时它**追加在用户正文之后**——否则「用户写了自己的预设」会把这些机制说明静默丢掉。
+    /// </summary>
+    public const string SystemAddendum = FloatingContextExplanation + "\n\n" + WorkflowNorm;
+
+    /// <summary>
     /// 预设文件读不到时用的那份。⚠️ <b>与 `SessionSpec.SystemPromptPreset` 的 <c>null</c> 无关</b>：
     /// <c>null</c> 是「没指定，跟随 default」，走的是 <c>DefaultPreset</c> 那个名字。
     /// </summary>
@@ -50,7 +74,7 @@ public static class CorePrompts
         fetch(id="…") 拿回当时的内容；想要现在的值，就自己重调一次那个工具。
 
         ⚠️ 回收是正常发生的，不是你之前看错了：一条结果可以在它被完整读完之后才被回收。
-        """ + "\n\n" + FloatingContextExplanation;
+        """ + "\n\n" + SystemAddendum;
 
     /// <summary>
     /// 会话没指定预设时找的那个名字（`<数据根>/presets/default.md`）。
@@ -150,6 +174,41 @@ public static class CorePrompts
         + "只有当你确认目标真正完成时才调用 finish_goal——它只是把主动性轴拨回 standard，"
         + "拨回之后你还会有一回合，用那段话总结已完成的工作。"
         + "需要用户决定或缺少关键信息时，用 ask 把阻塞说清楚。";
+
+    /// <summary>
+    /// **有计划时的当前步说明**（2026-10-24）。⚠️ 与 <see cref="GoalDirective"/> 同形：
+    /// 进尾块、不落盘——「当前步是哪一条」是**计划树的一个事实**，不是一条事件。
+    ///
+    /// <para>⚠️ <b>它只在主动性 = <c>step</c> 时出现</b>（用户原话：「无非从标准 step 的
+    /// 听用户的变成听计划的」）：<c>goal</c> 档有自己的目标线（持续推进到完成），
+    /// <c>standard</c> 档是「等用户下一步」——把计划的当前叶子说成当前步会**改写那一档的含义**。</para>
+    ///
+    /// <para>⚠️ <b>停点是提示词层的，不是硬打断</b>：推进一格之后**没有哪段代码**掐掉续推，
+    /// 模型按这条说明自己接着做下一个叶子；计划空了、或某条叶子需要用户决定时才停。
+    /// ⇒ 谁想「让推进更硬」，要改的是这里，而不是在 `CommandDispatcher` 里加一条停点。</para>
+    /// </summary>
+    public const string StepPlanDirective =
+        "当前步：以计划里 ▶ 那条叶子为准——它的正文就是这一步要做的事。"
+        + "它完成之后调用 advance_plan 把它推进掉，然后接着做下一个 ▶ 叶子，不必等用户再说一句。"
+        + "计划空了、或某条叶子需要用户决定 / 缺少关键输入时，停下来汇报。";
+
+    /// <summary>iterate 且普通计划已空时，模型应按固定 T0 为下一段制定普通计划。</summary>
+    public const string IteratePlanningDirective =
+        "iterate 模式的当前普通计划已经用完。先回顾上方 T0 固定长期任务与已有对话，"
+        + "规划下一段可执行的普通计划（用 plan 工具），并说明本段边界；不要调用 finish_goal。"
+        + "计划写好后调用 switch_plan_mode(mode=act, reason=...) 请求用户批准进入行动，"
+        + "获得批准后按 ▶ 逐项推进。";
+
+    /// <summary>
+    /// <b>规划模式</b>的那句话（2026-10-24，`mode` 轴 = <c>plan</c>）。
+    ///
+    /// <para>⚠️ <b>它只说「现在做什么」，不说「能做什么」</b>：能做什么由**权限轴**判（`01` §3.5）。
+    /// 这两件事必须分开——`plan` + `trusted` 是「放手规划」而不是「顺手把活干了」，
+    /// 而 `act` + `readonly` 照样能读、能查，只是不能改盘。</para>
+    /// </summary>
+    public const string PlanModeDirective =
+        "规划模式：现在只调整计划，不动手执行。用 plan 把路线写成树——分支用来分组，"
+        + "叶子写清正文（叶子是之后要真正做的一件事）。结构定好之后就停下，等用户切到行动模式。";
 
     /// <summary>
     /// 压缩指令线（2026-10-22，压缩改成工具那一批）。⚠️ 与 <see cref="GoalDirective"/> 同形：

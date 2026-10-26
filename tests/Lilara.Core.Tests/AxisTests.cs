@@ -11,8 +11,11 @@ public class AxisTests
     {
         // 顺序决定快照里轴的排列，也就决定头的渲染顺序——顺序不稳等于每步重排。
         // ⚠️ "temperature" 是本表第一条**数值范围**轴（01 §3.5），排在最后 = 渲染在最后。
+        // ⚠️ "mode"（2026-10-24 计划批）**追加在末尾**，没有插进行为轴那一组：
+        // 表序同时是控制面 `/axes` 与人看的顺序，而 `01` §3.5 那张表还没为它腾位置
+        // ⇒ 先按追加处理，等文档定序之后再一起搬（搬的时候这条与 `SlotTests` 那条要同时改）。
         Assert.Equal(
-            ["initiative", "permission", "safety", "verify", "network", "effort", "temperature"],
+            ["initiative", "permission", "safety", "verify", "network", "effort", "temperature", "mode"],
             Axes.Names);
     }
 

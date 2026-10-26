@@ -76,6 +76,8 @@ public static class Json
     //      同一个文件里，新行少一个键；老程序按旧形态读它，会看到一个没有摘要的检查点。
     //      ⚠️ 本版之前写下的那些行**仍带 `summary`**（字段改成可空、没删）——它们是旧检查点的
     //      回落来源，渲染时只在「记录里找不到对应调用」时用（见 `ContextCompaction.SummaryOf`）。
+    // 12（T0 plan）：`state.json` gains a fixed long-term-plan field that older cores would silently discard.
+    // 11（plan tree）：`state.json` gains a remaining-plan tree; older cores would silently ignore edits.
     // 10（2026-10-24，子 agent 批）：`spec.json` 加了 `parentSessionId` / `depth` / `maxDepth`
     //   三格（派生关系）。⚠️ 这一批**不是**「纯加字段所以顺手 +1」——判据同 4 号那条：
     //   它改变了一个已有位置的解释。老核心读到一份带 `parentSessionId` 的 spec 会**静默忽略**它
@@ -87,7 +89,7 @@ public static class Json
     //   老核心读它们只会当成一次普通的工具调用——那是**可接受的**：它不会误判派生关系
     //   （那在 spec 里），而配对判定那一处它会当成「另一个回合」⇒ 最坏结果是多补一条
     //   「上一次被打断了」。失败方向是**多一条可见的假话**，不是错读。
-    public const int FormatVersion = 10;
+    public const int FormatVersion = 12;
 
     public static readonly JsonSerializerOptions Options = new()
     {

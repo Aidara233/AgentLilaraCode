@@ -26,7 +26,9 @@ namespace Lilara.Core.Session.Tools;
 public sealed class SessionToolContext(
     string workingDirectory, BlobStore blobs, IReadOnlyList<TimelineEvent>? timeline = null,
     string? floatingContext = null, NetworkAccess? network = null, bool goalActive = false,
-    bool compactRequested = false, ShellAccess? shell = null, SubagentScope? subagents = null)
+    bool compactRequested = false, ShellAccess? shell = null, SubagentScope? subagents = null,
+    SessionPlan? plan = null, string? mode = null, IReadOnlyList<string>? approvedCallIds = null,
+    string? initiative = null)
     : IToolContext
 {
     private readonly string _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workingDirectory));
@@ -151,4 +153,37 @@ public sealed class SessionToolContext(
     /// ⚠️ **冻结在步开始**，与权限档位 / 联网配置同一条：一步之内两条 `compact` 调用必须按同一份指令判。
     /// </summary>
     public bool CompactRequested { get; } = compactRequested;
+
+    /// <summary>
+    /// 步开始时的计划树快照（2026-10-24）。⚠️ <b>它存在，是为了让 `plan` 的校验与落地是同一套判据</b>：
+    /// 工具没有这棵树就只能「形状校验」——`insert` 的 `parentId` 存不存在它答不上来，
+    /// 于是工具说「已登记」而落地时找不到父节点，改动**静默消失**。
+    /// ⚠️ 冻结在步开始（同权限档位 / 联网）：一步之内多条 `plan` 调用按同一棵树判，
+    /// 而它们**按调用序**依次生效（见 `Stepper.ApplyPlanCalls`）。
+    /// </summary>
+    public SessionPlan? Plan { get; } = plan;
+
+    /// <summary>
+    /// 步开始时的**工作模式**轴值（`plan` / `act`，2026-10-24）。⚠️ 冻结在步开始，同权限档位。
+    /// <para>两个读者：`switch_plan_mode`（要不要真的切）与计划模式的硬闸（拦不拦写文件的工具）。</para>
+    /// </summary>
+    public string? Mode { get; } = mode;
+
+    /// <summary>
+    /// **这一次调用是否已被用户批准**（只对 `AskKind.Permission` 那条回复成立）。
+    ///
+    /// <para>⚠️ 它存在的理由很具体：`switch_plan_mode` 请求「退出规划模式」时会挂起、等用户点头；
+    /// 批准之后这一次调用会**再跑一遍**（`ToolExecutor` 只在 `Question` 那条上跳过工具，
+    /// `Permission` 那条的「批准」意思就是「让它跑」）。⇒ 工具必须能分辨
+    /// 「第一次跑（要发问）」与「批准之后跑（要落地）」——否则它会对同一件事再发一次问，
+    /// 会话就永远在等一个已经答过的问题。</para>
+    /// </summary>
+    public IReadOnlyList<string>? ApprovedCallIds { get; } = approvedCallIds;
+
+    /// <summary>步开始时冻结的主动性档（包括 <c>iterate</c>）。</summary>
+    public string? Initiative { get; } = initiative;
+
+    /// <summary>这一次调用是否已经被用户批准过（见 <see cref="ApprovedCallIds"/>）。</summary>
+    public bool IsApproved(string callId) =>
+        ApprovedCallIds is { } ids && ids.Any(id => string.Equals(id, callId, StringComparison.Ordinal));
 }

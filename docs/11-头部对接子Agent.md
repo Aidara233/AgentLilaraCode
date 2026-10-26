@@ -65,6 +65,8 @@
 
 此行由核心生成，状态变更后才形成新的浮动读数。头部只显示它，不要再根据 `/sessions` 拼一份同义的提示词内容。
 
+⚠️ **浮动行不是运行中的实时状态源**：核心目前生成此行时读取孩子的 `state.json`；`Running` 只在内存里，所以正在推进的孩子在浮动行里可能显示为 `Idle`。左栏和运行状态徽标应以 `/sessions` 行的 `status` 为准；浮动行只作模型上下文里的关系提示。
+
 ### 2.3 `GET /sessions/{id}/history`
 
 工具调用按调用与结果分组，结果仍是扁平事件。父收到子回流时会看到一个名为 `subagent_report` 的合成工具调用与 `toolResult`：
@@ -90,6 +92,8 @@
 询问同时发布到 `approvals` 全局流和对应子会话流。头部要按 `approval.requested.sessionId` 把卡片路由到具体子会话；用户可以直接在子会话上回答。`Question` 类型询问也可能在父会话中形成一条 `subagent_report` 通知，但这不会移除子会话自己的审批卡。`Permission` 类型审批由用户处理，父 agent 不代批。
 
 父子注入也会产生普通会话流事件：父向子说话时，子流收到 `message.appended`（`from: "user"`）与后续状态事件；子向父说话时，父流收到合成回流的 `message.appended` 与 `tool.result.appended`。
+
+⚠️ **父收到子 `Question` 通知后如何回话**：父 agent 用 `tell_child(childId, text)` 回复时，核心会按普通父→子注入处理；如果子仍在等待这个 `Question`，这条输入会顶替该等待并解除子会话的等待状态。它是**给子的一条新消息**，不是 `approval.respond`，也不会把原问题答案自动填入询问结果。用户直接在头部提交 `approval.respond` 仍是另一条有效路径；两个入口竞速时，先完成的那条生效，头部应按 `approval.resolved` 更新并关闭卡片。
 
 ## 4. 命令：子会话仍是普通会话
 

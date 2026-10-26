@@ -31,9 +31,89 @@ public sealed class SlotTests : IDisposable
 
     private PromptSlots Render(
         string? systemId = null, string? premierId = null,
-        IReadOnlyDictionary<string, string>? axes = null) =>
+        IReadOnlyDictionary<string, string>? axes = null, SessionPlan? plan = null) =>
         SystemBlock.Render(
-            System, Premier, systemId, premierId, axes ?? Axes.Defaults());
+            System, Premier, systemId, premierId, axes ?? Axes.Defaults(), plan: plan);
+
+    // ---- 计划树与它的那句话（2026-10-24）----
+    //
+    // ⚠️ 这一组钉两件此前**没有任何测试碰过**的事：
+    //   ① 计划树真的渲染进尾块（`PlanTree.Render` 有单测也没有用——`SystemBlock` 不传它就是死代码）；
+    //   ② 「当前步」那句话**只在主动性 = step 时出现**（用户裁定：停点是提示词行为，不是硬打断），
+    //      而 `mode=plan` 时换成规划模式那句。这两句都是**提示词**，没有它们模型不会按计划走。
+
+    private static SessionPlan PlanOf(params PlanNode[] nodes) =>
+        new() { Nodes = nodes, UpdatedAt = DateTimeOffset.UnixEpoch };
+
+    private static readonly SessionPlan SamplePlan = PlanOf(
+        new PlanNode { Id = "a", Title = "读代码", Body = "先把它读一遍" },
+        new PlanNode
+        {
+            Id = "b",
+            Title = "改代码",
+            Children = [new PlanNode { Id = "b1", Title = "改一个文件", Body = "改 ToolExecutor" }],
+        });
+
+    private static string TailOf(PromptSlots slots) =>
+        Assert.IsType<Block.TextBlock>(Assert.Single(slots.Tail)).Text;
+
+    [Fact]
+    public void Tail_CarriesThePlanTree_WithTheCurrentLeafMarked()
+    {
+        var text = TailOf(Render(plan: SamplePlan));
+
+        Assert.Contains("计划（剩余树", text, StringComparison.Ordinal);
+        // ▶ = 当前叶子（最先遇到的那个），○ = 其余叶子，▸ = 分支。
+        Assert.Contains("▶ 读代码 [a]", text, StringComparison.Ordinal);
+        Assert.Contains("▸ 改代码 [b]", text, StringComparison.Ordinal);
+        Assert.Contains("○ 改一个文件 [b1]", text, StringComparison.Ordinal);
+        // 叶子正文必须出现——它才是「这一步到底做什么」的来源。
+        Assert.Contains("正文：先把它读一遍", text, StringComparison.Ordinal);
+        Assert.Contains("正文：改 ToolExecutor", text, StringComparison.Ordinal);
+
+        // 没有计划时那一整段**不出现**（不是印一个空标题）。
+        Assert.DoesNotContain("计划（剩余树", TailOf(Render()), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // 主动性 = step ⇒ 「当前步」那句；它是停点的**唯一**来源（没有硬打断）。
+    [InlineData("initiative", "step", "当前步：以计划里 ▶ 那条叶子为准")]
+    // 规划模式 ⇒ 只规划、不动手（与权限轴无关：能做什么仍由权限判）。
+    [InlineData("mode", "plan", "规划模式：现在只调整计划")]
+    public void Tail_ExplainsThePlanOnlyWhereItChangesWhatToDo(string axis, string value, string expected)
+    {
+        var axes = new Dictionary<string, string>(Axes.Defaults(), StringComparer.Ordinal) { [axis] = value };
+        Assert.Contains(expected, TailOf(Render(axes: axes, plan: SamplePlan)), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Tail_DoesNotTellTheModelToFollowAPlan_WhenThereIsNoPlan()
+    {
+        // ⚠️ 两句话都**以「有计划」为前提**：计划为空时它们会让模型去找一个不存在的 ▶。
+        foreach (var (axis, value) in new[] { ("initiative", "step"), ("mode", "plan") })
+        {
+            var axes = new Dictionary<string, string>(Axes.Defaults(), StringComparer.Ordinal) { [axis] = value };
+            var text = TailOf(Render(axes: axes));
+            Assert.DoesNotContain("当前步：以计划里", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("规划模式：现在只调整计划", text, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void Tail_DoesNotMentionThePlanStep_WhenInitiativeIsNotStep()
+    {
+        // standard / goal 各有自己的语义（等用户 / 持续推进到完成）；
+        // 把计划的叶子说成「当前步」会**改写那一档的含义**。
+        foreach (var initiative in new[] { "standard", "goal" })
+        {
+            var axes = new Dictionary<string, string>(Axes.Defaults(), StringComparer.Ordinal)
+            {
+                [Axes.Initiative] = initiative,
+            };
+            Assert.DoesNotContain("当前步：以计划里", TailOf(Render(axes: axes, plan: SamplePlan)),
+                StringComparison.Ordinal);
+        }
+    }
 
     // ---- 尾槽位（轴表）----
 
@@ -213,13 +293,15 @@ public sealed class SlotTests : IDisposable
     public void Tail_AxesFollowTheDeclaredRenderOrder()
     {
         // 序列被钉死——重排/增删轴会红（见上面那条注释：文化序那一半钉不住）。
+        // ⚠️ `mode`（2026-10-24 计划批）在 ordinal 序里落在 `initiative` 之后——那是**排序结果**，
+        // 不是被人排到那儿的；表序里它仍追加在末尾（见下面那条与 `AxisTests` 的同款注释）。
         Assert.Equal(
-            ["effort", "initiative", "network", "permission", "safety", "temperature", "verify"],
+            ["effort", "initiative", "mode", "network", "permission", "safety", "temperature", "verify"],
             Axes.RenderOrder);
 
         // 表序**保持不变**：它是控制面 `/axes` 与人看的序（`Axes.Names` 的注释）。
         Assert.Equal(
-            ["initiative", "permission", "safety", "verify", "network", "effort", "temperature"],
+            ["initiative", "permission", "safety", "verify", "network", "effort", "temperature", "mode"],
             Axes.Names);
 
         // ⚠️ 再看文本里的**先后**与 `RenderOrder` 一致（而不是与表序一致）。

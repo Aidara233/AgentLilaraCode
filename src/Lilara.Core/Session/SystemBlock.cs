@@ -76,14 +76,15 @@ public static class SystemBlock
         PromptContributionSnapshot? pluginPrompt = null,
         string? goalDirective = null,
         string? compactDirective = null,
-        string? subagentLine = null) =>
+        string? subagentLine = null,
+        SessionPlan? plan = null) =>
         Build(
             // ⚠️ 传**可空**的预设正文，不在这里折成 `SystemFallback`：那一折会抹掉
             // 「文件不在」与「文件在」的区分，而 `SystemBody` 的判据正是它
             // （文件不在时兜底里已含机制说明；文件在时补一句）。
             Load(presets, systemPresetId),
             Load(premiers, premierId),
-            axes, pluginPrompt, goalDirective, compactDirective, subagentLine);
+            axes, pluginPrompt, goalDirective, compactDirective, subagentLine, plan);
 
     /// <summary>
     /// 三块槽位的**纯装配**——输入是已经读好的两份正文 + 轴 + 插件贡献，不碰任何存储。
@@ -103,14 +104,15 @@ public static class SystemBlock
         PromptContributionSnapshot? pluginPrompt = null,
         string? goalDirective = null,
         string? compactDirective = null,
-        string? subagentLine = null) =>
+        string? subagentLine = null,
+        SessionPlan? plan = null) =>
         new(
             System: Text(SystemBody(systemText, pluginPrompt?.Text(PromptSlot.System))),
             Premier: Wrap(CorePrompts.PremierOpen,
                 Join(premierText, pluginPrompt?.Text(PromptSlot.Primary)), CorePrompts.PremierClose),
             Tail: Wrap(CorePrompts.TailOpen,
                 TailBody(axes, pluginPrompt?.Text(PromptSlot.Floating), goalDirective,
-                    compactDirective, subagentLine),
+                    compactDirective, subagentLine, plan),
                 CorePrompts.TailClose));
 
     // 非空自定义预设也需要机制说明；显式空预设且无系统贡献时仍不产生系统块。
@@ -118,7 +120,9 @@ public static class SystemBlock
     {
         var body = Join(preset ?? CorePrompts.SystemFallback, plugin);
         if (body is null) return "";
-        return preset is null ? body : Join(body, CorePrompts.FloatingContextExplanation)!;
+        // ⚠️ 用户自己的预设正文之后追加的是**整份**框架说明（回收 + 浮动上下文 + 工作流程规范），
+        // 不是只有浮动那一段：漏掉哪一段都会让「用户写了预设」的会话静默少一条机制约定。
+        return preset is null ? body : Join(body, CorePrompts.SystemAddendum)!;
     }
 
     private static string? Join(params string?[] values)
@@ -165,9 +169,24 @@ public static class SystemBlock
     /// </summary>
     private static string? TailBody(
         IReadOnlyDictionary<string, string> axes, string? plugin, string? goalDirective,
-        string? compactDirective = null, string? subagentLine = null)
+        string? compactDirective = null, string? subagentLine = null, SessionPlan? plan = null)
     {
         var table = AxisTable(axes);
+        var planText = PlanTree.Render(plan);
+        // ⚠️ **计划那两句话按轴判**（2026-10-24）：都是提示词层的语义，不是闸门——
+        // 谁能改计划由权限轴说了算（`plan` 是 `ReadOnly` 类工具，`off` 档照拒）。
+        // 计划为空时两句都不出现：没有树就谈不上「以 ▶ 为准」，也不该教模型先去建一棵。
+        var planDirective = string.IsNullOrEmpty(planText)
+            ? null
+            : axes.GetValueOrDefault(Axes.Mode) == "plan"
+                ? CorePrompts.PlanModeDirective
+                : axes.GetValueOrDefault(Axes.Initiative) == "step"
+                    ? CorePrompts.StepPlanDirective
+                    : null;
+        var iterateDirective = axes.GetValueOrDefault(Axes.Initiative) == Axes.Iterate
+            && PlanTree.Current(plan) is null && plan?.T0 is not null
+                ? CorePrompts.IteratePlanningDirective
+                : null;
         var descriptions = Axes.RenderOrder.Where(Axes.InContext)
             .Where(axes.ContainsKey)
             .Select(axis => Axes.DescriptionOf(axis, axes[axis]) is { } explanation
@@ -176,8 +195,12 @@ public static class SystemBlock
         // ——压缩——放最后，离模型最近。
         // ⚠️ **子会话那一段排在轴解释之后、目标线之前**（2026-10-24）：它也是「环境」，
         // 而不是「此刻该做什么」。⇒ 与轴同一侧，不跟目标/压缩抢最后那个位置。
+        // ⚠️ **计划树与它的那句说明排在目标/压缩线之前**（2026-10-24）：计划是**环境**
+        // （这一批还剩什么），而目标/压缩是**此刻要动手的那件事**——后者仍然离模型最近。
         var body = Join(table is null ? null : CorePrompts.TailAxesPrefix + table,
-            Join(descriptions.ToArray()), subagentLine, goalDirective, compactDirective, plugin);
+            Join(descriptions.ToArray()), subagentLine,
+            string.IsNullOrEmpty(planText) ? null : planText, planDirective, iterateDirective,
+            goalDirective, compactDirective, plugin);
         return body is null ? null : $"{CorePrompts.TailDeclaration}\n{body}";
     }
 

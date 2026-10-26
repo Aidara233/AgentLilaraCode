@@ -29,7 +29,11 @@ public class ArchitectureTests
         // 21 → 22（2026-10-22 联网批）：加了 `Network.cs`（联网配置 / 能力 / 传输契约）。
         // 22 → 23（2026-10-23 shell 批）：加了 `Shell.cs`（shell 的设备级配置 / 访问快照）。
         // 23 → 24（2026-10-24 子 agent 批）：加了 `Subagent.cs`（派生关系的词汇层）。
-        Assert.Equal(24, files.Length);
+        // 24 → 26（2026-10-24 计划批）：加了 `Plan.cs`（剩余计划树的词汇层）。
+        // ⚠️ **一次跳两格是实测，不是猜**：这一批开工时工作区已经是 25 个文件
+        // （`ProviderDefinition.cs` 在子 agent 那一批进来时探针没跟着改 ⇒ **这条测试当时就是红的**）。
+        // 探针只抓到「glob 少找了文件」；多出来的那个是**存量漏记**，在这里一并记下。
+        Assert.Equal(26, files.Length);
 
         var offenders = files
             .SelectMany(f => ExternalUsings(f).Select(u => $"{Path.GetFileName(f)}:{u.Line}  {u.Text}"))

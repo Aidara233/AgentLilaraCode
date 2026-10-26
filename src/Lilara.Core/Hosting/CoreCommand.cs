@@ -208,6 +208,16 @@ public abstract record CoreCommand
 
     public sealed record SessionStart(string SessionId) : CoreCommand;
 
+    public sealed record SessionPlanEdit(string SessionId, string Operation,
+        IReadOnlyList<PlanNode>? Nodes = null, string? ParentId = null, int? Index = null,
+        IReadOnlyList<string>? Ids = null) : CoreCommand;
+
+    /// <summary>用户/头设置固定 T0 长期任务。模型工具表中没有这条命令。</summary>
+    public sealed record SessionT0Set(string SessionId, string? Title, string? Body) : CoreCommand;
+
+    /// <summary>用户/头移除固定 T0；模型工具仍然没有这条能力。</summary>
+    public sealed record SessionT0Clear(string SessionId) : CoreCommand;
+
     public sealed record SessionInterrupt(string SessionId) : CoreCommand;
 
     /// <summary>

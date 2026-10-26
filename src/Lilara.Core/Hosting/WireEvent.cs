@@ -27,6 +27,7 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(Error), "error")]
 [JsonDerivedType(typeof(UsageUpdated), "usage.updated")]
 [JsonDerivedType(typeof(CompactionCompleted), "session.compaction.completed")]
+[JsonDerivedType(typeof(PlanUpdated), "plan.updated")]
 [JsonDerivedType(typeof(PhaseChanged), "session.phase")]
 public abstract record WireEvent
 {
@@ -254,6 +255,16 @@ public abstract record WireEvent
 
     public sealed record CompactionCompleted(
         string SessionId, string CheckpointId, string CoveredThroughEventId, long? SummaryTokens) : WireEvent;
+
+    /// <summary>
+    /// **计划树变了**（2026-10-24）。载荷里的 <c>plan</c> 与 `/state` 的 `plan` **同形**
+    /// （<see cref="PlanSummary"/>）——头因此只需要一个渲染函数。
+    ///
+    /// <para>⚠️ <b>没有计划时 `tree` / `currentId` / `currentTitle` 三格会被整个省掉</b>
+    /// （`WireJson` 的 `WhenWritingNull`），只剩 `active: false` 与 `remaining: 0`。
+    /// 头的判据必须是 `p.plan.tree` 是否存在，不是「这三个键一定在」（同列表行 `title` 那条）。</para>
+    /// </summary>
+    public sealed record PlanUpdated(string SessionId, PlanSummary Plan) : WireEvent;
 
     /// <summary>
     /// 会话**活动相位**变了（四态）。头只读这一条来显示「模型生成 / 工具处理 / 等你 / 闲置」。

@@ -67,6 +67,17 @@ public class CommandSurfaceTests
         (typeof(CoreCommand.ClaimAcquire),     null,                "claim src/foo"),
         (typeof(CoreCommand.ClaimRelease),     "claim.release",     "claim release src/foo"),
 
+        // 计划（2026-10-24 计划批）：线上有 `session.plan`（另有 HTTP `PUT /sessions/{id}/plan`，
+        // 两条走同一个 handler、同一个解析器）。
+        // ⚠️ **控制台没有文本形态**：一棵树用一行文本表达不了，而勉强拼一个
+        // `plan overwrite {json…}` 等于让那行里再嵌一层语法——读的人猜不准引号归谁。
+        // ⇒ 与 `session.send` / `session.start` 那两格同样是 `null`，但**理由不同**，写在这里。
+        (typeof(CoreCommand.SessionPlanEdit),  "session.plan",      null),
+        // T0 是用户固定上下文、模型不能改；线上走专用 HTTP `/sessions/{id}/plan/t0`，
+        // 没有 WS/控制台形态（同普通树 JSON 的理由：控制台单行命令不承载表单）。
+        (typeof(CoreCommand.SessionT0Set),      null,                null),
+        (typeof(CoreCommand.SessionT0Clear),    null,                null),
+
         // 询问：挂起的唯一解除入口（`01` §3.8）。四条线都在——
         // ⚠️ 控制台那条尤其不能缺：`approval …` 落回「当成消息」会**静默烧一次模型调用**
         // 而会话还挂在等待里。

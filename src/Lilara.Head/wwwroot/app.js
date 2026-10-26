@@ -595,6 +595,8 @@ async function openSessionInner(id) {
   renderSlots(state.slots);
   if (state.axisDefinitions) AXES = state.axisDefinitions;
   renderAxes(state.axes);
+  // 计划摘要随快照一起来（`plan` 与 `plan.updated.plan` 同形）；没有计划时它让面板说「还没有计划」。
+  renderPlan(state.plan);
   if (state.slots?.problem) renderMeta(state.slots.problem, "error");
   renderAsk(state);
   renderTitle(state.spec);
@@ -1391,6 +1393,8 @@ function clearCenter() {
   $("model-picker").innerHTML = "";
   $("model-note").textContent = "";
   $("sess-actions").innerHTML = "";
+  // 计划面板也要清：停在一个已删会话的计划树上，与停在它的时间线上是同一种谎。
+  renderPlan(null);
   renderSessions();
 }
 
@@ -1489,6 +1493,145 @@ async function diagnoseOrigin() {
   if (!i.allowedOrigin || i.allowedOrigin === location.origin) return;
   $("status").textContent = `连不上：核心只接受来自 ${i.allowedOrigin} 的页面（当前 ${location.origin}）`;
   $("status").className = "chip down";
+}
+
+// ---- 计划树（2026-10-24）----
+// ⚠️ **树的形状由核心定**：`/state.plan`、`plan.updated.plan`、`GET /plan` 的 `plan`
+// 是**同一个摘要对象**（核心的 `PlanTree.Summary` / `PlanSummary`）：
+//   `{ active, remaining, currentId, currentTitle, tree }`
+// 头因此只需要下面一个渲染函数。⚠️ 曾经三处形状不同（一处给节点数组、一处给 `{nodes,…}` 对象），
+// 结果同一个函数有一半路径把"有计划"画成"还没有计划"——别再把 `tree` 拆开传参。
+// ⚠️ **三个按钮都是「整份交回核心」的入口**：结构判定（id 唯一、叶子必须有正文、深度/节点上限）
+// 只有核心的 `PlanTree` 一处；头先自己判一遍就是第二份判据，判宽判窄都会与核心分叉。
+let planSummary = null;  // 最近一次从核心拿到的摘要（画树与「删除选中」共用它）
+let planSelected = null; // 用户点中的节点 id（删除要它；纯视图状态，不是真相）
+
+function planNodeLabel(n) {
+  return `${n.title} [${n.id}]`;
+}
+
+function renderPlan(summary) {
+  planSummary = summary || null;
+  // ⚠️ 没有计划时核心**不给 `tree` 这个键**（`WhenWritingNull` 省掉 null），
+  // 所以判据是 `summary.tree` 有没有，而不是 `tree.length` 有没有意义。
+  const tree = planSummary && planSummary.tree ? planSummary.tree : null;
+  const currentId = planSummary ? planSummary.currentId : null;
+  const box = $("plan-tree");
+  box.innerHTML = "";
+
+  if (!tree || !tree.length) {
+    box.innerHTML = '<div class="note">还没有计划。在下面的 JSON 里写，或用「追加节点」加一条。</div>';
+    $("plan-json").value = "";
+    $("plan-note").textContent = "";
+    planSelected = null;
+    return;
+  }
+
+  // ⚠️ 当前叶子用 ▶ 标出来——它是**提示词里「当前步」那一句的唯一依据**（主动性=step 时）。
+  // 头把它画出来，用户才知道模型此刻在做什么、下一步推进谁。
+  const draw = (list, depth) => {
+    for (const n of list) {
+      const leaf = !n.children || !n.children.length;
+      const row = document.createElement("div");
+      row.className = "plan-node" + (leaf ? " leaf" : " branch") +
+        (n.id === planSelected ? " selected" : "");
+      row.style.paddingLeft = (depth * 14) + "px";
+      row.textContent = (leaf ? (n.id === currentId ? "▶ " : "○ ") : "▸ ") + planNodeLabel(n);
+      // 点一下 = 选中（删除按钮要它）。叶子没有正文时把这一点说出来，别让它看着像普通的空行。
+      row.onclick = () => {
+        planSelected = planSelected === n.id ? null : n.id;
+        renderPlan(planSummary);
+      };
+      row.title = leaf ? (n.body || "（没有正文——核心会拒收这样的叶子）") : "分支";
+      box.appendChild(row);
+      if (n.children) draw(n.children, depth + 1);
+    }
+  };
+  draw(tree, 0);
+
+  // 文本框里放**核心那一份**的 JSON（用户改它再按「覆盖计划」）。
+  // ⚠️ 每次重画都覆盖文本框：用户没按保存就切走的话，留着他改了一半的草稿更危险
+  // ——那会让人以为计划已经是那样了。
+  $("plan-json").value = JSON.stringify(tree, null, 2);
+  $("plan-note").textContent = `剩余 ${planSummary.remaining ?? 0} 个普通节点。`;
+
+  // T0 是独立固定字段，不进入普通树 JSON；普通 overwrite/remove/advance 不能覆盖它。
+  $("t0-title").value = planSummary.t0?.title || "";
+  $("t0-body").value = planSummary.t0?.body || "";
+}
+
+// 计划编辑只有一条出口：`PUT /sessions/{id}/plan`（与核心的 `SessionPlanEdit` 同一份语义）。
+// ⚠️ 走 HTTP 而不是 WS 命令：这条端点**在**核心的控制面上（`docs/11`），
+// 而头的 WS 命令只认 `kind` 那一张表——两边都有入口时，多一个就多一处要同步的判据。
+async function putPlan(body) {
+  if (!current) return;
+  const r = await fetch(`${core}/sessions/${current}/plan`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    // ⚠️ 失败要**说出来**：结构的判定在核心（头不预判），所以这里的拒绝就是用户要改的东西。
+    let why = `HTTP ${r.status}`;
+    try { why = (await r.json()).error || why; } catch { /* 正文不是 JSON ⇒ 就用状态码 */ }
+    $("plan-note").textContent = "✗ " + why;
+    return;
+  }
+  $("plan-note").textContent = "已提交。";
+  // ⚠️ **不本地改树**：真相由 `plan.updated` 送回来（与 `axis.changed` 同一条纪律）。
+  // 本地先改的话，核心若拒了，页面会先显示成功再被打脸。
+}
+
+function wirePlanPanel() {
+  $("t0-save").onclick = async () => {
+    if (!current) return;
+    const r = await fetch(`${core}/sessions/${current}/plan/t0`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: $("t0-title").value, body: $("t0-body").value }),
+    });
+    if (!r.ok) {
+      let why = `HTTP ${r.status}`;
+      try { why = (await r.json()).error || why; } catch { /* 用状态码 */ }
+      $("plan-note").textContent = "✗ " + why;
+      return;
+    }
+    $("plan-note").textContent = "T0 已提交。";
+    // 不本地改摘要：等 plan.updated 用核心回来的 T0 重画。
+  };
+
+  $("plan-save").onclick = () => {
+    let nodes;
+    try {
+      nodes = JSON.parse($("plan-json").value || "[]");
+    } catch (e) {
+      $("plan-note").textContent = "✗ 不是合法 JSON：" + (e && e.message ? e.message : e);
+      return;
+    }
+    if (!Array.isArray(nodes)) {
+      $("plan-note").textContent = "✗ 最外层必须是节点数组。";
+      return;
+    }
+    putPlan({ operation: "overwrite", nodes });
+  };
+
+  $("plan-insert").onclick = () => {
+    // 追加一条**叶子**到根：叶子必须有正文（核心的判据），所以给它一句占位正文，
+    // 用户再在文本框里改。⚠️ 不塞空串——那会被核心当场拒掉，看起来像按钮坏了。
+    putPlan({
+      operation: "insert",
+      nodes: [{ title: "新节点", body: "（在这里写这一步要做什么）" }],
+    });
+  };
+
+  $("plan-remove").onclick = () => {
+    if (!planSelected) {
+      $("plan-note").textContent = "先在上面点中一个节点。";
+      return;
+    }
+    putPlan({ operation: "remove", ids: [planSelected] });
+    planSelected = null;
+  };
 }
 
 // ---- 轴（义务 4 的落点） ----
@@ -2015,6 +2158,14 @@ function handleEvent(p) {
     case "error":      // 业务失败走这里（不是 rejected：命令本身没写错）。
       if (p.sessionId === current) renderMeta("✗ " + p.message, "error");
       break;
+
+    // ⚠️ **计划改了**（2026-10-24）：载荷里的 `plan` 与 `/state.plan` **同形**
+    // （`{active, remaining, currentId, currentTitle, tree}`），照它重画即可，不必再拉 `/plan`。
+    // ⚠️ 没有计划时 `tree` 这个键**根本不在**（`WhenWritingNull`）⇒ 判据是「事件到了」，
+    // 而不是「`tree` 是空数组」。
+    case "plan.updated":
+      if (p.sessionId === current) renderPlan(p.plan);
+      break;
   }
 }
 
@@ -2038,6 +2189,7 @@ function send() {
 
 $("send").onclick = send;
 $("text").onkeydown = (e) => { if (e.key === "Enter") send(); };
+wirePlanPanel();
 $("nav-sessions").onclick = () => showView("sessions");
 $("nav-providers").onclick = () => showView("providers");
 $("nav-usage").onclick = () => showView("usage");

@@ -51,6 +51,10 @@ public static class Axes
     /// </summary>
     public const string Temperature = "temperature";
 
+    /// <summary>Planning versus execution intent; this does not alter tool permissions.</summary>
+    public const string Mode = "mode";
+    public const string Iterate = "iterate";
+
     /// <summary>安全轴里代表「生产」的档名（`01` §3.5 的跨轴告警的一端）。</summary>
     public const string AlertSafety = "prod";
 
@@ -146,7 +150,8 @@ public static class Axes
         Context(Initiative, "主动性", "step",
             ("step", "按用户明确给出的当前步骤行动；完成本步后汇报，等待下一步指示，不自行扩展目标。"),
             ("standard", "在用户任务范围内自主行动；遇到需要用户决策的事项时征询，没有后续可执行动作时汇报并停止。"),
-            ("goal", "围绕用户给定目标持续推进，自行处理可判断的实现细节；完成前继续执行可行动的后续工作，遇到审批或缺少关键输入时说明阻塞。此档不授予额外权限。")),
+            ("goal", "围绕用户给定目标持续推进，自行处理可判断的实现细节；完成前继续执行可行动的后续工作，遇到审批或缺少关键输入时说明阻塞。此档不授予额外权限。"),
+            ("iterate", "围绕固定 T0 长期任务反复规划与执行：自行在 mode=plan/act 间切换；普通计划用完时核心回到 plan 并要求规划下一段；T0 未完成时不得调用 finish_goal。此档不授予额外权限。")),
 
         // 权限 = 闸门。0..5 单调阶梯，低档是拒绝线、高档是询问线。
         // ⚠️ 档位**顺序是契约**：头的跨轴告警按
@@ -200,6 +205,10 @@ public static class Axes
         // 于是「从未设过温度的老会话」行为不变。⚠️ 这也是为什么默认值**不是**看着更讨喜的 0.7：
         // 那会把每一个既有会话的采样行为**悄悄改掉**，而用户从没要求过。
         Numeric(Temperature, "温度", TempRange, @default: "1.0"),
+
+        Context(Mode, "工作模式", "act",
+            ("plan", "规划模式：可调整普通计划树与 T0 长期任务说明；文件修改工具 write/update/delete/mkdir/git_write 会被模式硬闸拒绝，shell、dotnet、path 不在此模式闸范围内。权限轴仍独立决定其它工具。"),
+            ("act", "行动模式：按当前计划执行；工具权限仍由权限轴独立决定。")),
     ];
 
     /// <summary>按轴名找那一行。<see langword="null"/> 与未知轴都返回 <see langword="null"/>。</summary>
@@ -425,7 +434,7 @@ public static class Axes
     /// **且** `permission ∈ {authorized, trusted}` 两轴同时满足才响，单独改成 `prod` 一声不响。）</para>
     ///
     /// <para>⚠️ `effort` 的默认与建会话时的既有默认**必须一致**：
-    /// `CommandDispatcher.HandleSessionCreate` 调 `ToSelection(provider, null, "high", 16000)`
+    /// `CommandDispatcher.HandleSessionCreate` 调 `ToSelection(provider, null, "high", 64000)`
     /// ——改这里就得同时改那里，否则新会话的轴显示一个值、实际请求参数是另一个。</para>
     /// </summary>
     public static IReadOnlyDictionary<string, string> Defaults() =>

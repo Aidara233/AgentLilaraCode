@@ -85,7 +85,7 @@ public static class BuiltInTools
         new WebSearchTool(), new WebFetchTool(), new FinishGoalTool(),
         // 2026-10-22：压缩从「核心自己跑一次模型调用」改成工具。常驻的理由与上面同源
         // （工具表不动、指令走尾块），而它只在用户下发过指令时才生效。
-        new CompactTool(),
+        new CompactTool(), new PlanTool(), new AdvancePlanTool(), new PlanModeTool(),
         // 2026-10-24：子 agent 的一族。四个都是**机制入口**（开的是「会话能被派生 /
         // 能被对话」这几扇门），不是「干活的能力」——判据同上面那条拆读。
         // ⚠️ `tell_parent` 与 `subagent_report` 在顶层会话里会回一句「你没有父会话」/

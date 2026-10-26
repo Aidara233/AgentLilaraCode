@@ -36,8 +36,37 @@ public sealed class ToolExecutor(
     IReadOnlyList<ITool> tools,
     Storage.BlobStore blobs,
     string? permissionLevel,
-    ApprovalStore? approvals = null)
+    ApprovalStore? approvals = null,
+    string? mode = null)
 {
+    /// <summary>
+    /// **规划模式下被硬拦的工具名**（2026-10-24，用户裁定：「计划模式强制拦截几个内置的常见修改文件指令
+    /// （shell 之类的不拦截，硬要改也拦不住）」）。
+    ///
+    /// <para>⚠️ <b>这是<b>模式</b>的闸，不是权限的闸</b>：它按 `mode=plan` 拒，与档位无关
+    /// （`trusted` 在规划模式下同样写不了文件）——因为「模式」答的是「此刻按什么规矩做」，
+    /// 而权限答的是「你有多少能力」。两个轴各问各的。</para>
+    ///
+    /// <para>⚠️ <b>为什么不拦 `shell` / `dotnet_*` / `git_read`</b>：那些不是「改文件」这一个动作
+    /// （`shell` 能改一切，也什么都拦不住），把它们塞进来只会让规划模式变成
+    /// 「连读都读不了」——而读是规划的原料。用户原话：硬要改也拦不住。</para>
+    ///
+    /// <para>⚠️ <b>名单是<b>名字</b>，不是权限类别</b>：按类别拦会把 `Writing` 那一整档
+    /// （也包括将来某个「写日志」这类无害工具）一起拦掉，而用户要的是「几个常见的修改文件指令」。
+    /// ⇒ 加一个名字就在这里加一行，并想清楚它是不是「改本机文件」。</para>
+    /// </summary>
+    private static readonly HashSet<string> PlanModeBlocked = new(StringComparer.Ordinal)
+    {
+        "write", "update", "delete", "mkdir", "git_write",
+    };
+
+    private bool InPlanMode => string.Equals(mode, PlanModeTool.Plan, StringComparison.Ordinal);
+
+    private static string PlanModeDenial(string tool) =>
+        $"现在在规划模式：'{tool}' 会改本机文件，已被拦下。"
+        + $"要动手请先调用 {PlanModeTool.NameOf}（mode=act）请求退出规划模式——那会让用户确认一次。"
+        + "读、搜、查历史、`shell` 都不受这条限制。";
+
     /// <summary>
     /// **用户批过的那几条：跳闸门，直接执行**（`01` §3.8）。
     ///
@@ -133,6 +162,15 @@ public sealed class ToolExecutor(
             if (!byName.TryGetValue(call.Name, out var tool))
             {
                 plans.Add(new Plan(call, null, Verdict.Deny, $"没有名为 '{call.Name}' 的工具。"));
+                continue;
+            }
+
+            // ⚠️ **规划模式的硬闸**（2026-10-24）：在**一切放行之前**判——
+            // 包括「用户刚批过」那条捷径。理由：模式是**上限**，不是一次性的许可；
+            // 若批准能穿透它，那 `plan` 模式就成了「多问一句话就能绕过」的装饰。
+            if (InPlanMode && PlanModeBlocked.Contains(tool.Name))
+            {
+                plans.Add(new Plan(call, tool, Verdict.Deny, PlanModeDenial(tool.Name)));
                 continue;
             }
 

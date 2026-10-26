@@ -1,6 +1,6 @@
 # 控制面 API 参考
 
-> **最后更新：master `9efbe0a` + 本工作树（2026-10-18，三个线上键名缺陷已修）**
+> **最后更新：master `9efbe0a` + 本工作树（2026-10-26，新增 `LILARA_BIND` 对外监听）**
 >
 > 本文是**远程 API 的接口面**：HTTP 端点、WS 帧、命令、事件、快照字段。
 > 读者是**接核心的程序**（头、脚本、第三方客户端），不是读设计的开发者。
@@ -23,18 +23,28 @@
 
 | 项 | 值 | 证据 |
 |---|---|---|
-| 监听地址 | **仅 `127.0.0.1`** | `ControlServer.BindAddress`（`Control/ControlServer.cs:52`） |
-| 默认端口 | `17988`；环境变量 `LILARA_PORT` 覆盖 | `ControlServer.DefaultPort`（`:36`）、`Program.cs` |
-| HTTP 基址 | `http://127.0.0.1:{port}` | `ControlServer.Url`（`:56`） |
-| WS 端点 | `ws://127.0.0.1:{port}/ws` | `ControlServer.cs:648` |
-| 鉴权 | **没有**。「本机唯一核心、本机进程即可信」（`03` §10） | — |
-| CORS | `Access-Control-Allow-Origin: *`；预检 `OPTIONS` 回 `204` | `ControlServer.cs:79-89` |
+| 监听地址 | **默认仅 `127.0.0.1`**；环境变量 `LILARA_BIND` 可显式改成 `0.0.0.0` / 某个网卡地址 / `::` | `ControlServer.DefaultBindAddress`（`Control/ControlServer.cs:57`）、`BindAddressResolver`（`Control/BindAddressResolver.cs`） |
+| 默认端口 | `17988`；环境变量 `LILARA_PORT` 覆盖 | `ControlServer.DefaultPort`（`:40`）、`Program.cs` |
+| HTTP 基址 | `http://{监听地址}:{port}`（默认即 `http://127.0.0.1:17988`） | `ControlServer.Url`（`:69`） |
+| WS 端点 | `ws://{监听地址}:{port}/ws` | `ControlServer.cs:956` |
+| 鉴权 | **没有**。「本机唯一核心、本机进程即可信」（`03` §10）——所以**默认只监听本机**就是唯一边界 | — |
+| CORS | `Access-Control-Allow-Origin: *`；允许动词 `GET, POST, PUT, DELETE, OPTIONS`；预检 `OPTIONS` 回 `204` | `ControlServer.cs:94` |
+
+⚠️ **`LILARA_BIND` 一设成非环回地址，边界就只剩网络可达性**：核心没有鉴权，也没有请求限速——
+任何能路由到该端口的人/程序都能建会话、发消息、执行工具、读本机能读到的文件、花掉 provider 的额度。
+`safety` / `permission` 轴挡的是**模型**，不是**连接者**。只在自己信得过的网络里这样跑；启动横幅会复述这段代价。
+- 判定「是不是只在本机」用的是 `BindAddressResolver.IsLoopbackOnly`；主机名 / 通配符**判不出来时按对外算**
+  （警告宁可多响一次）。
+- IPv6 字面量在 URL 里自动补方括号（`::` ⇒ `http://[::]:17988`），`/info` 与横幅交出的地址可以直接用。
 
 ### 1.1 WS 握手的 Origin 闸
 
 - 请求**不带** `Origin` 头 ⇒ **放行**（curl / 脚本 / 测试都不带）。
 - 带了 ⇒ 必须**逐字等于**生效的 allowed origin（默认 `http://127.0.0.1:17990`，
   即头的默认端口；由 `LILARA_ALLOWED_ORIGIN` 或 `LILARA_HEAD_PORT` 推导），否则 **403**。
+- ⚠️ 对外开放（`LILARA_BIND`）之后，页面 origin 是**它实际被访问的地址**（如 `http://192.168.1.5:17990`）；
+  `LILARA_HEAD_PORT` 推导出来的永远是 `127.0.0.1` 那个 ⇒ 必须用 `LILARA_ALLOWED_ORIGIN` 显式指定。
+  它**只收一个值**：本机页面与远端页面不能同时放行（要么只开一边，要么从同一个 origin 进）。
 - ⚠️ `localhost` 与 `127.0.0.1` **不是同一个 origin**（按浏览器的判法），`localhost` 会被拒。
 - ⚠️ 这是**防网页**，不是鉴权：非浏览器客户端可以伪造 `Origin`。
 - 403 的响应体只有非浏览器客户端看得到（浏览器不把 WS 握手的响应体交给页面 JS）。
@@ -68,11 +78,11 @@
 | `note` | 只在 `accepted:true` 时出现，**给人看的补充**，不是协议的一部分 |
 
 ⚠️ **`accepted:true` 不等于成功**。业务失败（模型 400、上游 503、配置文件被占用）走
-**`error` 事件**，回执照样是 `accepted:true`（`03` §3 的硬约束；`ControlServer.cs:838-843`）。
+**`error` 事件**，回执照样是 `accepted:true`（`03` §3 的硬约束；`ControlServer.cs:1157-1160`）。
 
 ### 2.2 客户端 → 核心：入站帧
 
-⚠️ `03` 从未列出这一半。代码在 `ControlServer.cs:778-818`。
+⚠️ `03` 从未列出这一半。代码在 `ControlServer.cs:1090-1125`。
 
 ```jsonc
 // 订阅一条流
@@ -262,7 +272,9 @@
 
 ## 3. HTTP 端点
 
-⚠️ **只有 `GET`**。没有任何写端点（写全部走 WS 命令；附件上传 `POST /files` 未实现）。
+⚠️ **几乎只有 `GET`**。唯一写入资源是计划：`PUT /sessions/{id}/plan` 编辑普通剩余树，
+`PUT /sessions/{id}/plan/t0` 设置用户固定 T0 长期任务，`DELETE /sessions/{id}/plan/t0` 移除它（2026-10-24）；
+其余写全部走 WS 命令（附件上传 `POST /files` 未实现）。
 
 所有响应 `Content-Type: application/json`，字段 camelCase，`null` 值的键**整个省略**。
 
@@ -276,8 +288,8 @@
 
 - `sessions` 是**在内存里的**会话数（`CoreHost.Activated`），不是盘上的总数。
 - ⚠️ `dataRoot` / `workingDirectory` 是本机绝对路径。CORS 是 `*`，任何本机网页都读得到。
-  这是接受过的取舍（核心只绑本机）。
-- 证据：`ControlServer.cs:98-103`。
+  这是接受过的取舍——边界是**默认只绑本机**；`LILARA_BIND` 对外之后，这些路径也一并对外（见 §1）。
+- 证据：`ControlServer.cs:121-128`。
 
 ### 3.2 `GET /info`
 
@@ -292,8 +304,10 @@
 ```
 
 - `allowedOrigin` 是**生效值**，不是默认常量。
+- `endpoints` 交的是**实际绑定的地址**：用 `LILARA_BIND` 对外时这里会是 `0.0.0.0` / 网卡地址（IPv6 带方括号），
+  不一定是客户端该填的那个可达地址。
 - WS 握手被拒的浏览器页面看不到 403 响应体 ⇒ 头部应该拉这个端点、跟 `location.origin` 比对后显示原因。
-- 证据：`ControlServer.cs:111-120`。
+- 证据：`ControlServer.cs:134-141`。
 
 ### 3.3 `GET /projects`
 
@@ -303,7 +317,7 @@
 
 16 位小写 hex，`<数据根>/projects/` 下的**每一个目录**（不要求有会话）。
 顺序：按 pk 的 **ordinal 升序**（`SessionStore.ListProjects`，`Storage/SessionStore.cs:50-58`）。
-证据：`ControlServer.cs:122`。
+证据：`ControlServer.cs:145`。
 
 ### 3.4 `GET /directories?path=<绝对路径>`
 
@@ -329,7 +343,7 @@
   - ⚠️ 目录**存在但不可读** ⇒ **200**，带 `error` 一句原因、`directories: []`。
 - ⚠️ `error` 在成功响应里**显式是 `null`**（匿名类型里写了 `(string?)null`），不会因
   `WhenWritingNull` 被省略——客户端判断「有没有错误」要按 `error` 的值，不是按键在不在。
-- 证据：`ControlServer.cs:126-189`。
+- 证据：`ControlServer.cs:149-212`。
 
 ### 3.5 `GET /projects/{pk}/sessions`
 
@@ -341,11 +355,11 @@
 排序：`createdAt` **降序**（最新的在前），同一时刻按 id 升序（`SessionStore.cs:161-173`）。
 不存在的 pk ⇒ `[]`（不报 404）。
 ⚠️ `spec.json` 读不出来的会话**不列**（版本太新或损坏都算）。
-证据：`ControlServer.cs:191-192`。
+证据：`ControlServer.cs:214-215`。
 
 ### 3.6 `GET /sessions`
 
-**一次拿全**所有会话的运行状态（`ControlServer.cs:204-281`）。
+**一次拿全**所有会话的运行状态（`ControlServer.cs:227-316`）。
 
 ```jsonc
 [
@@ -378,7 +392,7 @@
 - ⚠️ **这个端点绝不激活会话**（与 `/state` 不同）。读它不会把会话载入内存、不会触发回收。
 - 顺序：项目序 × 项目内会话序，由既有的 `ListProjects` / `ListSessions` 定。
 - 坏 `state.json` 的会话**跳过**（不 500）。坏 `spec.json` 的会话**列不出来**。
-- 证据：`ControlServer.cs:204-281`；键集守卫 `ControlServerTests.Snapshot_Sessions_CarriesExactlyTheseKeys`。
+- 证据：`ControlServer.cs:227-316`；键集守卫 `ControlServerTests.Snapshot_Sessions_CarriesExactlyTheseKeys`。
 
 ### 3.7 `GET /sessions/{id}/state`
 
@@ -465,7 +479,7 @@
 ⚠️ **`/state` 的读有副作用**：不在内存的会话会被**激活**（载入 + 登记）。
 大批量轮询所有会话时用 `GET /sessions`，别用这个。
 
-证据：`ControlServer.cs:284-370`；键集守卫 `Snapshot_State_CarriesExactlyTheseKeys`
+证据：`ControlServer.cs:318-404`；键集守卫 `Snapshot_State_CarriesExactlyTheseKeys`
 （⚠️ 它钉顶层 9 个键、`slots` 的 3 个子键、`spec.model` 的 5 个子键，**不钉** `state` 与 `spec` 自身——
 它们由 `SessionSpec_HasExactlyTheseProperties` 一族单独钉）。
 
@@ -482,7 +496,7 @@
 }
 ```
 
-**历史项**（`ControlServer.cs:600-630` 的 `Render`），判别式 `kind`：
+**历史项**（`ControlServer.cs:916-951` 的 `Render`），判别式 `kind`：
 
 ```jsonc
 // 一条消息
@@ -516,7 +530,7 @@
   `SessionStore.FindSession` 刻意让 `FileFormatException` 冒上去——
   回一句「不存在」会把用户引向「删掉重来」，而那正是唯一会丢数据的做法（`SessionStore.cs:190-214`）。
   客户端应把 5xx 当成「这个核心版本太旧，读不了那个会话」，而不是「会话没了」。
-- 证据：`ControlServer.cs:379-424`。
+- 证据：`ControlServer.cs:421-481`。
 
 ### 3.9 `GET /sessions/{id}/queue`
 
@@ -527,7 +541,7 @@
 - `isRunning` = 有一步在跑；`queueDepth` = 待推进的用户消息条数。
 - ⚠️ 这两个是**内存事实**：不在内存的会话拿到的 handle 是磁盘载入的，队列恒 0。
 - **会激活会话**（走 `TryFind`）。
-- 证据：`ControlServer.cs:426-430`。
+- 证据：`ControlServer.cs:542-546`。
 
 ### 3.10 `GET /axes`
 
@@ -551,7 +565,7 @@
   `{ name, label, values, inContext, range }`。
   插件轴在这里**也是这个形状**（没有 `available` / `problem` / `pluginId`——那三格只在
   `/state` 的会话级清单里，见 §3.7）。
-- 证据：`ControlServer.cs:439-445`。
+- 证据：`ControlServer.cs:619-625`。
 
 ### 3.11 `GET /claims`
 
@@ -569,7 +583,7 @@
 - 没有声明 ⇒ `[]`。
 - ⚠️ **按工作目录去读** `claims.json`，而工作目录只有 `spec.json` 里有 ⇒
   **`spec.json` 损坏的会话，它自己那份声明列不出来**。
-- 证据：`ControlServer.cs:449-482`。
+- 证据：`ControlServer.cs:629-660`。
 
 ### 3.12 `GET /providers`
 
@@ -584,7 +598,7 @@
 - **永远不含 `apiKey`**。`hasApiKey` 只说「有没有」。
 - 可空字段（`endpoint` / `authScheme` / `models`）**没设时键不存在**。
 - `models` 存在 = 供应商声明了可选模型（头画下拉）；缺 = 没声明（头退回文本框）。
-- 证据：`ControlServer.cs:483-496`；键集守卫 `Snapshot_Providers_CarriesExactlyTheseKeys`
+- 证据：`ControlServer.cs:663-676`；键集守卫 `Snapshot_Providers_CarriesExactlyTheseKeys`
   与 `Snapshot_Providers_OmitsNullFields`。
 
 ### 3.13 `GET /provider-schema`
@@ -603,7 +617,7 @@
 - `authSchemes` 的顺序即下拉的显示序。
 - `providerIdRule` 与 `provider.upsert` / `.delete` 的真实闸共用一份文案
   （`CommandDispatcher.ProviderIdRule`）。
-- 证据：`ControlServer.cs:497-510`。
+- 证据：`ControlServer.cs:679-691`。
 
 ### 3.14 `GET /usage/calls?skip=0&limit=100`
 
@@ -789,7 +803,32 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 - 写入口是 WS 的 `shell.configure`；`shell.test` 会**真的起一个 sh** 跑 `echo`（不只是看文件在不在）。
 - 证据：`ControlServer.cs` 的 `/shell-config`；键集守卫 `ControlServerTests.Snapshot_ShellConfig_CarriesExactlyTheseKeys`。
 
-### 3.20 不存在的端点
+### 3.20 `GET|PUT /sessions/{id}/plan`
+
+计划树的读 / 写（2026-10-24）。**语义与字段的完整说明见 [`12-计划树-头部接入.md`](12-计划树-头部接入.md)**——
+这里只列形状，避免同一份契约写两遍。
+
+```
+GET  /sessions/{id}/plan      → { sessionId, plan: PlanSummary, updatedAt? }
+PUT  /sessions/{id}/plan      ← { operation, nodes?, parentId?, index?, ids? }
+                              → { ok: true } | 400 { error } | 404
+```
+
+```jsonc
+// PlanSummary —— 与 `/state` 的 `plan`、`plan.updated` 的 `plan` **逐字相同**
+{ "active": true, "remaining": 2, "currentId": "a", "currentTitle": "读代码",
+  "tree": [ { "id": "a", "title": "读代码", "body": "先读一遍", "children": [] }, … ] }
+```
+
+- ⚠️ **`tree` 缺失 = 没有计划**（`WhenWritingNull` 省掉 null 键）；判据是它存不存在。
+- `PUT` 的三种 `operation`：`overwrite`（整份替换，空数组 = 清空）、`insert`（`parentId` 必须是**分支**）、
+  `remove`（id 列表，含子树）。
+- ⚠️ **计划只存剩余**：推进一格 = 把它删掉。没有完成态、没有进度百分比。
+- 证据：`ControlServer.cs` 的两条 `Map…("/sessions/{id}/plan")`；
+  `HandleSessionPlanEdit`；形状的唯一来源 `Kernel/Plan.cs` 的 `PlanTree.Summary`。
+  守卫：`ControlServerTests.Plan_Endpoint_WritesReadsAndShowsInTheStateSnapshot`。
+
+### 3.21 不存在的端点
 
 | 路径 | 状态 |
 |---|---|
@@ -815,7 +854,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 
 - **必给键缺失** ⇒ `ack{accepted:false, reason:"命令形状不对：…"}`（`ParseCommand` 抛异常）。
 - **只认 JSON 的正确类型**：该是字符串的字段给数字、该是布尔的给字符串 `"false"`，
-  一律按「没给」处理（`ControlServer.cs:966-980` 的 `Opt` / `OptBool` / `OptNumber`）。
+  一律按「没给」处理（`ControlServer.cs:1330-1355` 的 `Opt` / `OptBool` / `OptNumber`）。
   ⚠️ 这不是宽容，是刻意：`session.archive` 的 `"false"` 会被当成「没给」⇒ **归档**。
 - **`rejected`（`accepted:false`）只用于命令不合法**：会话不存在、id 不合法、参数自相矛盾。
   业务失败走 `error` 事件。
@@ -841,7 +880,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 - 成功回执带 `sessionId`；`note` 是新会话的 `projectKey`。
 - 没有提供商 ⇒ rejected「先配提供商」。
 - ⚠️ 本命令**没有** `projectKey` 参数（键推不回目录）。
-- 证据：`ControlServer.cs:973-984`；`CommandDispatcher.cs:577-625`。
+- 证据：`ControlServer.cs:1176-1188`；`CommandDispatcher.cs:577-625`。
 
 #### `session.activate`
 
@@ -860,7 +899,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 
 把会话**摘出内存**，磁盘一字不动。**在跑 ⇒ rejected**。
 拒绝理由分两种：「不存在」与「本来就没激活」（别并成一句——用户要能分辨是敲错了 id 还是砍在空气上）。
-证据：`ControlServer.cs:895-896`；`CommandDispatcher.cs:1268-1295`。
+证据：`ControlServer.cs:1218-1222`；`CommandDispatcher.cs:1268-1295`。
 
 #### `session.archive`
 
@@ -873,7 +912,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
   ⚠️ **字符串 `"false"` 被当成「没给」⇒ 归档**。
 - 已经是那个状态 ⇒ rejected（不是幂等成功）。
 - **在跑 ⇒ rejected**。
-- 证据：`ControlServer.cs:900-901`；`CommandDispatcher.cs:1298-1350`。
+- 证据：`ControlServer.cs:1223-1224`；`CommandDispatcher.cs:1298-1350`。
 
 #### `session.delete`
 
@@ -907,7 +946,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 - 用户消息**立刻落盘**、立刻发 `message.appended`，然后（若没有推进在飞）在后台起一步。
 - 撞上 `WaitingForInput` ⇒ **不拒绝**：先顶替那次询问（落一条「用户没回答，说了别的」的结果、
   发 `approval.resolved{outcome:"superseded"}`），再当普通消息处理。
-- 证据：`ControlServer.cs:873-875`；`CommandDispatcher.cs:709-800`。
+- 证据：`ControlServer.cs:1192-1196`；`CommandDispatcher.cs:709-800`。
 
 #### `session.interrupt`
 
@@ -930,7 +969,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 - 同值 ⇒ no-op，不发 `axis.changed`。
 - 插件轴的值按**不区分大小写**匹配，保存声明里的规范拼写。
 - 插件不可用 ⇒ rejected，`reason` 是插件问题。
-- 证据：`ControlServer.cs:878-881`；`CommandDispatcher.cs:1105-1160`。
+- 证据：`ControlServer.cs:1197-1207`；`CommandDispatcher.cs:1105-1160`。
 
 #### `session.configure`
 
@@ -951,7 +990,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 - 真的变了才发 `spec.changed`；没变也回 `accepted:true`（`note: null`）。
 - 成功 `note` 是 `"{providerId} / {modelId}"`。
 - ⚠️ **没有「取消询问超时」的入口**（`askTimeoutMinutes` 只能设成正数，不能设回「不超时」）。
-- 证据：`ControlServer.cs:1005-1011`；`CommandDispatcher.cs:1176-1265`。
+- 证据：`ControlServer.cs:1208-1213`；`CommandDispatcher.cs:1176-1265`。
 
 #### `session.gc`
 
@@ -976,7 +1015,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 - 回执立刻到，压缩在后台跑；完成或失败都经事件（失败发 `error`）。
 - 成功 `note` 是 `"已压缩至 {coveredThroughEventId}。"`。
 - ⚠️ 压缩会**破前缀**（摘要替代了原来的中段）——这是它唯一的目的，也是它的代价。
-- 证据：`ControlServer.cs:1027-1028`；`CommandDispatcher.cs:740-850`。
+- 证据：`ControlServer.cs:1230-1233`；`CommandDispatcher.cs:740-850`。
 
 #### `preset.set` / `preset.list` / `preset.delete`
 
@@ -990,7 +1029,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 - 不存在预设 ⇒ `preset.delete` rejected。
 - 结果都在 `note` 里（`preset.list` 就是那个下拉的数据源，`"a / b / c"` 一句；
   空表 ⇒ `"还没有预设。…"`，仍然是 `accepted:true`）。
-- 证据：`ControlServer.cs:929-934`；`CommandDispatcher.cs:399-476`。
+- 证据：`ControlServer.cs:1282-1284`；`CommandDispatcher.cs:399-476`。
 
 #### `claim.release`
 
@@ -1000,7 +1039,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 
 强制释放声明（逃生口）。**不检查占用者是不是自己**，**不写时间线**。
 ⚠️ `scope` 是数组，逐个**规范化后逐字比较**，不展开子树。释放成功会发 `claim.released`。
-证据：`ControlServer.cs:891-893`；`CommandDispatcher.cs:1512-1534`。
+证据：`ControlServer.cs:1214-1217`；`CommandDispatcher.cs:1512-1534`。
 
 #### `provider.upsert`
 
@@ -1028,7 +1067,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 - ⚠️ **`timeoutSeconds` 缺省（`null`）= 交给协议自己的默认**，两条链路不同：
   OpenAI 兼容链路沿用 .NET `HttpClient` 的 100 秒（`ProviderLimits.DefaultTimeoutSeconds`），
   Claude 链路交给 SDK 的默认值。⚠️ 重试是另一层（`RetryPolicy`，最多再试 10 次）⇒
-  最坏总时长 ≈ (超时 × 11) + 35.6 秒。
+  最坏总时长 ≈ (超时 × 11) + 511.5 秒（退避**不封顶**：第 10 次重试前要等约 4 分 16 秒）。
 - 证据：`ControlServer.cs` 的 `provider.upsert`；`CommandDispatcher.HandleProviderUpsert`；
   `Kernel/ProviderDefinition.cs` 的 `ProviderLimits`。
 
@@ -1149,7 +1188,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
   （大小写不敏感）**。认不出的值按「只这一次」处理——**不**拒绝整条命令（旧行为，方向安全）。
 - `answers` 里的键除 `decision` / `arguments` 外，按**问题 id**（`items[].id`）取值；
   `submit` 时允许缺项，缺的会被写成「未回答」，不会编一个空值。
-- 证据：`ControlServer.cs:1061-1076`；`CommandDispatcher.cs:1536-1752`。
+- 证据：`ControlServer.cs:1292-1319`；`CommandDispatcher.cs:1536-1752`。
 
 ## 5. 客户端校验清单
 
@@ -1190,7 +1229,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
 > 留在这里是因为**线上契约变过**——升级之前写的客户端可能还按旧拼法发。
 
 1. ~~**`session.create` 的 `preset` 在线上被静默丢弃**~~ ✅ **已修**：
-   `ParseCommand` 的 `session.create` 臂补读 `preset`（`ControlServer.cs:973-984`）。
+   `ParseCommand` 的 `session.create` 臂补读 `preset`（`ControlServer.cs:1176-1188`）。
    守卫：`CommandSurfaceTests.WireLine_ReadsTheFieldsWhoseKeyNamesDifferFromThePropertyNames`。
    ⚠️ 缺陷曾经存在的原因值得记：`CommandSurfaceTests` 的 ② 只断**类型**，
    不断字段 ⇒「类型对、字段全默认」在它眼里完全合格。
@@ -1204,7 +1243,7 @@ shell 能力的**设备级**配置（`<数据根>/shell.json`，2026-10-23）。
    核心却比 `nameof(...)` 的 `"Tool"`），且全程无报错。
 
 3. ~~**`session.configure` 的模型键名是 `model`，不是 `modelId`**~~ ✅ **已修**：
-   线上读 `modelId`（`ControlServer.cs:1005-1011`），头也跟着改（`app.js` 的 `bind`）。
+   线上读 `modelId`（`ControlServer.cs:1208-1213`），头也跟着改（`app.js` 的 `bind`）。
    守卫同上第一条。⚠️ `provider.upsert` 的键**仍然叫 `model`**（那是 `defaultModel`）——
    两条命令的键名不同是**有意的**，别为了「一致」把它改掉。
 

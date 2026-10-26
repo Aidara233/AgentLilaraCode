@@ -187,7 +187,8 @@ public class WireFormatTests
         //          先数 `WireEvent.cs` 的 `JsonDerivedType`，别信这行注释。
         // 20 → 21：`retry.attempt`（2026-10-21，重试上报——头不能只看到一直等待）。
         // 21 → 22：`session.phase`（2026-10-25，四态由核心判、头只显示）。
-        Assert.Equal(22, declared.Length);
+        // 22 → 23：`plan.updated`（2026-10-24 计划批，计划树变了）。
+        Assert.Equal(23, declared.Length);
 
         var dispatcher = File.ReadAllText(Path.Combine(
             RepoRoot(), "src", "Lilara.Core", "Hosting", "CommandDispatcher.cs"));
@@ -204,7 +205,8 @@ public class WireFormatTests
     public void WireEventTable_HasExactlyTheTypesWeThinkItDoes()
     {
         // 21 → 22：`session.phase`（2026-10-25）。
-        Assert.Equal(22, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+        // 22 → 23：`plan.updated`（2026-10-24 计划批）。
+        Assert.Equal(23, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
     }
 
     // ⚠️ 重试上报的**载荷形状**（2026-10-21）：头按字段名取值（`p.attempt` / `p.maxAttempts` /

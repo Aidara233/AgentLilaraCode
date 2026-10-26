@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using Lilara.Core.Protocol;
 using Lilara.Core.Control;
@@ -147,13 +149,18 @@ var port = int.TryParse(Environment.GetEnvironmentVariable("LILARA_PORT"), out v
 
 // WS 的 Origin 白名单跟随头自己的端口配置。
 var allowedOrigin = AllowedOriginResolver.Resolve();
-var controlServer = new ControlServer(host, dispatcher, bus, port, allowedOrigin.Origin);
+
+// ⚠️ 监听地址**默认仍是本机**；对外是一条显式决定（核心没有鉴权，见下面 `PrintExternalBindWarning`）。
+var bind = BindAddressResolver.Resolve();
+
+var controlServer = new ControlServer(host, dispatcher, bus, port, allowedOrigin.Origin, bind.Address);
 WebApplication? api = null;
 try
 {
     api = await controlServer.StartAsync(CancellationToken.None);
-    Console.WriteLine($"  控制面 {controlServer.Url}（头连这个；只监听本机）");
+    Console.WriteLine($"  控制面 {controlServer.Url}（{BindAddressResolver.Describe(bind.Source)}）");
     Console.WriteLine($"  WS 只接受来自 {allowedOrigin.Origin} 的页面（{AllowedOriginResolver.Describe(allowedOrigin.Source)}）。");
+    PrintExternalBindWarning(controlServer);
 }
 catch (Exception ex)
 {
@@ -215,6 +222,39 @@ await heartbeatTask;
 try { File.Delete(heartbeatFile); } catch (IOException) { /* 删不掉最多误报一次崩溃 */ }
 
 return 0;
+
+/// <summary>
+/// 绑在环回之外时把代价说出来。⚠️ 核心**没有鉴权**（`03` §10）：能连到这个端口的人/程序
+/// 就能驱动模型、执行工具、读本机能读到的文件。默认不让它发生；发生时必须说得出来
+/// （`09` §1 把这条取舍写成了文档，这里负责让**不读文档的人**也看得见）。
+/// </summary>
+static void PrintExternalBindWarning(ControlServer server)
+{
+    if (!server.IsExternallyBound) return;
+
+    Console.Error.WriteLine("  ⚠️ 控制面不只监听本机 —— 核心没有鉴权：任何能访问该端口的人/程序都能驱动它。");
+    Console.Error.WriteLine($"     只在自己信得过的网络里这样跑。要收回：不设 {BindAddressResolver.EnvVar} 重启。");
+    Console.Error.WriteLine("     浏览器页面还要把它**自己**的 origin 配进 LILARA_ALLOWED_ORIGIN，否则 WS 握手会被拒。");
+
+    // 通配符绑定时把本机 IPv4 列出来：另一台机器上的头/脚本要填的就是这些地址之一。
+    if (server.BindAddress is not ("0.0.0.0" or "*" or "::" or "[::]")) return;
+
+    try
+    {
+        var addresses = Dns.GetHostAddresses(Dns.GetHostName())
+            .Where(a => a.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(a))
+            .Select(a => $"http://{a}:{server.Port}")
+            .Distinct()
+            .ToList();
+
+        if (addresses.Count > 0)
+            Console.WriteLine($"     这台机器的可达地址：{string.Join("、", addresses)}");
+    }
+    catch (SocketException)
+    {
+        // 解析不出来就只印上面那三行：地址列不出来不该影响启动。
+    }
+}
 
 /// <summary>
 /// 端点一行。⚠️ 没有端点（占位适配器）时**不印**——那是「还没配提供商」那条路径，

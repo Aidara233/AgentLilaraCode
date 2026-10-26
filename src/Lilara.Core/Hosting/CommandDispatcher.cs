@@ -226,6 +226,15 @@ public sealed class CommandDispatcher(
                 case CoreCommand.SessionStart st:
                     return HandleSessionStart(st, commandId);
 
+                case CoreCommand.SessionPlanEdit pe:
+                    return HandleSessionPlanEdit(pe, commandId);
+
+                case CoreCommand.SessionT0Set t0:
+                    return HandleSessionT0Set(t0, commandId);
+
+                case CoreCommand.SessionT0Clear t0c:
+                    return HandleSessionT0Clear(t0c, commandId);
+
                 case CoreCommand.SessionInterrupt i:
                     return HandleSessionInterrupt(i, commandId);
 
@@ -930,7 +939,7 @@ public sealed class CommandDispatcher(
                 return Reject(id, $"目录不存在：{workingDirectory}。核心不替你建目录。");
         }
 
-        var model = _host.Providers.ToSelection(provider, null, "high", 16000);
+        var model = _host.Providers.ToSelection(provider, null, "high", 64000);
 
         // ⚠️ 只拒 `<= 0`（`TimeSpan.Zero` 非法，见 `SessionSpec.AskTimeout`）；
         // 合法性的**唯一**判据在下面那两行，`SessionHandle.Create` 不重判。
@@ -1319,8 +1328,13 @@ public sealed class CommandDispatcher(
     {
         handle.NoteInterrupt();
         _host.CtsFor(handle.SessionId)?.Cancel();
+        StopDescendants(handle.SessionId);
+    }
 
-        foreach (var (projectKey, spec) in _host.Store.ChildrenOf(handle.SessionId))
+    /// <summary>级联停指定父会话的后代，即使父会话本身未激活。</summary>
+    private void StopDescendants(string parentSessionId)
+    {
+        foreach (var (projectKey, spec) in _host.Store.ChildrenOf(parentSessionId))
         {
             // ⚠️ 孩子可能没在内存里（没激活）⇒ `Activate` 载入它，只为了拿那两样内存账。
             // 这不是「顺手捡」的副作用：级联停止**必须**作用到那些盘上的孩子。
@@ -1711,6 +1725,21 @@ public sealed class CommandDispatcher(
                     new WireEvent.CompactionCompleted(
                         handle.SessionId, compacted.CheckpointId, compacted.CoveredThroughEventId, null));
 
+            // ⚠️ **计划改了要告诉头**（2026-10-24）：与 `axis.changed` 同一条分工——
+            // 载荷带整棵树，头照着重画即可（不必再拉 `/plan`）。
+            // ⚠️ <b>判据是 `PlanChanged` 而不是 `Plan is not null`</b>：计划可以被清空，
+            // 而清空之后 `Plan` 就是 null——那与「本步没动过计划」在类型上是同一个值。
+            // ⚠️ 在 `step.end` 之前发：头看到的次序是「这一步结束了，而它把计划改了」。
+            if (step.PlanChanged)
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.PlanUpdated(handle.SessionId, PlanTree.Summary(step.Plan)));
+
+            // ⚠️ **模式变了要告诉头**（2026-10-24）：复用 `axis.changed`——
+            // 头已经在处理它（行 / 调音台 / 快照都靠这条刷新），所以这个新工具**不需要头改一行代码**。
+            if (step.ModeChanged && step.Mode is { } newMode)
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.AxisChanged(handle.SessionId, Axes.Mode, newMode));
+
             var usageCalls = _host.Usage.ForSession(handle.SessionId);
             if (usageCalls.Count > usageCountBefore)
             {
@@ -1723,7 +1752,6 @@ public sealed class CommandDispatcher(
             }
 
             PublishStepEnd(handle, replyForLoop);
-
             // ⚠️ **这里刻意不 `return`**：要让 `finally` 先跑（它 `ExitStep()` 放掉那把标志，
             // 而下一步要重新拿它）。返回值在 finally 之后的续推那一步给出。
         }
@@ -1968,6 +1996,49 @@ public sealed class CommandDispatcher(
     /// （**装配请求的地方只有一处**，三个适配器各补一次等于把同一条规则抄三遍）。
     /// 而这条命令的效果没变——它推进，而推进前那段收尾顺带把过期的询问合成掉。</para>
     /// </summary>
+    private DispatchResult HandleSessionT0Set(CoreCommand.SessionT0Set command, string id)
+    {
+        if (!TryFind(command.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
+        var title = command.Title?.Trim();
+        var body = command.Body?.Trim();
+        if (string.IsNullOrWhiteSpace(title) || title.Length > PlanTree.MaxTitleChars)
+            return Reject(id, $"T0 标题必须为 1..{PlanTree.MaxTitleChars} 个字符。");
+        if (string.IsNullOrWhiteSpace(body) || body.Length > PlanTree.MaxBodyChars)
+            return Reject(id, $"T0 正文必须为 1..{PlanTree.MaxBodyChars} 个字符。");
+
+        var plan = PlanTree.EnsureT0(handle.State.Plan, title, body, CoreClock.Now());
+        handle.UpdateStateAndPersist(_host.Store, s => s with { Plan = plan }, diskStatus: SessionStatus.Idle);
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.PlanUpdated(handle.SessionId, PlanTree.Summary(plan)));
+        return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = handle.SessionId });
+    }
+
+    /// <summary>移除固定 T0；普通剩余树保留。T0 是用户设的，模型删不了，这里给头/用户一条明确出口。</summary>
+    private DispatchResult HandleSessionT0Clear(CoreCommand.SessionT0Clear command, string id)
+    {
+        if (!TryFind(command.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
+        if (handle.State.Plan?.T0 is null) return Reject(id, "这条会话没有固定 T0。");
+        var plan = PlanTree.ClearT0(handle.State.Plan, CoreClock.Now());
+        handle.UpdateStateAndPersist(_host.Store, s => s with { Plan = plan }, diskStatus: SessionStatus.Idle);
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.PlanUpdated(handle.SessionId, PlanTree.Summary(plan)));
+        return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = command.SessionId });
+    }
+
+    /// <summary>设置 T0：它是用户固定任务，不属于模型工具的普通树编辑协议。</summary>
+    private DispatchResult HandleSessionPlanEdit(CoreCommand.SessionPlanEdit command, string id)
+    {
+        if (!TryFind(command.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
+        var edit = new PlanEdit(command.Operation, command.Nodes, command.ParentId, command.Index, command.Ids);
+        var (plan, error) = PlanTree.Apply(handle.State.Plan, edit, CoreClock.Now());
+        if (error is not null) return Reject(id, error);
+        var diskStatus = handle.State.Status == SessionStatus.Running ? SessionStatus.Idle : handle.State.Status;
+        handle.UpdateStateAndPersist(_host.Store, state => state with { Plan = plan }, diskStatus: diskStatus);
+        _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+            new WireEvent.PlanUpdated(handle.SessionId, PlanTree.Summary(plan)));
+        return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = handle.SessionId });
+    }
+
     private DispatchResult HandleSessionStart(CoreCommand.SessionStart s, string id)
     {
         if (!TryFind(s.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
@@ -2221,10 +2292,8 @@ public sealed class CommandDispatcher(
 
         if (IsRunning(live)) return Reject(id, RunningRefusal(c.SessionId));
 
-        // ⚠️ **归档前先级联停子**（2026-10-24 用户裁定）：归档是「原地标记」，但一个
-        // 还在跑的子树不该越过它继续烧钱。⚠️ 只对**已激活**的走这条：未激活的会话
-        // 进程内没有东西在推它（`Running` / 队列 / goal 续跑都是内存账），停也无从停。
-        if (live is not null) StopSubtree(live);
+        // ⚠️ 归档前级联停后代，即使父会话未激活，子会话仍可能正在运行。
+        StopDescendants(c.SessionId);
         // 那会把「没给」与「给定 false」混成同一个分支（本记录的注释里有完整理由）。
         var archive = c.Archived != false;
         var wanted = archive ? CoreClock.Now() : (DateTimeOffset?)null;
@@ -2299,12 +2368,8 @@ public sealed class CommandDispatcher(
         var live = _host.TryGetActivated(c.SessionId, out var h) ? h : null;
         if (IsRunning(live)) return Reject(id, RunningRefusal(c.SessionId));
 
-        // ⚠️ **删之前先级联停子**（2026-10-24 用户裁定）：子树**不跟着删**
-        // （`01` §10.3「父停：子停止推进，记录保留」），但绝不能让它们在父消失之后
-        // 继续跑——那会是一批没有父的会话在往虚空里回报。⚠️ 它们会变成**孤儿**
-        // （`parentSessionId` 指着一个查不到的会话），而 `ReportToParent` 对那种情况
-        // 是**静默丢弃**（可见：工具结果说了「已转达」，对面什么都没发生）。
-        if (live is not null) StopSubtree(live);
+        // ⚠️ 删除前级联停后代；子记录保留，但不会在父会话删除后继续运行。
+        StopDescendants(c.SessionId);
 
         // 声明全在**它自己的工作目录**里（`ClaimStore` 按工作目录分区、`claim.acquire`
         // 用的就是 `handle.Spec.WorkingDirectory`）⇒ 只需要建**一个** store。

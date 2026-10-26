@@ -22,7 +22,8 @@ namespace Lilara.Core.Control;
 // 命令投递即返回、结果走事件；WS 收到命令立刻回 ack，步在后台跑。
 public sealed class ControlServer(
     CoreHost host, CommandDispatcher dispatcher, EventBus bus, int port,
-    string allowedOrigin = ControlServer.DefaultAllowedOrigin)
+    string allowedOrigin = ControlServer.DefaultAllowedOrigin,
+    string? bindAddress = null)
 {
     /// <summary>
     /// 控制面默认端口。
@@ -46,10 +47,26 @@ public sealed class ControlServer(
     /// </summary>
     internal const string DefaultAllowedOrigin = "http://127.0.0.1:17990";
 
-    // 只监听本机（核心是本设备唯一的，本机进程即可信）。
-    public const string BindAddress = "127.0.0.1";
+    /// <summary>
+    /// 默认只监听本机（核心是本设备唯一的，本机进程即可信）。
+    ///
+    /// <para>⚠️ <b>对外监听是一条显式决定</b>（<c>LILARA_BIND</c>，见 <see cref="BindAddressResolver"/>）：
+    /// 核心没有鉴权（`03` §10），绑到对外地址等于把模型、工具与可读文件交给任何能路由到该端口的人。
+    /// 这个常量是**默认值**；真正生效的地址是实例值 <see cref="BindAddress"/>。</para>
+    /// </summary>
+    public const string DefaultBindAddress = "127.0.0.1";
 
-    public string Url => $"http://{BindAddress}:{port}";
+    /// <summary>本实例真正绑定的地址（不是默认常量）——`/info`、启动横幅与 WS 端点都读它。</summary>
+    public string BindAddress { get; } =
+        string.IsNullOrWhiteSpace(bindAddress) ? DefaultBindAddress : bindAddress.Trim();
+
+    /// <summary>绑在环回之外 ⇒ 本机之外也能连进来。⚠️ 没有鉴权，启动横幅据此报警。</summary>
+    public bool IsExternallyBound => !BindAddressResolver.IsLoopbackOnly(BindAddress);
+
+    /// <summary>配置的端口（`0` 会在启动时由 OS 分配，那时以 `StartAsync` 返回的 `Urls` 为准）。</summary>
+    public int Port => port;
+
+    public string Url => $"http://{BindAddressResolver.HostForUrl(BindAddress)}:{port}";
 
     // 给启动横幅读闸真正在接受的那个值（实例值，不是默认常量）；internal 只给同程序集读。
     internal string AllowedOrigin => allowedOrigin;
@@ -76,7 +93,9 @@ public sealed class ControlServer(
         {
             ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
             ctx.Response.Headers["Access-Control-Allow-Headers"] = "content-type";
-            ctx.Response.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
+            // 允许的动词要覆盖 MapSnapshots 的真实端点：GET 快照 / PUT 计划 / DELETE 清 T0 / OPTIONS 预检。
+            // 少一个的后果不是 403，而是预检阶段就失败——浏览器里的 fetch 只会报 “Failed to fetch”。
+            ctx.Response.Headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
             if (ctx.Request.Method == "OPTIONS") { ctx.Response.StatusCode = 204; return; }
             await next();
         });
@@ -97,7 +116,8 @@ public sealed class ControlServer(
         // 自检**最先**列：核心跑在哪个数据根、哪个工作目录、几个会话在内存里。
         // 「我配了 provider 怎么看不到」这类问题，九成是数据根不对——这是它唯一的答案来源。
         // ⚠️ dataRoot / workingDirectory 是本机绝对路径，在 CORS(*) 下可读——沿用 `/state` 早就
-        // 接受的同一个取舍（它一直在交出 WorkingDirectory），且只绑 127.0.0.1。
+        // 接受的同一个取舍（它一直在交出 WorkingDirectory）。⚠️ 这个取舍的边界是**默认只绑 127.0.0.1**；
+        // 用 `LILARA_BIND` 对外之后，这两个字段（以及 `/directories`）就一并对外了，见 `09` §1。
         app.MapGet("/health", () => Results.Json(new
         {
             Ok = true,
@@ -107,9 +127,9 @@ public sealed class ControlServer(
         }, WireJson.Options));
 
         // 核心自述：版本 + 真正在接受的那个 origin + 两个端点的 URL。
-        // origin 读**实例值**（不是默认常量）——构造参数换过之后，这里必须跟着变。
-        // ⚠️ 构造参数今天由 `AllowedOriginResolver` 从环境变量解析（`Program.cs` 的调用点）。
-        // **核心不解析任何命令行参数**——所以这里没有 `--allowed-origin` 那样的旗标，
+        // origin / 监听地址读的都是**实例值**（不是默认常量）——构造参数换过之后，这里必须跟着变。
+        // ⚠️ 构造参数今天由 `AllowedOriginResolver` 与 `BindAddressResolver` 从环境变量解析（`Program.cs` 的调用点）。
+        // **核心不解析任何命令行参数**——所以这里没有 `--allowed-origin` / `--bind` 那样的旗标，
         // 配置一律走环境变量。别在这一行写一个不存在的旗标名：那会让读注释的人以为有这么个入口。
         app.MapGet("/info", () => Results.Json(new
         {
@@ -117,7 +137,7 @@ public sealed class ControlServer(
             WorkingDirectory = host.WorkingDirectory,
             CoreVersion = typeof(ControlServer).Assembly.GetName().Version?.ToString() ?? "?",
             AllowedOrigin = allowedOrigin,
-            Endpoints = new { Http = Url, Ws = $"ws://{BindAddress}:{port}/ws" },
+            Endpoints = new { Http = Url, Ws = $"ws://{BindAddressResolver.HostForUrl(BindAddress)}:{port}/ws" },
         }, WireJson.Options));
 
         // 每个快照都带该 topic 的 seq 高水位：头拿它去 subscribe(since:)，
@@ -321,6 +341,10 @@ public sealed class ControlServer(
                     // goal 状态（2026-10-22）。⚠️ 判据仍然是主动性轴（`GoalMode`），
                     // 这里只是把它**显式交出去**，省得头为了一个布尔自己去翻 axes。
                     Goal = new { Active = Session.GoalMode.IsActive(handle.State) },
+                    // 计划的摘要（2026-10-24）。⚠️ **树也交出去**（`tree`）：头打开会话时要画它，
+                    // 少这一格头就得再拉一次 `/plan`——两个入口读同一件事，早晚会分叉。
+                    // ⚠️ 形状由 `PlanTree.Summary` 一处定义，与 `plan.updated` 逐字同形。
+                    Plan = PlanTree.Summary(handle.State.Plan),
 
                     // 整个 spec 交出去、不做子集裁剪：SessionSpec 里没有 ApiKey，所以天生不泄 key。
                     // 代价：WorkingDirectory 是本机绝对路径，在开放 CORS(*) 下可读。
@@ -454,6 +478,77 @@ public sealed class ControlServer(
                 hasMore,
                 NextCursor = nextCursor ?? "",
             }, WireJson.Options);
+        });
+
+        app.MapPut("/sessions/{id}/plan", async (string id, HttpRequest request) =>
+        {
+            if (!TryFind(id, out var handle)) return Results.NotFound();
+
+            // ⚠️ **用模型工具那一个解析器**（`PlanJson.ParseEdit`），不另写一份 STJ 反序列化：
+            // 三条入口（模型工具 / WS 命令 / 这条 HTTP）读同一份载荷、同一套 id 生成与提示语。
+            // 另写一份的代价是具体的：`PlanNode.Id` 是 `required`，STJ 遇到「新节点没写 id」
+            // 会抛异常 ⇒ 头的「追加节点」按钮当场 400，而模型侧同一个载荷是合法的。
+            string body;
+            using (var reader = new StreamReader(request.Body))
+                body = await reader.ReadToEndAsync(request.HttpContext.RequestAborted);
+
+            var (edit, error) = Session.Tools.PlanJson.ParseEdit(body);
+            if (edit is null) return Results.BadRequest(new { error });
+
+            var result = await dispatcher.DispatchAsync(
+                new CoreCommand.SessionPlanEdit(id, edit.Operation, edit.Nodes, edit.ParentId, edit.Index, edit.Ids),
+                Ids.New(), awaitCompletion: true, request.HttpContext.RequestAborted);
+            return result.Ack is Ack.Rejected rejected
+                ? Results.BadRequest(new { error = rejected.Reason })
+                : Results.Json(new { ok = true }, WireJson.Options);
+        });
+
+        app.MapGet("/sessions/{id}/plan", (string id) =>
+        {
+            if (!TryFind(id, out var handle)) return Results.NotFound();
+            var plan = handle.State.Plan;
+            // ⚠️ `plan` 形状与 `/state.plan`、`plan.updated.plan` 同源；T0 单独置顶展示。
+            return Results.Json(new
+            {
+                SessionId = id,
+                Plan = PlanTree.Summary(plan),
+                UpdatedAt = plan?.UpdatedAt,
+            }, WireJson.Options);
+        });
+
+        app.MapPut("/sessions/{id}/plan/t0", async (string id, HttpRequest request) =>
+        {
+            if (!TryFind(id, out var handle)) return Results.NotFound();
+            string body;
+            using (var reader = new StreamReader(request.Body))
+                body = await reader.ReadToEndAsync(request.HttpContext.RequestAborted);
+            JsonDocument? doc = null;
+            try { doc = JsonDocument.Parse(body); }
+            catch (JsonException) { return Results.BadRequest(new { error = "T0 JSON 格式不正确。" }); }
+            using (doc)
+            {
+                var root = doc!.RootElement;
+                string? Get(string key) => root.ValueKind == JsonValueKind.Object
+                    && root.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.String
+                        ? value.GetString() : null;
+                var command = new CoreCommand.SessionT0Set(id, Get("title"), Get("body"));
+                var result = await dispatcher.DispatchAsync(command, Ids.New(), true, request.HttpContext.RequestAborted);
+                return result.Ack is Ack.Rejected rejected
+                    ? Results.BadRequest(new { error = rejected.Reason })
+                    : Results.Json(new { ok = true }, WireJson.Options);
+            }
+        });
+
+        app.MapDelete("/sessions/{id}/plan/t0", async (string id, HttpRequest request) =>
+        {
+            if (!TryFind(id, out _)) return Results.NotFound();
+            // 与 PUT 同一条 dispatch 线：拒绝理由仍走 400 + error，成功发 plan.updated。
+            var result = await dispatcher.DispatchAsync(
+                new CoreCommand.SessionT0Clear(id),
+                Ids.New(), awaitCompletion: true, request.HttpContext.RequestAborted);
+            return result.Ack is Ack.Rejected rejected
+                ? Results.BadRequest(new { error = rejected.Reason })
+                : Results.Json(new { ok = true }, WireJson.Options);
         });
 
         app.MapGet("/sessions/{id}/queue", (string id) =>
@@ -1146,6 +1241,9 @@ public sealed class ControlServer(
                 payload.GetProperty("sessionId").GetString()!),
             "session.compact" => new CoreCommand.SessionCompact(
                 payload.GetProperty("sessionId").GetString()!),
+            // 计划编辑（2026-10-24）：与 `PUT /sessions/{id}/plan`、以及模型那个 `plan` 工具
+            // **共用同一个解析器**（`PlanJson.ParseEdit`）——三条入口一份语义，不多写第二份。
+            "session.plan" => PlanEditFrom(payload),
             "provider.upsert" => new CoreCommand.ProviderUpsert(
                 payload.GetProperty("id").GetString()!,
                 // apiKey 必须走 Opt：GetProperty 在键缺失时抛 KeyNotFoundException，
@@ -1284,6 +1382,28 @@ public sealed class ControlServer(
             }
             return list;
         }
+    }
+
+    /// <summary>
+    /// 线上 `session.plan` → <see cref="CoreCommand.SessionPlanEdit"/>（2026-10-24）。
+    ///
+    /// <para>⚠️ <b>它把 `<c>nodes</c>` 原样交给 <see cref="Session.Tools.PlanJson.ParseEdit"/>，
+    /// 不在这里反序列化</b>：那是模型工具、HTTP `PUT /sessions/{id}/plan`、与这条 WS 命令
+    /// <b>共用的同一个解析器</b>。另写一份 STJ 反序列化的代价是具体的——`PlanNode.Id` 是
+    /// `required`，STJ 遇到「新节点没写 id」会抛异常，而同一个载荷在模型那一侧是合法的
+    /// （解析器会给它生成 id）⇒ 一条路能建、另一条路 400。</para>
+    ///
+    /// <para>⚠️ <b>解析失败不抛</b>：`operation` 落成空串（非空类型），由 `PlanTree.Apply`
+    /// 说一句人话（「operation 只能是 …」）。在解析层抛会掀掉整条连接，而代价是一句听不懂的
+    /// `KeyNotFoundException`——同 <see cref="ParseCommand"/> 其它臂的取舍。</para>
+    /// </summary>
+    private static CoreCommand.SessionPlanEdit PlanEditFrom(JsonElement payload)
+    {
+        var (edit, _) = Session.Tools.PlanJson.ParseEdit(payload.GetRawText());
+        return new CoreCommand.SessionPlanEdit(
+            payload.GetProperty("sessionId").GetString()!,
+            edit?.Operation ?? "",
+            edit?.Nodes, edit?.ParentId, edit?.Index, edit?.Ids);
     }
 
     private bool TryFind(string sessionId, out SessionHandle handle)

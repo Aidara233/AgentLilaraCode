@@ -88,10 +88,33 @@ public class ControlServerTests : IAsyncLifetime
 
     private static readonly HttpClient Client = new() { Timeout = TimeSpan.FromSeconds(10) };
 
-    // 只监听本机（鉴权最小）。
+    // 默认只监听本机（鉴权最小）——对外必须是**显式**设定，不是默认行为。
     [Fact]
-    public void BindAddress_IsLoopbackOnly() =>
-        Assert.Equal("127.0.0.1", ControlServer.BindAddress);
+    public void BindAddress_DefaultsToLoopbackOnly() =>
+        Assert.Equal("127.0.0.1", ControlServer.DefaultBindAddress);
+
+    // 显式绑定的地址必须落到 Url 里：头/脚本拿它去连，写死 127.0.0.1 会让远端连错地方。
+    [Fact]
+    public void BindAddress_ExplicitValueIsReportedInTheUrl()
+    {
+        var server = new ControlServer(_host, _dispatcher, _bus, 17988,
+            ControlServer.DefaultAllowedOrigin, "0.0.0.0");
+
+        Assert.Equal("0.0.0.0", server.BindAddress);
+        Assert.True(server.IsExternallyBound);
+        Assert.Equal("http://0.0.0.0:17988", server.Url);
+    }
+
+    // IPv6 字面量在 URL 里必须带方括号，否则 `/info` 交出去的端点不可用。
+    [Fact]
+    public void BindAddress_Ipv6IsBracketedInTheUrl()
+    {
+        var server = new ControlServer(_host, _dispatcher, _bus, 17988,
+            ControlServer.DefaultAllowedOrigin, "::1");
+
+        Assert.False(server.IsExternallyBound);
+        Assert.Equal("http://[::1]:17988", server.Url);
+    }
 
     // 快照必须带 seq 高水位：头拿它去 subscribe(since:)，「拉快照 → 订阅」之间落的事件才不漏不重。
     [Fact]
@@ -126,6 +149,74 @@ public class ControlServerTests : IAsyncLifetime
 
         Assert.Equal(System.Net.HttpStatusCode.NotFound, r.StatusCode);
     }
+
+    /// <summary>
+    /// **计划端点**（2026-10-24）：`PUT /sessions/{id}/plan` 写得进、`GET` 读得出、`/state` 带摘要。
+    ///
+    /// <para>⚠️ <b>为什么这条必须存在</b>：头那三个按钮走的就是这条 HTTP 路，而
+    /// `CommandSurfaceTests` 只钉「线上能解析成哪个类型」——「PUT 进来的载荷真的落到
+    /// `state.json` 上」在此之前**没有任何 C# 测试碰过**。而它有一条很容易踩的坑：
+    /// 头新建的节点**不带 id**（`PlanNode.Id` 是 `required`），换一条反序列化路径就会 400。</para>
+    /// </summary>
+    [Fact]
+    public async Task Plan_Endpoint_WritesReadsAndShowsInTheStateSnapshot()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        // ① insert **不带 id**（头「追加节点」按钮发的正是这种载荷）⇒ 核心要给新节点生成一个。
+        var put = await Client.PutAsync(Http($"/sessions/{sid}/plan"), JsonBody(
+            """{"operation":"insert","nodes":[{"title":"读一遍","body":"读完它"}]}"""));
+        Assert.Equal(System.Net.HttpStatusCode.OK, put.StatusCode);
+
+        var afterInsert = await GetJson($"/sessions/{sid}/plan");
+        // ⚠️ 形状与 `/state.plan`、`plan.updated.plan` **逐字相同**（核心的 `PlanSummary`）：
+        // `{ active, remaining, currentId, currentTitle, tree }`。头一个渲染函数吃三处。
+        var tree = afterInsert.GetProperty("plan").GetProperty("tree");
+        Assert.Equal(1, tree.GetArrayLength());
+        var id = tree[0].GetProperty("id").GetString();
+        Assert.False(string.IsNullOrEmpty(id), "没有 id 的新节点必须由核心生成一个");
+        Assert.Equal("读一遍", afterInsert.GetProperty("plan").GetProperty("currentTitle").GetString());
+
+        // ② 快照里的摘要跟着变（头打开会话读的是它，不是另拉一次 `/plan`）。
+        var state = await GetJson($"/sessions/{sid}/state");
+        Assert.True(state.GetProperty("plan").GetProperty("active").GetBoolean());
+        Assert.Equal(1, state.GetProperty("plan").GetProperty("remaining").GetInt32());
+        Assert.Equal(id, state.GetProperty("plan").GetProperty("currentId").GetString());
+
+        // ③ 结构不合法的载荷要**说人话地拒**（400 + 理由），不是 500：叶子没有正文是核心的判据。
+        var bad = await Client.PutAsync(Http($"/sessions/{sid}/plan"), JsonBody(
+            """{"operation":"overwrite","nodes":[{"title":"没有正文的叶子"}]}"""));
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, bad.StatusCode);
+        Assert.Contains("正文", await bad.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+
+        // ④ remove 掉唯一那条 ⇒ 计划空：`active=false`、`remaining=0`（`plan` 里只剩两格，null 被省掉）。
+        var remove = await Client.PutAsync(Http($"/sessions/{sid}/plan"), JsonBody(
+            $$"""{"operation":"remove","ids":["{{id}}"]}"""));
+        Assert.Equal(System.Net.HttpStatusCode.OK, remove.StatusCode);
+        var emptied = await GetJson($"/sessions/{sid}/state");
+        Assert.False(emptied.GetProperty("plan").GetProperty("active").GetBoolean());
+        Assert.Equal(0, emptied.GetProperty("plan").GetProperty("remaining").GetInt32());
+
+        // ⑤ T0 是用户设置的固定上下文，不在普通模型 plan 编辑协议中。
+        var setT0 = await Client.PutAsync(Http($"/sessions/{sid}/plan/t0"), JsonBody(
+            """{"title":"长期目标","body":"维护服务并持续改进"}"""));
+        Assert.Equal(System.Net.HttpStatusCode.OK, setT0.StatusCode);
+        var withT0 = await GetJson($"/sessions/{sid}/plan");
+        var summaryWithT0 = withT0.GetProperty("plan");
+        Assert.True(summaryWithT0.GetProperty("active").GetBoolean());
+        Assert.Equal(0, summaryWithT0.GetProperty("remaining").GetInt32());
+        Assert.Equal("长期目标", summaryWithT0.GetProperty("t0").GetProperty("title").GetString());
+
+        // 普通 overwrite 清空可推进计划，但固定 T0 仍保留。
+        var overwrite = await Client.PutAsync(Http($"/sessions/{sid}/plan"), JsonBody(
+            """{"operation":"overwrite","nodes":[]}"""));
+        Assert.Equal(System.Net.HttpStatusCode.OK, overwrite.StatusCode);
+        var stillT0 = await GetJson($"/sessions/{sid}/state");
+        Assert.Equal("长期目标", stillT0.GetProperty("plan").GetProperty("t0").GetProperty("title").GetString());
+    }
+
+    private static StringContent JsonBody(string body) => new(body, Encoding.UTF8, "application/json");
 
     // 头是独立 origin，不放开 CORS 浏览器就连不上；预检（OPTIONS）必须回 204 且带允许头。
     [Fact]
@@ -1164,10 +1255,23 @@ public class ControlServerTests : IAsyncLifetime
         var sid = ((Ack.Accepted)created.Ack).SessionId!;
 
         var root = await GetJson($"/sessions/{sid}/state");
-        AssertKeysOf(root, "sessionId", "state", "highWater", "axes", "spec", "slots", "goal", "axisDefinitions", "pluginProblems");
+        AssertKeysOf(root, "sessionId", "state", "highWater", "axes", "spec", "slots", "goal", "plan", "axisDefinitions", "pluginProblems");
 
         // goal 是「永远在的对象」（照 `ask` 的 `{}` 纪律），内部只有 active 一格。
         AssertKeysOf(root.GetProperty("goal"), "active");
+
+        // plan 同一条纪律（2026-10-24 计划批）：对象永远在。
+        // ⚠️ **没有计划时只有两格**：`currentId` / `currentTitle` / `tree` 都是 null，
+        // 而 `WireJson` 的 `WhenWritingNull` 会把它们整个省掉——与上面列表行那条 `title` 同一个判据。
+        AssertKeysOf(root.GetProperty("plan"), "active", "remaining");
+
+        // 有计划时五格都在（头打开会话就靠 `tree` 画面板，少它就得再拉一次 `/plan`）。
+        await _dispatcher.DispatchAsync(new CoreCommand.SessionPlanEdit(sid, "overwrite",
+            [new PlanNode { Id = "n1", Title = "读一遍", Body = "读完它" }]), "c2", false, CancellationToken.None);
+        var withPlan = (await GetJson($"/sessions/{sid}/state")).GetProperty("plan");
+        AssertKeysOf(withPlan, "active", "remaining", "currentId", "currentTitle", "tree");
+        Assert.True(withPlan.GetProperty("active").GetBoolean());
+        Assert.Equal("n1", withPlan.GetProperty("currentId").GetString());
 
         // ⚠️ 嵌套那层也钉：往 `slots` / `model` 里加字段，顶层看不见。
         //（`spec` 自己那层**不在这里钉**——它归 `SessionSpec_HasExactlyTheseProperties` +

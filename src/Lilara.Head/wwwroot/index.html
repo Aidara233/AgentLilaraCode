@@ -1034,6 +1034,22 @@ button:disabled:hover { border-color: var(--rule); }
     <div id="axes"></div>
   </section>
 
+  <section class="panel">
+    <h4>计划树</h4>
+    <div id="plan-tree" class="plan-tree"></div>
+    <textarea id="plan-json" rows="10" spellcheck="false" aria-label="计划树 JSON"></textarea>
+    <div class="actions">
+      <button id="plan-save" class="btn-primary">覆盖普通计划</button>
+      <button id="plan-insert">追加节点</button>
+      <button id="plan-remove">删除选中节点</button>
+    </div>
+    <h5>T0 固定长期任务（模型不可移除）</h5>
+    <input id="t0-title" type="text" maxlength="160" aria-label="T0 标题" placeholder="长期任务标题">
+    <textarea id="t0-body" rows="4" maxlength="2000" aria-label="T0 正文" placeholder="长期目标和约束"></textarea>
+    <button id="t0-save">保存 T0</button>
+    <div class="note" id="plan-note"></div>
+  </section>
+
   <!-- 义务 2：声明可见。冲突顶到这栏，不只画在树里。 -->
   <section class="panel">
     <h4>声明</h4>
