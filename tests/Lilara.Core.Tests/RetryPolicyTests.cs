@@ -124,24 +124,38 @@ public class RetryPolicyTests
         Assert.False(ClaudeAdapter.IsTransient(new Anthropic.Exceptions.AnthropicInvalidDataException("bad body")));
     }
 
-    // ---- 退避曲线：单调、封顶、确定性 ----
+    // ---- 退避曲线：单调、不封顶、确定性 ----
 
     [Fact]
-    public void DelayBefore_GrowsAndStaysUnderTheCap()
+    public void DelayBefore_GrowsExponentially_WithoutACap()
     {
-        // ⚠️ 上下界都断：只断上限的话，一个恒等 0 的实现会绿（而它等于没有退避）。
+        // ⚠️ 上下界都断：只断下界的话，一个恒等 0 的实现会绿（而它等于没有退避）。
         Assert.InRange(RetryPolicy.DelayBefore(1).TotalMilliseconds, 400, 600);
         Assert.InRange(RetryPolicy.DelayBefore(2).TotalMilliseconds, 800, 1_200);
         Assert.InRange(RetryPolicy.DelayBefore(3).TotalMilliseconds, 1_600, 2_400);
         Assert.InRange(RetryPolicy.DelayBefore(4).TotalMilliseconds, 3_200, 4_800);
 
-        for (var retry = 5; retry <= RetryPolicy.MaxRetries; retry++)
+        // ⚠️ **曲线不封顶**（2026-10-26 改：原来第 5 次起封在 5 秒）。
+        // 每一格都是「500ms × 2^(n-1) 带 ±20% 抖动」，而这里逐格钉住——
+        // 「不封顶」是个**决定**（封顶会让十次重试一直按 5 秒的节奏去撞同一个限流窗口），
+        // 被悄悄改回去时必须有一条红，而不是靠谁记得。
+        var total = 0d;
+        var nominalTotal = 0d;
+        for (var retry = 1; retry <= RetryPolicy.MaxRetries; retry++)
         {
             var ms = RetryPolicy.DelayBefore(retry).TotalMilliseconds;
-            Assert.InRange(ms, 3_500, 5_000);
-            // 「上限」是个能被引用的数：抖动之后也不许超过它。
-            Assert.True(ms <= RetryPolicy.MaxDelayMilliseconds);
+            var nominal = RetryPolicy.BaseDelayMilliseconds * Math.Pow(2, retry - 1);
+            Assert.InRange(ms, nominal * 0.8, nominal * 1.2);
+            total += ms;
+            nominalTotal += nominal;
         }
+
+        // 十次重试的等待之和 ≈ 511.5 秒（约 8 分 32 秒）——`RetryPolicy` 的类注释引用的就是这个量级。
+        // ⚠️ 边界按**标称和的 ±20%** 给，不写死一个数：抖动是逐格独立的，十格叠起来
+        // 可能落在标称值的任何一侧（实测 545.6 秒，比标称高 6.7%）——写死区间等于让这条
+        // 断言去猜抖动，而抖动一改（+20% → +25%）它就变成一条与策略无关的假红。
+        Assert.InRange(total, nominalTotal * 0.8, nominalTotal * 1.2);
+        Assert.InRange(total / 1000, 480, 620);   // 「约 8 分钟出头」这个量级本身也要钉住
     }
 
     [Fact]

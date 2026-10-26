@@ -27,7 +27,7 @@ namespace Lilara.Core.Protocol;
 /// <para>⚠️ <b>没有读 `Retry-After`</b>：Claude SDK 的异常只交出 `StatusCode` 与 `ResponseBody`
 /// （本地复现过：反射 `AnthropicApiException` 的公开属性只有这两样 + `InnerException`），
 /// 拿不到响应头 ⇒ 只给 OpenAI 那条链路实现会让两条协议的重试节奏分叉。
-/// 代价写在这里：上游要是要求等 30 秒，我们会以 ≤5 秒的间隔一直试下去（十次全失败约 36 秒），然后如实报失败。</para>
+/// 代价写在这里：目前不读取上游的等待建议；本地退避按指数增长，十次重试的等待之和约 8 分 32 秒，然后如实报失败。</para>
 /// </summary>
 public static class RetryPolicy
 {
@@ -39,12 +39,6 @@ public static class RetryPolicy
 
     /// <summary>第一次重试前的基础等待。</summary>
     internal const int BaseDelayMilliseconds = 500;
-
-    /// <summary>
-    /// 单次退避的上限。⚠️ 它是**单次等待**的上限，不是总时长——
-    /// 十次重试的等待之和**实测 35.6 秒**（2026-10-21，按本文件这条曲线逐次算出来的）。
-    /// </summary>
-    internal const int MaxDelayMilliseconds = 5_000;
 
     /// <summary>
     /// 这个失败值不值得再发一次。⚠️ **只认标志**，别在这里按消息内容猜
@@ -68,22 +62,19 @@ public static class RetryPolicy
     /// <summary>
     /// 第 <paramref name="retry"/> 次重试**之前**等多久（<paramref name="retry"/> 从 1 起）。
     ///
-    /// <para>指数退避 0.5s → 1s → 2s → 4s，从第 5 次起封顶 5s；再乘一个
-    /// <b>确定性的</b> ±20% 抖动。⚠️ 抖动**不用随机数**：同一个 <paramref name="retry"/>
-    /// 永远给同一个值（测试要能钉住曲线），而它仍然打散了「多个会话同时被限流 ⇒
-    /// 以同一节奏一起再撞上去」这件事——那正是抖动唯一的用途。
-    /// ⚠️ 注意第 4 次就可能**比第 5 次长**（4s 的基数带抖动 vs 5s 的基数带抖动，区间重叠）
-    /// ——曲线是「有上限」的，不是逐次严格递增的。</para>
+    /// <para>指数退避从 0.5 秒开始，每次翻倍，再乘一个确定性的 ±20% 抖动；不设等待上限。
+    /// 抖动不用随机数，同一个重试序号永远给出相同值，便于测试并错开多个会话的重试节奏。</para>
     /// </summary>
     public static TimeSpan DelayBefore(int retry)
     {
         if (retry < 1) throw new ArgumentOutOfRangeException(nameof(retry), retry, "重试序号从 1 起。");
 
-        var backoff = Math.Min(MaxDelayMilliseconds, BaseDelayMilliseconds * Math.Pow(2, retry - 1));
-        // ⚠️ 抖动之后再封顶一次：否则 5s 的基数乘上 +20% 会给出 6s，
-        // 而「上限」这个词就不成立了（单次等待的上限是一个能被人引用的数，别让它是个约数）。
-        return TimeSpan.FromMilliseconds(
-            Math.Min(MaxDelayMilliseconds, backoff * (0.8 + 0.4 * Spread(retry))));
+        // 十次重试的生产路径远低于 TimeSpan 上限；饱和处理也让此公开方法对大序号保持安全。
+        var exponent = Math.Min(retry - 1, 62);
+        var backoff = BaseDelayMilliseconds * Math.Pow(2, exponent);
+        var milliseconds = Math.Min(TimeSpan.MaxValue.TotalMilliseconds,
+            backoff * (0.8 + 0.4 * Spread(retry)));
+        return TimeSpan.FromMilliseconds(milliseconds);
     }
 
     /// <summary>
