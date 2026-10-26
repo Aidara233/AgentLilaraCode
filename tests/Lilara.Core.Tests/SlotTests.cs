@@ -149,7 +149,7 @@ public sealed class SlotTests : IDisposable
     }
 
     [Fact]
-    public void LevelChangesOnlyChangeFloatingText_AndSystemTeachesItsOriginAndLifetime()
+    public void LevelChangesOnlyChangeFloatingText_AndSystemTeachesItsShapeAndLifetime()
     {
         System.Save("default", "用户自定义系统原文");
         var before = Render(axes: new Dictionary<string, string> { [Axes.Verify] = "none" });
@@ -159,11 +159,15 @@ public sealed class SlotTests : IDisposable
         Assert.NotEqual(before.Tail, after.Tail);
         Assert.StartsWith("用户自定义系统原文\n", system);
         Assert.Contains("浮动上下文", system);
-        // ⚠️ 2026-10-23 改口：这几条钉的是**语义**，措辞随「不出现『你』」那条一起改过。
-        // ① 来源（谁生成的）② 寿命（一步一份、下一步换掉）③ 权限不由此授予。
-        Assert.Contains("Lilara 核心", system);
+        // ⚠️ 2026-10-26 改口：系统块**不再声明这条读数是谁发起的**（用户裁定）——
+        // 模型在训练里只见过「tool_use 都是我自己发的」，而这条注入与它自己的调用逐字同形，
+        // 硬说「是框架发的」等于要它同时相信两件相反的事，而它唯一能做的核对动作是再调一次。
+        // ⇒ 这里钉的是**形状与寿命**（它长什么样、什么时候换新），不再钉来源。
+        Assert.Contains("当前状态的一份读数", system);
         Assert.Contains("同一步内保持一致", system);
         Assert.Contains("不自行授予权限", system);
+        Assert.DoesNotContain("Lilara 核心", system);
+        Assert.DoesNotContain("不是你调用的", system);
         // ⚠️ 第二人称禁令也钉在系统块上：一块**环境读数**不该变成一封给读者的信。
         Assert.DoesNotContain("你此前", system);
         Assert.Contains("浮动上下文", CorePrompts.SystemFallback);

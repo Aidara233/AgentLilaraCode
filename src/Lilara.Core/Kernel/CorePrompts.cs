@@ -33,8 +33,8 @@ public static class CorePrompts
     /// </summary>
     public const string FloatingContextExplanation =
         """
-        浮动上下文是 Lilara 核心为本次请求生成的当前状态，落在时间线末尾的一条 floating_context 工具结果里：id 以 floating- 开头，首块是 [floating_context] 框架头。
-        它按步开始时的快照生成：同一步内保持一致，下一步换成新的一份；它不落盘，也不属于历史。
+        浮动上下文是当前状态的一份读数，形式是时间线末尾那条 floating_context 结果：首块是 [floating_context] 框架头，id 以 floating- 开头。
+        它按步开始时的快照生成：同一步内保持一致；内容变了才会有新的一份，不变时你看到的仍是上一份（内容相同）。
         其中列出当前生效的行为轴等级及其解释，也可能包含已绑定插件的上下文。轴等级以本次请求里的值为准，不沿用先前请求的等级。
         轴解释不自行授予权限；工具能否执行以框架闸门和审批结果为准。安全与验证强度是行为提示，不代表框架已经执行了验证。
         """;

@@ -113,7 +113,8 @@ public sealed class PluginIntegrationTests : IDisposable
             Assert.Contains("Explain the reasoning with concrete examples.", content);
             Assert.DoesNotContain("Keep the answer concise.", content);
             Assert.Contains("验证未通过时不得声称完成", content);
-            Assert.Contains("浮动上下文是 Lilara 核心", content);
+            // ⚠️ 2026-10-26 改口：系统块不再声明「这条读数由核心生成」——见 `CorePrompts.FloatingContextExplanation`。
+            Assert.Contains("浮动上下文是当前状态的一份读数", content);
         }
         var claude = ClaudeRequestBuilder.Build(after);
         var claudeText = string.Join("\n", claude.Messages.SelectMany(m =>
@@ -127,7 +128,8 @@ public sealed class PluginIntegrationTests : IDisposable
         Assert.DoesNotContain("Keep the answer concise.", claudeText);
         Assert.Contains("验证未通过时不得声称完成", claudeText);
         using var claudeJson = JsonDocument.Parse(JsonSerializer.Serialize(claude));
-        Assert.Contains("浮动上下文是 Lilara 核心", Strings(claudeJson.RootElement));
+        // ⚠️ 2026-10-26 改口：系统块不再声明「这条读数由核心生成」（见 `CorePrompts.FloatingContextExplanation`）。
+        Assert.Contains("浮动上下文是当前状态的一份读数", Strings(claudeJson.RootElement));
     }
 
     [Theory]
