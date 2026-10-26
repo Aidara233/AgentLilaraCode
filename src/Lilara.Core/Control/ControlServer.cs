@@ -810,7 +810,8 @@ public sealed class ControlServer(
             handle.State.PendingCompact ? CorePrompts.CompactDirective : null,
             // 子会话那一行同理（2026-10-24）：头看到的浮动槽与模型收到的必须是同一份
             // ——否则「头显示我有两个孩子」而模型眼里一个都没有，两边都以为自己对。
-            SubagentView.Line(SubagentScopeOf(handle)));
+            SubagentView.Line(SubagentScopeOf(handle)),
+            iterateReplan: handle.PendingIterateReplan);
 
         return new
         {

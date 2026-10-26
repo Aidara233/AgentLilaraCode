@@ -1,4 +1,5 @@
 using Lilara.Core.Kernel;
+using Lilara.Core.Session;
 using Lilara.Core.Session.Tools;
 using Lilara.Core.Storage;
 
@@ -93,7 +94,7 @@ public sealed class PlanModeToolTests : IDisposable
     }
 
     [Fact]
-    public async Task PlanModeSwitch_IterateCannotExitAndGoalCannotExitBeforeOrdinaryPlanIsEmpty()
+    public async Task PlanModeSwitch_IterateExitsWithoutAsking_ButGoalWaitsForEmptyPlan()
     {
         var tool = new PlanModeTool();
         var args = """{"mode":"act","reason":"继续执行"}""";
@@ -104,15 +105,69 @@ public sealed class PlanModeToolTests : IDisposable
             T0 = new T0PlanNode { Title = "长期目标", Body = "持续维护" },
         };
 
+        // ⚠️ iterate 下**免批**（2026-10-26）：不产出询问卡，直接就是「已退出规划模式」。
+        // 那张卡只属于 goal / step / standard——iterate 的授权来自 T0，不来自一次点击。
         var iterate = await tool.RunAsync(new ToolCall("i", tool.Name, args),
             Context("plan", Axes.Iterate, plan), CancellationToken.None);
         Assert.Null(iterate.Ask);
-        Assert.Contains("iterate", Assert.IsType<Block.TextBlock>(Assert.Single(iterate.Content)).Text, StringComparison.Ordinal);
+        var iterateText = Assert.IsType<Block.TextBlock>(Assert.Single(iterate.Content)).Text;
+        Assert.Contains("已退出规划模式", iterateText, StringComparison.Ordinal);
+        Assert.Contains("iterate", iterateText, StringComparison.Ordinal);
 
+        // goal 侧一字未动：普通计划没推空前不许退出。
         var goal = await tool.RunAsync(new ToolCall("g", tool.Name, args),
             Context("plan", "goal", plan), CancellationToken.None);
         Assert.Null(goal.Ask);
         Assert.Contains("普通计划尚未完成", Assert.IsType<Block.TextBlock>(Assert.Single(goal.Content)).Text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// **那次提醒只出现一次**（2026-10-26）：判据是 `SessionHandle.PendingIterateReplan`，
+    /// 不是「树现在是空的」——后者会在每一步都念一遍，把 nudge 变成噪音。
+    /// </summary>
+    [Fact]
+    public void IterateReplanReminder_FollowsTheFlag_NotTheEmptyPlan()
+    {
+        var empty = new SessionPlan
+        {
+            Nodes = [],
+            UpdatedAt = DateTimeOffset.UnixEpoch,
+            T0 = new T0PlanNode { Title = "长期目标", Body = "持续维护" },
+        };
+        IReadOnlyDictionary<string, string> iterate = new Dictionary<string, string>
+        {
+            [Axes.Initiative] = Axes.Iterate,
+            [Axes.Mode] = "act",
+        };
+
+        // ① 树空 + T0 在，但标志没置位 ⇒ 一句都不说（不再每步重复）。
+        Assert.DoesNotContain(CorePrompts.IteratePlanningDirective, Tail(iterate, empty, replan: false),
+            StringComparison.Ordinal);
+
+        // ② 标志置位 ⇒ 恰好说一次。
+        var reminded = Tail(iterate, empty, replan: true);
+        Assert.Equal(1, Occurrences(reminded, CorePrompts.IteratePlanningDirective));
+
+        // ③ 标志在、主动性不是 iterate ⇒ 也不说（这句话只属于 iterate 那一档）。
+        IReadOnlyDictionary<string, string> step = new Dictionary<string, string>(iterate)
+        {
+            [Axes.Initiative] = "step",
+        };
+        Assert.DoesNotContain(CorePrompts.IteratePlanningDirective, Tail(step, empty, replan: true),
+            StringComparison.Ordinal);
+
+        static string Tail(IReadOnlyDictionary<string, string> axes, SessionPlan plan, bool replan) =>
+            string.Concat(SystemBlock.Build(null, null, axes, null, null, null, null, plan, replan)
+                .Tail.OfType<Block.TextBlock>().Select(block => block.Text));
+
+        static int Occurrences(string haystack, string needle)
+        {
+            var count = 0;
+            for (var at = haystack.IndexOf(needle, StringComparison.Ordinal); at >= 0;
+                 at = haystack.IndexOf(needle, at + needle.Length, StringComparison.Ordinal))
+                count++;
+            return count;
+        }
     }
 
     private sealed class StubTool(string name, PermissionClass permission) : ITool

@@ -53,8 +53,9 @@ public sealed class PlanModeTool : ITool
         + "⚠️ 必须填 reason：一句话说明为什么要切，退出时它就是给用户的判断依据。"
         + "⚠️ 只在确实需要改变工作方式时调用；不要为了汇报进度、也不要为了打个招呼而切换。"
         + "规划模式下 write / update / delete / mkdir / git_write 会被硬拒（shell、dotnet、path 不受限），"
-        + "要动文件必须先退出。iterate 主动性下普通计划用完时核心会自动切回 plan，本工具不能退出该循环；"
-        + "goal 下普通计划没清空时也不能退出。";
+        + "要动文件必须先退出。iterate 主动性下切 act **不询问**：T0 已经授权这段自主循环；"
+        + "普通计划用完时核心会在尾块提一句「该按 T0 规划下一段」，切不切由你决定。"
+        + "goal 下普通计划没清空时不能退出。";
 
     public string ParametersSchemaJson => """
         {
@@ -94,21 +95,9 @@ public sealed class PlanModeTool : ITool
         if (target == Act && initiative == "goal" && PlanTree.Current(plan) is not null)
             return Task.FromResult(ToolText.Of(
                 "普通计划尚未完成；goal 模式完成所有普通节点后才能请求退出规划模式。"));
-        if (target == Act && initiative == Axes.Iterate)
-            return Task.FromResult(ToolText.Of(
-                "iterate 模式不能主动退出规划循环。普通计划完成后核心会回到 plan，并提示你按 T0 规划下一段。"));
 
-        if ((context as SessionToolContext)?.Initiative == Axes.Iterate
-            && current == Plan && target == Act)
-            return Task.FromResult(ToolText.Of(
-                "当前是 iterate 模式；计划用完时核心会自动切回 plan，由你规划下一段。"
-                + "现在先完成 T0 指令和当前计划，不要请求退出。"));
-
-        if ((context as SessionToolContext)?.Initiative == Axes.Iterate
-            && target == Act
-            && PlanTree.Current((context as SessionToolContext)?.Plan) is null)
-            return Task.FromResult(ToolText.Of(
-                "iterate 模式下普通计划为空；核心会切回 plan。先参考 T0 规划下一段并用 plan 写入，之后才能请求切到 act。"));
+        // ⚠️ **iterate 不再限制切 act**（2026-10-26，用户裁定）：那一档把「围绕 T0 反复规划
+        // 与执行」交给模型，切不切由它判断；核心只在普通计划刚用完时提一句该规划下一段。
 
         // 幂等：目标等于当前 ⇒ 什么也不做、不发事件（同 `session.setAxis` 的规矩）。
         if (string.Equals(target, current, StringComparison.Ordinal))
@@ -119,6 +108,17 @@ public sealed class PlanModeTool : ITool
             return Task.FromResult(ToolText.Of(
                 $"已切到规划模式（理由：{reason}）。本步结束时生效——在此之前仍然照旧判定。"
                 + "退出规划模式需要用户批准。"));
+
+        // ---- iterate：切 act **免批**（用户 2026-10-26 裁定）----
+        // ⚠️ 理由：那一档的授权来自 T0——用户把「围绕这条长期任务反复规划与执行」交给了模型，
+        // 其中就包含「规划完就动手」。每段再问一次，等于把授权退回成一问一答。
+        // ⚠️ 免批**只在这一档**：`goal` / `step` / `standard` 下退出规划模式照样要那张卡。
+        // ⚠️ 这里**返回文本而不是 `Ask`** 是安全的：本工具没有副作用，`ToolExecutor` 的收问遍
+        // 拿不到 `Ask` 就当作「不需要问」，随后照常执行一遍——真正落地仍然由 `Stepper` 做。
+        if (initiative == Axes.Iterate)
+            return Task.FromResult(ToolText.Of(
+                $"已退出规划模式（理由：{reason}）。iterate 主动性下不询问：T0 已经授权这段自主循环。"
+                + "本步结束时生效——在此之前仍然照旧判定。"));
 
         // ---- 退出：**任何权限档位都问**（用户裁定）----
         // ⚠️ 判据是「这次调用有没有被批准过」，不是「记不记得住」：

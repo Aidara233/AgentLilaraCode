@@ -120,6 +120,19 @@ public sealed record SessionHandle
     public void NoteInterrupt() => Interlocked.Increment(ref _interruptEpoch);
 
     /// <summary>
+    /// **iterate 下「普通计划刚用完」的一次性提醒**（2026-10-26）。
+    ///
+    /// <para>⚠️ <b>不落盘</b>：它是一句「下一步才说得出的话」，不是状态。丢了最坏的结果是
+    /// 模型晚一步看到提醒——而 T0 与空计划它本来就看得见；反过来，为了一句提醒动
+    /// `state.json` 要付一次磁盘格式迁移（`Json.FormatVersion` +1 与全部金样本）。</para>
+    ///
+    /// <para>⚠️ <b>它替代的是「核心自动切回 plan」</b>：模式由模型自己调 `switch_plan_mode`
+    /// 决定，核心只在计划刚用完的那一刻说一句「该按 T0 规划下一段了」，然后由
+    /// `Stepper` 在装配之后清掉（一次性，不每步重复）。</para>
+    /// </summary>
+    public bool PendingIterateReplan { get; set; }
+
+    /// <summary>
     /// **答复那条路要交给下一步的东西**（`01` §3.8）。
     ///
     /// <para>⚠️ <b>为什么不走「重新入队」那条路</b>：答复不是一条用户消息

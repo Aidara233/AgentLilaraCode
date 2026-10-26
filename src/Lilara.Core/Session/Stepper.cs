@@ -127,6 +127,13 @@ public sealed class Stepper(
         // ——两处各算一次会分叉（尾块说 A 在等回答，而工具眼里 A 已经空闲）。
         var subagents = SubagentScopeFor(handle);
 
+        // ⚠️ **一次性提醒的消费点就在这里**（2026-10-26）：装进尾块之后立刻清掉，所以它只出现一次。
+        // ⚠️ 清在**装配之后**而不是步末：`slots` 已经把那句话冻住了，往后清与现在清没有区别；
+        // 而这一步若中途失败，提醒算「说过了」——代价只是模型少看一句提示
+        // （T0 与空计划它本来就看得见），不会留下错误状态。
+        var iterateReplan = handle.PendingIterateReplan;
+        if (iterateReplan) handle.PendingIterateReplan = false;
+
         var slots = SystemBlock.Render(
             new PresetStore(_store.DataRoot, PresetStore.SystemDir),
             new PresetStore(_store.DataRoot, PresetStore.PremierDir),
@@ -138,7 +145,7 @@ public sealed class Stepper(
             // ⚠️ 文本由解析器交进来（`StepperResolver`），推进器不碰预设——两条路给出同一句话。
             stepState.PendingCompact ? _pendingCompactText : null,
             // ⚠️ **这一行只在真有派生关系时出现**（`SubagentView.Line` 对空关系给 null）。
-            SubagentView.Line(subagents), stepState.Plan);
+            SubagentView.Line(subagents), stepState.Plan, iterateReplan);
 
         // ⚠️ **引擎租约**：所有 `StepAsync` 调用都在 **_stepper 的会话内串行** 之内
         // （`CommandDispatcher` 的会话闸），所以这里不需要再同步。
@@ -392,14 +399,15 @@ public sealed class Stepper(
             // ⚠️ 退出规划模式那一条**只会在批准之后**出现在 `ExecutedCallIds` 里（见 `ApplyModeCalls`）。
             (modeAfter, modeChanged) = ApplyModeCalls(batch.ExecutedCallIds, toolCalls,
                 handle.State.Axes![Axes.Mode], planAfter ?? handle.State.Plan, handle.State.Axes![Axes.Initiative]);
-            // iterate 普通计划耗尽时强制回到 plan，避免同一批 mode=act 覆盖自动回切。
+            // iterate 下普通计划刚用完 ⇒ **只置一条一次性提醒**，模式由模型自己切（2026-10-26 改）。
+            // ⚠️ 核心不再替它切成 plan：自动切会把「模型本来还想接着说 / 接着做」硬掰回规划，
+            // 而它并没有请求过。提醒在下一次装配时进尾块，讲清「该按 T0 规划下一段了」。
+            // ⚠️ 一次性：置位之后由 `ConsumeIterateReplan` 在真正进过尾块的那一步末清掉，
+            // 不在每步重复——重复的提醒会变成噪音，而模型本来就看得到 T0 与空计划。
             if (handle.State.Axes![Axes.Initiative] == Axes.Iterate
                 && planChanged && PlanTree.Current(planAfter) is null
                 && (planAfter?.T0 ?? handle.State.Plan?.T0) is not null)
-            {
-                modeAfter = Tools.PlanModeTool.Plan;
-                modeChanged = !string.Equals(handle.State.Axes[Axes.Mode], modeAfter, StringComparison.Ordinal);
-            }
+                handle.PendingIterateReplan = true;
 
             // ⚠️ **`release` 的线在这里落盘**（`01` §12.4，2026-10-11）：
             // 它和别的事件**不一样**——工具只跑出一次「成功」，而**记录上要留的那条不是结果**。
@@ -434,13 +442,8 @@ public sealed class Stepper(
         // 头靠它刷新「谁在动哪些文件」；不发的话，头会继续显示模型已经说用完了的锁。
         // ⇒ 与 `StepOutcome` 一起交回，由 `CommandDispatcher` 在落盘之后发。
 
-        if (handle.State.Axes![Axes.Initiative] == Axes.Iterate
-            && planChanged && PlanTree.Current(planAfter) is null
-            && (planAfter?.T0 ?? handle.State.Plan?.T0) is not null)
-        {
-            modeAfter = Tools.PlanModeTool.Plan;
-            modeChanged = !string.Equals(handle.State.Axes[Axes.Mode], modeAfter, StringComparison.Ordinal);
-        }
+        // ⚠️ iterate 的提醒**只有一处判据**（上面那条 `if`），这里不再判第二次：
+        // 两处都判会让「什么时候该提醒」有两份真相，而读代码的人不知道该信哪一份。
 
         // ⚠️ **有问 ⇒ 中止这一步的「执行」，但那条模型消息照样落盘**（`01` §3.8）。
         //
@@ -928,13 +931,12 @@ public sealed class Stepper(
             // 模式同理：答复这一批里也可能有 `switch_plan_mode`（退出的那一条**正是**从这里来的）。
             (modeAfter, modeChanged) = ApplyModeCalls(batch.ExecutedCallIds, calls, handle.State.Axes![Axes.Mode],
                 planAfter ?? handle.State.Plan, handle.State.Axes![Axes.Initiative]);
+            // 与 `StepAsync` 同一条判据、同一个效果（答复路径上也可能刚把普通计划推空）：
+            // 只置一次性提醒，不替模型切模式。
             if (handle.State.Axes![Axes.Initiative] == Axes.Iterate
                 && planChanged && PlanTree.Current(planAfter) is null
                 && (planAfter?.T0 ?? handle.State.Plan?.T0) is not null)
-            {
-                modeAfter = Tools.PlanModeTool.Plan;
-                modeChanged = !string.Equals(handle.State.Axes[Axes.Mode], modeAfter, StringComparison.Ordinal);
-            }
+                handle.PendingIterateReplan = true;
 
             // ⚠️ **`release` 的线在这里也要落**（2026-10-17）——原先只在 `StepAsync` 有一半：
             // 一批里只要有一条要问，整批就挂起；用户批准之后全部执行（`ToolExecutor` 的
@@ -1147,7 +1149,7 @@ public sealed class Stepper(
             state.PendingCompact ? _pendingCompactText : null,
             // 子会话那一行同理：答复路径不给它的话，用户批准一次询问之后
             // 模型会以为自己没有孩子——而它其实有一堆。
-            SubagentView.Line(subagents));
+            SubagentView.Line(subagents), iterateReplan: handle.PendingIterateReplan);
         return FloatingTextOf(slots);
     }
 
@@ -1285,7 +1287,6 @@ public sealed class Stepper(
             var target = ToolArgs.String(call.Arguments, "mode");
             if (target is not (Tools.PlanModeTool.Plan or Tools.PlanModeTool.Act)) continue;
             if (string.IsNullOrWhiteSpace(ToolArgs.String(call.Arguments, "reason"))) continue;
-            if (target == Tools.PlanModeTool.Act && initiative == Axes.Iterate) continue;
             if (target == Tools.PlanModeTool.Act && initiative == "goal" && PlanTree.Current(plan) is not null) continue;
             if (target == mode) continue;
             mode = target;

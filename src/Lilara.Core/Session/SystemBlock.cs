@@ -77,14 +77,15 @@ public static class SystemBlock
         string? goalDirective = null,
         string? compactDirective = null,
         string? subagentLine = null,
-        SessionPlan? plan = null) =>
+        SessionPlan? plan = null,
+        bool iterateReplan = false) =>
         Build(
             // ⚠️ 传**可空**的预设正文，不在这里折成 `SystemFallback`：那一折会抹掉
             // 「文件不在」与「文件在」的区分，而 `SystemBody` 的判据正是它
             // （文件不在时兜底里已含机制说明；文件在时补一句）。
             Load(presets, systemPresetId),
             Load(premiers, premierId),
-            axes, pluginPrompt, goalDirective, compactDirective, subagentLine, plan);
+            axes, pluginPrompt, goalDirective, compactDirective, subagentLine, plan, iterateReplan);
 
     /// <summary>
     /// 三块槽位的**纯装配**——输入是已经读好的两份正文 + 轴 + 插件贡献，不碰任何存储。
@@ -105,14 +106,15 @@ public static class SystemBlock
         string? goalDirective = null,
         string? compactDirective = null,
         string? subagentLine = null,
-        SessionPlan? plan = null) =>
+        SessionPlan? plan = null,
+        bool iterateReplan = false) =>
         new(
             System: Text(SystemBody(systemText, pluginPrompt?.Text(PromptSlot.System))),
             Premier: Wrap(CorePrompts.PremierOpen,
                 Join(premierText, pluginPrompt?.Text(PromptSlot.Primary)), CorePrompts.PremierClose),
             Tail: Wrap(CorePrompts.TailOpen,
                 TailBody(axes, pluginPrompt?.Text(PromptSlot.Floating), goalDirective,
-                    compactDirective, subagentLine, plan),
+                    compactDirective, subagentLine, plan, iterateReplan),
                 CorePrompts.TailClose));
 
     // 非空自定义预设也需要机制说明；显式空预设且无系统贡献时仍不产生系统块。
@@ -169,7 +171,8 @@ public static class SystemBlock
     /// </summary>
     private static string? TailBody(
         IReadOnlyDictionary<string, string> axes, string? plugin, string? goalDirective,
-        string? compactDirective = null, string? subagentLine = null, SessionPlan? plan = null)
+        string? compactDirective = null, string? subagentLine = null, SessionPlan? plan = null,
+        bool iterateReplan = false)
     {
         var table = AxisTable(axes);
         var planText = PlanTree.Render(plan);
@@ -183,10 +186,13 @@ public static class SystemBlock
                 : axes.GetValueOrDefault(Axes.Initiative) == "step"
                     ? CorePrompts.StepPlanDirective
                     : null;
-        var iterateDirective = axes.GetValueOrDefault(Axes.Initiative) == Axes.Iterate
-            && PlanTree.Current(plan) is null && plan?.T0 is not null
-                ? CorePrompts.IteratePlanningDirective
-                : null;
+        // ⚠️ **提醒由标志决定，不由「树现在是空的」决定**（2026-10-26）：树空而模型没切模式时
+        // 每步都念一遍就成了噪音——用户要的是「刚用完那一步说一次」。
+        // ⇒ 判据是 `SessionHandle.PendingIterateReplan`（`Stepper` 在计划刚被推空时置位，
+        // 装配进尾块之后立刻清掉，所以它天然只出现一次）。
+        var iterateDirective = iterateReplan && axes.GetValueOrDefault(Axes.Initiative) == Axes.Iterate
+            ? CorePrompts.IteratePlanningDirective
+            : null;
         var descriptions = Axes.RenderOrder.Where(Axes.InContext)
             .Where(axes.ContainsKey)
             .Select(axis => Axes.DescriptionOf(axis, axes[axis]) is { } explanation
