@@ -219,6 +219,14 @@ if (api is not null) await api.StopAsync(CancellationToken.None);
 //（心跳文件还在 ⇒ 下一次知道要收尾）。
 await heartbeat.CancelAsync();
 await heartbeatTask;
+
+// ⚠️ **后台任务也要一起走**（用户裁定：「一块退出，最后结果记得写原因」）。
+// ⚠️ 放在删心跳文件**之前**：反过来的话，那些任务的 `Reason` 还没写完，
+// 而下一次启动会看到「Running ⇒ 结局未知」——那会**盖掉我们本来写得出原因**的这一格。
+// ⚠️ 而**强杀 / 断电走不到这里**，那条路由 `CoreHost.CreateBackgroundJobs` 里的 `Recover()` 兜底
+// （把残留的 Running 标成 Lost 并写明原因）。两条路互补，缺一条就会出现假活口。
+host.BackgroundJobs.KillAll("核心正常退出（控制台 quit / Ctrl-C）。");
+
 try { File.Delete(heartbeatFile); } catch (IOException) { /* 删不掉最多误报一次崩溃 */ }
 
 return 0;

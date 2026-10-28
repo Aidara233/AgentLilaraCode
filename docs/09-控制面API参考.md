@@ -727,32 +727,36 @@
 ### 3.17 `GET /sessions/{id}/context`
 
 **最近一次实际请求的输入 token**（上下文长度的事实来源）。
+⚠️ 2026-10-27：它的选取判据与 `inputTokens` 的口径**与浮动读数那一行是同一份**
+（`Session/ContextUsage`）——两处各算一遍会出现「尾块说未知、这里报出一条旧值」。
 
 ```jsonc
 {
   "sessionId": "…",
   "projectKey": "…",
-  "latest": {                       // 没有任何一次**报了输入**的调用 ⇒ null（键被省略）
+  "latest": {                       // 最近一次真实请求没报输入 ⇒ null（键被省略）
     "callId": "…",
     "startedAt": "…", "endedAt": "…",
     "modelId": "deepseek-flash",
     "protocol": "claude-messages",
-    "inputTokens": 1200,
-    "source": "reported",           // 能走到这里就一定是上报的（没报输入的那次不会入选）
+    "inputTokens": 1200,            // ⚠️ **归一后的总输入**：未命中输入 + 缓存读取（Claude 另加缓存写入）
+    "source": "reported",           // 能走到这里就一定是上报的
     "requestFingerprint": "…"       // 可空
   },
+  "line": "上次调用上下文总长度：1200 tokens（上游报告的总输入，含缓存；不含输出，非本次估算）。",
   "preview": null                   // 本地 tokenizer 预估；**今天恒为 null**
 }
 ```
 
 - ⚠️ `preview` 是显式 `null`（键**存在**，值为 `null`），不是省略——两者在线上可分辨。
   今天它恒为 `null`：预估未实现。
-- ⚠️ `latest` 只取**报了输入**（`usage.inputTokens`）的最近一条——不是「带了 usage」：
-  一次失败的尝试可以只报输出、没报输入，挑到它会把「上下文长度」显示成未报告，
-  那比一条旧值更糟（看起来像上下文没了）。`source` 因此今天恒是 `"reported"`
-  （`"unknown"` 那条分支实际够不着，留着是给将来）。
+- ⚠️ **取哪一条**：本会话**最后一次真实请求**（`purpose=session`，按 `startedAt` 取末条）。
+  它没报输入 ⇒ `latest` 省略、`line` 是「未知」那句话，**不回退**到更早那条已知值
+  ——「上次调用的上下文总长度」问的是那一次，用更早的冒充它就是在编一个数。
+  （2026-10-27 之前这里挑的是「最近一条报了输入的调用」，与浮动读数那一行不一致。）
+- ⚠️ **`line` 就是模型看到的那一行**：头直接显示它，不必自己拼文案。
 - 不存在 ⇒ **404**；不激活会话。
-- 证据：`ControlServer.cs` 的 `/sessions/{id}/context`。
+- 证据：`ControlServer.cs` 的 `/sessions/{id}/context` + `Session/ContextUsage.cs`。
 
 ### 3.18 `GET /network-config`
 

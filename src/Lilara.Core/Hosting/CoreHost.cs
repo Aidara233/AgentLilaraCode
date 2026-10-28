@@ -41,6 +41,39 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
     private readonly Dictionary<string, Stepper> _steppers = new();
     private readonly Lock _stepperLock = new();
 
+    /// <summary>
+    /// **后台任务的进程表**（2026-10-24）。⚠️ <b>进程级、一个数据根一份</b>——
+    /// 它持有 `Process` 句柄，而那些句柄属于**这个进程**，不属于某个会话。
+    ///
+    /// <para>⚠️ <b>它不认识任何一种具体工具</b>：`shell` / `dotnet_build` / `dotnet_test`
+    /// 都走这一张表（种类是 <c>job.json</c> 里的 <c>kind</c>）。</para>
+    ///
+    /// <para>⚠️ <b>它在构造时就把上一次留下的残骸标成「结局未知」</b>（<see cref="IBackgroundJobs.Recover"/>）：
+    /// 强杀 / 断电走不到退出清理，盘上会留一格 <c>Running</c>。不修的话 `jobs`
+    /// 会永远显示一个**假的活口**，而模型会等一个不会来的结果。</para>
+    ///
+    /// <para>⚠️ <b>「核心退出时全部杀掉」有两个落点，缺一不可</b>
+    /// （用户裁定 + 要求写明原因）：CLI 的退出路径（正常 <c>quit</c> / Ctrl-C）
+    /// 与 <see cref="Hosting.KernelRuntime.Dispose"/>（嵌入方）。⚠️ 而**强杀两处都走不到**
+    /// ——那正是 <see cref="IBackgroundJobs.Recover"/> 存在的原因，两者是**互补**关系，不是重复。</para>
+    /// </summary>
+    public IBackgroundJobs BackgroundJobs { get; } = CreateBackgroundJobs(dataRoot);
+
+    /// <summary>
+    /// 造宿主，**顺手做一次重启补偿**（<see cref="IBackgroundJobs.Recover"/>）。
+    ///
+    /// <para>⚠️ <b>为什么写在初始化器里、而不是构造函数体里</b>：`CoreHost` 用的是主构造函数，
+    /// 没有地方放语句体。⚠️ 而「造完就 Recover」是一条**必须成对**的事实——
+    /// 交回一个没 Recover 过的宿主，`jobs` 就会显示上一个进程留下的假活口。
+    /// ⇒ 收进一个工厂方法，让「造」与「补偿」在语法上不可分割。</para>
+    /// </summary>
+    private static IBackgroundJobs CreateBackgroundJobs(string dataRoot)
+    {
+        var jobs = new Session.Tools.BackgroundJobHost(dataRoot);
+        jobs.Recover();
+        return jobs;
+    }
+
     public SessionStore Store => _store;
     public ProviderStore Providers => _providers;
     public UsageStore Usage => _usage;
@@ -148,6 +181,19 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
     /// <para>读不出来时返回 <c>"Idle"</c>：这是**尽最大努力**的判据，不是权威。
     /// 返回 null 会逼每个调用方各写一遍兜底。</para>
     /// </summary>
+    /// <summary>Task observation includes scheduled steps and queued input; Idle between steps is not completion.</summary>
+    public string? TaskStatusOf(string sessionId)
+    {
+        if (_activated.TryGetValue(sessionId, out var live))
+        {
+            if (live.State.Status == SessionStatus.WaitingForInput) return SessionStatus.WaitingForInput;
+            if (Live.IsLive(live)) return SessionStatus.Running;
+            return live.State.Status;
+        }
+        var found = _store.FindSession(sessionId);
+        return found is null ? null : _store.ReadState(found.Value.ProjectKey, sessionId).Status;
+    }
+
     public string StatusOf(string sessionId)
     {
         if (_activated.TryGetValue(sessionId, out var live)) return live.State.Status;
@@ -197,7 +243,7 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
         {
             if (_steppers.TryGetValue(handle.SessionId, out var cached)) return cached;
 
-            var stepper = StepperResolver.Resolve(_store, _providers, handle.Spec.Model.ProviderId, Plugins, _usage);
+            var stepper = StepperResolver.Resolve(_store, _providers, handle.Spec.Model.ProviderId, Plugins, _usage, BackgroundJobs, StatusOf);
             _steppers[handle.SessionId] = stepper;
             return stepper;
         }

@@ -47,6 +47,7 @@ public sealed class SpawnTool : ITool
         + "它落定（或者有事要问你）时，你会收到一条 subagent_report 结果。"
         + "⚠️ 它在后台跑：**不要**为了看进度反复 tell_child，也不要一直去确认它的状态——"
         + "回报会自动回来，而一次「看看进度」的催促只会打断它。"
+        + "下一步确实需要结果时，可用 wait(task=子会话id) 等它本轮工作停下；需要回答或审批时等待会返回阻塞状态。"
         + "⚠️ 默认只能派生一层：子会话自己不能再派生。";
 
     public string ParametersSchemaJson => """

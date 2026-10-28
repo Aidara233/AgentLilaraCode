@@ -157,7 +157,8 @@ public sealed class PlanModeToolTests : IDisposable
             StringComparison.Ordinal);
 
         static string Tail(IReadOnlyDictionary<string, string> axes, SessionPlan plan, bool replan) =>
-            string.Concat(SystemBlock.Build(null, null, axes, null, null, null, null, plan, replan)
+            string.Concat(SystemBlock.Build(null, null,
+                    new TailContext(axes) { Plan = plan, IterateReplan = replan })
                 .Tail.OfType<Block.TextBlock>().Select(block => block.Text));
 
         static int Occurrences(string haystack, string needle)

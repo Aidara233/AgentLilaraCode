@@ -311,6 +311,30 @@ public abstract record CoreCommand
 
     public sealed record SessionCompact(string SessionId) : CoreCommand;
 
+    /// <summary>
+    /// **列出某个会话的后台任务**（2026-10-27）——用户侧的那只眼。
+    ///
+    /// <para>⚠️ <b>它是 `off` 档下的逃生口的一半</b>：模型那一侧的 `jobs` / `job_kill` 都受权限轴管，
+    /// 而**命令不受它管**（同 `session.interrupt`）——用户总能看见并停掉自己机器上的进程。
+    /// 判据是「命令是用户自己的手，不是模型的动作」。</para>
+    ///
+    /// <para>⚠️ 它<b>不</b>顺手把任务列表塞进会话记录：那是一条**查询**，不是一件发生过的事。
+    /// 落进记录会让模型以为「用户刚说了句话」。</para>
+    /// </summary>
+    public sealed record JobsList(string SessionId) : CoreCommand;
+
+    /// <summary>
+    /// **停掉一个后台任务**（2026-10-27）。理由同上：用户侧必须有这个口子。
+    ///
+    /// <para>⚠️ <b>与工具那条 `job_kill` 的区别只有「过不过权限闸」</b>：两者最终都调
+    /// <see cref="Kernel.IBackgroundJobs.Kill"/>，归属判据（只认本会话的任务）由宿主统一守。
+    /// 不存在「命令能杀别人的」——那会让一条命令变成跨会话的越权通道。</para>
+    /// </summary>
+    public sealed record JobKill(string SessionId, string JobId) : CoreCommand;
+
+    /// <summary>读取本会话任务的输出字节窗口；省略 Offset 从头读，下一页使用 NextOffset。</summary>
+    public sealed record JobOutput(string SessionId, string JobId, long Offset = 0) : CoreCommand;
+
     /// <summary>占用一片区域。路径可以是相对的，按会话的工作目录解析。</summary>
     /// <param name="Scope">
     /// **名字与形状都照协议**：release 的形参写作 `scope: [...]` ⇒ 它是**列表**。

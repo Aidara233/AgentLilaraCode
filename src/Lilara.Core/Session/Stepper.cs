@@ -26,7 +26,9 @@ public sealed class Stepper(
     UsageStore? usage = null,
     Func<TimeSpan, CancellationToken, Task>? retryDelay = null,
     INetworkTransport? networkTransport = null,
-    string? pendingCompactText = null)
+    string? pendingCompactText = null,
+    IBackgroundJobs? backgroundJobs = null,
+    Func<string, string?>? sessionStatus = null)
 {
     private readonly SessionStore _store = store;
     private readonly IModelAdapter _adapter = adapter;
@@ -86,6 +88,26 @@ public sealed class Stepper(
     /// 而测试不能真的连公网。生产路径不传 = 真的走 HTTP。
     /// </summary>
     private readonly INetworkTransport _networkTransport = networkTransport ?? new HttpNetworkTransport();
+
+    /// <summary>
+    /// **后台任务的宿主**（2026-10-24）。⚠️ <c>null</c> = 这个推进器没有后台能力
+    /// ——后台工具会回一句人话，前台路径照常。
+    ///
+    /// <para>⚠️ <b>它是<b>注入</b>的，不是这里造的</b>：宿主是**进程级**的（一个数据根一份），
+    /// 而 `Stepper` 是**会话级**的（`CoreHost.StepperFor` 每会话一个）。
+    /// 在这里 `new` 一个会让每个会话各有一张进程表，而「核心退出时杀干净」那句话当场失效。</para>
+    ///
+    /// <para>⚠️ 与 <see cref="INetworkTransport"/> 同一个形状与同一个理由（可测性）：
+    /// 后台任务的判据（不随步死 / 杀得掉 / 上限）必须能测，而真起进程的测试既慢又不稳。</para>
+    /// </summary>
+    private readonly IBackgroundJobs? _backgroundJobs = backgroundJobs;
+
+    /// <summary>
+    /// **子会话状态的实况探针**（2026-10-27，`wait` 用）。⚠️ 注入而不是自查：
+    /// 现读状态要知道「这一刻有没有东西在推它」，而那件事只在 `CoreHost` 手上
+    /// （`LiveSessions` + 激活表）。⚠️ `null` = 没有通道（纯单测），`wait` 会如实说看不见。
+    /// </summary>
+    public Func<string, string?>? TaskStatus { get; set; } = sessionStatus;
 
     /// <summary>
     /// 构造时定下的适配器。⚠️ 这个只读访问器存在的唯一理由是**可测性**：
@@ -148,18 +170,17 @@ public sealed class Stepper(
         var iterateReplan = handle.PendingIterateReplan;
         if (iterateReplan) handle.PendingIterateReplan = false;
 
+        // ⚠️ **三处装配点共用同一个入口**（2026-10-27）：`TailContext.For` 从 handle 派生
+        // 目标线、压缩线、子会话行、计划树、一次性提醒、上下文用量——这里不再逐项传参。
+        // 从前那六样是六个可空位置参数，于是「头里没有计划树」「答复路径没有计划树」
+        // 这类漏传在编译期完全合法（三次）。现在少传一样东西在**结构上**不可能。
+        // ⚠️ `iterateReplan:` 显式交「清之前读到的值」：那面旗子上面刚被清掉（只许说一次）。
         var slots = SystemBlock.Render(
             new PresetStore(_store.DataRoot, PresetStore.SystemDir),
             new PresetStore(_store.DataRoot, PresetStore.PremierDir),
             handle.Spec.SystemPromptPreset, handle.Spec.PremierPrompt,
-            pluginAxes.Values, pluginPrompt,
-            // ⚠️ 目标线进**尾块**（浮动上下文），不落盘：目标是状态，不是事件。
-            GoalMode.IsActive(stepState) ? CorePrompts.GoalDirective : null,
-            // 压缩指令同源：它也是状态（`state.json` 的 `pendingCompact`），不是事件。
-            // ⚠️ 文本由解析器交进来（`StepperResolver`），推进器不碰预设——两条路给出同一句话。
-            stepState.PendingCompact ? _pendingCompactText : null,
-            // ⚠️ **这一行只在真有派生关系时出现**（`SubagentView.Line` 对空关系给 null）。
-            SubagentView.Line(subagents), stepState.Plan, iterateReplan);
+            TailContext.For(handle, pluginAxes.Values, pluginPrompt, subagents, _usage,
+                compactDirective: _pendingCompactText, iterateReplan: iterateReplan));
 
         // ⚠️ **引擎租约**：所有 `StepAsync` 调用都在 **_stepper 的会话内串行** 之内
         // （`CommandDispatcher` 的会话闸），所以这里不需要再同步。
@@ -380,14 +401,21 @@ public sealed class Stepper(
                 // 所以「谁算数」只有 `CompactTool.Parse` 一个答案。
                 handle.State.PendingCompact,
                 // ⚠️ shell 配置与联网同形：执行这一刻现读（浮动字段），步内冻结。
-                ShellFor(),
+                ShellFor(handle),
                 // ⚠️ **用步开始冻住的那一份**（2026-10-24）：与尾块同一份字节，
                 // 两处各算一次会让「模型从尾块看到的」与「工具判定的」分叉。
                 subagents,
                 handle.State.Plan,
                 handle.State.Axes![Axes.Mode],
                 callIdsToExecute,
-                handle.State.Axes![Axes.Initiative]);
+                handle.State.Axes![Axes.Initiative],
+                // ⚠️ **实况探针**（2026-10-27）：`wait` 等子会话时靠它现读状态
+                // ——`subagents` 那份是步开始的快照，用来「等」会永远等到超时。
+                TaskStatus,
+                // ⚠️ **越过 900k 之后任何模式都压得成**（2026-10-27）：判据与尾块那句命令式
+                // 警告是**同一个谓词**（`ContextUsage.OverLimit`）——两处各判会分叉，
+                // 而分叉的表现是「尾块喊着现在就压、工具却回一句没有指令」。
+                ContextUsage.OverLimit(_usage, handle.SessionId));
 
             // 相位：回复里有 tool_use，接下来是工具执行。
             onPhase?.Invoke(SessionPhase.Tools);
@@ -528,7 +556,11 @@ public sealed class Stepper(
             var contextForCompact = new SessionToolContext(
                 handle.Spec.WorkingDirectory, blobsForCompact, recorded,
                 FloatingTextOf(slots), NetworkFor(handle), GoalMode.IsActive(handle.State),
-                handle.State.PendingCompact, ShellFor());
+                handle.State.PendingCompact, ShellFor(handle),
+                initiative: handle.State.Axes![Axes.Initiative],
+                // ⚠️ 落检查点时**重判一次**超限（同 `Parse` 那条注释：以这一刻的上下文为准），
+                // 用的是与步开始那条工具上下文**同一个谓词**。
+                contextFull: ContextUsage.OverLimit(_usage, handle.SessionId));
             compactSummary = Tools.CompactTool.Parse(
                 new ToolCall(compactCall.CallId, compactCall.Name, compactCall.Arguments),
                 contextForCompact, out _);
@@ -925,12 +957,16 @@ public sealed class Stepper(
                 NetworkFor(handle),
                 GoalMode.IsActive(handle.State),
                 handle.State.PendingCompact,
-                ShellFor(),
+                ShellFor(handle),
                 subagents,
                 handle.State.Plan,
                 handle.State.Axes![Axes.Mode],
                 reply.Kind is AskKind.Permission ? reply.CallIds : null,
-                handle.State.Axes![Axes.Initiative]);
+                handle.State.Axes![Axes.Initiative],
+                TaskStatus,
+                // 同上（2026-10-27）：答复路径也要知道「是不是已经越过那条硬线」，
+                // 否则用户批准的那次 compact 会被拒，而尾块刚刚才命令它压。
+                ContextUsage.OverLimit(_usage, handle.SessionId));
 
             // 相位：答复之后真正跑掉的那批工具。
             onPhase?.Invoke(SessionPhase.Tools);
@@ -1221,19 +1257,24 @@ public sealed class Stepper(
         var state = handle.State;
         var axes = _plugins.Freeze(PluginSessionView.Values(state), now, handle.Spec.Plugins ?? []);
         var prompt = _plugins.Collect(axes, handle.Spec.Plugins ?? []);
-        var slots = SystemBlock.Build(systemText: null, premierText: null, axes.Values, prompt,
-            // 与 `StepAsync` 同一来源：答复路径 / 控制面探测看到的尾块也要带目标线。
-            GoalMode.IsActive(state) ? CorePrompts.GoalDirective : null,
-            // 压缩指令同理：答复路径上也必须看得到它，否则用户下发指令后去批准一次询问，
-            // 那条尾块会「忽然没有压缩请求」——而指令明明还在。
-            state.PendingCompact ? _pendingCompactText : null,
-            // 子会话那一行同理：答复路径不给它的话，用户批准一次询问之后
-            // 模型会以为自己没有孩子——而它其实有一堆。
-            SubagentView.Line(subagents), iterateReplan: handle.PendingIterateReplan);
+        // ⚠️ **与 `StepAsync` 共用 `TailContext.For`**（2026-10-27）：这条路从前逐项传参，
+        // 于是目标线、压缩线、子会话行、上下文用量都在、**计划树不在**——而「头里看不到计划」
+        // 与「批准一次询问之后计划消失」是同一个缺陷的两个面。今天它只交 handle + 三样外部输入。
+        var slots = SystemBlock.Build(systemText: null, premierText: null,
+            TailContext.For(handle, axes.Values, prompt, subagents, _usage,
+                compactDirective: _pendingCompactText));
         return FloatingTextOf(slots);
     }
 
-    /// <summary>尾槽位的块 → 一段文本。<c>null</c> = 没有尾块（`SystemBlock.Wrap` 的「连包边一起不产出」）。</summary>
+    /// <summary>
+    /// 本会话上次请求的输入用量那一行。
+    /// ⚠️ <b>实现只有一份</b>（<see cref="ContextUsage.Line"/>）：控制面的
+    /// `GET /sessions/{id}/context` 读的是同一份测量，两处不该各自算一遍
+    /// ——从前它们连「取哪一条调用」的判据都不同（一处回退到更早的已知值，一处不回退）。
+    /// </summary>
+    internal string PreviousContextUsage(SessionHandle handle) =>
+        ContextUsage.Line(_usage, handle.SessionId);
+
     private static string? FloatingTextOf(PromptSlots slots)
     {
         var text = string.Concat(slots.Tail.OfType<Block.TextBlock>().Select(b => b.Text));
@@ -1252,8 +1293,14 @@ public sealed class Stepper(
     /// <summary>
     /// 这一刻的 shell 能力快照（`shell.json`）。⚠️ 与 <see cref="NetworkFor"/> 同一条：
     /// **每步读一次配置**，步内冻结。「能不能跑」不在这里——那是权限轴的事。
+    ///
+    /// <para>⚠️ <b><paramref name="handle"/> 是 2026-10-24 才加的参数</b>：后台任务要按
+    /// **会话归属**（`IShellJobHost` 只认本会话的任务），而会话 id 只能从 handle 来。
+    /// 另给一个 <c>string sessionId</c> 参数也能做到，但那会让两个调用点各挑一个——
+    /// 交整个 handle 是「归属就是那个会话」这句话的直接形状。</para>
     /// </summary>
-    private ShellAccess ShellFor() => new(new ShellStore(_store.DataRoot).Load());
+    private ShellAccess ShellFor(SessionHandle handle) =>
+        new(new ShellStore(_store.DataRoot).Load(), _backgroundJobs, handle.SessionId);
 
     /// <summary>
     /// 这一刻的**派生关系快照**（`01` §10，2026-10-24）。⚠️ 与 <see cref="ShellFor"/> 同一条：

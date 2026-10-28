@@ -48,7 +48,7 @@ internal static class DotnetRunner
 
     public static Task<ToolOutcome> RunBuildAsync(
         string executable, ToolCall call, IToolContext context, CancellationToken ct) =>
-        RunBuildAsync(executable, call, context, BuildTimeout, ct);
+        RunAsync("dotnet_build", "build", executable, call, context, BuildTimeout, ct);
 
     public static async Task<ToolOutcome> RunBuildAsync(
         string executable, ToolCall call, IToolContext context, TimeSpan timeout, CancellationToken ct) =>
@@ -56,11 +56,101 @@ internal static class DotnetRunner
 
     public static Task<ToolOutcome> RunTestAsync(
         string executable, ToolCall call, IToolContext context, CancellationToken ct) =>
-        RunTestAsync(executable, call, context, TestTimeout, ct);
+        RunAsync("dotnet_test", "test", executable, call, context, TestTimeout, ct);
 
     public static async Task<ToolOutcome> RunTestAsync(
         string executable, ToolCall call, IToolContext context, TimeSpan timeout, CancellationToken ct) =>
         await RunAsync("dotnet_test", "test", executable, call, context, timeout, ct);
+
+    /// <summary>
+    /// **后台启动**：与 <see cref="RunAsync"/> 共用同一份参数校验与同一份 argv，
+    /// 只是不等它跑完（2026-10-24 用户裁定「其余的可异步指令也一样」）。
+    ///
+    /// <para>⚠️ <b>为什么值得给 dotnet 也开后台</b>：一次全量构建 / 全量测试动辄几十秒到几分钟，
+    /// 而前台那条会**占着这一步**。后台化之后模型可以「先起构建，再去看别的」。
+    /// ⚠️ <b>而它不新增任何判据</b>：参数校验、`BuildArguments`、环境清理全部复用——
+    /// 后台只是「谁等退出」这一个差别（与 `ShRunner.RunAsync` / `StartProcess` 同一条分工）。</para>
+    ///
+    /// <para>⚠️ <b>同目录互斥那条闸不在这条路上</b>：它保护的是**同一目录并发构建**，
+    /// 而后台任务的生命周期远长于一次调用——把 `SemaphoreSlim` 攥在一个后台任务里，
+    /// 别的会话会**无限等**它（而不是等到自己超时）。⇒ 后台构建**不拿那把闸**，
+    /// 代价如实认：同一目录可能同时跑两个 MSBuild，而它们会在 `obj/` 上撞锁并各自报错。
+    /// 这条判据写在 `JobRequest` 旁边，改它之前先读这段。</para>
+    /// </summary>
+    public static ToolOutcome StartBackground(
+        string toolName, string verb, string executable, ToolCall call, IToolContext context)
+    {
+        if (context.Shell is not { } shell)
+            return Decision(toolName, "这个会话没有后台任务上下文。");
+
+        if (shell.BackgroundDenialFor() is { } denial)
+            return Decision(toolName, denial);
+
+        if (!TryParseArguments(toolName, verb, call.ArgumentsJson, context,
+                out var project, out var noRestore, out var noIncremental, out var filter, out var error))
+            return Decision(toolName, error!);
+
+        if (ReadTimeout(call, out var timeoutSeconds) is { } timeoutError)
+            return Decision(toolName, timeoutError);
+
+        var args = BuildArguments(verb, project, noRestore, noIncremental, filter);
+
+        var environment = new Dictionary<string, string?>(StringComparer.Ordinal);
+        foreach (var key in BuildEnvironmentKeysToClear()) environment[key] = null;
+        foreach (var (key, value) in BuildEnvironmentOverrides()) environment[key] = value;
+
+        var started = shell.Jobs!.Start(shell.SessionId!, new BackgroundJobRequest
+        {
+            Kind = toolName,
+            Label = $"dotnet {verb} {project}" + (filter is null ? "" : $" --filter {filter}"),
+            Executable = executable,
+            Arguments = args,
+            WorkingDirectory = context.WorkingDirectory,
+            Environment = environment,
+            TimeoutSeconds = timeoutSeconds,
+        });
+
+        if (started.Job is not { } job) return Decision(toolName, started.Error ?? "后台任务没能启动。");
+
+        return new ToolOutcome
+        {
+            Content =
+            [
+                new Block.TextBlock(
+                    $"已在后台启动（任务 {job.Id}，pid {job.ProcessId}）：dotnet {verb} {project}。"
+                    + (job.TimeoutSeconds is { } s ? $"它会在 {s} 秒后被自动停掉。\n" : "\n")
+                    + "用 job_output 读它跑到哪了；jobs 看它还在不在；job_kill 停掉它。\n"
+                    + "⚠️ 不要在这一步等它：先去干别的，回头再来看结果。"),
+            ],
+            Fingerprint = null,
+            DependsOn = null,
+            Framing = new ToolFraming(toolName,
+            [
+                new ToolFramingField("job", job.Id),
+                new ToolFramingField("state", "running"),
+            ]),
+        };
+    }
+
+    /// <summary>
+    /// 读 `timeoutSeconds`（两个工具共用）。⚠️ 与 `ShellTool.TryReadTimeout` **同一条判据**：
+    /// 显式给了但读不出来 ⇒ **拒绝**，不悄悄用默认值。
+    /// </summary>
+    private static string? ReadTimeout(ToolCall call, out int? seconds)
+    {
+        seconds = null;
+        if (!ToolPaths.HasKey(call.ArgumentsJson, "timeoutSeconds")) return null;
+
+        if (ToolArgs.Number(call.ArgumentsJson, "timeoutSeconds") is not { } value)
+            return "`timeoutSeconds` 必须是整数秒。";
+
+        if (value < BackgroundJobLimits.MinTimeoutSeconds || value > BackgroundJobLimits.MaxTimeoutSeconds)
+            return $"`timeoutSeconds` 要在 {BackgroundJobLimits.MinTimeoutSeconds}"
+                 + $"..{BackgroundJobLimits.MaxTimeoutSeconds} 秒之间（给的是 {value}）。不限时就不写这个参数。";
+
+        seconds = (int)value;
+        return null;
+    }
 
     private static async Task<ToolOutcome> RunAsync(
         string toolName, string verb, string executable, ToolCall call, IToolContext context,
@@ -70,11 +160,13 @@ internal static class DotnetRunner
                 out var project, out var noRestore, out var noIncremental, out var filter, out var error))
             return Decision(toolName, error!);
 
+        if (ReadTimeout(call, out var explicitTimeout) is { } timeoutError)
+            return Decision(toolName, timeoutError);
+        if (explicitTimeout is { } seconds) timeout = TimeSpan.FromSeconds(seconds);
         var args = BuildArguments(verb, project, noRestore, noIncremental, filter);
 
         var start = CreateStartInfo(executable, context, args);
         using var process = new Process { StartInfo = start };
-
         var gate = DirectoryGates.GetOrAdd(context.WorkingDirectory, _ => new SemaphoreSlim(1, 1));
         try
         {
@@ -177,8 +269,8 @@ internal static class DotnetRunner
             }
 
             var allowed = verb == "build"
-                ? new[] { "project", "noRestore", "noIncremental" }
-                : new[] { "project", "noRestore", "filter" };
+                ? new[] { "project", "noRestore", "noIncremental", "background", "timeoutSeconds" }
+                : new[] { "project", "noRestore", "filter", "background", "timeoutSeconds" };
             var unknown = root.EnumerateObject().Select(p => p.Name)
                 .FirstOrDefault(name => !allowed.Contains(name, StringComparer.Ordinal));
             if (unknown is not null)
@@ -365,25 +457,38 @@ internal static class DotnetRunner
         // ⚠️ 清掉继承的构建环境：外部的 `DOTNET_*` / `MSBUILD*` / `NUGET_*` 能改变构建行为
         // （目标框架、还原源、诊断开关），而模型不该被这些**它看不见的输入**影响；
         // 同 `GitWriteTool` 清 `GIT_*` 的判据。
-        foreach (var key in start.Environment.Keys
-                     .Where(k => k.StartsWith("DOTNET_", StringComparison.OrdinalIgnoreCase)
-                         || k.StartsWith("MSBUILD", StringComparison.OrdinalIgnoreCase)
-                         || k.StartsWith("NUGET_", StringComparison.OrdinalIgnoreCase))
-                     .ToArray())
-            start.Environment.Remove(key);
+        // ⚠️ 这两段是**后台那条路共用的同一份数据**（`StartBackground` 也要它）——
+        // 抄一份过去，两条路的构建环境就会漂，而漂的后果是一次「前台过、后台不过」的构建。
+        foreach (var key in BuildEnvironmentKeysToClear()) start.Environment.Remove(key);
+        foreach (var (key, value) in BuildEnvironmentOverrides()) start.Environment[key] = value;
 
-        start.Environment["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1";
-        start.Environment["DOTNET_NOLOGO"] = "1";
-        start.Environment["DOTNET_SKIP_FIRST_TIME_EXPERIENCE"] = "1";
-        start.Environment["DOTNET_GENERATE_ASPNET_CERTIFICATE"] = "0";
-        // 构建输出的语言固定成英文，避免同一份失败在不同区域设置下渲染成不同的文本。
-        start.Environment["LC_ALL"] = "C";
-        start.Environment["LANG"] = "C";
-        // ⚠️ Windows 上 `dotnet` 会把中文摘要按控制台代码页（默认 936/GBK）写出来，
-        // 而这里按 UTF-8 解码 ⇒ 不解码失败也只会得到乱码，且**不报错**。
-        start.Environment["VSLANG"] = "1033";
         return start;
     }
+
+    /// <summary>
+    /// 要从继承环境里**删掉**的那些变量（前缀判据）。⚠️ 前台与后台共用这一处。
+    /// ⚠️ 返回的是**前缀**，不是枚举——枚举一张清单等于要求维护它。
+    /// </summary>
+    internal static IReadOnlyList<string> BuildEnvironmentKeysToClear() =>
+        [.. Environment.GetEnvironmentVariables().Keys.Cast<string>()
+            .Where(k => k.StartsWith("DOTNET_", StringComparison.OrdinalIgnoreCase)
+                || k.StartsWith("MSBUILD", StringComparison.OrdinalIgnoreCase)
+                || k.StartsWith("NUGET_", StringComparison.OrdinalIgnoreCase))];
+
+    /// <summary>要**设上**的那些变量（前台与后台共用）。</summary>
+    internal static IReadOnlyList<(string Key, string? Value)> BuildEnvironmentOverrides() =>
+    [
+        ("DOTNET_CLI_TELEMETRY_OPTOUT", "1"),
+        ("DOTNET_NOLOGO", "1"),
+        ("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1"),
+        ("DOTNET_GENERATE_ASPNET_CERTIFICATE", "0"),
+        // 构建输出的语言固定成英文，避免同一份失败在不同区域设置下渲染成不同的文本。
+        ("LC_ALL", "C"),
+        ("LANG", "C"),
+        // ⚠️ Windows 上 `dotnet` 会把中文摘要按控制台代码页（默认 936/GBK）写出来，
+        // 而这里按 UTF-8 解码 ⇒ 不解码失败也只会得到乱码，且**不报错**。
+        ("VSLANG", "1033"),
+    ];
 
     /// <summary>
     /// 有界读取：**只保留开头**，最多 <see cref="ToolLimits.MaxToolOutputBytes"/> 字节。
@@ -492,7 +597,9 @@ public sealed class DotnetBuildTool : ITool
         + "不给 `project` 时使用工作目录顶层的唯一 .sln / .slnx / .csproj；多个候选会报错并列出它们。"
         + "会先还原依赖（可能联网）；`noRestore` 跳过还原。"
         + "`noIncremental` 强制重新编译——改完代码想确认「真的能编过」时用它。"
-        + "只编译，不跑测试；不开放其他 dotnet 参数。";
+        + "只编译，不跑测试；不开放其他 dotnet 参数。"
+        + "构建可能要几分钟：`background: true` 让它转到后台，立刻拿到任务 id（之后用 jobs / job_output / job_kill）；"
+        + "`timeoutSeconds` 给这一次的超时。";
 
     public string ParametersSchemaJson => """
         {
@@ -509,13 +616,36 @@ public sealed class DotnetBuildTool : ITool
             "noIncremental": {
               "type": "boolean",
               "description": "忽略增量构建结果，强制完整重新编译。"
+            },
+            "background": {
+              "type": "boolean",
+              "description": "true = 转到后台构建并立刻返回任务 id（不等它跑完）。省略 = 前台等结果。"
+            },
+            "timeoutSeconds": {
+              "type": "integer",
+              "description": "这一次的超时（秒），1..3600。省略 = 前台用默认 180 秒 / 后台不限时。"
             }
           }
         }
         """;
 
     public Task<ToolOutcome> RunAsync(ToolCall call, IToolContext context, CancellationToken ct) =>
-        DotnetRunner.RunBuildAsync(_executable, call, context, ct);
+        ToolArgs.Bool(call.ArgumentsJson, "background")
+            ? Task.FromResult(DotnetRunner.StartBackground("dotnet_build", "build", _executable, call, context))
+            : DotnetRunner.RunBuildAsync(_executable, call, context, TimeoutOf(call), ct);
+
+    /// <summary>
+    /// 这一次的超时：给了就用，没给就是默认。⚠️ 越界**不夹紧**（同 `ShellTool` 那条）：
+    /// 悄悄换成一个模型没要求的数，会让它误判「为什么会超时」。
+    /// </summary>
+    private static TimeSpan TimeoutOf(ToolCall call)
+    {
+        if (!ToolPaths.HasKey(call.ArgumentsJson, "timeoutSeconds")) return DotnetRunner.BuildTimeout;
+        if (ToolArgs.Number(call.ArgumentsJson, "timeoutSeconds") is not { } value) return DotnetRunner.BuildTimeout;
+
+        return TimeSpan.FromSeconds(Math.Clamp(value,
+            BackgroundJobLimits.MinTimeoutSeconds, BackgroundJobLimits.MaxTimeoutSeconds));
+    }
 }
 
 /// <summary>
@@ -542,7 +672,9 @@ public sealed class DotnetTestTool : ITool
         + "不给 `project` 时使用工作目录顶层的唯一 .sln / .slnx / .csproj；多个候选会报错并列出它们。"
         + "会先还原依赖（可能联网）；`noRestore` 跳过还原。"
         + "`filter` 只跑匹配的测试，例如 FullyQualifiedName~StepperTests。"
-        + "不开放其他 dotnet 参数。";
+        + "不开放其他 dotnet 参数。"
+        + "全量测试可能要几分钟：`background: true` 让它转到后台，立刻拿到任务 id"
+        + "（之后用 jobs / job_output / job_kill）；`timeoutSeconds` 给这一次的超时。";
 
     public string ParametersSchemaJson => """
         {
@@ -559,11 +691,31 @@ public sealed class DotnetTestTool : ITool
             "filter": {
               "type": "string",
               "description": "测试筛选表达式，例如 FullyQualifiedName~StepperTests；最多 512 字符。"
+            },
+            "background": {
+              "type": "boolean",
+              "description": "true = 转到后台跑测试并立刻返回任务 id（不等它跑完）。省略 = 前台等结果。"
+            },
+            "timeoutSeconds": {
+              "type": "integer",
+              "description": "这一次的超时（秒），1..3600。省略 = 前台用默认 300 秒 / 后台不限时。"
             }
           }
         }
         """;
 
     public Task<ToolOutcome> RunAsync(ToolCall call, IToolContext context, CancellationToken ct) =>
-        DotnetRunner.RunTestAsync(_executable, call, context, ct);
+        ToolArgs.Bool(call.ArgumentsJson, "background")
+            ? Task.FromResult(DotnetRunner.StartBackground("dotnet_test", "test", _executable, call, context))
+            : DotnetRunner.RunTestAsync(_executable, call, context, TimeoutOf(call), ct);
+
+    /// <summary>这一次的超时：给了就用，没给就是默认。⚠️ 与 build 那条同一条判据（`TimeoutOf` 的注释）。</summary>
+    private static TimeSpan TimeoutOf(ToolCall call)
+    {
+        if (!ToolPaths.HasKey(call.ArgumentsJson, "timeoutSeconds")) return DotnetRunner.TestTimeout;
+        if (ToolArgs.Number(call.ArgumentsJson, "timeoutSeconds") is not { } value) return DotnetRunner.TestTimeout;
+
+        return TimeSpan.FromSeconds(Math.Clamp(value,
+            BackgroundJobLimits.MinTimeoutSeconds, BackgroundJobLimits.MaxTimeoutSeconds));
+    }
 }

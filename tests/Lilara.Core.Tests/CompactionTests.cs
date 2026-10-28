@@ -52,6 +52,162 @@ public sealed class CompactionTests : IDisposable
     private Stepper NewStepper(FakeAdapter adapter) =>
         new(_store, adapter, BuiltInTools.All, pendingCompactText: CorePrompts.CompactDirective);
 
+    [Theory]
+    [InlineData("goal", true)]
+    [InlineData("iterate", true)]
+    [InlineData("standard", false)]
+    [InlineData("step", false)]
+    public void FloatingContext_ExplainsAutonomousCompaction(string initiative, bool expected)
+    {
+        var axes = new Dictionary<string, string>(Axes.Defaults()) { [Axes.Initiative] = initiative };
+        var text = string.Concat(SystemBlock.Build(null, null, new TailContext(axes))
+            .Tail.OfType<Block.TextBlock>().Select(b => b.Text));
+        Assert.Equal(expected, text.Contains(CorePrompts.AutonomousCompactionDirective));
+    }
+
+    /// <summary>
+    /// ⚠️ **越过 900k 之后尾块里是那句命令式的「现在就压」，而且任何主动性都有**
+    /// （2026-10-27 用户裁定：无论哪个模型都允许自动压缩）。
+    ///
+    /// <para>⚠️ 同时钉住「它是<b>替换</b>而不是并列」：goal / iterate 下那句「你可随时自行决定」
+    /// 必须**消失**——两句并存时「随时」会把「现在」稀释掉，而这一格没有选择。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("standard")]
+    [InlineData("step")]
+    [InlineData("goal")]
+    [InlineData("iterate")]
+    public void FloatingContext_OverLimit_CommandsCompactionInEveryMode(string initiative)
+    {
+        SetInitiative(initiative);
+        var text = TailTextAt(initiative, tokens: ContextUsage.AutoCompactThreshold);
+
+        Assert.Contains(CorePrompts.ContextOverflowDirective, text, StringComparison.Ordinal);
+        Assert.DoesNotContain(CorePrompts.AutonomousCompactionDirective, text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ **边界下侧仍是老规矩**：899_999 不到线 ⇒ standard 里一句压缩话都没有，
+    /// goal / iterate 里只有那句「可以自行决定」。这条挡的是「阈值写成 `>` 变成了 `>=` 以外
+    /// 的任意误改」，也是「一直在喊压」的另一种失效形态。
+    /// </summary>
+    [Theory]
+    [InlineData("standard", false)]
+    [InlineData("goal", true)]
+    public void FloatingContext_BelowLimit_KeepsTheOldRule(string initiative, bool autonomous)
+    {
+        SetInitiative(initiative);
+        var text = TailTextAt(initiative, tokens: ContextUsage.AutoCompactThreshold - 1);
+
+        Assert.DoesNotContain(CorePrompts.ContextOverflowDirective, text, StringComparison.Ordinal);
+        Assert.Equal(autonomous, text.Contains(CorePrompts.AutonomousCompactionDirective, StringComparison.Ordinal));
+    }
+
+    /// <summary>按「上一次调用报了多少输入」装配一份尾块——走的是生产路径（`TailContext.For`）。</summary>
+    private string TailTextAt(string initiative, long tokens)
+    {
+        var usage = new UsageStore(_store.DataRoot);
+        usage.Append(new UsageCall
+        {
+            CallId = Ids.New(), SessionId = _handle.SessionId, ProviderId = "provider", ModelId = "model",
+            Protocol = Protocols.ClaudeMessages, StartedAt = CoreClock.Now(), Status = "completed",
+            Usage = new TokenUsage { InputTokens = tokens },
+        });
+        var axes = new Dictionary<string, string>(_handle.State.Axes!) { [Axes.Initiative] = initiative };
+        return string.Concat(SystemBlock.Build(null, null,
+                TailContext.For(_handle, axes, plugin: null,
+                    new SubagentScope(_handle.SessionId, null, 0, 1, []), usage))
+            .Tail.OfType<Block.TextBlock>().Select(b => b.Text));
+    }
+
+    [Theory]
+    [InlineData(Protocols.ClaudeMessages, 600)]
+    [InlineData(Protocols.OpenAiChat, 300)]
+    public async Task FloatingContext_ReportsPreviousInputIncludingCache(string protocol, long expected)
+    {
+        var usage = new UsageStore(_store.DataRoot);
+        var adapter = new FakeAdapter().ReplyWith(_ => new ModelReply
+        {
+            Blocks = [new Block.TextBlock("ok")], StopReason = "end_turn", Refused = false,
+            Usage = new TokenUsage { InputTokens = 100, CacheReadTokens = 200, CacheWriteTokens = 300, OutputTokens = 99 },
+        });
+        usage.Append(new UsageCall
+        {
+            CallId = "previous", SessionId = _handle.SessionId, ProviderId = "provider", ModelId = "model",
+            Protocol = protocol, StartedAt = CoreClock.Now(), Status = "completed",
+            Usage = new TokenUsage { InputTokens = 100, CacheReadTokens = 200, CacheWriteTokens = 300, OutputTokens = 99 },
+        });
+        var stepper = new Stepper(_store, adapter, BuiltInTools.All, usage: usage);
+        await stepper.StepAsync(_handle, [], CancellationToken.None);
+        var request = adapter.Calls.Single();
+        var text = string.Concat(request.Slots.Tail.OfType<Block.TextBlock>().Select(b => b.Text))
+            + string.Concat(request.Timeline.OfType<TimelineEvent.ToolResultEvent>()
+                .SelectMany(r => r.Content.OfType<Block.TextBlock>()).Select(b => b.Text));
+        Assert.Contains($"上次调用上下文总长度：{expected} tokens", text);
+    }
+
+    [Fact]
+    public void FloatingContext_MissingUsageDoesNotReuseOlderCount()
+    {
+        var usage = new UsageStore(_store.DataRoot);
+        foreach (var known in new[] { true, false })
+            usage.Append(new UsageCall
+            {
+                CallId = Ids.New(), SessionId = _handle.SessionId, ProviderId = "provider", ModelId = "model",
+                Protocol = Protocols.ClaudeMessages, StartedAt = CoreClock.Now(), Status = "completed",
+                Usage = known ? new TokenUsage { InputTokens = 123 } : null,
+            });
+        var stepper = new Stepper(_store, new FakeAdapter(), BuiltInTools.All, usage: usage);
+        Assert.Contains("未知", stepper.PreviousContextUsage(_handle));
+    }
+
+    private void SetInitiative(string initiative) =>
+        _handle.UpdateState(s => s with
+        {
+            Axes = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal)
+            {
+                [Axes.Initiative] = initiative,
+                [Axes.Permission] = "off",
+            },
+        });
+
+    [Theory]
+    [InlineData("goal")]
+    [InlineData("iterate")]
+    public async Task CompactTool_AutonomousModes_CanCompactRepeatedlyWithoutRequest(string initiative)
+    {
+        SetInitiative(initiative);
+        var adapter = new FakeAdapter().ReplyWith(_ => Calls(("c1", "compact", Args("第一份摘要"))));
+        var first = await NewStepper(adapter).StepAsync(_handle, [], CancellationToken.None);
+        Assert.NotNull(first.Compacted);
+        Assert.False(_handle.State.PendingCompact);
+        Assert.Equal(initiative, _handle.State.Axes![Axes.Initiative]);
+
+        var next = new FakeAdapter().ReplyWith(_ => Calls(("c2", "compact", Args("累积摘要"))));
+        var second = await NewStepper(next).StepAsync(_handle, [], CancellationToken.None);
+        Assert.NotNull(second.Compacted);
+        Assert.Equal(2, new CompactionStore(_store).ReadAll(_handle.ProjectKey, _handle.SessionId).Count);
+        Assert.False(_handle.State.PendingCompact);
+        var rendered = TimelineRender.Render(_store, _handle);
+        Assert.DoesNotContain(rendered.OfType<TimelineEvent.MessageEvent>(), m => m.Id == "user-1");
+        Assert.Contains(rendered.OfType<TimelineEvent.MessageEvent>()
+            .SelectMany(m => m.Blocks.OfType<Block.ToolUseBlock>()), c => c.CallId == "c2");
+    }
+
+    [Theory]
+    [InlineData("goal", false, "摘要")]
+    [InlineData("iterate", false, "摘要")]
+    [InlineData("goal", true, "")]
+    [InlineData("iterate", true, "")]
+    public async Task CompactTool_AutonomousModes_StillValidateArguments(string initiative, bool requested, string summary)
+    {
+        SetInitiative(initiative);
+        var adapter = new FakeAdapter().ReplyWith(_ => Calls(("c1", "compact", Args(summary, requested))));
+        var outcome = await NewStepper(adapter).StepAsync(_handle, [], CancellationToken.None);
+        Assert.Null(outcome.Compacted);
+        Assert.Null(Latest());
+    }
+
     private void RequestCompaction() =>
         _handle.UpdateStateAndPersist(_store, s => s with { PendingCompact = true }, diskStatus: SessionStatus.Idle);
 
@@ -82,9 +238,12 @@ public sealed class CompactionTests : IDisposable
     }
 
     // 没有指令 ⇒ 一句人话、什么都不做：没有检查点、历史没被切、指令状态不变。
-    [Fact]
-    public async Task CompactTool_WithoutRequest_DoesNothing()
+    [Theory]
+    [InlineData("step")]
+    [InlineData("standard")]
+    public async Task CompactTool_WithoutRequest_DoesNothing(string initiative)
     {
+        SetInitiative(initiative);
         var adapter = new FakeAdapter().ReplyWith(_ => Calls(("c1", "compact", Args("不该生效"))));
 
         var outcome = await NewStepper(adapter).StepAsync(_handle, [], CancellationToken.None);
@@ -98,6 +257,65 @@ public sealed class CompactionTests : IDisposable
         Assert.Contains("没有压缩指令", string.Concat(result.Content.OfType<Block.TextBlock>().Select(b => b.Text)));
         // 投影仍然看得到全部历史。
         Assert.Null(ContextCompaction.Project(_store, _handle).Checkpoint);
+    }
+
+    /// <summary>
+    /// ⚠️ **越过 900k ⇒ standard 也压得成**（2026-10-27 用户裁定：无论哪个模型、哪个模式都允许）。
+    ///
+    /// <para>⚠️ 它同时钉住「授权判据与尾块那句警告<b>同源</b>」：尾块刚喊完「现在就压」、
+    /// 工具却回一句「没有指令」，是这一格最坏的分叉——模型照着做了，却被自己拒掉。</para>
+    /// </summary>
+    [Fact]
+    public async Task CompactTool_AtOverLimit_CompactsEvenInStandardMode()
+    {
+        SetInitiative("standard");
+        var usage = SeedUsage(ContextUsage.AutoCompactThreshold);
+        var adapter = new FakeAdapter().ReplyWith(_ => Calls(("c1", "compact", Args("超限摘要"))));
+
+        var outcome = await new Stepper(_store, adapter, BuiltInTools.All, usage: usage,
+            pendingCompactText: CorePrompts.CompactDirective).StepAsync(_handle, [], CancellationToken.None);
+
+        // ⚠️ 这一步自己的回复**没有报用量**（`FakeAdapter` 不带 usage），而超限判据取的是
+        // 「最近一次**报过**输入的调用」⇒ 这一格恰好也钉住了那条不对称的取舍：
+        // 不能用「最近一次调用没报 ⇒ 未知」把安全带松开。
+        Assert.NotNull(outcome.Compacted);
+        Assert.Null(outcome.Compacted.Summary);          // 摘要只在参数里（同其他用例）
+        Assert.False(_handle.State.PendingCompact);      // 没有指令可清，也没凭空造一条
+    }
+
+    /// <summary>
+    /// ⚠️ **边界下侧不放行**：少一个 token 就不算「必须压」，standard 仍要用户下发指令。
+    /// 没有这条，把阈值写成 0 也会绿。
+    /// </summary>
+    [Fact]
+    public async Task CompactTool_BelowLimit_StandardMode_IsStillRefused()
+    {
+        SetInitiative("standard");
+        var usage = SeedUsage(ContextUsage.AutoCompactThreshold - 1);
+        var adapter = new FakeAdapter().ReplyWith(_ => Calls(("c1", "compact", Args("不该生效"))));
+
+        var outcome = await new Stepper(_store, adapter, BuiltInTools.All, usage: usage,
+            pendingCompactText: CorePrompts.CompactDirective).StepAsync(_handle, [], CancellationToken.None);
+
+        Assert.Null(outcome.Compacted);
+        Assert.Null(Latest());
+        var result = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .Last(r => !r.CallId.StartsWith("floating-", StringComparison.Ordinal));
+        Assert.Contains("没有压缩指令", string.Concat(result.Content.OfType<Block.TextBlock>().Select(b => b.Text)));
+    }
+
+    /// <summary>按「上一次调用报了多少输入」造一条账本行——超限判据读的就是它。</summary>
+    private UsageStore SeedUsage(long inputTokens)
+    {
+        var usage = new UsageStore(_store.DataRoot);
+        usage.Append(new UsageCall
+        {
+            CallId = Ids.New(), SessionId = _handle.SessionId, ProviderId = "provider", ModelId = "model",
+            Protocol = Protocols.ClaudeMessages, StartedAt = CoreClock.Now(), Status = "completed",
+            Usage = new TokenUsage { InputTokens = inputTokens },
+        });
+        return usage;
     }
 
     // `requested: false` ⇒ 工具拒绝——这是「误触发」的显式闸，而摘要顶掉的历史不可逆。

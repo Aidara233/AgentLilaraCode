@@ -19,6 +19,13 @@ public sealed class KernelRuntime : IDisposable
     private readonly object _gateLock = new();
     private bool _disposed;
 
+    /// <summary>
+    /// **这个进程亲手载入过的会话**（`wait` 探针用）。⚠️ 与 `CoreHost._activated` 同一个理由：
+    /// `Running` 只写内存 ⇒ 不看这一份就只能看到盘上的 `Idle`，而那会让 `wait` 以为
+    /// 子会话早就停了（**比等下去更坏**：它会让父在子还没干完时就去汇报）。
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SessionHandle> _live = new(StringComparer.Ordinal);
+
     private KernelRuntime(string dataRoot, string workingDirectory, IDisposable dataRootLock)
     {
         DataRoot = Path.GetFullPath(dataRoot);
@@ -26,6 +33,12 @@ public sealed class KernelRuntime : IDisposable
         _dataRootLock = dataRootLock;
         Store = new SessionStore(DataRoot);
         Usage = new UsageStore(DataRoot);
+
+        // ⚠️ **重启补偿在这一刻做**（同 `CoreHost`）：上一个进程被强杀时会把任务留在 `Running`，
+        // 而那是一个假的活口——`jobs` 会一直说「在跑」，模型会等一个不会来的结果。
+        var jobs = new Session.Tools.BackgroundJobHost(DataRoot);
+        jobs.Recover();
+        BackgroundJobs = jobs;
     }
 
     public string DataRoot { get; }
@@ -33,6 +46,13 @@ public sealed class KernelRuntime : IDisposable
     public SessionStore Store { get; }
     public UsageStore Usage { get; }
     public PluginHost Plugins => _plugins;
+
+    /// <summary>
+    /// **后台任务的进程表**（2026-10-24）。⚠️ 嵌入方只要用 `KernelRuntime`，
+    /// 后台能力就自动接上——这条是刻意的：让「后台能不能用」变成一个**装配事实**，
+    /// 而不是每个宿主各记得接一次的约定。
+    /// </summary>
+    public IBackgroundJobs BackgroundJobs { get; }
 
     public static KernelRuntime Open(string dataRoot, string workingDirectory)
     {
@@ -64,6 +84,7 @@ public sealed class KernelRuntime : IDisposable
         var handle = SessionHandle.Create(Store, WorkingDirectory, model, title,
             systemPromptPreset, askTimeout: askTimeout, plugins: _plugins);
         lock (_gateLock) _sessionGates.Add(handle.SessionId, new SemaphoreSlim(1, 1));
+        _live[handle.SessionId] = handle;   // `wait` 探针要它（见 `_live` 的注释）
         return handle;
     }
 
@@ -72,6 +93,7 @@ public sealed class KernelRuntime : IDisposable
         ThrowIfDisposed();
         var handle = SessionHandle.Load(Store, projectKey, sessionId);
         lock (_gateLock) _sessionGates.TryAdd(sessionId, new SemaphoreSlim(1, 1));
+        _live[sessionId] = handle;   // `wait` 探针要它
         return handle;
     }
 
@@ -149,7 +171,8 @@ public sealed class KernelRuntime : IDisposable
                     Blocks = input,
                 });
 
-            var stepper = new Stepper(Store, adapter, tools, _plugins, Usage);
+            var stepper = new Stepper(Store, adapter, tools, _plugins, Usage,
+                backgroundJobs: BackgroundJobs, sessionStatus: SessionStatusOf);
             return await stepper.StepAsync(handle, input, cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -158,10 +181,29 @@ public sealed class KernelRuntime : IDisposable
         }
     }
 
+    /// <summary>
+    /// **子会话状态的实况探针**（2026-10-27，`wait` 用）：内存优先、盘面回退。
+    /// ⚠️ 读盘那半是必要的：一个**没被这个进程载入**的子会话，它的真相只在 `state.json` 里
+    /// （`Running` 从不落盘 ⇒ 那一格最多是 `Idle` / `WaitingForInput`，不会骗人）。
+    /// </summary>
+    private string? SessionStatusOf(string sessionId)
+    {
+        if (_live.TryGetValue(sessionId, out var live)) return live.State.Status;
+
+        var found = Store.FindSession(sessionId);
+        return found is null ? null : Store.ReadState(found.Value.ProjectKey, sessionId).Status;
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+
+        // ⚠️ **后台任务跟着这个核心一起走**（用户裁定：一块退出，并写清原因）。
+        // 顺序在释放闸之前：那些任务与这些闸无关，而它们若还活着，`Dispose` 之后
+        // 就再也没有人能停掉它们了（句柄随这个对象一起没）。
+        BackgroundJobs.KillAll("核心退出了（KernelRuntime 被释放）。");
+
         lock (_gateLock)
         {
             foreach (var gate in _sessionGates.Values) gate.Dispose();

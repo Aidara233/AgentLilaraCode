@@ -317,7 +317,7 @@ public interface IToolContext
     /// **用户下发过、而 `compact` 还没消费的压缩指令**（2026-10-22）。
     ///
     /// <para>⚠️ <b>它是那份<b>持久化</b>指令在工具这一侧的唯一入口</b>（`SessionState.PendingCompact`）。
-    /// `compact` 据此判「这次调用算不算数」——没指令时它是<b>一句人话 + 什么都不做</b>。</para>
+    /// `compact` 在 step / standard 模式据此判授权；goal / iterate 无需这条指令也能自主压缩。</para>
     ///
     /// <para>⚠️ <b>它不是「留位」用的</b>（那条「别为了留位先加没人用的成员」）：消费者今天就有两个
     /// ——`CompactTool`（判生效）与尾块指令（`Stepper` 每步注入的那句「用户要求压缩」）。
@@ -418,8 +418,8 @@ public interface ITool
     ///
     /// <para>⚠️ <b>今天只有 `compact` 声明 `false`</b>，判据是「它不改变世界」：
     /// 它只动<b>加载边界</b>（哪些记录还给模型看），不碰工作目录、不联网、不进库；
-    /// 而它<b>本来就只在用户下发的指令期内生效</b>（`IToolContext.CompactRequested`）。
-    /// ⇒ 指令就是授权。再拿一个档位去拦它，只会造出「`off` 档下压缩压不了」——
+    /// 它由用户压缩指令（`IToolContext.CompactRequested`）或 goal / iterate 主动性授权。
+    /// ⇒ 再拿一个档位去拦它，只会造出「`off` 档下压缩压不了」——
     /// 而 `off` 档的语义是「别动我的东西」，不是「不许整理你自己的上下文」；
     /// 真压不了时连这次会话本身都会撑爆。</para>
     ///

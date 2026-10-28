@@ -211,6 +211,39 @@ public static class CoreCommandParser
         if (trimmed.StartsWith("session gc ", StringComparison.Ordinal))
             return OneWord(trimmed, "session gc ", id => new CoreCommand.SessionGc(id));
 
+        // 后台任务（2026-10-27）：`jobs [<会话>]` 与 `job kill <任务>`。
+        // ⚠️ **两条都必须有文本形态**：没有的话它们会掉进 `Repl.AsMessage`，
+        // 被当成一条消息发给模型——用户以为在看 / 停了任务，实际烧了一次调用、
+        // 而后台那个进程还在跑（正是 `off` 档下最需要逃生口的时候）。
+        if (string.Equals(trimmed, "jobs", StringComparison.OrdinalIgnoreCase))
+            return currentSessionId is null
+                ? (null, "用法：jobs [<会话 id>]（控制台里可以省略，表示当前会话）")
+                : (new CoreCommand.JobsList(currentSessionId), null);
+
+        if (StartsWithToken(trimmed, "jobs"))
+            return OneWordBody(trimmed, "jobs", body => new CoreCommand.JobsList(body));
+
+        if (StartsWithToken(trimmed, "job"))
+        {
+            const string usage = "用法：job kill <任务 id> | job output <任务 id> [--offset <字节位置>]（任务 id 见 `jobs`）";
+            var words = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (words.Length < 3) return (null, usage);
+            var kill = string.Equals(words[1], "kill", StringComparison.OrdinalIgnoreCase);
+            var output = string.Equals(words[1], "output", StringComparison.OrdinalIgnoreCase);
+            long offset = 0;
+            if (kill ? words.Length != 3 : !output || (words.Length != 3 && words.Length != 5))
+                return (null, usage);
+            if (output && words.Length == 5
+                && (!string.Equals(words[3], "--offset", StringComparison.OrdinalIgnoreCase)
+                    || !long.TryParse(words[4], System.Globalization.NumberStyles.None,
+                        System.Globalization.CultureInfo.InvariantCulture, out offset)))
+                return (null, usage);
+            if (currentSessionId is null)
+                return (null, "还没有选中会话。先 `session create` 或 `session activate <id>`。");
+            return (kill ? new CoreCommand.JobKill(currentSessionId, words[2])
+                : new CoreCommand.JobOutput(currentSessionId, words[2], offset), null);
+        }
+
         // 光一个 `axis` 不能落回「当成消息」——用户以为在设轴（`axis set` 已被上面截住）。
         if (string.Equals(trimmed, "axis", StringComparison.OrdinalIgnoreCase))
             return (null, "用法：axis set <会话 id> <轴> <值>");
@@ -348,6 +381,23 @@ public static class CoreCommandParser
             sid is null
                 ? (null, "还没有选中会话。先 `session create` 或 `session activate <id>`。")
                 : (make(sid, path), null);
+    }
+
+    // `jobs <会话>` / `job kill <任务>`：判「前缀之后恰好一个词」。
+    //
+    // ⚠️ **与 `OneWord` 分开**只是一个差别：`make` 可能返回 `null`（命令缺会话上下文时），
+    // 而那要折成一句用法——两者混在一起会让「没有当前会话」看起来像「命令不存在」。
+    private static (CoreCommand?, string?) OneWordBody(string line, string prefix, Func<string, CoreCommand?> make)
+    {
+        if (!line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return (null, null);
+
+        var parts = line[prefix.Length..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 1) return (null, $"用法：{prefix} <id>");
+
+        return make(parts[0]) is { } command
+            ? (command, null)
+            : (null, $"用法：{prefix} <id>（在控制台里，先在会话里操作才省略会话 id）");
     }
 
     // `session deactivate <id>` / `session delete <id>`：只判「前缀之后恰好一个词」。

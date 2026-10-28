@@ -169,6 +169,32 @@ public static class CorePrompts
     /// </summary>
     public const string TailDeclaration = "每步重建 · 此刻的值";
 
+    public const string AutonomousCompactionDirective =
+        "goal / iterate 模式下，你可随时自行决定压缩时机并调用 compact，无需用户授权。"
+        + "结合上次调用上下文总长度和剩余任务判断；压缩前保留目标、关键事实、决定、未完成任务与必要引用。";
+
+    /// <summary>
+    /// 上下文越过那条硬线（<see cref="Session.ContextUsage.AutoCompactThreshold"/>）时的那句话
+    /// ——**命令式，而且与主动性轴、与模型都无关**（2026-10-27 用户裁定）。
+    ///
+    /// <para>⚠️ <b>它替换掉 <see cref="AutonomousCompactionDirective"/>，不是与它并列</b>：
+    /// 越过 900k 之后「你可以自己决定压不压」是错的话——这一格没有选择。两句同时出现还会让
+    /// 「随时」压过「现在」，而那正是最不该被稀释的一格。</para>
+    ///
+    /// <para>⚠️ <b>它必须自己说清「授权」</b>：模型的默认推理是「compaction 要用户批准」
+    /// （这句话在它的训练里到处都是），所以光喊「快压」不够——得同时说「这一步任何模式都允许」，
+    /// 否则它会去等一个不会来的指令。</para>
+    ///
+    /// <para>⚠️ <b>它必须说「先别再读」</b>：压之前的每一次 `read` 都在把窗口往上顶，
+    /// 而摘要只要写清「已确认的事实 + 未完成的任务 + 必要的 id」，细节压完还能取回。</para>
+    /// </summary>
+    public const string ContextOverflowDirective =
+        "最近一次已知的上下文长度已越过 " + "900k"
+        + " tokens：**现在**就调用 compact（requested: true），不要再往下做别的。"
+        + "这一步不受主动性轴限制——无论当前主动性是什么、无论用的是哪个模型，都允许你立刻压缩，不需要用户授权。"
+        + "把当前目标、已确认的事实、关键决定与约束、未完成任务、重要文件路径与工具结果 id、当前状态和不确定的地方写进 summary；"
+        + "压缩之前不要再读新文件，需要引用的东西先记成 id 或路径。";
+
     /// <summary>
     /// 尾块里轴表那一行的**开头**。
     ///

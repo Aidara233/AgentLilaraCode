@@ -52,10 +52,10 @@ public sealed class SubagentStatusTests : IDisposable
     public void Tail_CarriesTheSubagentNormOnlyWhenThereIsASubagentLine()
     {
         var withLine = TailText(SystemBlock.Build(
-            null, null, Axes.Defaults(), subagentLine: "子会话 c1 运行中"));
+            null, null, new TailContext(Axes.Defaults(), SubagentLine: "子会话 c1 运行中")));
         Assert.Contains(CorePrompts.SubagentNorm, withLine, StringComparison.Ordinal);
 
-        var without = TailText(SystemBlock.Build(null, null, Axes.Defaults()));
+        var without = TailText(SystemBlock.Build(null, null, new TailContext(Axes.Defaults())));
         Assert.DoesNotContain(CorePrompts.SubagentNorm, without, StringComparison.Ordinal);
 
         static string TailText(PromptSlots slots) =>

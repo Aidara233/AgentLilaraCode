@@ -606,27 +606,30 @@ public sealed class ControlServer(
         app.MapGet("/sessions/{id}/context", (string id) =>
         {
             if (host.Store.FindSession(id) is not { } found) return Results.NotFound();
-            // ⚠️ 只挑**报了输入**的调用：一次失败的尝试可以带 usage（有输出、没输入），
-            // 挑到它会让「上下文长度」变成「未报告」——而那比一条旧值更糟，它看起来像上下文没了。
-            // 判据与 `UsageSummary.CallsWithKnownInput` 同一个谓词。
-            var latest = host.Usage.ForSession(id).Select(Normalized)
-                .LastOrDefault(c => c.Usage?.InputTokens is not null);
+            // ⚠️ **与浮动读数里那一行同一份测量**（`ContextUsage`，2026-10-27）：
+            // 从前这里挑「最近一条报了输入的调用」（会回退到更早的值），而尾块那边
+            // 只看「最近一次请求、它没报就未知」——同一件事两个答案，用户无从判断信谁。
+            // ⇒ 判据只有一处：最近一次真实请求；它没报输入 ⇒ 未知，不回退。
+            var (last, _, total) = ContextUsage.Measure(host.Usage, id);
             return Results.Json(new
             {
                 SessionId = id,
                 ProjectKey = found.ProjectKey,
-                Latest = latest is null ? null : new
+                Latest = last is null || total is null ? null : new
                 {
-                    latest.CallId,
-                    latest.StartedAt,
-                    latest.EndedAt,
-                    latest.ModelId,
-                    latest.Protocol,
-                    InputTokens = latest.Usage?.InputTokens,
-                    // 判据在上面的 LastOrDefault 里已经收死了：能走到这里就一定报了输入。
+                    last.CallId,
+                    last.StartedAt,
+                    last.EndedAt,
+                    last.ModelId,
+                    last.Protocol,
+                    // ⚠️ 给的是**归一口径下的总输入**（未命中输入 + 缓存读取，Claude 另加缓存写入），
+                    // 与浮动读数里那个数逐字相同。原先这里是「未命中输入」一项，两个数对不上。
+                    InputTokens = total,
                     Source = "reported",
-                    RequestFingerprint = latest.RequestFingerprint,
+                    last.RequestFingerprint,
                 },
+                // ⚠️ 这一句就是模型看到的那一行（同一份文案），头可以直接显示，不必自己拼。
+                Line = ContextUsage.Line(host.Usage, id),
                 Preview = (object?)null,
             }, WireJson.Options);
         });
@@ -760,6 +763,42 @@ public sealed class ControlServer(
                 },
             }, WireJson.Options);
         });
+
+        // 后台任务（2026-10-27）。⚠️ **用户侧的那只眼**：模型那一侧的 `jobs` / `job_kill`
+        // 受权限轴管（`off` 档下连看都看不到），而头必须永远看得见自己机器上跑了什么。
+        // ⚠️ 与 `/claims` 同一条纪律：**不 Activate、不产生状态副作用**（纯读）。
+        app.MapGet("/sessions/{id}/jobs/{jobId}/output", (string id, string jobId, long? offset) =>
+        {
+            if (host.Store.FindSession(id) is null) return Results.NotFound();
+            if (offset is < 0) return Results.BadRequest(new { error = "offset 不能是负数。" });
+            var read = host.BackgroundJobs.Read(id, jobId, offset ?? 0, BackgroundJobLimits.MaxReadBytes);
+            if (read is null) return Results.NotFound();
+            return Results.Json(new
+            {
+                SessionId = id, JobId = jobId,
+                read.Text, read.Offset, read.NextOffset, read.TotalBytes, read.Running,
+                Truncated = read.TotalBytes >= BackgroundJobLimits.MaxOutputBytes,
+            }, WireJson.Options);
+        });
+
+        app.MapGet("/sessions/{id}/jobs", (string id) =>
+        {
+            if (host.Store.FindSession(id) is not { } found) return Results.NotFound();
+
+            var jobs = host.BackgroundJobs.List(id).Select(job => new
+            {
+                job.Id, job.Kind, job.State, job.ExitCode, job.Reason,
+                job.StartedAt, job.EndedAt, job.OutputBytes, job.ProcessId, job.TimeoutSeconds,
+                job.Label, job.WorkingDirectory,
+            });
+
+            return Results.Json(new
+            {
+                SessionId = id,
+                ProjectKey = found.ProjectKey,
+                Jobs = jobs,
+            }, WireJson.Options);
+        });
     }
 
     // 一条事件的可渲染形态（核心渲染，头只显示）。
@@ -807,21 +846,17 @@ public sealed class ControlServer(
         {
             problem = ex.Message;
         }
+        // ⚠️ **尾块的输入走与推进器同一个入口**（2026-10-27）：`TailContext.For` 从 handle 派生
+        // 目标线 / 压缩线 / 子会话行 / **计划树** / 一次性提醒 / **上下文用量**。
+        // 从前这里逐项传参，于是头那块浮动槽里**永远没有计划树、也没有上下文长度**
+        // ——而模型那份有。两处都「看着对」，用户却无从发现「头上看不到注入情况」。
+        // ⚠️ 上下文用量要交 usage：`ContextUsage.Line` 与 `/sessions/{id}/context` 是同一份测量。
         var slots = SystemBlock.Render(
             new PresetStore(host.DataRoot, PresetStore.SystemDir),
             new PresetStore(host.DataRoot, PresetStore.PremierDir),
             handle.Spec.SystemPromptPreset,
             handle.Spec.PremierPrompt,
-            values, contribution,
-            // 与 `Stepper.StepAsync` 同一来源：头看到的浮动槽也要带目标线。
-            Session.GoalMode.IsActive(handle.State) ? CorePrompts.GoalDirective : null,
-            // 压缩指令同理：不给它的话，用户下发指令后头里那块浮动槽会「忽然没有压缩请求」
-            // ——而指令明明还在（`Stepper.FloatingTextAt` 那条注释的同一个理由）。
-            handle.State.PendingCompact ? CorePrompts.CompactDirective : null,
-            // 子会话那一行同理（2026-10-24）：头看到的浮动槽与模型收到的必须是同一份
-            // ——否则「头显示我有两个孩子」而模型眼里一个都没有，两边都以为自己对。
-            SubagentView.Line(SubagentScopeOf(handle)),
-            iterateReplan: handle.PendingIterateReplan);
+            TailContext.For(handle, values, contribution, SubagentScopeOf(handle), host.Usage));
 
         return new
         {
@@ -1261,6 +1296,17 @@ public sealed class ControlServer(
                 payload.GetProperty("sessionId").GetString()!),
             "session.compact" => new CoreCommand.SessionCompact(
                 payload.GetProperty("sessionId").GetString()!),
+            // 后台任务（2026-10-27）：用户侧的两条。⚠️ `jobId` 走 GetProperty（必给）——
+            // 缺了它只可能是发命令的程序写错了，而「猜一个任务」在这里是不可接受的。
+            "jobs.list" => new CoreCommand.JobsList(
+                payload.GetProperty("sessionId").GetString()!),
+            "job.output" => new CoreCommand.JobOutput(
+                payload.GetProperty("sessionId").GetString()!,
+                payload.GetProperty("jobId").GetString()!,
+                payload.TryGetProperty("offset", out var offset) ? offset.GetInt64() : 0),
+            "job.kill" => new CoreCommand.JobKill(
+                payload.GetProperty("sessionId").GetString()!,
+                payload.GetProperty("jobId").GetString()!),
             // 计划编辑（2026-10-24）：与 `PUT /sessions/{id}/plan`、以及模型那个 `plan` 工具
             // **共用同一个解析器**（`PlanJson.ParseEdit`）——三条入口一份语义，不多写第二份。
             "session.plan" => PlanEditFrom(payload),

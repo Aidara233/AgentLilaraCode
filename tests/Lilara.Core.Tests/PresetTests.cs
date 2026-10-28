@@ -49,7 +49,8 @@ public sealed class PresetTests : IDisposable
     /// </summary>
     private PromptSlots Slots(
         string? systemId, string? premierId = null, IReadOnlyDictionary<string, string>? axes = null) =>
-        SystemBlock.Render(Store, PremierStore, systemId, premierId, axes ?? Axes.Defaults());
+        SystemBlock.Render(Store, PremierStore, systemId, premierId,
+            new TailContext(axes ?? Axes.Defaults()));
 
     private (CoreHost Host, CommandDispatcher Dispatcher) NewHarness()
     {

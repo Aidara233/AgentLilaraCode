@@ -232,6 +232,183 @@ internal static class ShRunner
     }
 
     /// <summary>
+    /// **起一个后台进程**（2026-10-24 通用版）：只认「可执行文件 + 参数列表」，
+    /// 不认识任何一种具体工具。
+    ///
+    /// <para>⚠️ <b>与 <see cref="Start"/> 的分界</b>：那个是「跑一段 sh 脚本」（前台那条路
+    /// 与 `shell` 的后台都走它），这个是**任意 argv**——`dotnet_build` 自己拼好了参数，
+    /// 硬塞回一段 shell 文本会引入引号问题（而引号出错的症状是**静默跑错命令**）。</para>
+    ///
+    /// <para>⚠️ <b>读泵必须立刻起</b>：不读的话，子进程写满管道（Windows 上约 64 KiB）
+    /// 就会**自己阻塞**，而那看起来像「命令卡住了」，完全不像「输出太多」。</para>
+    ///
+    /// <para>⚠️ <b>它<b>不</b>链接任何 <c>CancellationToken</c></b>：后台任务的寿命与「这一步」
+    /// 无关（`session.interrupt` 只打断当前步）。停止由 <see cref="IBackgroundJobs.Kill"/>
+    /// 或超时看守发起。</para>
+    /// </summary>
+    /// <param name="request">纯数据的启动描述（可执行文件 / argv / 环境覆盖 / 工作目录）。</param>
+    /// <param name="onChunk">读到一段就调一次（字节，不解码）。⚠️ 回调抛异常不影响读泵继续排空。</param>
+    /// <exception cref="ShellStartException">起不来（找不到可执行文件 / 没有权限）。</exception>
+    public static (Process Process, Task Pump) StartProcess(
+        BackgroundJobRequest request, Func<ReadOnlyMemory<byte>, Task> onChunk)
+    {
+        var start = new ProcessStartInfo
+        {
+            FileName = request.Executable,
+            WorkingDirectory = request.WorkingDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = new UTF8Encoding(false),
+            StandardErrorEncoding = new UTF8Encoding(false),
+            // ⚠️ stdin 与前台同一条实测结论：重定向之后**立刻关掉**，
+            // 否则某些组合下进程会挂在等输入上（而 `RunAsync` 会等到超时才回来）。
+            RedirectStandardInput = true,
+        };
+
+        foreach (var argument in request.Arguments) start.ArgumentList.Add(argument);
+
+        // ⚠️ **值为 null = 删掉**：`dotnet_build` 靠它清掉继承的 `DOTNET_*` / `MSBUILD*` /
+        // `NUGET_*`（那些是模型看不见的输入，能改变构建行为）。
+        foreach (var (key, value) in request.Environment)
+        {
+            if (value is null) start.Environment.Remove(key);
+            else start.Environment[key] = value;
+        }
+
+        return StartCore(start, request.Executable, onChunk);
+    }
+
+    /// <summary>
+    /// 真正起进程的那一段（两条入口共用）。⚠️ 失败时**释放进程对象**再抛：
+    /// 不释放的话，一个起不来的 `Process` 会攥着它已经拿到的句柄直到 GC。
+    /// </summary>
+    private static (Process Process, Task Pump) StartCore(
+        ProcessStartInfo start, string executable, Func<ReadOnlyMemory<byte>, Task> onChunk)
+    {
+        var process = new Process { StartInfo = start };
+        try
+        {
+            if (!process.Start()) throw new Win32Exception($"无法启动 {executable}");
+        }
+        catch (Exception ex) when (ex is Win32Exception or FileNotFoundException)
+        {
+            process.Dispose();
+            throw new ShellStartException($"无法启动 `{executable}`：{ex.Message}");
+        }
+
+        // ⚠️ 同 `RunAsync` 那条实测：stdin 必须是一个**已关闭的管道**，不是继承的控制台。
+        try { process.StandardInput.Close(); }
+        catch (IOException) { }
+
+        var pump = PumpBothAsync(process, onChunk);
+        return (process, pump);
+    }
+
+    /// <summary>
+    /// **备好一份"跑这段脚本"的启动参数**（`shell` 前台与后台共用这一处）。
+    ///
+    /// <para>⚠️ <b>抽出来是判据，不是整洁</b>：`sh` 的参数顺序（`-l` 然后 `-c` 然后脚本）、
+    /// 三条重定向、`LC_ALL`/`LANG`、stdin 那个「必须重定向再立刻关掉」的实测结论——
+    /// 任何一条在第二处抄漏，症状都**不会报错**：`-c` 写成裸参数会静默退化成「跑一个文件」，
+    /// 少了 `LC_ALL` 只是输出没人读得懂，少了 stdin 重定向会让命令挂到超时。
+    /// 这正是本仓那条「两层判据必须共用一个谓词」。</para>
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ **调用方负责 <c>ArgumentList</c> 的收尾与进程的整个生命周期**：
+    /// 本方法只造参数对象，起不起、读不读、什么时候关 stdin 都是调用方的事。
+    /// </remarks>
+    public static ProcessStartInfo ScriptStartInfo(string executable, string script, string workingDirectory)
+    {
+        var start = CreateStartInfo(executable, workingDirectory);
+        start.ArgumentList.Add("-l");
+        start.ArgumentList.Add("-c");
+        start.ArgumentList.Add(script);
+        return start;
+    }
+
+    /// <summary>
+    /// **`shell` 那一族后台启动要的那份请求**——`sh -lc &lt;脚本&gt;` 写成纯数据。
+    ///
+    /// <para>⚠️ <b>它存在，是为了让「sh 在哪、脚本怎么传」只有一处</b>：
+    /// `shell` 工具与测试都从这里拿，两处各拼一遍 `["-l","-c",…]` 就会漂
+    /// （而漂的后果是**静默跑错东西**）。</para>
+    /// </summary>
+    public static BackgroundJobRequest ShellRequest(
+        string executable, string script, string workingDirectory, string label, int? timeoutSeconds = null) =>
+        new()
+        {
+            Kind = "shell",
+            Label = label,
+            Executable = executable,
+            Arguments = ["-l", "-c", script],
+            WorkingDirectory = workingDirectory,
+            Environment = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["LC_ALL"] = "C",
+                ["LANG"] = "C",
+            },
+            TimeoutSeconds = timeoutSeconds,
+        };
+
+    /// <summary>
+    /// **起一个进程，交回它 + 两个持续排空的读泵**——`shell` 的后台那条路。
+    ///
+    /// <para>⚠️ 它现在是 <see cref="StartProcess"/> 的一层壳：`sh` 专用那部分只在
+    /// <see cref="ShellRequest"/> 里，起进程的判据只有一处。⚠️ 保留它是因为
+    /// `ShellStartException` 的措辞要说清「是哪个可执行文件起不来」，而那需要 executable 参数。</para>
+    /// </summary>
+    public static (Process Process, Task Pump) Start(
+        string executable, string script, string workingDirectory,
+        Func<ReadOnlyMemory<byte>, Task> onChunk) =>
+        StartProcess(ShellRequest(executable, script, workingDirectory, label: script), onChunk);
+
+    /// <summary>
+    /// 两条流 → 一个回调。⚠️ 用 <c>Task.WhenAll</c> 而非 await 串联（理由见 <see cref="Start"/>）。
+    ///
+    /// <para>⚠️ <b>顺手把回调的异常吞掉</b>：回调是调用方的东西（写盘 / 计数），
+    /// 它抛了之后如果我们跟着停掉读泵，子进程会在写满管道时**卡死**——那时现场是
+    /// 「后台任务不输出、也不结束」，而真正的原因早就被另一个异常盖住了。
+    /// ⇒ 宁可丢掉后续输出，也不能让子进程卡死。</para>
+    /// </summary>
+    private static async Task PumpBothAsync(Process process, Func<ReadOnlyMemory<byte>, Task> onChunk)
+    {
+        var stdout = PumpAsync(process.StandardOutput.BaseStream, onChunk);
+        var stderr = PumpAsync(process.StandardError.BaseStream, onChunk);
+        await Task.WhenAll(stdout, stderr).ConfigureAwait(false);
+    }
+
+    private static async Task PumpAsync(Stream stream, Func<ReadOnlyMemory<byte>, Task> onChunk)
+    {
+        var buffer = new byte[8192];
+        while (true)
+        {
+            int read;
+            try
+            {
+                read = await stream.ReadAsync(buffer).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+            {
+                // 流被关掉 = 进程退出了。这不是错误，是**结束**。
+                return;
+            }
+
+            if (read == 0) return;
+
+            try
+            {
+                await onChunk(buffer.AsMemory(0, read)).ConfigureAwait(false);
+            }
+            catch
+            {
+                // ⚠️ 见 `PumpBothAsync` 的注释：回调的失败不许让子进程卡死。
+            }
+        }
+    }
+
+    /// <summary>
     /// 有界读取：只保留开头，最多 <paramref name="maxBytes"/> 字节；到上限后**继续排空管道**但不保留。
     /// ⚠️ 与 `DotnetRunner.ReadBoundedAsync` 同一个形状、同一个理由：工具不替核心做投递截断。
     /// </summary>

@@ -547,6 +547,8 @@ async function openSessionInner(id) {
   await connected();
   if (gen !== epoch) return;
   current = id;
+  $("jobs-toggle").disabled = false;
+  if (leaving !== id) resetJobsPanel();
   if (leaving !== id) renderContextStatus(null);
   $("interrupt").disabled = false;   // 没选中会话时它是死的 —— 别让它看起来可点（点了也没事，只是会骗人）
   $("gc").disabled = false;
@@ -1382,6 +1384,8 @@ async function deleteSession(id, spec) {
 // （用户会以为自己看的是现存的东西）。
 function clearCenter() {
   current = null;
+  $("jobs-toggle").disabled = true;
+  resetJobsPanel();
   $("timeline").innerHTML = "";
   $("title").innerHTML = "";
   $("title").className = "muted";
@@ -2419,6 +2423,104 @@ $("new-go").onclick = async () => {
     renderMeta("✗ 会话建好了但打不开：" + (e && e.message ? e.message : e), "error");
   }
 };
+
+// 后台输出留在任务面板；每个异步请求绑定会话与面板世代，切换后丢弃旧响应。
+let jobsGeneration = 0;
+let jobsListRequest = 0;
+let outputRequest = 0;
+let selectedJob = null;
+let jobNextOffset = 0;
+function resetJobsPanel() {
+  jobsGeneration++;
+  selectedJob = null;
+  jobNextOffset = 0;
+  $("jobs-panel").hidden = true;
+  $("jobs-toggle").setAttribute("aria-expanded", "false");
+  $("jobs-list").replaceChildren();
+  $("job-output").textContent = "";
+  $("job-output-status").textContent = "";
+  $("job-output-more").hidden = true;
+}
+async function loadJobs() {
+  const sid = current, generation = jobsGeneration, request = ++jobsListRequest;
+  if (!sid) return;
+  const valid = () => current === sid && generation === jobsGeneration && request === jobsListRequest;
+  $("jobs-list").textContent = "正在读取后台任务…";
+  try {
+    const response = await fetch(`${core}/sessions/${encodeURIComponent(sid)}/jobs`);
+    if (!response.ok) throw new Error(`读取任务失败（HTTP ${response.status}）`);
+    const data = await response.json();
+    if (!valid()) return;
+    $("jobs-list").replaceChildren();
+    if (!data.jobs.length) $("jobs-list").textContent = "这个会话没有后台任务。";
+    for (const job of data.jobs) {
+      const row = document.createElement("div");
+      const label = document.createElement("span");
+      label.textContent = `${job.id} · ${job.kind} · ${job.state} · ${job.outputBytes} 字节`
+        + (job.exitCode != null ? ` · 退出码 ${job.exitCode}` : "")
+        + (job.reason ? ` · ${job.reason}` : "") + ` · ${job.label} `;
+      row.append(label);
+      const output = document.createElement("button");
+      output.textContent = "查看输出";
+      output.onclick = () => {
+        selectedJob = job.id;
+        jobNextOffset = 0;
+        $("job-output").textContent = "";
+        readJobOutput();
+      };
+      row.append(output);
+      const stop = document.createElement("button");
+      stop.textContent = "停止任务";
+      stop.disabled = job.state !== "Running";
+      stop.onclick = async () => {
+        stop.disabled = true;
+        try {
+          const ack = await commandNow(crypto.randomUUID().slice(0, 8),
+            { kind: "job.kill", sessionId: sid, jobId: job.id });
+          if (!valid()) return;
+          $("job-output-status").textContent = ack.accepted ? (ack.note || "已停止任务。") : `✗ ${ack.reason}`;
+          await loadJobs();
+        } catch (error) {
+          if (valid()) { $("job-output-status").textContent = `✗ ${error.message}`; stop.disabled = false; }
+        }
+      };
+      row.append(stop);
+      $("jobs-list").append(row);
+    }
+  } catch (error) {
+    if (valid()) $("jobs-list").textContent = `✗ ${error.message}`;
+  }
+}
+async function readJobOutput() {
+  const sid = current, job = selectedJob, generation = jobsGeneration, request = ++outputRequest;
+  if (!sid || !job) return;
+  const valid = () => current === sid && selectedJob === job && generation === jobsGeneration && request === outputRequest;
+  $("job-output-more").disabled = true;
+  $("job-output-status").textContent = "正在读取输出…";
+  try {
+    const response = await fetch(`${core}/sessions/${encodeURIComponent(sid)}/jobs/${encodeURIComponent(job)}/output?offset=${jobNextOffset}`);
+    if (!response.ok) throw new Error(`读取输出失败（HTTP ${response.status}）`);
+    const data = await response.json();
+    if (!valid()) return;
+    $("job-output").textContent += data.text;
+    jobNextOffset = data.nextOffset;
+    $("job-output-status").textContent = `${job} · 已读至 ${data.nextOffset}/${data.totalBytes} 字节`
+      + (data.running ? " · 还在运行" : " · 已结束")
+      + (data.truncated ? " · [已截断] 输出已达保存上限，后续内容没有保存。" : "");
+    $("job-output-more").hidden = !data.running && data.nextOffset >= data.totalBytes;
+  } catch (error) {
+    if (valid()) { $("job-output-status").textContent = `✗ ${error.message}`; $("job-output-more").hidden = false; }
+  } finally {
+    if (valid()) $("job-output-more").disabled = false;
+  }
+}
+$("jobs-toggle").onclick = () => {
+  $("jobs-panel").hidden = !$("jobs-panel").hidden;
+  $("jobs-toggle").setAttribute("aria-expanded", String(!$("jobs-panel").hidden));
+  if (!$("jobs-panel").hidden) loadJobs();
+};
+$("jobs-refresh").onclick = loadJobs;
+$("job-output-more").onclick = readJobOutput;
 
 $("interrupt").onclick = () => {
   if (current) command(crypto.randomUUID().slice(0, 8), { kind: "session.interrupt", sessionId: current });

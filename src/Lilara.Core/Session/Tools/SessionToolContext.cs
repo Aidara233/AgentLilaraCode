@@ -28,7 +28,7 @@ public sealed class SessionToolContext(
     string? floatingContext = null, NetworkAccess? network = null, bool goalActive = false,
     bool compactRequested = false, ShellAccess? shell = null, SubagentScope? subagents = null,
     SessionPlan? plan = null, string? mode = null, IReadOnlyList<string>? approvedCallIds = null,
-    string? initiative = null)
+    string? initiative = null, Func<string, string?>? subagentStatus = null, bool contextFull = false)
     : IToolContext
 {
     private readonly string _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workingDirectory));
@@ -145,6 +145,18 @@ public sealed class SessionToolContext(
     /// <summary>见 <see cref="IToolContext.Subagents"/>：步开始时算好的派生关系快照。</summary>
     public SubagentScope? Subagents { get; } = subagents;
 
+    /// <summary>
+    /// **子会话此刻状态的实况探针**（2026-10-27，`wait` 用）。
+    ///
+    /// <para>⚠️ <b>`Subagents` 那份是**步开始的快照**，它不会变</b>——拿它来「等」会永远等到超时
+    /// （判据一直读同一个值）。⇒ `wait` 必须有一条**现读**的通道，而这条通道只能是注入的
+    /// （工具够不着 `CoreHost` / `LiveSessions`）。</para>
+    ///
+    /// <para>⚠️ <c>null</c> = 没有实况通道（纯单测的手工句柄）：`wait` 这时退回快照那份，
+    /// 并把「看不到实时状态」写进结果——**别猜**它已经结束。</para>
+    /// </summary>
+    public Func<string, string?>? SubagentStatus { get; } = subagentStatus;
+
     /// <summary>见 <see cref="IToolContext.GoalActive"/>：步开始时的主动性轴快照。</summary>
     public bool GoalActive { get; } = goalActive;
 
@@ -182,6 +194,17 @@ public sealed class SessionToolContext(
 
     /// <summary>步开始时冻结的主动性档（包括 <c>iterate</c>）。</summary>
     public string? Initiative { get; } = initiative;
+
+    /// <summary>
+    /// **上一次请求是否已越过上下文那条硬线**（`ContextUsage.AutoCompactThreshold`，2026-10-27）。
+    ///
+    /// <para>⚠️ <b>它让 `compact` 的授权不再只看主动性轴</b>：越过 900k 之后任何模式、任何模型都
+    /// 压得成——这一格没有选择，不压就是下一步上游报错 / 截断，而那时连摘要都写不出来了。</para>
+    ///
+    /// <para>⚠️ <b>它是「上一次请求」的事实，不是「这一步已经压过」的状态</b>：同一步里第二条
+    /// `compact` 仍按同一份值判（冻结在步开始，与权限档位同一条纪律）。</para>
+    /// </summary>
+    public bool ContextFull { get; } = contextFull;
 
     /// <summary>这一次调用是否已经被用户批准过（见 <see cref="ApprovedCallIds"/>）。</summary>
     public bool IsApproved(string callId) =>

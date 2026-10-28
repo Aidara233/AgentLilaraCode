@@ -66,7 +66,7 @@ namespace Lilara.Core.Session.Tools;
 /// 它只说出「用这段摘要截断此前的历史」，而**真正的截断**（检查点 / 清指令 / 开窗）在推进器里
 /// ——同 `release` 的「线落盘在推进器」与 `finish_goal` 的「拨轴在推进器」。
 /// ⚠️ 它是这几个里唯一**不归闸门管**的（`ITool.GatedByPermission == false`）：它不改变世界，
-/// 而它只在用户下发的指令期内生效（`pendingCompact`）——指令就是授权。</para>
+/// 生效授权来自用户压缩指令（`pendingCompact`）或 goal / iterate 主动性。</para>
 ///
 /// <para>⚠️ <b><see cref="ArchiveChildTool"/>（2026-10-26）是子 agent 那一族的第五个</b>：
 /// 它把「派生关系能被收起」这扇门打开——一个已经落定、结论也收下的子会话**不必**每步
@@ -86,6 +86,14 @@ public static class BuiltInTools
         // 后果核心事后挽不回来；边界只有权限轴、设备开关、超时与输出上限。
         // ⚠️ 它常驻：找不到 sh 时也照样声明（工具表不动），调用只回一句人话。
         new ShellTool(),
+        // 2026-10-24：后台任务的三个工具（**通用的**，不只是 shell —— dotnet_build / dotnet_test
+        // 也能转到后台，见它们的 `background` 参数）。
+        // ⚠️ `job_kill` 声明成**只读**（用户裁定：撤回类功能要能在低档位用，否则「切了权限想杀都杀不掉」），
+        // 判据与代价写在 `JobKillTool` 的类型注释里——别把它当成笔误顺手"修正"。
+        new JobsTool(), new JobOutputTool(), new JobKillTool(),
+        // 2026-10-27：`wait` —— 等一个后台任务（进程 **或子会话**）跑完。
+        // ⚠️ 它是唯一一个「会占住这一步」的工具，判据与上限写在 `WaitTool` 的类型注释里。
+        new WaitTool(),
         // 2026-10-22：联网与 goal 收尾。三个都常驻——配置和轴值**不进工具声明**，
         // 因此拨轴 / 改配置不会破前缀；关着时它们只回一句人话。
         new WebSearchTool(), new WebFetchTool(), new FinishGoalTool(),

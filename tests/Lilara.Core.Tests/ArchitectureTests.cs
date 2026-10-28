@@ -33,7 +33,8 @@ public class ArchitectureTests
         // ⚠️ **一次跳两格是实测，不是猜**：这一批开工时工作区已经是 25 个文件
         // （`ProviderDefinition.cs` 在子 agent 那一批进来时探针没跟着改 ⇒ **这条测试当时就是红的**）。
         // 探针只抓到「glob 少找了文件」；多出来的那个是**存量漏记**，在这里一并记下。
-        Assert.Equal(26, files.Length);
+        // 26 → 27（2026-10-24 后台 shell 批）：加了 `ShellJobs.cs`（后台任务的词汇层）。
+        Assert.Equal(28, files.Length);
 
         var offenders = files
             .SelectMany(f => ExternalUsings(f).Select(u => $"{Path.GetFileName(f)}:{u.Line}  {u.Text}"))

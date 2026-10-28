@@ -37,6 +37,81 @@ public sealed record PromptSlots(
 }
 
 /// <summary>
+/// **尾块的输入**——浮动读数里除了轴表与插件字段之外的每一样东西（2026-10-27）。
+///
+/// <para>⚠️ <b>它取代了六个各自可空的位置参数</b>，理由不是整洁，是一类已经发生了三次的缺陷：
+/// 尾块的输入在<b>三个</b>装配点各拼一遍（`Stepper.StepAsync` 的步开始、
+/// `Stepper.FloatingTextAt` 的答复 / 探测路径、`ControlServer.SlotsOf` 的头槽位），
+/// 而每加一样东西（目标线、压缩指令、子会话行、计划树、一次性提醒、上下文用量）都只被
+/// **记得加的那一处**传进去 ⇒ 头里看不到计划树、答复路径看不到计划树，两处都「看着对」。
+/// 位置参数 + 默认值让「漏传」在编译期完全合法，那正是它能重复发生的原因。</para>
+///
+/// <para>⚠️ <b>所以：这个记录里的每一项都有值，而值只由 <see cref="For"/> 一处派生。</b>
+/// 三个装配点不再逐项拼参数，它们交的是同一个 handle ⇒ 少传一样东西<b>在结构上不可能</b>。</para>
+///
+/// <para>⚠️ <b>这里的每一项仍然是「产物」而不是「判据」</b>：派生规则（目标线看主动性、
+/// 压缩线看 <c>pendingCompact</c>、计划树看 <c>State.Plan</c>……）住在 <see cref="For"/>，
+/// 而「怎么渲染」住在 <see cref="SystemBlock.TailBody"/>——两件事各一处，谁都不许在调用点再判一遍。</para>
+/// </summary>
+public sealed record TailContext(
+    IReadOnlyDictionary<string, string> Axes,
+    PromptContributionSnapshot? Plugin = null,
+    string? GoalDirective = null,
+    string? CompactDirective = null,
+    string? SubagentLine = null,
+    SessionPlan? Plan = null,
+    bool IterateReplan = false,
+    string? UsageLine = null,
+    bool ContextFull = false)
+{
+    /// <summary>
+    /// **从会话状态派生整份尾块输入**——步、答复路径、头槽位都走这一个入口。
+    ///
+    /// <para>⚠️ <b>它唯一拿不到、必须由调用方交进来的三样</b>：
+    /// ① 轴值（插件宿主冻结后的那一份，见 <c>PluginSessionView.Values</c>）；
+    /// ② 插件贡献快照（同一个 <c>Collect</c> 的产物）；
+    /// ③ 派生关系快照（`SubagentScope`，它要读孩子的盘面，本类是纯函数）。
+    /// 其余全部从 <paramref name="handle"/> 读——**这才是「不可能漏」的来源**。</para>
+    ///
+    /// <para>⚠️ <b><paramref name="iterateReplan"/> 可覆盖</b>：`StepAsync` 在装配<b>之前</b>
+    /// 就把那个一次性提醒清掉了（它只许说一次），所以那一路要交「清之前读到的值」。
+    /// 其余调用点不传，读到的就是 handle 上此刻的值。</para>
+    ///
+    /// <para>⚠️ <b><paramref name="compactDirective"/> 的默认值是那唯一一句话</b>：
+    /// 从前这句话由三个调用点各传一次（推进器从解析器注入、控制面直接写常量），
+    /// 而它们本来就该逐字相同。今天它有一个默认值 ⇒ 谁都不用再传，也就没有「传了别的一句」这一格。</para>
+    /// </summary>
+    public static TailContext For(
+        SessionHandle handle,
+        IReadOnlyDictionary<string, string> axes,
+        PromptContributionSnapshot? plugin,
+        SubagentScope subagents,
+        UsageStore? usage,
+        string? compactDirective = null,
+        bool? iterateReplan = null) =>
+        new(
+            Axes: axes,
+            Plugin: plugin,
+            // 目标线：主动性 = goal 才有（目标是**状态**，不是事件）。
+            GoalDirective: GoalMode.IsActive(handle.State) ? CorePrompts.GoalDirective : null,
+            // 压缩线：用户下过指令（`state.json` 的 `pendingCompact`）才有。
+            CompactDirective: handle.State.PendingCompact
+                ? compactDirective ?? CorePrompts.CompactDirective
+                : null,
+            // 子会话那一行：只在真有派生关系时出现（`SubagentView.Line` 对空关系给 null）。
+            SubagentLine: SubagentView.Line(subagents),
+            // 计划树：T0 与剩余节点都在 `State.Plan` 里，渲染判据在 `PlanTree.Render`。
+            Plan: handle.State.Plan,
+            IterateReplan: iterateReplan ?? handle.PendingIterateReplan,
+            // 上下文用量：与 `/sessions/{id}/context` 同一份测量（`ContextUsage`）。
+            UsageLine: ContextUsage.Line(usage, handle.SessionId),
+            // ⚠️ 越过那条硬线没有（2026-10-27）：**同一个谓词**也决定 `compact` 的授权
+            // （`Stepper` 把它交进 `SessionToolContext.ContextFull`）——两处各算一次就会分叉，
+            // 而分叉的表现是「尾块喊着快压，工具却说没有指令」。
+            ContextFull: ContextUsage.OverLimit(usage, handle.SessionId));
+}
+
+/// <summary>
 /// <b>三个槽位从哪来</b>——`01` §3.1 头槽位那两块 + §3.2 尾槽位那一块，一处装配。
 ///
 /// <para>⚠️ <b>判定与产物挤在一个类里</b>（同 <see cref="Reclaim"/> 那条理由）：
@@ -67,25 +142,20 @@ public static class SystemBlock
     /// <param name="premiers">首要块的落点。⚠️ 与预设是**两个目录**，见 `CorePrompts.DefaultPremier`。</param>
     /// <param name="systemPresetId"><c>null</c> = 没指定 ⇒ 跟随全局默认那个名字。</param>
     /// <param name="premierId"><c>null</c> = 没指定 ⇒ 跟随 <c>CorePrompts.DefaultPremier</c>。</param>
-    /// <param name="axes">这个会话此刻的轴值（`State.Axes`）。⚠️ 由调用方交进来，**不在这里读盘**：
-    /// 轴是 handle 上的活数据，而本类是纯函数。</param>
+    /// <param name="tail">尾块的输入（<see cref="TailContext"/>）。⚠️ **要装配一个会话的三块，
+    /// 就用 <see cref="TailContext.For"/>**——它是唯一一处派生规则，三个装配点共用。
+    /// 轴值、插件贡献、派生关系快照这三样是它拿不到的（要调用方先取），别的全部由 handle 派生。</param>
     public static PromptSlots Render(
         PresetStore presets, PresetStore premiers,
         string? systemPresetId, string? premierId,
-        IReadOnlyDictionary<string, string> axes,
-        PromptContributionSnapshot? pluginPrompt = null,
-        string? goalDirective = null,
-        string? compactDirective = null,
-        string? subagentLine = null,
-        SessionPlan? plan = null,
-        bool iterateReplan = false) =>
+        TailContext tail) =>
         Build(
             // ⚠️ 传**可空**的预设正文，不在这里折成 `SystemFallback`：那一折会抹掉
             // 「文件不在」与「文件在」的区分，而 `SystemBody` 的判据正是它
             // （文件不在时兜底里已含机制说明；文件在时补一句）。
             Load(presets, systemPresetId),
             Load(premiers, premierId),
-            axes, pluginPrompt, goalDirective, compactDirective, subagentLine, plan, iterateReplan);
+            tail);
 
     /// <summary>
     /// 三块槽位的**纯装配**——输入是已经读好的两份正文 + 轴 + 插件贡献，不碰任何存储。
@@ -99,23 +169,12 @@ public static class SystemBlock
     /// <c>null</c> = 没有这一块，<c>""</c> = 有但为空（系统块那一格甚至会产出空串块——
     /// 那是「用户明说纯聊天」的声明，见 <see cref="Text"/>）。</para>
     /// </summary>
-    internal static PromptSlots Build(
-        string? systemText, string? premierText,
-        IReadOnlyDictionary<string, string> axes,
-        PromptContributionSnapshot? pluginPrompt = null,
-        string? goalDirective = null,
-        string? compactDirective = null,
-        string? subagentLine = null,
-        SessionPlan? plan = null,
-        bool iterateReplan = false) =>
+    internal static PromptSlots Build(string? systemText, string? premierText, TailContext tail) =>
         new(
-            System: Text(SystemBody(systemText, pluginPrompt?.Text(PromptSlot.System))),
+            System: Text(SystemBody(systemText, tail.Plugin?.Text(PromptSlot.System))),
             Premier: Wrap(CorePrompts.PremierOpen,
-                Join(premierText, pluginPrompt?.Text(PromptSlot.Primary)), CorePrompts.PremierClose),
-            Tail: Wrap(CorePrompts.TailOpen,
-                TailBody(axes, pluginPrompt?.Text(PromptSlot.Floating), goalDirective,
-                    compactDirective, subagentLine, plan, iterateReplan),
-                CorePrompts.TailClose));
+                Join(premierText, tail.Plugin?.Text(PromptSlot.Primary)), CorePrompts.PremierClose),
+            Tail: Wrap(CorePrompts.TailOpen, TailBody(tail), CorePrompts.TailClose));
 
     // 非空自定义预设也需要机制说明；显式空预设且无系统贡献时仍不产生系统块。
     private static string SystemBody(string? preset, string? plugin)
@@ -163,19 +222,22 @@ public static class SystemBlock
         string.IsNullOrEmpty(body) ? [] : [new Block.TextBlock($"{open}\n{body}\n{close}")];
 
     /// <summary>
-    /// 尾块的正文——框架自述、当前轴表与等级解释、插件浮动字段。
+    /// 尾块的正文——框架自述、轴表与等级解释、子会话那两行、计划树与它的说明、
+    /// 上次调用上下文长度、插件浮动字段，以及（目标 / 压缩 / iterate 提醒那几条）「此刻该做什么」。
+    ///
+    /// <para>⚠️ <b>它只读 <see cref="TailContext"/>，不再逐个接六个可空参数</b>（2026-10-27）：
+    /// 那些参数由三处调用点各自拼，漏传在编译期完全合法——头里因此长期看不到计划树与上下文长度。
+    /// 今天「有哪几项」由记录说清，「值从哪来」由 <see cref="TailContext.For"/> 一处派生。</para>
     ///
     /// <para>⚠️ <b>自述是恒定的，所以它不参与「有没有内容」的判定</b>：判据是
     /// <b>有没有轴表或插件浮动字段</b>。若把自述也算进去，一个没有内容的会话会得到一个只有自述的尾块
     /// ——而那正是 <see cref="Wrap"/> 那条「空的不能长得像有内容」要防的。</para>
     /// </summary>
-    private static string? TailBody(
-        IReadOnlyDictionary<string, string> axes, string? plugin, string? goalDirective,
-        string? compactDirective = null, string? subagentLine = null, SessionPlan? plan = null,
-        bool iterateReplan = false)
+    private static string? TailBody(TailContext tail)
     {
+        var axes = tail.Axes;
         var table = AxisTable(axes);
-        var planText = PlanTree.Render(plan);
+        var planText = PlanTree.Render(tail.Plan);
         // ⚠️ **计划那两句话按轴判**（2026-10-24）：都是提示词层的语义，不是闸门——
         // 谁能改计划由权限轴说了算（`plan` 是 `ReadOnly` 类工具，`off` 档照拒）。
         // 计划为空时两句都不出现：没有树就谈不上「以 ▶ 为准」，也不该教模型先去建一棵。
@@ -190,7 +252,7 @@ public static class SystemBlock
         // 每步都念一遍就成了噪音——用户要的是「刚用完那一步说一次」。
         // ⇒ 判据是 `SessionHandle.PendingIterateReplan`（`Stepper` 在计划刚被推空时置位，
         // 装配进尾块之后立刻清掉，所以它天然只出现一次）。
-        var iterateDirective = iterateReplan && axes.GetValueOrDefault(Axes.Initiative) == Axes.Iterate
+        var iterateDirective = tail.IterateReplan && axes.GetValueOrDefault(Axes.Initiative) == Axes.Iterate
             ? CorePrompts.IteratePlanningDirective
             : null;
         var descriptions = Axes.RenderOrder.Where(Axes.InContext)
@@ -205,11 +267,19 @@ public static class SystemBlock
         // （这一批还剩什么），而目标/压缩是**此刻要动手的那件事**——后者仍然离模型最近。
         // ⚠️ 子会话那两行**成对**出现（2026-10-26）：状态行 + 一条机制约定（回报会自动回来，
         // 别去轮询、别催）。没有派生关系时两句都不出现——见 `SubagentNorm` 的注释。
-        var subagentNorm = string.IsNullOrEmpty(subagentLine) ? null : CorePrompts.SubagentNorm;
+        var subagentNorm = string.IsNullOrEmpty(tail.SubagentLine) ? null : CorePrompts.SubagentNorm;
+        // ⚠️ **越过 900k 之后那句话替换掉 goal / iterate 那条，而不是与它并列**（2026-10-27）：
+        // 那一格没有选择——「随时可以压」会让「现在就压」变软，而这一步正是最不该被稀释的。
+        var compactionAdvice = tail.ContextFull
+            ? CorePrompts.ContextOverflowDirective
+            : axes.GetValueOrDefault(Axes.Initiative) is "goal" or Axes.Iterate
+                ? CorePrompts.AutonomousCompactionDirective
+                : null;
         var body = Join(table is null ? null : CorePrompts.TailAxesPrefix + table,
-            Join(descriptions.ToArray()), subagentLine, subagentNorm,
+            Join(descriptions.ToArray()), tail.SubagentLine, subagentNorm,
             string.IsNullOrEmpty(planText) ? null : planText, planDirective, iterateDirective,
-            goalDirective, compactDirective, plugin);
+            tail.UsageLine, compactionAdvice, tail.GoalDirective, tail.CompactDirective,
+            tail.Plugin?.Text(PromptSlot.Floating));
         return body is null ? null : $"{CorePrompts.TailDeclaration}\n{body}";
     }
 

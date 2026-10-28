@@ -82,7 +82,11 @@ public sealed class ShellTool : ITool
         + "用单引号 / 双引号、$VAR、管道、&& 与 ||，不要用 PowerShell 语法。"
         + "命令的工作目录是会话的工作目录；它会真正执行，可以改动文件与系统状态。"
         + "超时会杀掉整棵进程树并如实报告；输出超过上限时只保留开头。"
-        + "要读文件优先用 read / search，要改文件优先用 write / update——它们的结果更省上下文。";
+        + "要读文件优先用 read / search，要改文件优先用 write / update——它们的结果更省上下文。"
+        + "⚠️ 这是**前台**执行：它占着这一步，直到命令结束或超时。"
+        + "要跑持续很久的东西（起服务、盯日志、长构建），用 background: true 起成后台任务；"
+        + "它会立刻返回一个任务 id，之后用 job_output 读进展、jobs 看还在不在、job_kill 停掉。"
+        + "⚠️ 后台任务**不随这一步结束，也不会被 session.interrupt 打断**——停它只能靠 job_kill。";
 
     public string ParametersSchemaJson => """
         {
@@ -91,13 +95,121 @@ public sealed class ShellTool : ITool
             "command": {
               "type": "string",
               "description": "要交给 sh -c 的脚本原文。可以多行。"
+            },
+            "background": {
+              "type": "boolean",
+              "description": "true = 起成后台任务并立刻返回任务 id（不等它跑完）。省略 = 前台执行。"
+            },
+            "timeoutSeconds": {
+              "type": "integer",
+              "description": "超时（秒）。前台：到时杀掉整棵进程树并如实报告。后台：到时自动停掉它。省略 = 用 shell 配置里的值（前台）/ 不限时（后台）。"
             }
           },
           "required": ["command"]
         }
         """;
 
-    public async Task<ToolOutcome> RunAsync(ToolCall call, IToolContext context, CancellationToken ct)
+    /// <summary>
+    /// ⚠️ <b>两条路的权限类别是同一个</b>（<see cref="PermissionClass.Destructive"/>）——
+    /// 后台化**不降级**：起一个后台进程与前台跑一条命令，对世界的后果一样不可逆。
+    /// 判据在 <see cref="PermissionClass"/> 那里已经写过，这里只提醒别为了「后台更轻」而放宽。
+    /// </summary>
+    public Task<ToolOutcome> RunAsync(ToolCall call, IToolContext context, CancellationToken ct) =>
+        ToolArgs.Bool(call.ArgumentsJson, "background")
+            ? Task.FromResult(RunBackground(call, context))
+            : RunForegroundAsync(call, context, ct);
+
+    /// <summary>
+    /// 解析 `timeoutSeconds`。⚠️ <b>越界/不是整数 ⇒ 一句话拒绝</b>，不夹紧：
+    /// 模型写了个它以为能生效的时限、而我们悄悄换成另一个值，是最坏的一类静默。
+    /// ⚠️ 「不超时」的表达是**省略这个键**，不是给 0——同 `session.create` 的 `askTimeoutMinutes`。
+    /// </summary>
+    private static string? TryReadTimeout(ToolCall call, int min, int max, out int? seconds)
+    {
+        seconds = null;
+
+        // ⚠️ 用 `ToolPaths.HasKey` 判断「显式给了」：`ToolArgs.Number` 对「键缺失」与
+        // 「值不是数字」都给 null，而那两件事的处置相反（一个用默认值、一个要拒绝）。
+        if (!ToolPaths.HasKey(call.ArgumentsJson, "timeoutSeconds")) return null;
+
+        if (ToolArgs.Number(call.ArgumentsJson, "timeoutSeconds") is not { } value)
+            return "`timeoutSeconds` 必须是整数秒。";
+
+        if (value < min || value > max)
+            return $"`timeoutSeconds` 要在 {min}..{max} 秒之间（给的是 {value}）。不限时就不写这个参数。";
+
+        seconds = (int)value;
+        return null;
+    }
+
+    /// <summary>
+    /// **后台**：起进程、立刻交回任务 id。
+    ///
+    /// <para>⚠️ 它刻意**不接 <c>CancellationToken</c></b>：那是<b>这一步</b>的令牌，
+    /// 而任务的寿命要长过这一步（用户裁定：`interrupt` 只打断当前步）。
+    /// ⇒ 传进来再忽略比不传更糟——下一个人会以为它被接上了。</para>
+    ///
+    /// <para>⚠️ <b>`timeoutSeconds` 在这里是「自动停」而不是「报超时」</b>：
+    /// 前台那条超时之后这一步还能看见「命令被终止了」；后台没有人在等，
+    /// 所以它只能靠**状态与原因**说清楚（`job.json` 里那句「超过 N 秒的时限，被核心终止了」）。</para>
+    /// </summary>
+    private ToolOutcome RunBackground(ToolCall call, IToolContext context)
+    {
+        var command = ToolArgs.String(call.ArgumentsJson, "command");
+        if (string.IsNullOrWhiteSpace(command))
+            return ToolText.Of("缺少 `command` 参数。要跑什么命令？");
+
+        if (context.Shell is not { } shell)
+            return ToolText.Of("这个会话没有 shell 上下文，命令不可用。");
+
+        if (shell.DenialFor() is { } denial)
+            return ToolText.Of(denial);
+
+        if (shell.BackgroundDenialFor() is { } backgroundDenial)
+            return ToolText.Of(backgroundDenial);
+
+        if (TryReadTimeout(call, BackgroundJobLimits.MinTimeoutSeconds, BackgroundJobLimits.MaxTimeoutSeconds,
+                out var timeoutSeconds) is { } timeoutError)
+            return ToolText.Of(timeoutError);
+
+        // ⚠️ 与前台那条**同一个定位谓词**（`ShRunner.TryLocate`）：两处各写一份的话，
+        // 「前台找得到、后台找不到」会出现，而两边看着都对。
+        var configured = shell.Config.Executable ?? _environmentExecutable();
+        if (!ShRunner.TryLocate(configured, _exists, out var executable, out var locateError))
+            return ToolText.Of(locateError!);
+
+        var started = shell.Jobs!.Start(shell.SessionId!,
+            ShRunner.ShellRequest(executable, command, context.WorkingDirectory,
+                label: JobsTool.OneLine(command), timeoutSeconds: timeoutSeconds));
+
+        if (started.Job is not { } job)
+            return ToolText.Of(started.Error ?? "后台任务没能启动。");
+
+        return new ToolOutcome
+        {
+            Content =
+            [
+                new Block.TextBlock(
+                    $"已在后台启动（任务 {job.Id}，pid {job.ProcessId}）。它不随这一步结束，也不会被 session.interrupt 打断。"
+                    + (job.TimeoutSeconds is { } s ? $"它会在 {s} 秒后被自动停掉（到点写进原因）。\n" : "\n")
+                    + "用 job_output 读输出（可反复读，每次只取新的一段）；jobs 看它还在不在；job_kill 停掉它。\n"
+                    + $"⏳ 想等它跑完再继续，就调 wait(task=\"{job.Id}\")。\n"
+                    + "⚠️ 现在别干等：先去干别的，回头再来看。"),
+            ],
+            // ⚠️ **不可重演**：再跑一次就是第二个进程。同前台那条判据。
+            Fingerprint = null,
+            DependsOn = null,
+            Framing = new ToolFraming(NameOf,
+            [
+                new ToolFramingField("job", job.Id),
+                new ToolFramingField("state", "running"),
+            ]),
+        };
+    }
+
+    /// <summary>前台：等它跑完（或超时）。这是 2026-10-23 那一版，行为一个字没改。</summary>
+    private async Task<ToolOutcome> RunForegroundAsync(
+        ToolCall call, IToolContext context, CancellationToken ct)
     {
         var command = ToolArgs.String(call.ArgumentsJson, "command");
         if (string.IsNullOrWhiteSpace(command))
@@ -116,6 +228,15 @@ public sealed class ShellTool : ITool
             return ToolText.Of(locateError!);
 
         var timeout = TimeSpan.FromSeconds(shell.Config.TimeoutSeconds);
+
+        // ⚠️ **逐次覆盖**（用户 2026-10-24 裁定「超时时间……整合进来」）：
+        // 给了就用给的，没给就用 `shell.json` 里那个。⚠️ 值域用 **ShellLimits**（前景的上限 600 秒），
+        // 不是后台那个 3600 ——前台占着一步，跑一小时不是它该做的事。
+        if (TryReadTimeout(call, ShellLimits.MinTimeoutSeconds, ShellLimits.MaxTimeoutSeconds,
+                out var overrideSeconds) is { } timeoutError)
+            return ToolText.Of(timeoutError);
+
+        if (overrideSeconds is { } seconds) timeout = TimeSpan.FromSeconds(seconds);
 
         int exitCode;
         string stdout, stderr;

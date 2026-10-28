@@ -274,6 +274,51 @@ public sealed class FloatingContextTests : IDisposable
         Assert.Contains(body.Tools, t => t.Name == FloatingContextTool.NameOf);
     }
 
+    /// <summary>
+    /// ⚠️ **模型收到的读数里有计划树与上下文用量**（2026-10-27）：这两样从前只在这一处传参，
+    /// 所以它们在这里是绿的、在头那一侧是缺的。今天三处共用 `TailContext.For`，
+    /// 这条与 `ControlServerTests.State_FloatingSlotCarriesThePlanTreeAndTheContextLine`
+    /// 成对存在——**两边都断言同一批事实**，任何一处漏传都会让其中一条变红。
+    /// </summary>
+    [Fact]
+    public async Task Step_ReadoutCarriesThePlanTreeAndTheContextLine()
+    {
+        var handle = NewSession();
+        var usage = new UsageStore(_store.DataRoot);
+        usage.Append(new UsageCall
+        {
+            CallId = "previous", SessionId = handle.SessionId, ProviderId = "p", ModelId = "m",
+            Protocol = Protocols.ClaudeMessages, StartedAt = CoreClock.Now(), Status = "completed",
+            Usage = new TokenUsage { InputTokens = 100, CacheReadTokens = 20, CacheWriteTokens = 5 },
+        });
+        var stepper = new Stepper(_store, _adapter, BuiltInTools.All, usage: usage);
+        handle.UpdateState(s => s with
+        {
+            Plan = new SessionPlan
+            {
+                Nodes =
+                [
+                    new PlanNode { Id = "a", Title = "读代码", Body = "先读一遍" },
+                    new PlanNode
+                    {
+                        Id = "b", Title = "改代码",
+                        Children = [new PlanNode { Id = "b1", Title = "改一个文件", Body = "改 executor" }],
+                    },
+                ],
+                UpdatedAt = CoreClock.Now(),
+            },
+        });
+
+        _adapter.ReplyWith(_ => Say("好"));
+        await stepper.StepAsync(handle, "你好", default);
+
+        var readout = TextOf(Assert.IsType<TimelineEvent.ToolResultEvent>(_adapter.Calls[0].Timeline[1]));
+        Assert.Contains("计划（剩余树", readout);
+        Assert.Contains("▶ 读代码", readout);
+        Assert.Contains("改一个文件", readout);
+        Assert.Contains("上次调用上下文总长度：125 tokens", readout);
+    }
+
     // ---- 工具本身 ----
 
     /// <summary>

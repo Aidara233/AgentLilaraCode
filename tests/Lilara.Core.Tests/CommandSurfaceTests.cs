@@ -64,6 +64,13 @@ public class CommandSurfaceTests
         (typeof(CoreCommand.SessionGc),        "session.gc",        "session gc s1"),
         (typeof(CoreCommand.SessionCompact),   "session.compact",   "session compact s1"),
 
+        // 后台任务（2026-10-27）：**用户侧的口子**。⚠️ 两条都必须有文本形态——
+        // 没有的话它们会掉进「当成消息」，而用户以为在看 / 停了任务（`off` 档下尤其要命：
+        // 那时模型那一侧的 `jobs` / `job_kill` 被闸门拒，这两条命令是唯一的逃生口）。
+        (typeof(CoreCommand.JobsList),         "jobs.list",         "jobs s1"),
+        (typeof(CoreCommand.JobKill),          "job.kill",          "job kill s1"),
+        (typeof(CoreCommand.JobOutput),        "job.output",        "job output j1 --offset 12"),
+
         (typeof(CoreCommand.ClaimAcquire),     null,                "claim src/foo"),
         (typeof(CoreCommand.ClaimRelease),     "claim.release",     "claim release src/foo"),
 
@@ -189,6 +196,9 @@ public class CommandSurfaceTests
         // 联网：显式载荷，因为兜底那张塞的 `id` / `sessionId` 这两个键它一个都不读。
         "network.configure" => """{"kind":"network.configure","enabled":true,"endpoint":"https://api.tavily.com/search","maxResults":5}""",
         "network.test" => """{"kind":"network.test"}""",
+        // 后台任务（2026-10-27）：`job.kill` 要 `jobId`，兜底那份只有 `id` / `sessionId`。
+        "job.kill" => """{"kind":"job.kill","sessionId":"s1","jobId":"job-abc123"}""",
+        "job.output" => """{"kind":"job.output","sessionId":"s1","jobId":"job-abc123","offset":12}""",
         _ => $$"""{"kind":"{{kind}}","id":"x","sessionId":"s1"}""",
     };
 

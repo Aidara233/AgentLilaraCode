@@ -27,22 +27,14 @@ public static class Subagent
     /// <summary>
     /// **核心替模型注入的那些记录的 id 前缀**（回流的合成对、以及它们的调用那一半）。
     ///
-    /// <para>⚠️ <b>它必须存在，而且只能由这里定</b>（同 `Interruption.NoteIdPrefix` 的理由）：
-    /// 合成对在时间线上**长得完全像一次真实的工具调用**（那正是我们要的——三个适配器
-    /// 一个字都不用改），而有一处判据必须把它们与真实的调用分开：
-    /// <see cref="Interruption.WasInterrupted"/> 的配对扫描。没有这个前缀，
-    /// 父正挂着一次询问时收到子的回报，那条挂着的调用会被判成**断裂**，
-    /// 于是核心补一条「上一次这一步被打断了」——而用户只是在想怎么回答。</para>
-    ///
-    /// <para>⚠️ <b>前缀写在 id 上，不写在内容里</b>：内容会进模型上下文（每步全价付），
-    /// 而 id 只在判定那一侧被读一眼。同 `floating-` 前缀的判据（`00` §7 判据 5：
-    /// 能进机械层的，绝不靠嘴说）。</para>
+    /// <para>⚠️ <b>2026-10-27 起它搬到 <see cref="Injected"/> 了</b>：注入现在有三种来源
+    /// （子会话回报 / 子会话提问 / 后台任务结束），而它们必须被**同一条判据**一起忽略。
+    /// 这里保留常量是为了不把已有的引用一次改到别处；**新代码用 <see cref="Injected"/>**。</para>
     /// </summary>
-    public const string InjectedIdPrefix = "subagent-";
+    public const string InjectedIdPrefix = Injected.SubagentPrefix;
 
-    /// <summary>这条记录是不是核心替模型注入的（见 <see cref="InjectedIdPrefix"/>）。</summary>
-    public static bool IsInjected(TimelineEvent evt) =>
-        evt.Id.StartsWith(InjectedIdPrefix, StringComparison.Ordinal);
+    /// <summary>这条记录是不是核心替模型注入的（判据只有 <see cref="Injected.IsInjected"/> 一处）。</summary>
+    public static bool IsInjected(TimelineEvent evt) => Injected.IsInjected(evt);
 
     /// <summary>
     /// 这个会话还能不能派生子会话（`01` §10.3 的「深度限量而非禁止」）。

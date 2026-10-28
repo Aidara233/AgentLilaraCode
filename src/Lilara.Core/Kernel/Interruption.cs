@@ -180,5 +180,5 @@ public static class Interruption
     /// </list>
     /// </summary>
     private static bool IgnoresPairing(TimelineEvent evt) =>
-        evt is TimelineEvent.ReleaseEvent || Subagent.IsInjected(evt);
+        evt is TimelineEvent.ReleaseEvent || Injected.IsInjected(evt);
 }

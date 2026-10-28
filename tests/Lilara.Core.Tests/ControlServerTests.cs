@@ -83,6 +83,69 @@ public class ControlServerTests : IAsyncLifetime
         }
     }
 
+    [Fact]
+    public async Task JobOutput_PagesAndRejectsForeignJobsWithoutActivatingSession()
+    {
+        var session = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "create1", true, CancellationToken.None);
+        var other = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "create2", true, CancellationToken.None);
+        var sid = Assert.IsType<Ack.Accepted>(session.Ack).SessionId!;
+        var otherId = Assert.IsType<Ack.Accepted>(other.Ack).SessionId!;
+        const string jobId = "abcdef123456";
+        var directory = Path.Combine(_root, "jobs", sid);
+        Directory.CreateDirectory(directory);
+        var text = new string('a', BackgroundJobLimits.MaxReadBytes) + "末尾";
+        File.WriteAllText(Path.Combine(directory, jobId + ".log"), text, new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(directory, jobId + ".json"), JsonSerializer.Serialize(new BackgroundJobInfo
+        {
+            Id = jobId, SessionId = sid, Kind = "test", Label = "fixture", WorkingDirectory = _work,
+            StartedAt = DateTimeOffset.UtcNow, State = BackgroundJobState.Exited,
+            OutputBytes = Encoding.UTF8.GetByteCount(text), ExitCode = 0,
+        }, Lilara.Core.Kernel.Json.Options));
+        _host.BackgroundJobs.Recover();
+        await _dispatcher.DispatchAsync(new CoreCommand.SessionDeactivate(sid), "deactivate", true, CancellationToken.None);
+        var activeBefore = _host.Activated.Count();
+
+        using var first = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/jobs/{jobId}/output")));
+        Assert.Equal(new string('a', BackgroundJobLimits.MaxReadBytes), first.RootElement.GetProperty("text").GetString());
+        Assert.Equal(BackgroundJobLimits.MaxReadBytes, first.RootElement.GetProperty("nextOffset").GetInt64());
+        using var last = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/jobs/{jobId}/output?offset={BackgroundJobLimits.MaxReadBytes}")));
+        Assert.Equal("末尾", last.RootElement.GetProperty("text").GetString());
+        Assert.False(last.RootElement.GetProperty("running").GetBoolean());
+        Assert.Equal(Encoding.UTF8.GetByteCount(text), last.RootElement.GetProperty("totalBytes").GetInt64());
+        using var end = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/jobs/{jobId}/output?offset={Encoding.UTF8.GetByteCount(text)}")));
+        Assert.Equal("", end.RootElement.GetProperty("text").GetString());
+        using var listing = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/jobs")));
+        Assert.Equal(jobId, Assert.Single(listing.RootElement.GetProperty("jobs").EnumerateArray()).GetProperty("id").GetString());
+        foreach (var path in new[] { $"/sessions/{otherId}/jobs/{jobId}/output", $"/sessions/{sid}/jobs/missing/output", $"/sessions/missing/jobs/{jobId}/output" })
+        {
+            using var response = await Client.GetAsync(Http(path));
+            Assert.Equal(System.Net.HttpStatusCode.NotFound, response.StatusCode);
+        }
+        foreach (var offset in new[] { "-1", "wrong", "9223372036854775808" })
+        {
+            using var response = await Client.GetAsync(Http($"/sessions/{sid}/jobs/{jobId}/output?offset={offset}"));
+            Assert.Equal(System.Net.HttpStatusCode.BadRequest, response.StatusCode);
+        }
+        var result = await _dispatcher.DispatchAsync(new CoreCommand.JobOutput(sid, jobId, BackgroundJobLimits.MaxReadBytes), "output", true, CancellationToken.None);
+        Assert.Contains("末尾", Assert.IsType<Ack.Accepted>(result.Ack).Note);
+        Assert.IsType<Ack.Rejected>((await _dispatcher.DispatchAsync(new CoreCommand.JobOutput(otherId, jobId), "foreign", true, CancellationToken.None)).Ack);
+        Assert.IsType<Ack.Rejected>((await _dispatcher.DispatchAsync(new CoreCommand.JobOutput(sid, jobId, -1), "negative", true, CancellationToken.None)).Ack);
+        Assert.Equal(activeBefore, _host.Activated.Count());
+
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(Ws()), CancellationToken.None);
+        await SendAsync(ws, JsonSerializer.Serialize(new { kind = "command", id = "read", payload = new { kind = "job.output", sessionId = sid, jobId, offset = 65536 } }));
+        var outputAck = await ReceiveAsync(ws);
+        Assert.True(outputAck.GetProperty("accepted").GetBoolean());
+        Assert.Equal("末尾", outputAck.GetProperty("data").GetProperty("text").GetString());
+        await SendAsync(ws, JsonSerializer.Serialize(new { kind = "command", id = "stop", payload = new { kind = "job.kill", sessionId = sid, jobId } }));
+        Assert.True((await ReceiveAsync(ws)).GetProperty("accepted").GetBoolean());
+        Assert.Equal(BackgroundJobState.Exited, _host.BackgroundJobs.Find(sid, jobId)!.State);
+        await SendAsync(ws, JsonSerializer.Serialize(new { kind = "command", id = "foreign-stop", payload = new { kind = "job.kill", sessionId = otherId, jobId } }));
+        Assert.False((await ReceiveAsync(ws)).GetProperty("accepted").GetBoolean());
+        await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "done", CancellationToken.None);
+    }
+
     private string Http(string path) => $"http://127.0.0.1:{_port}{path}";
     private string Ws() => $"ws://127.0.0.1:{_port}/ws";
 
@@ -995,6 +1058,113 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Contains(Axes.Defaults()[Axes.Permission], floating);
     }
 
+    /// <summary>
+    /// ⚠️ **头那块浮动槽必须看得见「模型被注入了什么」**（2026-10-27 用户点名：在头上看不到
+    /// 计划之类的注入情况）。
+    ///
+    /// <para>缺陷的形状：三处装配点（步开始 / 答复路径 / 这里的 `/state`）从前各自逐项拼
+    /// `SystemBlock.Render` 的参数，于是**计划树**与**上下文用量**只被推进器那一处传了进去
+    /// ——头里永远没有它们，而模型收到的有。两处都「看着对」，用户无从发现。</para>
+    ///
+    /// <para>⇒ 今天三处共用 `TailContext.For`（从 handle 派生），这条钉的就是「头这一侧真的
+    /// 拿到了同一批事实」。⚠️ 只钉「非空」是不够的：那样一个恒定输出轴的实现也绿。</para>
+    /// </summary>
+    [Fact]
+    public async Task State_FloatingSlotCarriesThePlanTreeAndTheContextLine()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+
+        // 计划：一条叶子 + 一条分支（分支下的那条叶子用来钉「树真的渲染了」）。
+        await _dispatcher.DispatchAsync(new CoreCommand.SessionPlanEdit(sid, "overwrite",
+            [
+                new PlanNode { Id = "a", Title = "读代码", Body = "先读一遍" },
+                new PlanNode
+                {
+                    Id = "b", Title = "改代码",
+                    Children = [new PlanNode { Id = "b1", Title = "改一个文件", Body = "改 executor" }],
+                },
+            ]), "plan1", false, CancellationToken.None);
+
+        // 账本：一条报了输入的调用 ⇒ 浮动槽那行该给出具体数字（130 = 100 + 20 + 10）。
+        new UsageStore(_root).Append(new UsageCall
+        {
+            CallId = "previous", SessionId = sid, ProviderId = "p", ModelId = "m",
+            Protocol = Protocols.ClaudeMessages, StartedAt = CoreClock.Now(), Status = "completed",
+            Usage = new TokenUsage { InputTokens = 100, CacheReadTokens = 20, CacheWriteTokens = 10 },
+        });
+
+        using var doc = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/state")));
+        var floating = doc.RootElement.GetProperty("slots").GetProperty("floating")
+            .EnumerateArray().Single().GetProperty("text").GetString()!;
+
+        // ① 计划树在（标题、当前叶子那个 ▶、叶子正文）。
+        Assert.Contains("计划（剩余树", floating);
+        Assert.Contains("读代码", floating);
+        Assert.Contains("改一个文件", floating);
+        Assert.Contains("▶ 读代码", floating);
+
+        // ② 上下文用量那一行在，而且是**归一口径**的数（归一口径与 `/sessions/{id}/context` 同一份）。
+        Assert.Contains("上次调用上下文总长度：130 tokens", floating);
+    }
+
+    /// <summary>
+    /// ⚠️ **`/sessions/{id}/context` 与浮动读数那一行是同一份测量**（2026-10-27）：
+    /// 从前前者挑「最近一条报了输入的调用」（会回退到更早的值），后者只看「最近一次请求、
+    /// 它没报就未知」——同一件事两个答案。现在两处都走 `ContextUsage`。
+    /// </summary>
+    [Fact]
+    public async Task ContextEndpoint_ReportsTheSameNumberAsTheFloatingSlot()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        new UsageStore(_root).Append(new UsageCall
+        {
+            CallId = "previous", SessionId = sid, ProviderId = "p", ModelId = "m",
+            Protocol = Protocols.OpenAiChat, StartedAt = CoreClock.Now(), Status = "completed",
+            Usage = new TokenUsage { InputTokens = 100, CacheReadTokens = 25, CacheWriteTokens = 999 },
+        });
+
+        using var state = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/state")));
+        using var context = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/context")));
+
+        // OpenAI 系的缓存写入已含在输入里 ⇒ 不加（125，而不是 1124）。
+        var latest = context.RootElement.GetProperty("latest");
+        Assert.Equal(125, latest.GetProperty("inputTokens").GetInt64());
+
+        // ⚠️ 线上那句话就是模型看到的那一行：头不该自己拼。
+        var line = context.RootElement.GetProperty("line").GetString();
+        Assert.Equal(ContextUsage.Line(new UsageStore(_root), sid), line);
+
+        var floating = state.RootElement.GetProperty("slots").GetProperty("floating")
+            .EnumerateArray().Single().GetProperty("text").GetString()!;
+        Assert.Contains(line!, floating);
+    }
+
+    /// <summary>
+    /// ⚠️ **头上也看得到那句「现在就压」**（2026-10-27）：超限判据在 `TailContext.For` 里，
+    /// 而头与模型走的是同一个入口 ⇒ 用户打开会话就能看见模型此刻被要求做什么，
+    /// 不必去猜「那个警告是不是只在模型那边」。
+    /// </summary>
+    [Fact]
+    public async Task State_FloatingSlot_CommandsCompactionWhenOverTheLimit()
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        new UsageStore(_root).Append(new UsageCall
+        {
+            CallId = "previous", SessionId = sid, ProviderId = "p", ModelId = "m",
+            Protocol = Protocols.ClaudeMessages, StartedAt = CoreClock.Now(), Status = "completed",
+            Usage = new TokenUsage { InputTokens = ContextUsage.AutoCompactThreshold },
+        });
+
+        using var doc = JsonDocument.Parse(await Client.GetStringAsync(Http($"/sessions/{sid}/state")));
+        var floating = doc.RootElement.GetProperty("slots").GetProperty("floating")
+            .EnumerateArray().Single().GetProperty("text").GetString()!;
+
+        Assert.Contains(CorePrompts.ContextOverflowDirective, floating, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task State_CarriesTheWholeSpec()
     {
@@ -1156,10 +1326,12 @@ public class ControlServerTests : IAsyncLifetime
         Assert.Equal(0, summary.GetProperty("callsWithKnownCache").GetInt32());
     }
 
-    // ⚠️ 旧实现挑的是「最后一条带 usage 的调用」：一条只有输出、没报输入的失败行会把
-    // 「上下文长度」变成「未报告」——比一条旧值更糟，它看起来像上下文没了。
+    // ⚠️ **2026-10-27 改口**：从前这里挑的是「最后一条**报了输入**的调用」（会跳过一条
+    // 只有输出的失败行、回退到更早的值），而浮动读数那一行只看「最近一次请求、它没报就未知」
+    // ——同一件事两个答案。⇒ 现在两处都走 `ContextUsage`：**最近一次真实请求没报输入 ⇒ 未知**，
+    // 不回退。这样「上次调用的上下文总长度」问的那一次就是它，头与模型看到的是同一句话。
     [Fact]
-    public async Task Context_SkipsCallsThatDidNotReportInput()
+    public async Task Context_ReportsUnknownWhenTheLatestCallDidNotReportInput()
     {
         var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
         var sid = ((Ack.Accepted)created.Ack).SessionId!;
@@ -1181,10 +1353,9 @@ public class ControlServerTests : IAsyncLifetime
 
         var context = await GetJson($"/sessions/{sid}/context");
 
-        var latest = context.GetProperty("latest");
-        Assert.Equal("good", latest.GetProperty("callId").GetString());
-        Assert.Equal(1200, latest.GetProperty("inputTokens").GetInt64());
-        Assert.Equal("reported", latest.GetProperty("source").GetString());
+        // ⚠️ 不回退到更早那条「good」：那会是一个**冒充**上次调用的数。
+        Assert.False(context.TryGetProperty("latest", out _));
+        Assert.Equal(ContextUsage.UnknownLine, context.GetProperty("line").GetString());
     }
 
     [Fact]

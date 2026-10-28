@@ -1,3 +1,4 @@
+using Lilara.Core.Kernel;
 using Lilara.Core.Protocol;
 using Lilara.Core.Storage;
 using Lilara.Core.Providers;
@@ -29,16 +30,17 @@ public static class StepperResolver
     /// </summary>
     public static Stepper Resolve(
         SessionStore store, ProviderStore providers, string? preferredProviderId = null,
-        PluginHost? plugins = null, UsageStore? usage = null)
+        PluginHost? plugins = null, UsageStore? usage = null, IBackgroundJobs? backgroundJobs = null,
+        Func<string, string?>? sessionStatus = null)
     {
         if (preferredProviderId is null)
         {
             var any = providers.List().FirstOrDefault();
             return any is null
                 ? new Stepper(store, new UnconfiguredAdapter(), Tools.BuiltInTools.All, plugins, usage,
-                    pendingCompactText: CompactText)
+                    pendingCompactText: CompactText, backgroundJobs: backgroundJobs, sessionStatus: sessionStatus)
                 : new Stepper(store, AdapterFactory.Create(any), Tools.BuiltInTools.All, plugins, usage,
-                    pendingCompactText: CompactText);
+                    pendingCompactText: CompactText, backgroundJobs: backgroundJobs, sessionStatus: sessionStatus);
         }
 
         var bound = providers.Load(preferredProviderId);
@@ -48,10 +50,11 @@ public static class StepperResolver
             // 用户明明配了（别的）提供商，只是这个会话绑的那个没了。
             return new Stepper(store, new UnconfiguredAdapter(
                 $"会话绑定的提供商 '{preferredProviderId}' 已不存在。用 `provider set` 重新配一个。"),
-                plugins: plugins, usage: usage, pendingCompactText: CompactText);
+                plugins: plugins, usage: usage, pendingCompactText: CompactText,
+                backgroundJobs: backgroundJobs, sessionStatus: sessionStatus);
         }
 
         return new Stepper(store, AdapterFactory.Create(bound), Tools.BuiltInTools.All, plugins, usage,
-            pendingCompactText: CompactText);
+            pendingCompactText: CompactText, backgroundJobs: backgroundJobs, sessionStatus: sessionStatus);
     }
 }

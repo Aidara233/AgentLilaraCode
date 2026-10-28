@@ -33,7 +33,8 @@ public sealed class SlotTests : IDisposable
         string? systemId = null, string? premierId = null,
         IReadOnlyDictionary<string, string>? axes = null, SessionPlan? plan = null) =>
         SystemBlock.Render(
-            System, Premier, systemId, premierId, axes ?? Axes.Defaults(), plan: plan);
+            System, Premier, systemId, premierId,
+            new TailContext(axes ?? Axes.Defaults()) { Plan = plan });
 
     // ---- 计划树与它的那句话（2026-10-24）----
     //
@@ -179,7 +180,8 @@ public sealed class SlotTests : IDisposable
         System.Save("default", "");
         var plugin = new PromptContributionSnapshot([], [], [new()
             { PluginId = "demo", Key = "field", Slot = PromptSlot.Floating, Text = "plugin-context" }]);
-        var slots = SystemBlock.Render(System, Premier, null, null, new Dictionary<string, string>(), plugin);
+        var slots = SystemBlock.Render(System, Premier, null, null,
+            new TailContext(new Dictionary<string, string>(), Plugin: plugin));
         Assert.Empty(slots.System);
         var tail = Assert.IsType<Block.TextBlock>(Assert.Single(slots.Tail)).Text;
         // ⚠️ 2026-10-17：尾块改走末尾合成的 `floating_context` 调用，自述句随之改口。
@@ -197,7 +199,8 @@ public sealed class SlotTests : IDisposable
         System.Save("default", "");
         var plugin = new PromptContributionSnapshot([new()
             { PluginId = "demo", Key = "system", Slot = PromptSlot.System, Stable = true, Text = "plugin-system" }], [], []);
-        var slots = SystemBlock.Render(System, Premier, null, null, new Dictionary<string, string>(), plugin);
+        var slots = SystemBlock.Render(System, Premier, null, null,
+            new TailContext(new Dictionary<string, string>(), Plugin: plugin));
         var system = Assert.IsType<Block.TextBlock>(Assert.Single(slots.System)).Text;
         Assert.StartsWith("[demo/system]\nplugin-system\n", system);
         Assert.Contains("浮动上下文", system);

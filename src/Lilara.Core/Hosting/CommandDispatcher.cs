@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Lilara.Core.Protocol;
 using Lilara.Core.Kernel;
 using Lilara.Core.Network;
@@ -50,8 +51,8 @@ public sealed class CommandDispatcher(
         // ⚠️ **子会话状态要内存那份**（2026-10-26）：`Running` 只写内存、从不落盘，只喂盘面的
         // `ReadState` 会让一个正在跑的子会话在父的尾块里恒显示「空闲」——而模型据此以为它做完了。
         // 与 `OnRetry` 同一条纪律：**解析口接一次**，所有入口自动带上。
-        stepper.LiveStatus = sessionId =>
-            _host.TryGetActivated(sessionId, out var child) ? child.State.Status : null;
+        stepper.LiveStatus = sessionId => _host.TaskStatusOf(sessionId);
+        stepper.TaskStatus = sessionId => _host.TaskStatusOf(sessionId);
 
         stepper.OnRetry = notice => _bus.Publish(
             EventBus.SessionTopic(handle.SessionId),
@@ -63,6 +64,116 @@ public sealed class CommandDispatcher(
 
     private readonly Func<ProviderDefinition, IModelAdapter> _createAdapter =
         createAdapter ?? AdapterFactory.Create;
+
+    /// <summary>
+    /// **后台任务结束时醒来**（2026-10-27）——与 `subagent_report` **同一条通道**
+    /// （用户裁定「这个应该可以和子agent统一一下」）。
+    ///
+    /// <para>⚠️ <b>为什么订阅点在这里</b>：这件事要做三样东西——往记录里追加、发事件、
+    /// `Start` 一步。三样都只有 `Hosting` 这层有（`Stepper` 不碰事件总线，也拿不到队列）。
+    /// 子会话回报（`ReportToParent`）就在同一个文件里，两处**共用同一段落地逻辑**。</para>
+    ///
+    /// <para>⚠️ <b>订阅是在构造时挂的</b>：哪条命令路径起来都一样，不需要每个入口各记得接一次
+    /// （同 `OnRetry` 那条分工的教训）。⚠️ 而宿主是进程级的，所以 `CommandDispatcher`
+    /// 与宿主必须**同生同死**——`CoreHost` 持有宿主，`CoreCli` 构造分派器时它已经在了。</para>
+    /// </summary>
+    private void SubscribeJobFinished() =>
+        _host.BackgroundJobs.Finished += OnJobFinished;
+
+    /// <summary>
+    /// **只挂一次**（主构造函数没有语句体，所以挂载点是「第一次分派」）。
+    ///
+    /// <para>⚠️ 用 `Interlocked.Exchange` 而不是 `bool`：分派可能在多个线程上并发
+    /// （控制台同步路 + 控制面后台路），而「读-判-写」会让同一条订阅挂两遍
+    /// ——那会让一次任务结束**追加两对合成记录**（模型读到两遍同一件事）。</para>
+    /// </summary>
+    private void EnsureJobWiring()
+    {
+        lock (_jobWiringLock)
+        {
+            if (_jobWired) return;
+            SubscribeJobFinished();
+            _jobWired = true;
+        }
+    }
+
+    private readonly object _jobWiringLock = new();
+    private bool _jobWired;
+
+    /// <summary>
+    /// **一个后台任务走到终态**：往它的会话里追加一对合成调用 + 结果，入队，然后推一步。
+    ///
+    /// <para>⚠️ <b>为什么要唤醒</b>（用户 2026-10-27 裁定）：不唤醒的话，模型起完任务就再也
+    /// 不会知道结果——它得自己「想起来」去问，而它没有任何理由想起来。这条与
+    /// `01` §10.1「事项的值得上报的事件追加进时间线并入队」是同一句话。</para>
+    ///
+    /// <para>⚠️ <b>为什么是<b>一对合成调用</b>而不是一条用户消息</b>：写成用户消息会**谎报发言者**
+    /// （用户没说话）。这一对与 `subagent_report` 完全同形，id 带
+    /// <see cref="Kernel.Injected.JobPrefix"/>，于是 `Interruption` 的配对扫描会跳过它们
+    /// （否则父挂着询问时收到它，那条挂着的调用会被判成断裂）。</para>
+    ///
+    /// <para>⚠️ <b>失败方向</b>：这条跑在**后台线程**上（读泵的守护任务 / 计时器），
+    /// 抛出去只会变成一条没人观测的任务异常 ⇒ 全包住。最坏结果是「任务结束了但没人叫醒会话」，
+    /// 而那是**可自愈**的：模型下一次自己调 `jobs` 就看得到。</para>
+    /// </summary>
+    private void OnJobFinished(Kernel.BackgroundJobInfo job)
+    {
+        try
+        {
+            if (!TryFind(job.SessionId, out var handle, out _)) return;   // 会话没了 ⇒ 静默
+            if (handle.Spec.ArchivedAt is not null) return;                // 已归档 ⇒ 不打扰
+
+            InjectReport(handle, job.Id, JobOutputTool.NameOf,
+                JsonSerializer.Serialize(new { job = job.Id }), JobNoticeText(job),
+                new ToolFraming(JobOutputTool.NameOf,
+                [new("job", job.Id), new("kind", job.Kind), new("state", job.State)]));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            // 见上面那段「失败方向」：不抛，也不假装成功。
+        }
+    }
+
+    /// <summary>
+    /// 那条通知的正文：**结论 + 结尾一段输出**。
+    ///
+    /// <para>⚠️ <b>只带结尾一段（最多 4 KiB）</b>：一次构建的输出可能几 MB，
+    /// 而模型看通知时最需要的是「它怎么结束的」——完整内容用 `job_output` 按 offset 读。
+    /// 这正是 `01` §10.2「产物写文件，上报只带指针 + 摘要」在进程这一侧的样子。</para>
+    ///
+    /// <para>⚠️ <b>不说「失败了」</b>：退出码非零是**事实**，而「失败」是判断——
+    /// 一条 `grep` 没匹配到就是退出码 1，它不是失败。</para>
+    /// </summary>
+    private string JobNoticeText(Kernel.BackgroundJobInfo job)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("后台任务 ").Append(job.Id).Append("（").Append(job.Kind).Append("）已经结束：")
+          .Append(job.State == Kernel.BackgroundJobState.Exited ? "自己退出" : "被停止");
+
+        if (job.ExitCode is { } code) sb.Append("，退出码 ").Append(code);
+        if (job.Reason is { } reason) sb.Append(" —— ").Append(reason);
+
+        sb.Append("。\n");
+
+        const int tailBytes = 4096;
+        var tail = _host.BackgroundJobs.Read(
+            job.SessionId, job.Id, Math.Max(0, job.OutputBytes - tailBytes), tailBytes);
+
+        if (tail is { Text.Length: > 0 })
+        {
+            if (job.OutputBytes > tailBytes) sb.Append("（最后 4 KiB 输出）\n");
+            sb.Append(tail.Text.TrimEnd()).Append('\n');
+        }
+        else
+        {
+            sb.Append("（这个任务没有任何输出）\n");
+        }
+
+        sb.Append("完整输出用 job_output job=").Append(job.Id)
+          .Append(" 读（可以反复读，只取新的一段）。");
+
+        return sb.ToString();
+    }
 
     // 预设的读写点。**从数据根现造**（与 `Reclaim` 那处 `new BlobStore(DataRoot)` 同形）：
     // 它无状态、只包一个路径前缀，做成字段就得给 `CoreHost` 再开一个属性，
@@ -187,6 +298,10 @@ public sealed class CommandDispatcher(
     public async Task<DispatchResult> DispatchAsync(
         CoreCommand command, string commandId, bool awaitCompletion, CancellationToken ct)
     {
+        // ⚠️ **后台任务的终态订阅挂在第一次分派上**（2026-10-27）：主构造函数没有语句体，
+        // 而「订阅」这件事只需要发生一次。⚠️ 它不能放在字段初始化器里——那里读不到 `this`。
+        EnsureJobWiring();
+
         // 兜底：这里是常驻进程唯一的最后一道闸——handler 逃出的任何异常都会掀翻
         // 同时托管控制台与控制面的那个进程（调用它的 `Program.cs` 那一层没有任何 catch）。
         // 两个 `when` 都不是可选的：取消要原样冒出去（`Stepper` 的中断路依赖它传导）、
@@ -264,6 +379,31 @@ public sealed class CommandDispatcher(
                 // ---- 回收（触发源是手动；`01` §8.0.2）----
                 case CoreCommand.SessionGc g:
                     return HandleSessionGc(g, commandId);
+
+                // ---- 后台任务（2026-10-27）：用户侧的口子 ----
+                case CoreCommand.JobsList jl:
+                    return HandleJobsList(jl, commandId);
+
+                case CoreCommand.JobKill jk:
+                    return HandleJobKill(jk, commandId);
+
+                case CoreCommand.JobOutput jo:
+                    if (_host.Store.FindSession(jo.SessionId) is null)
+                        return Reject(commandId, "会话不存在。");
+                    if (jo.Offset < 0) return Reject(commandId, "offset 不能是负数。");
+                    var read = _host.BackgroundJobs.Read(jo.SessionId, jo.JobId, jo.Offset, Kernel.BackgroundJobLimits.MaxReadBytes);
+                    if (read is null) return Reject(commandId, $"这个会话没有后台任务 `{jo.JobId}`。");
+                    var truncated = read.TotalBytes >= Kernel.BackgroundJobLimits.MaxOutputBytes;
+                    return new DispatchResult(new Ack.Accepted
+                    {
+                        CommandId = commandId, SessionId = jo.SessionId,
+                        Data = new { read.Text, read.Offset, read.NextOffset, read.TotalBytes, read.Running, Truncated = truncated },
+                        Note = $"任务 {jo.JobId} · {read.Offset}–{read.NextOffset}/{read.TotalBytes} 字节"
+                            + (read.Running ? "（还在跑）" : "（已结束）") + "\n"
+                            + (read.Text.Length > 0 ? read.Text : "（没有新输出）")
+                            + (read.NextOffset < read.TotalBytes ? $"\n接着读：job output {jo.JobId} --offset {read.NextOffset}" : "")
+                            + (truncated ? "\n[已截断] 输出已达保存上限，后续内容没有保存。" : ""),
+                    });
 
                 // ⚠️ 2026-10-22：压缩是**下发指令 + 推一步**，不再是「核心自己跑一次模型调用」
                 // ⇒ 不再需要 `awaitCompletion` 分流（那条分流原本是为了「同步等压缩跑完」）。
@@ -1266,62 +1406,37 @@ public sealed class CommandDispatcher(
         if (child.Spec.ParentSessionId is not { } parentId) return;
         if (!TryFind(parentId, out var parent, out _)) return;   // 父没了 ⇒ 静默丢弃（同 `DeliverTell`）
 
+        var callId = $"{Injected.SubagentPrefix}{Ids.New()}";
+        InjectReport(parent, callId, SubagentReportTool.NameOf,
+            JsonSerializer.Serialize(new { child = child.SessionId }), text,
+            new ToolFraming(SubagentReportTool.NameOf,
+            [new("from", child.SessionId), new("status", status)]));
+    }
+
+    // Both child reports and process completion enter the same durable, paired channel.
+    private void InjectReport(SessionHandle target, string callId, string tool,
+        string args, string text, ToolFraming framing)
+    {
         var at = CoreClock.Now();
-        var token = Ids.New();
-        var callId = $"{Kernel.Subagent.InjectedIdPrefix}{token}";
-
-        // ⚠️ **参数也落进去**（`child`）：模型读那条 `tool_use` 时能看见「这是哪个孩子说的」，
-        // 而它是逐字 JSON（与模型自己发的调用同形，见 `Block.ToolUseBlock.Arguments`）。
-        var args = $"{{\"child\":\"{child.SessionId}\"}}";
-
-        TimelineEvent[] pair =
-        [
-            new TimelineEvent.MessageEvent
-            {
-                Id = $"{callId}-call",
-                At = at,
-                From = Speaker.Model,
-                Blocks = [new Block.ToolUseBlock(callId, SubagentReportTool.NameOf, args)],
-            },
-            new TimelineEvent.ToolResultEvent
-            {
-                Id = $"{callId}-result",
-                At = at,
-                CallId = callId,
-                Content = [new Block.TextBlock(text)],
-                // ⚠️ 框架放进 `Framing` 那一格（不是拼进内容）：回收/截断换的是 `Content`，
-                // 而框架是**事实**——混进去会让它被一起吃掉（`ToolResultEvent.Framing` 的注释）。
-                // ⚠️ 它也进了**投递预算**：`Truncate` 按 `MaxResultBytes` 砍的是 `Content`，
-                // 超出部分由模型用 `fetch(id, offset)` 自己取——那正是用户要的那套。
-                Framing = new ToolFraming(SubagentReportTool.NameOf,
-                [
-                    new ToolFramingField("from", child.SessionId),
-                    new ToolFramingField("status", status),
-                ]),
-            },
-        ];
-
-        _host.Store.AppendEvents(parent.ProjectKey, parent.SessionId, pair);
-
-        // ⚠️ **两条活事件**（模型消息 + 工具结果），与 `RunStepAsync` 里那两段同形：
-        // 头按到达次序画，而记录里的次序就是「调用、然后它的结果」。
-        _bus.Publish(EventBus.SessionTopic(parent.SessionId),
-            new WireEvent.MessageAppended(parent.SessionId, "model", pair[0] is TimelineEvent.MessageEvent m ? m.Blocks : [], at)
-            {
-                HistoryId = pair[0].Id,
-            });
-
-        foreach (var result in pair.OfType<TimelineEvent.ToolResultEvent>())
-            _bus.Publish(EventBus.SessionTopic(parent.SessionId),
-                new WireEvent.ToolResultAppended(
-                    parent.SessionId, result.Id, result.CallId, result.Content, result.At));
-
-        // ⚠️ 队列里放一段**非空**的块：它是「有事要它动」的凭据（`Recovery.BeforeStep`
-        // 的 `hasNewInput`），而**不是**一条会追加进记录的用户消息——记录已经由上面那对写好了。
-        // ⇒ 别在这里 `AppendEvent`，那会让父的时间线多一条它没说过的话。
-        parent.Enqueue([new Block.TextBlock(text)]);
-
-        Start(parent);
+        var message = new TimelineEvent.MessageEvent
+        {
+            Id = callId + "-call", At = at, From = Speaker.Model,
+            Blocks = [new Block.ToolUseBlock(callId, tool, args)],
+        };
+        var result = new TimelineEvent.ToolResultEvent
+        {
+            Id = callId + "-result", At = at, CallId = callId,
+            Content = [new Block.TextBlock(text)], Framing = framing,
+        };
+        _host.Store.AppendEvents(target.ProjectKey, target.SessionId, [message, result]);
+        _bus.Publish(EventBus.SessionTopic(target.SessionId),
+            new WireEvent.MessageAppended(target.SessionId, "model", message.Blocks, at)
+            { HistoryId = message.Id });
+        _bus.Publish(EventBus.SessionTopic(target.SessionId),
+            new WireEvent.ToolResultAppended(target.SessionId, result.Id, callId, result.Content, at));
+        target.Enqueue([new Block.TextBlock(text)]);
+        // A pending user question must remain pending; its resume will consume queued reports.
+        if (target.State.Status != SessionStatus.WaitingForInput) Start(target);
     }
 
     /// <summary>
@@ -1463,6 +1578,74 @@ public sealed class CommandDispatcher(
             CommandId = id,
             SessionId = g.SessionId,
             Note = reason,
+        });
+    }
+
+    /// <summary>
+    /// **列出某个会话的后台任务**（`jobs` 命令，2026-10-27）。
+    ///
+    /// <para>⚠️ <b>它不受权限轴管</b>：命令是用户自己的手，而模型那一侧的 `jobs` 工具在
+    /// `off` 档会被闸门拒——那种时候用户仍然要看得见自己机器上跑了什么。</para>
+    ///
+    /// <para>⚠️ 结果走 `Ack.Accepted.Note`（同 `provider.test` / `session.gc` 的用法）：
+    /// 它是一句给**人**看的话，头不该依赖它的形状。而它<b>不</b>写进记录——
+    /// 查询不是事件，落盘会让模型以为用户说了句话。</para>
+    /// </summary>
+    private DispatchResult HandleJobsList(CoreCommand.JobsList c, string id)
+    {
+        if (!TryFind(c.SessionId, out _, out var notFound)) return Reject(id, notFound!);
+
+        var jobs = _host.BackgroundJobs.List(c.SessionId);
+        if (jobs.Count == 0)
+            return new DispatchResult(new Ack.Accepted
+            {
+                CommandId = id, SessionId = c.SessionId, Note = "这个会话没有后台任务。",
+            });
+
+        var lines = jobs.Select(job =>
+        {
+            var state = job.State == Kernel.BackgroundJobState.Exited ? "已退出"
+                : job.State == Kernel.BackgroundJobState.Killed ? "已停止"
+                : job.State == Kernel.BackgroundJobState.Lost ? "结局未知"
+                : "在跑";
+
+            return $"{job.Id} · {job.Kind} · {state}"
+                 + (job.ExitCode is { } code ? $" · 退出码 {code}" : "")
+                 + $" · {job.OutputBytes} 字节"
+                 + (job.Reason is { } reason ? $" · {reason}" : "")
+                 + $" · {Session.Tools.JobsTool.OneLine(job.Label)}";
+        });
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            SessionId = c.SessionId,
+            Note = string.Join("\n", lines),
+        });
+    }
+
+    /// <summary>
+    /// **停掉一个后台任务**（`job kill` 命令，2026-10-27）。
+    ///
+    /// <para>⚠️ <b>归属判据由宿主守</b>（只认本会话的）：命令这一层**不**自己去翻任务表，
+    /// 否则两处判「它是不是你的」就会漂——而漂了会让一条命令变成跨会话的越权通道。</para>
+    /// </summary>
+    private DispatchResult HandleJobKill(CoreCommand.JobKill c, string id)
+    {
+        if (!TryFind(c.SessionId, out _, out var notFound)) return Reject(id, notFound!);
+
+        var before = _host.BackgroundJobs.Find(c.SessionId, c.JobId);
+        if (before is null) return Reject(id, $"这个会话没有后台任务 `{c.JobId}`。");
+
+        var after = _host.BackgroundJobs.Kill(c.SessionId, c.JobId, "用户在控制台 / 头上停掉了它。");
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            SessionId = c.SessionId,
+            Note = before.State == Kernel.BackgroundJobState.Running
+                ? $"已停止 {c.JobId}（整棵进程树）。它的输出仍然读得到。"
+                : $"任务 {c.JobId} 本来就已结束（{after?.State ?? before.State}），没有需要停止的东西。",
         });
     }
 

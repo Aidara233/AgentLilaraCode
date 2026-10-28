@@ -13,4 +13,18 @@ namespace Lilara.Core.Kernel;
 public static class Ids
 {
     public static string New() => Guid.NewGuid().ToString("N")[..12];
+
+    /// <summary>
+    /// **后台任务的 id**（2026-10-27）。⚠️ 它带 <c>job-</c> 前缀，而这是**判据不是装饰**：
+    ///
+    /// <para>会话 id 也是 12 位 hex，而「等待一个任务」（`wait`）要同时接受**两类**目标
+    /// ——后台进程（`job-…`）与子会话（`…`）。⚠️ 两者格式相同的话，`wait("a1b2c3d4e5f6")`
+    /// 根本分不出它指的是哪个 ⇒ 只能靠「先查任务表、再查子会话」的顺序猜，
+    /// 而那个顺序一旦猜错，模型等的是一个**永远不会结束**的东西。</para>
+    ///
+    /// <para>⚠️ 前缀与 <see cref="Injected.JobPrefix"/> **是同一个字符串**：注入那一对的 id
+    /// 就是「<c>job-…</c> 加后缀」，两处各拼一遍会漂（而漂了的表现是「通知的 id 与任务的 id
+    /// 对不上」，模型据此去 `job_output` 会查无此人）。</para>
+    /// </summary>
+    public static string NewJob() => Injected.JobPrefix + Guid.NewGuid().ToString("N")[..12];
 }

@@ -5,9 +5,9 @@ namespace Lilara.Core.Session.Tools;
 /// <summary>
 /// `compact`——**用一段摘要截断此前的历史**（2026-10-22，压缩从「核心自己跑一次模型调用」改成工具）。
 ///
-/// <para>⚠️ <b>它只在用户下发过压缩指令时算数</b>（`IToolContext.CompactRequested`）：
-/// 没指令时调用它，就是一句人话 + 什么都不做——不能假装收尾，更不能真的截断历史
-/// （用户没要求，而截断是<b>不可逆</b>的：被压掉的那段在渲染里就只剩摘要了）。</para>
+/// <para>主动性为 goal / iterate 时模型可随时自主压缩；**上下文越过 900k tokens 时任何模式都允许**
+/// （2026-10-27 用户裁定：那一格没有选择，而模型默认会以为要等用户批准）；其他模式需要用户下发压缩指令
+/// （`IToolContext.CompactRequested`）。授权与参数由 <see cref="Parse"/> 统一校验。</para>
 ///
 /// <para>⚠️ <b>工具本身什么都不写</b>：检查点、清指令、开回收窗口全在
 /// <see cref="Stepper"/> 里。理由是 `IToolContext` 只读（`04` §5.1）——工具没有写盘的手。
@@ -21,7 +21,7 @@ namespace Lilara.Core.Session.Tools;
 /// 它的形态就是一段 JSON 字符串，而模型自己下一轮看得见它——不需要另一条前置合成消息。</para>
 ///
 /// <para>⚠️ <b>权限：不归闸门管</b>（<see cref="GatedByPermission"/>）。判据写在那个属性上：
-/// 它只动加载边界、不碰世界，而它本来就只在用户指令期内生效。`off` 档下也应该压得成——
+/// 它只动加载边界、不碰世界；用户指令或 goal / iterate 主动性授权其生效。`off` 档下也应该压得成——
 /// 压不成时连这次会话本身都会撑爆。</para>
 /// </summary>
 public sealed class CompactTool : ITool
@@ -53,7 +53,9 @@ public sealed class CompactTool : ITool
         + "重要的文件路径与工具结果 id、当前状态和不确定的地方。"
         + "调用之后，此前的记录不再发给模型（要用还取得回），而<b>这次调用本身及它之后的一切</b>会保留——"
         + "所以先把自己需要的东西读完再调。"
-        + $"摘要不超过 {MaxSummaryChars} 个字符。只有用户要求压缩时它才会生效；否则它什么也不做。";
+        + $"摘要不超过 {MaxSummaryChars} 个字符。主动性为 goal 或 iterate 时可随时自主压缩，无需用户授权；"
+        + $"上下文超过 {ContextUsage.AutoCompactThreshold / 1000}k tokens 时任何模式、任何模型都允许自主压缩；"
+        + "其他情况只有用户要求压缩时才会生效。";
 
     public string ParametersSchemaJson => $$"""
         {
@@ -80,14 +82,24 @@ public sealed class CompactTool : ITool
     /// <para>⚠️ <b>判据只有一处</b>：推进器（写检查点）与 <see cref="RunAsync"/>（回哪句话）
     /// 都调这一个函数——两处各判一次，就是本仓栽过的「两层判据必须共用一个谓词」。
     /// 「有没有指令」也在这里判，所以工具那边不需要再读一次上下文。</para>
+    ///
+    /// <para>⚠️ <b>授权有三个来源，任一成立即可</b>（2026-10-27 加了第三个）：
+    /// ① 用户下发了压缩指令（<see cref="IToolContext.CompactRequested"/>）；
+    /// ② 主动性是 goal / iterate（可随时自主压）；
+    /// ③ **上一次请求已越过 900k**（<see cref="SessionToolContext.ContextFull"/>）——
+    /// 这一条<b>与模式、与模型都无关</b>：不压就是下一步上游报错 / 截断，那时连摘要都写不出来了。</para>
     /// </summary>
     public static string? Parse(ToolCall call, IToolContext context, out string refusal)
     {
         refusal = "";
 
-        if (!context.CompactRequested)
+        var session = context as SessionToolContext;
+        var initiative = session?.Initiative;
+        if (!context.CompactRequested && session?.ContextFull != true
+            && initiative is not ("goal" or Axes.Iterate))
         {
-            refusal = "当前没有压缩指令，什么都没做。只有用户要求压缩时它才会生效。";
+            refusal = "当前没有压缩指令、也没到必须压缩的长度，什么都没做。"
+                      + $"goal / iterate 模式允许自主压缩；其他模式需要用户要求压缩，或上下文超过 {ContextUsage.AutoCompactThreshold / 1000}k tokens。";
             return null;
         }
 
@@ -121,6 +133,6 @@ public sealed class CompactTool : ITool
             Parse(call, context, out var refusal) is null
                 ? refusal
                 // ⚠️ 这句是**两个判据都成立之后**才说得出的：这次调用真的执行过（工具被调用了）、
-                // 而且它会在推进器里兑现（指令在、参数合格）。篇幅压到最短——它进上下文，没有信息量。
+                // 而且它会在推进器里兑现（授权成立、参数合格）。篇幅压到最短——它进上下文，没有信息量。
                 : "已请求压缩。此前的记录将由这段摘要代替；本调用与它之后的一切保留。"));
 }
