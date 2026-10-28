@@ -39,6 +39,16 @@ public abstract record CoreCommand
         /// 配置写错了要让人看见）。</para>
         /// </summary>
         public int? TimeoutSeconds { get; init; }
+
+        /// <summary>
+        /// **前缀缓存的显式断点**（2026-10-28）：`null` = 本次没提到 = **保留旧值**（同 <see cref="Models"/>）；
+        /// `auto` / `explicit` 二选一，其余值在这里被拒。
+        ///
+        /// <para>⚠️ <b>它是按提供商开的</b>：Anthropic 没有隐式缓存（不标就全价）、OpenAI 只有 5.6+ 认断点、
+        /// DeepSeek 系标了也没用 ⇒ 只有端点自己知道该不该开。判据与位置见
+        /// <see cref="Lilara.Core.Protocol.CacheBreakpoint"/>。</para>
+        /// </summary>
+        public string? CacheMode { get; init; }
     }
 
     /// <summary>

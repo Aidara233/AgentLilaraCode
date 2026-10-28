@@ -517,6 +517,12 @@ public sealed class CommandDispatcher(
             && (seconds < ProviderLimits.MinTimeoutSeconds || seconds > ProviderLimits.MaxTimeoutSeconds))
             return Reject(id, $"`--timeout` 要在 {ProviderLimits.MinTimeoutSeconds}..{ProviderLimits.MaxTimeoutSeconds} 秒之间（给的是 {seconds}）。");
 
+        // 缓存形态：只收表里那两档（`null` = 本次没提到 = 保留旧值）。
+        // ⚠️ 大小写与拼写都判——它进的是**请求字节**，写错了会静默退回 auto，而用户以为开了。
+        if (p.CacheMode is { } cacheMode
+            && !CacheBreakpoint.Modes.Contains(cacheMode, StringComparer.Ordinal))
+            return Reject(id, $"未知缓存形态 '{cacheMode}'。支持：{string.Join(" / ", CacheBreakpoint.Modes)}");
+
         // 先读旧定义，保留本次没提到的字段（Endpoint / Modality / DefaultModel / Protocol 都是操作者配置）。
         var existing = _host.Providers.Load(p.Id);
 
@@ -547,6 +553,9 @@ public sealed class CommandDispatcher(
             Models = p.Models ?? existing?.Models,
             // 同上：没提到就保留旧的（`null` 在这里是「本次没提到」，不是「清回默认」）。
             TimeoutSeconds = p.TimeoutSeconds ?? existing?.TimeoutSeconds,
+            // 缓存形态同理。⚠️ 它进的是**请求字节**：值写错会让整条前缀缓存失效而不报错，
+            // 所以校验在上一段（dispatcher），这里只负责「没提到 = 保留」。
+            CacheMode = p.CacheMode ?? existing?.CacheMode,
         });
 
         // 失效点必须在这里，不能挂在控制台的字符串判据 `IsProviderSetCommand` 上——

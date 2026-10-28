@@ -695,6 +695,10 @@ public sealed class ControlServer(
                 p.Models,
                 // 一次模型调用的超时（秒）。null = 没配（由协议自己的默认值管）。
                 p.TimeoutSeconds,
+                // 前缀缓存的显式断点（2026-10-28）：`auto` / `explicit`，null = 没声明（= auto）。
+                // ⚠️ 它是**按端点**的属性：头据此画下拉，但**合法取值不在这里**——
+                // 那个真相在 `/provider-schema`（见那边同一条注释）。
+                p.CacheMode,
                 // key 只回 HasApiKey（能改不能看）：表单能显示「已配置」而不是空框。
                 HasApiKey = p.HasApiKey,
             }), WireJson.Options));
@@ -711,6 +715,9 @@ public sealed class ControlServer(
             // ⚠️ 文案与谓词同处一地（`CommandDispatcher.ProviderIdRule`）——别在这里内联，
             // 那份曾经内联在此，改谓词的人看不见它 ⇒ 人话会静默变成假话。
             ProviderIdRule = CommandDispatcher.ProviderIdRule,
+            // 缓存形态的合法取值（2026-10-28）。⚠️ 从 `CacheBreakpoint.Modes` 读，**不是**头里手抄：
+            // 这一格决定「请求字节里会不会多出断点字段」，抄错一档就是静默的缓存失效。
+            CacheModes = CacheBreakpoint.Modes,
         }, WireJson.Options));
 
         // 联网配置（2026-10-22）。⚠️ 与 `/providers` 同一条纪律：**key 只回 hasApiKey**。

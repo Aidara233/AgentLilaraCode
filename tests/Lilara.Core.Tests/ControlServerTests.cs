@@ -1666,7 +1666,7 @@ public class ControlServerTests : IAsyncLifetime
 
     [Fact]
     public async Task Snapshot_ProviderSchema_CarriesExactlyTheseKeys() =>
-        AssertKeysOf(await GetJson("/provider-schema"), "protocols", "authSchemes", "defaultAuthScheme", "providerIdRule");
+        AssertKeysOf(await GetJson("/provider-schema"), "protocols", "authSchemes", "defaultAuthScheme", "providerIdRule", "cacheModes");
 
     [Fact]
     public async Task Snapshot_NetworkConfig_CarriesExactlyTheseKeys()
@@ -1780,7 +1780,7 @@ public class ControlServerTests : IAsyncLifetime
         using var s = JsonDocument.Parse(await Client.GetStringAsync(Http("/provider-schema")));
 
         Assert.Equal(
-            ["authSchemes", "defaultAuthScheme", "protocols", "providerIdRule"],
+            ["authSchemes", "cacheModes", "defaultAuthScheme", "protocols", "providerIdRule"],
             s.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal));
 
         // ⚠️ 判据文案与缺省认证方式都要**来自定义处**，不能是在端点里内联的第二份。
