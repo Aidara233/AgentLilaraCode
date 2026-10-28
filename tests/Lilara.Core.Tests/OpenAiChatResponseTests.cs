@@ -280,6 +280,43 @@ public class OpenAiChatResponseTests
         Assert.Equal(100, reply.Usage?.InputTokens);
     }
 
+    /// <summary>
+    /// **缓存写入**（2026-10-28）：GPT-5.6 起 OpenAI 单独上报 `cache_write_tokens`
+    /// （单价 1.25× 未缓存输入）。此前解析器只认 Anthropic 的 `cache_creation_input_tokens`
+    /// ⇒ OpenAI 系的缓存写入恒为「未报告」，而它正是 5.6+ 最该盯的那笔成本。
+    ///
+    /// <para>⚠️ 这与本文件开头那一组（缓存读取从没读到过）是**同一个漏法**换了字段名。</para>
+    /// </summary>
+    [Fact]
+    public void Map_ReadsCacheWriteTokensFromTheDetailsObject()
+    {
+        var reply = OpenAiChatResponse.Map("""
+            {"choices":[{"message":{"role":"assistant","content":"答"},"finish_reason":"stop"}],
+             "usage":{"prompt_tokens":1566,"completion_tokens":1518,"total_tokens":3084,
+                      "prompt_tokens_details":{"cached_tokens":1408,"cache_write_tokens":1024},
+                      "completion_tokens_details":{"reasoning_tokens":576}}}
+            """);
+
+        Assert.Equal(1024, reply.Usage?.CacheWriteTokens);
+        Assert.Equal(1408, reply.Usage?.CacheReadTokens);
+        // 写入**不从输入里扣**：它不是「这次没算进去的输入」，而是一次已发生的计算
+        // （与缓存读取不同——后者是输入的一个子集）。
+        Assert.Equal(158, reply.Usage?.InputTokens);
+    }
+
+    /// <summary>Anthropic 的名字照旧要认（同一套解析器服务三条链路）。</summary>
+    [Fact]
+    public void Map_StillReadsTheAnthropicCacheWriteName()
+    {
+        var reply = OpenAiChatResponse.Map("""
+            {"choices":[{"message":{"role":"assistant","content":"答"},"finish_reason":"stop"}],
+             "usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,
+                      "cache_creation_input_tokens":640}}
+            """);
+
+        Assert.Equal(640, reply.Usage?.CacheWriteTokens);
+    }
+
     [Fact]
     public void Map_PrefersTheDetailsObject_WhenBothCacheFieldsArePresent()
     {

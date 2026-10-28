@@ -49,6 +49,25 @@ public abstract record CoreCommand
         /// <see cref="Lilara.Core.Protocol.CacheBreakpoint"/>。</para>
         /// </summary>
         public string? CacheMode { get; init; }
+
+        /// <summary>
+        /// **思考强度要不要进请求参数**（2026-10-28）：`null` = 本次没提到 = **保留旧值**；
+        /// `auto` / `reasoning` 二选一，其余值在这里被拒。
+        ///
+        /// <para>⚠️ 它与 <see cref="CacheMode"/> 同一个形状，理由也同源：两者都进**请求字节**，
+        /// 而两种端点的兼容性差得很远（`reasoning_effort` 不是所有网关都认）。
+        /// 判据见 <see cref="Lilara.Core.Protocol.EffortParam"/>。</para>
+        /// </summary>
+        public string? EffortParam { get; init; }
+
+        /// <summary>
+        /// **Responses 请求要不要 `include: ["reasoning.encrypted_content"]`**（2026-10-28）：
+        /// `null` = 本次没提到 = **保留旧值**；`auto` / `include` 二选一，其余值在这里被拒。
+        ///
+        /// <para>⚠️ 本仓不用 `previous_response_id` ⇒ 推理回传只能靠客户端带密文重放，
+        /// 这个开关是那条路的总闸。判据见 <see cref="Lilara.Core.Protocol.ReasoningInclude"/>。</para>
+        /// </summary>
+        public string? ReasoningInclude { get; init; }
     }
 
     /// <summary>

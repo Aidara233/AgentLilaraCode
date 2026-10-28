@@ -699,6 +699,10 @@ public sealed class ControlServer(
                 // ⚠️ 它是**按端点**的属性：头据此画下拉，但**合法取值不在这里**——
                 // 那个真相在 `/provider-schema`（见那边同一条注释）。
                 p.CacheMode,
+                // 思考强度参数与推理回传（2026-10-28）：同样是按端点的属性，
+                // 合法取值在 `/provider-schema`（见那边同一条注释）。
+                p.EffortParam,
+                p.ReasoningInclude,
                 // key 只回 HasApiKey（能改不能看）：表单能显示「已配置」而不是空框。
                 HasApiKey = p.HasApiKey,
             }), WireJson.Options));
@@ -718,6 +722,9 @@ public sealed class ControlServer(
             // 缓存形态的合法取值（2026-10-28）。⚠️ 从 `CacheBreakpoint.Modes` 读，**不是**头里手抄：
             // 这一格决定「请求字节里会不会多出断点字段」，抄错一档就是静默的缓存失效。
             CacheModes = CacheBreakpoint.Modes,
+            // 思考强度参数与推理回传的合法取值（2026-10-28）。同一条纪律：从核心读，头不许手抄。
+            EffortParams = EffortParam.Modes,
+            ReasoningIncludes = ReasoningInclude.Modes,
         }, WireJson.Options));
 
         // 联网配置（2026-10-22）。⚠️ 与 `/providers` 同一条纪律：**key 只回 hasApiKey**。

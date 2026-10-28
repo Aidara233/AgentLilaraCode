@@ -35,6 +35,39 @@ public sealed record ProviderDefinition
     public string? CacheMode { get; init; }
 
     /// <summary>
+    /// **思考强度要不要进请求参数**（2026-10-28）：`null` / `auto` = 不发（默认，请求字节不变）；
+    /// `reasoning` = 发（Chat 走顶层 `reasoning_effort`，Responses 走 `reasoning.effort`）。
+    ///
+    /// <para>⚠️ <b>默认关的理由</b>：`reasoning_effort` 不是所有端点都认——真 OpenAI 的推理模型认、
+    /// DeepSeek 认，而 GLM / doubao / 网关代理对未知参数的处理不一致（有的 400，有的静默忽略）。
+    /// 本仓的 provider 里这类端点是多数 ⇒ 无条件发等于拿能跑的会话换一条新字段。</para>
+    ///
+    /// <para>⚠️ <b>但「不发」也是一种缺陷，而且更难查</b>：`Axes.Effort` 是 `InContext = false`
+    /// 的纯参数轴，它<b>只有</b>进请求参数这一条路。此前两条 OpenAI 链路一次都没读过
+    /// `ModelRequest.Effort`（只有 Claude 读）⇒ 改 effort 时线上字节<b>逐字节相同</b>：
+    /// 没有错误、没有日志，只有一个永远不变的档位。⇒ 开关是「关着但它存在」，不是「没有」。</para>
+    ///
+    /// <para>判据与取值见 <see cref="Protocol.EffortParam"/>。</para>
+    /// </summary>
+    public string? EffortParam { get; init; }
+
+    /// <summary>
+    /// **Responses 请求要不要 `include: ["reasoning.encrypted_content"]`**（2026-10-28）：
+    /// `null` / `auto` = 不发（默认，请求字节不变）；`include` = 发。
+    ///
+    /// <para>⚠️ <b>它解决的是本仓架构下推理回传的唯一可行路径</b>：本仓<b>不用</b>
+    /// `previous_response_id`（全量重放自己的时间线）⇒ 服务端那份推理拿不到，只能靠
+    /// 客户端带着 `encrypted_content` 重放。没有这个字段，响应里的 reasoning 项就没有
+    /// 加密载荷 ⇒ 即使响应侧把它记下来，下一轮发回去的也只是一段摘要（对真 OpenAI 而言
+    /// 「不相关的推理项会被丢弃」）。</para>
+    ///
+    /// <para>⚠️ <b>为什么也要按端点开</b>：`include` 是 OpenAI 的形状，兼容网关不一定认
+    /// （未知 `include` 值可能 400）；而 `encrypted_content` 会让<b>每条</b> reasoning 项
+    /// 变大一坨密文——它对缓存前缀是**稳定的**（同一轮同一串字节），但体积是真的。</para>
+    /// </summary>
+    public string? ReasoningInclude { get; init; }
+
+    /// <summary>
     /// 这个提供商**可选的**模型清单（头把会话的模型画成下拉，选项就从这里来）。
     ///
     /// <para>⚠️ **加法式可空**：缺失即反序列化成 `null`。可空是**语义**（「没声明清单」），

@@ -18,10 +18,14 @@ public sealed class OpenAiChatAdapter : IModelAdapter
     /// <inheritdoc />
     public bool ExplicitCache { get; }
 
+    /// <summary>这个端点上要不要发 `reasoning_effort`（`effortParam: reasoning`）。默认不发。</summary>
+    public bool SendEffort { get; }
+
     public OpenAiChatAdapter(ProviderDefinition provider)
     {
         ArgumentNullException.ThrowIfNull(provider);
         ExplicitCache = provider.CacheMode == CacheBreakpoint.Explicit;
+        SendEffort = provider.EffortParam == EffortParam.Reasoning;
         if (provider.Protocol != ProtocolId)
             throw new ArgumentException(
                 $"OpenAiChatAdapter 只认协议 '{ProtocolId}'，收到 '{provider.Protocol}'", nameof(provider));
@@ -44,7 +48,7 @@ public sealed class OpenAiChatAdapter : IModelAdapter
         // 逃出去会变成未捕获异常。
         try
         {
-            var body = OpenAiChatRequest.Build(request, ExplicitCache);
+            var body = OpenAiChatRequest.Build(request, ExplicitCache, SendEffort);
             var json = await _http.PostAsync(OpenAiChatRequest.Path, body, ct, transport);
             return OpenAiChatResponse.Map(json);
         }

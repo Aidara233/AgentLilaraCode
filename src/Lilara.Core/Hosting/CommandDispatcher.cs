@@ -523,6 +523,16 @@ public sealed class CommandDispatcher(
             && !CacheBreakpoint.Modes.Contains(cacheMode, StringComparer.Ordinal))
             return Reject(id, $"未知缓存形态 '{cacheMode}'。支持：{string.Join(" / ", CacheBreakpoint.Modes)}");
 
+        // 思考强度参数与推理回传（2026-10-28）：同一条纪律——它们都进**请求字节**，
+        // 拼错了会静默退回 auto，而用户以为开了。
+        if (p.EffortParam is { } effortParam
+            && !EffortParam.Modes.Contains(effortParam, StringComparer.Ordinal))
+            return Reject(id, $"未知思考强度参数 '{effortParam}'。支持：{string.Join(" / ", EffortParam.Modes)}");
+
+        if (p.ReasoningInclude is { } reasoningInclude
+            && !ReasoningInclude.Modes.Contains(reasoningInclude, StringComparer.Ordinal))
+            return Reject(id, $"未知推理回传形态 '{reasoningInclude}'。支持：{string.Join(" / ", ReasoningInclude.Modes)}");
+
         // 先读旧定义，保留本次没提到的字段（Endpoint / Modality / DefaultModel / Protocol 都是操作者配置）。
         var existing = _host.Providers.Load(p.Id);
 
@@ -556,6 +566,9 @@ public sealed class CommandDispatcher(
             // 缓存形态同理。⚠️ 它进的是**请求字节**：值写错会让整条前缀缓存失效而不报错，
             // 所以校验在上一段（dispatcher），这里只负责「没提到 = 保留」。
             CacheMode = p.CacheMode ?? existing?.CacheMode,
+            // 思考强度参数与推理回传同理（都是「没提到 = 保留」）。
+            EffortParam = p.EffortParam ?? existing?.EffortParam,
+            ReasoningInclude = p.ReasoningInclude ?? existing?.ReasoningInclude,
         });
 
         // 失效点必须在这里，不能挂在控制台的字符串判据 `IsProviderSetCommand` 上——

@@ -94,13 +94,25 @@ internal static class UsageJson
             // 原始形状仍在 RawJson 里，可回去核对。
             input = Math.Max(0, input.Value - cacheRead.Value);
 
+        // ⚠️ **缓存写入**（2026-10-28）：GPT-5.6 起 OpenAI 单独计费并单独上报
+        // （`input_tokens_details.cache_write_tokens` / `prompt_tokens_details.cache_write_tokens`，
+        // 单价 1.25× 未缓存输入）。此前这里只认 Anthropic 的 `cache_creation_input_tokens`
+        // ⇒ **OpenAI 系的缓存写入恒为「未报告」**，而它正是 5.6+ 最该盯的那笔成本。
+        // ⚠️ 这与 `08` §3.1 记的那次「缓存读取从没读到过」是**同一个漏法**（只认一家的字段名），
+        // 换了个字段名重演一遍 ⇒ 读法照抄上面 `cacheRead` 那个多槽位写法。
+        var cacheWrite = ReadCache(
+            ("input_tokens_details", "cache_write_tokens"),
+            ("prompt_tokens_details", "cache_write_tokens"),
+            (null, "cache_write_tokens"),
+            (null, "cache_creation_input_tokens"));
+
         return new TokenUsage
         {
             InputTokens = input,
             OutputTokens = output,
             TotalTokens = total,
             CacheReadTokens = cacheRead,
-            CacheWriteTokens = Read("cache_creation_input_tokens"),
+            CacheWriteTokens = cacheWrite,
             ReasoningTokens = ReasoningOf(usage),
             RawJson = usage.GetRawText(),
         };

@@ -1253,6 +1253,12 @@ public class ControlServerTests : IAsyncLifetime
         DefaultModel = "m", Modality = "vision",
         Endpoint = "http://127.0.0.1:1/v1", AuthScheme = AuthSchemes.Bearer,
         Models = ["m1", "m2"],
+        // ⚠️ 这几个**必须设上**：`WhenWritingNull` 会把没设的可空字段整个省掉，
+        // 而这套测试钉的正是「每个键都在」⇒ 漏设一个，上面那条断言就变成
+        // 「碰巧只有 N 个键」（下面 `OmitsNullFields` 才是有意钉省略的那条）。
+        CacheMode = CacheBreakpoint.Explicit,
+        EffortParam = EffortParam.Reasoning,
+        ReasoningInclude = ReasoningInclude.Mode,
     });
 
     private static string[] KeysOf(JsonElement obj) =>
@@ -1650,7 +1656,8 @@ public class ControlServerTests : IAsyncLifetime
         var item = (await GetJson("/providers")).EnumerateArray()
             .Single(e => e.GetProperty("id").GetString() == "full");
 
-        AssertKeysOf(item, "id", "protocol", "defaultModel", "endpoint", "authScheme", "modality", "models", "hasApiKey");
+        AssertKeysOf(item, "id", "protocol", "defaultModel", "endpoint", "authScheme", "modality", "models",
+            "cacheMode", "effortParam", "reasoningInclude", "hasApiKey");
     }
 
     // 缺省供应商（可空字段全不设）的键集**更小**——这条把「省略」也钉住：
@@ -1661,12 +1668,15 @@ public class ControlServerTests : IAsyncLifetime
         var item = (await GetJson("/providers")).EnumerateArray()
             .Single(e => e.GetProperty("id").GetString() == "p");   // InitializeAsync 播的那个
 
+        // ⚠️ `effortParams` / `reasoningIncludes` **不在这里**：它们是 `/provider-schema` 的键
+        // （合法取值），不是 `/providers` 的（那份是每个 provider 的实例值）。
         AssertKeysOf(item, "id", "protocol", "defaultModel", "modality", "hasApiKey");
     }
 
     [Fact]
     public async Task Snapshot_ProviderSchema_CarriesExactlyTheseKeys() =>
-        AssertKeysOf(await GetJson("/provider-schema"), "protocols", "authSchemes", "defaultAuthScheme", "providerIdRule", "cacheModes");
+        AssertKeysOf(await GetJson("/provider-schema"), "protocols", "authSchemes", "defaultAuthScheme",
+            "providerIdRule", "cacheModes", "effortParams", "reasoningIncludes");
 
     [Fact]
     public async Task Snapshot_NetworkConfig_CarriesExactlyTheseKeys()
@@ -1780,7 +1790,8 @@ public class ControlServerTests : IAsyncLifetime
         using var s = JsonDocument.Parse(await Client.GetStringAsync(Http("/provider-schema")));
 
         Assert.Equal(
-            ["authSchemes", "cacheModes", "defaultAuthScheme", "protocols", "providerIdRule"],
+            ["authSchemes", "cacheModes", "defaultAuthScheme", "effortParams", "protocols",
+             "providerIdRule", "reasoningIncludes"],
             s.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal));
 
         // ⚠️ 判据文案与缺省认证方式都要**来自定义处**，不能是在端点里内联的第二份。

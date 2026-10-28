@@ -178,6 +178,114 @@ public sealed class CacheBreakpointTests
         Assert.False(OpenAiResponsesCache.Mark(input));
     }
 
+    /// <summary>
+    /// ⚠️ <b>断点绝不许落在尾槽位上</b>（2026-10-28）——这是本套测试里最要紧的一条。
+    ///
+    /// <para>尾块是**每步都变**的那一段（此刻的时间 / 步数 / 用量）。旧判据靠「末尾那条是什么形状」
+    /// 猜它不在末尾，而那**只在有 `floating_context` 工具时成立**（那种会话尾槽位被清空）。
+    /// 没有那个工具的会话（纯 chat 预设、测试替身）尾块会拼成一条纯文本 user 消息追加在最后
+    /// ⇒ 旧判据会选中它 ⇒ 断点划在变动内容上 ⇒ 每步 miss，GPT-5.6+ 还要按 1.25× 付写入。
+    /// ⇒ 现在靠**代码次序**保证（断点在尾槽位追加之前打），这条测试钉的正是那个次序。</para>
+    /// </summary>
+    [Fact]
+    public void OpenAiChat_BreakpointStaysOffTheVolatileTailSlot()
+    {
+        var request = Request([Say("u1", Speaker.User, "你好")]) with
+        {
+            Slots = new PromptSlots(
+                System: [new Block.TextBlock("SYS")],
+                Premier: [],
+                // 每步都变的那一段——它会被拼成最后一条 user 消息。
+                Tail: [new Block.TextBlock("态势：时间 2026-10-28T12:00:00 · 步数 7")]),
+        };
+
+        var json = OpenAiChatRequest.Build(request, explicitCache: true);
+        var messages = JsonDocument.Parse(json).RootElement.GetProperty("messages");
+
+        // 最后一个断点必须落在 `u1` 上，**不是**最后那条尾块。
+        string? markedText = null;
+        foreach (var m in messages.EnumerateArray())
+        {
+            if (!m.TryGetProperty("content", out var content) || content.ValueKind != JsonValueKind.Array)
+                continue;
+            foreach (var part in content.EnumerateArray())
+                if (part.TryGetProperty("prompt_cache_breakpoint", out _))
+                    markedText = part.GetProperty("text").GetString();
+        }
+
+        Assert.Equal("你好", markedText);
+    }
+
+    /// <summary>Responses 同一条判据（那边只能挂历史那一个断点，但它照样不许落在尾块上）。</summary>
+    [Fact]
+    public void OpenAiResponses_BreakpointStaysOffTheVolatileTailSlot()
+    {
+        var request = Request([Say("u1", Speaker.User, "你好")]) with
+        {
+            Slots = new PromptSlots(
+                System: [new Block.TextBlock("SYS")],
+                Premier: [],
+                Tail: [new Block.TextBlock("态势：时间 2026-10-28T12:00:00")]),
+        };
+
+        var json = OpenAiResponsesRequest.Build(request, explicitCache: true);
+        var input = JsonDocument.Parse(json).RootElement.GetProperty("input");
+
+        string? markedText = null;
+        foreach (var item in input.EnumerateArray())
+        {
+            if (!item.TryGetProperty("content", out var content) || content.ValueKind != JsonValueKind.Array)
+                continue;
+            foreach (var part in content.EnumerateArray())
+                if (part.TryGetProperty("prompt_cache_breakpoint", out _))
+                    markedText = part.GetProperty("text").GetString();
+        }
+
+        Assert.Equal("你好", markedText);
+    }
+
+    /// <summary>
+    /// **思考强度按 provider 开**（2026-10-28）：默认不发（请求字节与加这个能力之前相同），
+    /// 开了才发——而且两条 OpenAI 协议的**字段名不一样**（Chat 顶层 `reasoning_effort`、
+    /// Responses 嵌套 `reasoning.effort`），这是最容易被顺手抄错的一处。
+    /// </summary>
+    [Fact]
+    public void Effort_IsSentOnlyWhenTheProviderAsksForIt()
+    {
+        var request = Request([Say("u1", Speaker.User, "你好")]);
+
+        var off = OpenAiChatRequest.Build(request);
+        Assert.DoesNotContain("reasoning_effort", off, StringComparison.Ordinal);
+
+        var on = OpenAiChatRequest.Build(request, sendEffort: true);
+        Assert.Contains("\"reasoning_effort\":\"high\"", on, StringComparison.Ordinal);
+
+        // Responses：嵌套在 reasoning 对象里，**不是**顶层同名键。
+        var respOff = OpenAiResponsesRequest.Build(request);
+        Assert.DoesNotContain("\"reasoning\"", respOff, StringComparison.Ordinal);
+
+        var respOn = OpenAiResponsesRequest.Build(request, sendEffort: true);
+        Assert.Contains("\"reasoning\":{\"effort\":\"high\"}", respOn, StringComparison.Ordinal);
+        Assert.DoesNotContain("reasoning_effort", respOn, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// **推理回传开关**（2026-10-28）：`include: ["reasoning.encrypted_content"]` 默认不发。
+    /// 本仓不用 `previous_response_id` ⇒ 这是推理回传唯一可行的那条路。
+    /// </summary>
+    [Fact]
+    public void ReasoningInclude_IsSentOnlyWhenTheProviderAsksForIt()
+    {
+        var request = Request([Say("u1", Speaker.User, "你好")]);
+
+        Assert.DoesNotContain("include", OpenAiResponsesRequest.Build(request), StringComparison.Ordinal);
+
+        var on = OpenAiResponsesRequest.Build(request, includeReasoning: true);
+        Assert.Contains("\"include\":[\"reasoning.encrypted_content\"]", on, StringComparison.Ordinal);
+        // 只开 include 时 `reasoning` 对象不该凭空出现（effort 没开）。
+        Assert.DoesNotContain("\"reasoning\":{", on, StringComparison.Ordinal);
+    }
+
     private static int Count(string haystack, string needle)
     {
         var n = 0;

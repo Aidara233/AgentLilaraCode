@@ -204,6 +204,8 @@ public class OpenAiResponsesRequestTests
     public void Build_KeepsTextOrderWithAReasoningItemAroundThem()
     {
         // 推理块变成独立项后，两段正文仍然留在**同一条**消息里、顺序不变（与改动之前同一条判据）。
+        // ⚠️ 2026-10-28：`Signature`（这是 Claude 的凭据）**不发给 OpenAI**，故 reasoning 项里
+        // 没有 `id`——见 `ReasoningItems` 那条注释。
         var json = OpenAiResponsesRequest.Build(Req(Msg(Speaker.Model,
             new Block.TextBlock("前"), new Block.ReasoningBlock("s", "中"), new Block.TextBlock("后"))));
 
@@ -213,6 +215,25 @@ public class OpenAiResponsesRequestTests
             "{\"type\":\"message\",\"role\":\"assistant\",\"content\":" +
             "[{\"type\":\"output_text\",\"text\":\"前\"},{\"type\":\"output_text\",\"text\":\"后\"}]}]}",
             json);
+    }
+
+    /// <summary>
+    /// **加密推理块发成 `encrypted_content`，不发 `summary`**（2026-10-28）。
+    ///
+    /// <para>那一格装的是密文（<see cref="ReasoningKind.Redacted"/>）⇒ 把它当摘要正文发出去
+    /// 就是伪造（模型会读到一坨 base64）。这条钉住两条方向的判据。</para>
+    /// </summary>
+    [Fact]
+    public void Build_SendsRedactedReasoningAsEncryptedContent_NotAsSummary()
+    {
+        var json = OpenAiResponsesRequest.Build(Req(Msg(Speaker.Model,
+            new Block.ReasoningBlock(null, "gAAAAAB-密文", ReasoningKind.Redacted),
+            new Block.TextBlock("答"))));
+
+        Assert.Contains("\"encrypted_content\":\"gAAAAAB-密文\"", json);
+        // 密文一个字节都不许出现在 summary 里。
+        Assert.DoesNotContain("summary_text", json);
+        Assert.Contains("\"summary\":[]", json);
     }
 
     [Fact]

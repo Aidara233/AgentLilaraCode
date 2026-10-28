@@ -50,6 +50,67 @@ public class OpenAiResponsesResponseTests
         Assert.Equal(40, reply.Usage?.ReasoningTokens);
     }
 
+    /// <summary>
+    /// **推理项不再被丢掉**（2026-10-28）。此前 `output` 里 `type:"reasoning"` 的项整个跳过，
+    /// 而请求侧早就在发 reasoning 项 ⇒ 记录里从来没有推理块 ⇒ 请求侧那段代码永远枚举不到东西。
+    ///
+    /// <para>两样内容各占一块：`summary` → Text（可读），`encrypted_content` → Redacted（密文）。</para>
+    /// </summary>
+    [Fact]
+    public void Map_KeepsReasoningItems()
+    {
+        var reply = OpenAiResponsesResponse.Map("""
+            {"id":"r","status":"completed","output":[
+              {"type":"reasoning","id":"rs_1",
+               "summary":[{"type":"summary_text","text":"想了一下"}],
+               "encrypted_content":"gAAAAAB密文"},
+              {"type":"message","role":"assistant","content":[{"type":"output_text","text":"答案"}]}]}
+            """);
+
+        // 次序保持：思考在前、正文在后（记录是有序的）。
+        Assert.Equal(3, reply.Blocks.Count);
+        var summary = Assert.IsType<Block.ReasoningBlock>(reply.Blocks[0]);
+        Assert.Equal("想了一下", summary.Text);
+        Assert.Equal(ReasoningKind.Text, summary.Kind);
+        // ⚠️ Signature 是 **null**：协议项的 `id` 是 OpenAI 的 id，而这一格是 Claude 的凭据格，
+        // 两家的字段不许混装（否则请求侧会把它当签名发出去）。
+        Assert.Null(summary.Signature);
+
+        var encrypted = Assert.IsType<Block.ReasoningBlock>(reply.Blocks[1]);
+        Assert.Equal("gAAAAAB密文", encrypted.Text);
+        Assert.Equal(ReasoningKind.Redacted, encrypted.Kind);
+
+        Assert.Equal("答案", ((Block.TextBlock)reply.Blocks[2]).Text);
+    }
+
+    /// <summary>只有密文没有摘要（真实 OpenAI 的常见形态：`summary: []`）⇒ 一块，不造空块。</summary>
+    [Fact]
+    public void Map_KeepsEncryptedContentWithoutASummary()
+    {
+        var reply = OpenAiResponsesResponse.Map("""
+            {"id":"r","status":"completed","output":[
+              {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"gAAA"},
+              {"type":"message","role":"assistant","content":[{"type":"output_text","text":"答"}]}]}
+            """);
+
+        Assert.Equal(2, reply.Blocks.Count);
+        var encrypted = Assert.IsType<Block.ReasoningBlock>(reply.Blocks[0]);
+        Assert.Equal(ReasoningKind.Redacted, encrypted.Kind);
+    }
+
+    /// <summary>两样都没有的空 reasoning 项 ⇒ 零块（别造一个空块）。</summary>
+    [Fact]
+    public void Map_DropsAnEmptyReasoningItem()
+    {
+        var reply = OpenAiResponsesResponse.Map("""
+            {"id":"r","status":"completed","output":[
+              {"type":"reasoning","id":"rs_1","summary":[]},
+              {"type":"message","role":"assistant","content":[{"type":"output_text","text":"答"}]}]}
+            """);
+
+        Assert.Single(reply.Blocks);
+    }
+
     [Fact]
     public void Map_SkipsNonMessageOutputItems()
     {

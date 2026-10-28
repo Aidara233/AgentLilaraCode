@@ -10,7 +10,7 @@ public static class OpenAiChatRequest
 {
     public const string Path = "/v1/chat/completions";
 
-    public static string Build(ModelRequest request, bool explicitCache = false)
+    public static string Build(ModelRequest request, bool explicitCache = false, bool sendEffort = false)
     {
         // ⚠️ 判据与 Claude 那条**必须逐字相同**（空时间线 + 两槽位都空才早失败）——
         // 三条链路对「什么算合法的请求」各判一套的话，换个 provider 就会静默换一种行为。
@@ -34,6 +34,31 @@ public static class OpenAiChatRequest
         foreach (var evt in request.Timeline)
             messages.Add(ToMessage(evt, request.Protocol, request.Tools.Count > 0));
 
+        // ⚠️ `body` 先声明、`messages` 是按引用装进去的数组 ⇒ 后面往 `messages` 里追加
+        // （尾槽位）仍然会反映到 `body` 上。声明放在这里只是为了让断点那一段能写 `body[...]`。
+        var body = new JsonObject
+        {
+            ["model"] = request.ModelId,
+            ["max_tokens"] = request.MaxTokens,
+            ["messages"] = messages,
+        };
+
+        // ---- 显式缓存断点（2026-10-28，只在这个 provider 声明 `cacheMode: explicit` 时）----
+        //
+        // ⚠️ **必须打在这里：尾槽位追加之前**。断点的判据是「落在每步都变的东西之前」，
+        // 而尾块（此刻的时间 / 步数 / 用量）<b>就是</b>每步都变的那一段 ⇒ 它一进 `messages`，
+        // 「最后一条纯文本 user 消息」正好选中它，断点就划在变动内容上 ⇒ 每步 miss
+        // （GPT-5.6+ 还要按 1.25× 付 `cache_write_tokens`，比不开缓存更贵）。
+        //
+        // ⚠️ 旧注释在这里断言「浮动读数那对没有可挂的文本块，被自动跳过 ⇒ 断点天然在它们之前」
+        // ——那句话**只在有 `floating_context` 工具时成立**：那种会话的尾槽位被清空
+        // （`Stepper`：`Slots = HasFloatingContextTool ? slots with { Tail = [] } : slots`），
+        // 末尾是 `role:"tool"` 的合成结果。而没有那个工具的会话（纯 chat 预设、
+        // 测试替身）尾块会**原样拼成一条 user 消息追加在最后**，旧判据当场选错。
+        // ⇒ 位置判据不能靠「末尾那条是什么形状」猜，只能靠**代码次序**保证。
+        if (explicitCache && MarkCacheBreakpoints(messages))
+            body["prompt_cache_options"] = new JsonObject { ["mode"] = "explicit" };
+
         // ---- 尾槽位：**拼进末尾那条 user 消息**（`01` §3.2 / §3.3）----
         //
         // ⚠️ **判据只有一条：末尾是不是 user。** 是 ⇒ 拼进去；不是 ⇒ 补一条 user 消息。
@@ -49,24 +74,23 @@ public static class OpenAiChatRequest
         if (TailText(request.Slots.Tail) is { Length: > 0 } tail)
             messages.Add(new JsonObject { ["role"] = "user", ["content"] = tail });
 
-        var body = new JsonObject
-        {
-            ["model"] = request.ModelId,
-            ["max_tokens"] = request.MaxTokens,
-            ["messages"] = messages,
-        };
+        // ⚠️ **断点已在上面（尾槽位追加之前）打过了**——这里不再重复。
+        // 那一处有完整理由；删掉这里的第二份是为了让「位置判据只有一处」兑现。
 
-        // ---- 显式缓存断点（2026-10-28，只在这个 provider 声明 `cacheMode: explicit` 时）----
+        // ---- 思考强度（2026-10-28）----
         //
-        // ⚠️ **为什么必须同时打两个断点**：`prompt_cache_options.mode = "explicit"` 会**关掉隐式缓存**
-        // （OpenAI 文档原文：不放断点的请求完全不缓存/不写缓存）。所以只打 header 断点等于把
-        // 「整段历史的隐式缓存」换成「只有 header」，反而更差 ⇒ 打不上历史断点就**不开 explicit**。
+        // ⚠️ **这是一条「此前根本没接线」的轴**：`Axes.Effort` 是 `InContext = false` 的纯参数轴
+        // ⇒ 它只有进请求参数这一条路，而三条链路里此前只有 Claude 读过 `request.Effort`。
+        // 两条 OpenAI 链路上改 effort，线上字节**逐字节相同**（没有错误、没有日志）。
         //
-        // ⚠️ 断点落在**最后一条 content 是纯文本的 user/assistant 消息**上：
-        // 浮动读数那对（assistant 的 tool_use + role=tool 的结果）没有可挂的文本块，被自动跳过
-        // ⇒ 断点天然在它们之前，末尾每步变的那一段不污染前缀。
-        if (explicitCache && MarkCacheBreakpoints(messages))
-            body["prompt_cache_options"] = new JsonObject { ["mode"] = "explicit" };
+        // ⚠️ **默认不发**（`sendEffort` 由 provider 的 `effortParam: reasoning` 打开）：
+        // `reasoning_effort` 不是所有端点都认（GLM / doubao / 网关代理对未知参数的处理不一致，
+        // 有的 400 有的静默忽略）。判据与理由见 `EffortParam`。
+        //
+        // ⚠️ 档名**原样发**：本仓 5 档是真 OpenAI 与 DeepSeek 合法值的子集，中间不插映射表
+        // （再写一张就是 G10 那种第二份副本）。
+        if (sendEffort)
+            body["reasoning_effort"] = request.Effort;
 
         // ⚠️ **空工具表 ⇒ 不写这个键**（不是写一个空数组）：与 `temperature` 同一条判据，
         // 也是「没配工具的会话请求逐字节不变」的依据。

@@ -3,7 +3,8 @@ using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Protocol.OpenAi;
 
-// OpenAI Responses 响应 → canonical。纯函数：output 是异构数组，只取 type == "message" 的项，其余（reasoning 等）跳过。
+// OpenAI Responses 响应 → canonical。纯函数：output 是异构数组，取 message / function_call / reasoning 三类项，
+// 其余（内置工具调用项等）跳过。
 public static class OpenAiResponsesResponse
 {
     public static ModelReply Map(string json)
@@ -47,7 +48,15 @@ public static class OpenAiResponsesResponse
                         if (FunctionCallOf(item) is { } call) blocks.Add(call);
                         break;
 
-                    // 其余（reasoning 等）跳过——与改动之前一致。
+                    // ⚠️ **2026-10-28：推理项不再丢**。此前这里写的是「其余（reasoning 等）跳过」，
+                    // 而请求侧早就在发 `type:"reasoning"` 项（2026-10-17 那批）——两边合起来的
+                    // 效果是**请求侧那段代码永远枚举不到东西**（记录里从来没有推理块）。
+                    // 那是一个「只改了一半」的缺陷：测试全绿，因为它们手工 `new ReasoningBlock`。
+                    case "reasoning":
+                        blocks.AddRange(ReasoningOf(item));
+                        break;
+
+                    // 其余（web_search_call 等内置工具项）跳过：它们不是对话内容。
                 }
             }
         }
@@ -64,6 +73,73 @@ public static class OpenAiResponsesResponse
             ReportedModel = reportedModel,
             ResponseId = responseId,
         };
+    }
+
+    /// <summary>
+    /// `type:"reasoning"` 项 → 一或两个 <see cref="Block.ReasoningBlock"/>。
+    ///
+    /// <para>⚠️ <b>2026-10-28：这个方法补的是一个「只改了一半」的缺陷</b>。请求侧从 2026-10-17
+    /// 起就在发 `type:"reasoning"` 项（`OpenAiResponsesRequest.ReasoningItems`），而响应侧
+    /// 一直把推理项整个跳过 ⇒ 记录里<b>从来不会有</b>推理块 ⇒ 请求侧那段
+    /// `OfType&lt;Block.ReasoningBlock&gt;()` <b>永远枚举不到东西</b>。测试全绿，因为它们是
+    /// 手工 `new ReasoningBlock(...)` 造的输入——生产路径造不出来。</para>
+    ///
+    /// <para>⚠️ <b>为什么是「一或两个块」</b>：一条协议项里有两样东西要各自保住——
+    /// <c>summary</c>（可读摘要）与 <c>encrypted_content</c>（不透明推理状态）。
+    /// <see cref="Block.ReasoningBlock"/> 只有 Text 一格，塞不下两样，硬塞就是伪造
+    /// ⇒ 拆成两块。发回去时是<b>两条</b>项（见 `ReasoningItems` 为什么不合回一条）。</para>
+    ///
+    /// <para>⚠️ <b>为什么 <c>encrypted_content</c> 记成 <see cref="ReasoningKind.Redacted"/></b>：
+    /// 那一档的契约就是「加密载荷：原样保留、不解释、不打印」。它是<b>字节</b>，不是给人和模型
+    /// 读的正文 ⇒ 当成 Text 会让它出现在界面上，也会让 Chat 链路把它当 `reasoning_content` 发出去。
+    /// （<see cref="ReasoningKind.Redacted"/> 在 Claude 那边对应 `redacted_thinking`，语义一致。）</para>
+    ///
+    /// <para>两样都没有 ⇒ 空列表（一个空的 reasoning 项没有可记录的内容，别造空块）。</para>
+    /// </summary>
+    private static List<Block> ReasoningOf(JsonElement item)
+    {
+        var blocks = new List<Block>();
+
+        // ⚠️ **`item.id`（`rs_…`）刻意不记录**：唯一能存它的格子是
+        // <see cref="Block.ReasoningBlock.Signature"/>，而那一格是 **Claude 的凭据格**
+        // （`ClaudeRequestBuilder` 把它当 thinking 块的 `signature` 发出去）。把 OpenAI 的 id
+        // 写进去，`ReasoningItems` 就得再加一条「发的时候别发它」的判据——而那不是安全网，
+        // 是把两家字段混装之后的补丁。`encrypted_content` 本身**自足**（Azure 文档：无状态模式
+        // 「keep every output item, … and replay the complete history」，不要求带 id），
+        // 所以记住它、把内容原样重放就够了。
+
+        // summary 是数组（可多段）。拼成一格——契约上它是「这一项的可读摘要」，
+        // 而分段只是生成时的换行，不是结构（与 `TextsOf` 处理 message 的 content 同一条判据）。
+        var summary = string.Concat(SummaryTextsOf(item));
+        if (summary.Length > 0)
+            blocks.Add(new Block.ReasoningBlock(null, summary, ReasoningKind.Text));
+
+        // 加密载荷：原样保住，一个字节都不动（`00` §7 判据 5：能保住就保住）。
+        if (item.TryGetProperty("encrypted_content", out var encrypted)
+            && encrypted.ValueKind == JsonValueKind.String
+            && encrypted.GetString() is { Length: > 0 } payload)
+            blocks.Add(new Block.ReasoningBlock(null, payload, ReasoningKind.Redacted));
+
+        return blocks;
+    }
+
+    /// <summary>`summary: [{type:"summary_text", text:…}]` 里的各段文本，按原序。</summary>
+    private static List<string> SummaryTextsOf(JsonElement item)
+    {
+        var texts = new List<string>();
+        if (!item.TryGetProperty("summary", out var summary)
+            || summary.ValueKind != JsonValueKind.Array) return texts;
+
+        foreach (var part in summary.EnumerateArray())
+        {
+            if (part.ValueKind != JsonValueKind.Object) continue;
+            if (part.TryGetProperty("text", out var text)
+                && text.ValueKind == JsonValueKind.String
+                && text.GetString() is { Length: > 0 } str)
+                texts.Add(str);
+        }
+
+        return texts;
     }
 
     private static List<Block> TextsOf(JsonElement message)

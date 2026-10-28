@@ -12,7 +12,8 @@ public static class OpenAiResponsesRequest
 {
     public const string Path = "/v1/responses";
 
-    public static string Build(ModelRequest request, bool explicitCache = false)
+    public static string Build(
+        ModelRequest request, bool explicitCache = false, bool sendEffort = false, bool includeReasoning = false)
     {
         // ⚠️ 判据与另两条**必须逐字相同**（空时间线 + 两槽位都空才早失败）。
         if (request.Timeline.Count == 0
@@ -24,6 +25,16 @@ public static class OpenAiResponsesRequest
         foreach (var evt in request.Timeline)
             foreach (var item in ToItems(evt, request.Protocol))
                 input.Add(item);
+
+        // ---- 显式缓存断点（2026-10-28，只在 provider 声明 `cacheMode: explicit` 时）----
+        //
+        // ⚠️ **必须打在这里：尾槽位追加之前**（与 Chat 那条同一个理由，那处有完整解释）。
+        // 简短版：尾块是每步都变的那一段，它一进 `input`，「最后一条能挂断点的 message 项」
+        // 就可能选中它 ⇒ 断点划在变动内容上 ⇒ 每步 miss。
+        // ⚠️ 旧注释断言「`function_call_output` 被跳过 ⇒ 断点天然在浮动对之前」——
+        // 那句话**只在有 `floating_context` 工具时成立**（那种会话尾槽位被清空）；
+        // 没有那个工具的会话，尾块会拼成一条 `type:"message"` 项追加在最后，而它**能**挂断点。
+        var marked = explicitCache && OpenAiResponsesCache.Mark(input);
 
         // ---- 尾槽位：**拼进末尾那条 user 消息**（`01` §3.2 / §3.3）----
         //
@@ -69,13 +80,36 @@ public static class OpenAiResponsesRequest
 
         body["input"] = input;
 
+        // ---- 思考强度与推理回传（2026-10-28，两个都由 provider 打开，默认都不发）----
+        //
+        // ⚠️ **`reasoning.effort`**：与 Chat 那条同一条理由（`Axes.Effort` 是纯参数轴，
+        // 而这条链路此前一次都没读过 `request.Effort`）。字段名**不一样**——Responses 是
+        // 嵌套对象里的 `reasoning.effort`，Chat 是顶层 `reasoning_effort`。别互相抄。
+        //
+        // ⚠️ **`reasoning.context` 不写**：它是「历史推理要不要渲染进下一步」的开关，
+        // 默认值随模型代际变（5.4/5.5 是 current_turn，5.6+ 是 all_turns）。
+        // 写死任何一个都会把「升级模型后的默认行为」钉在某一代上，而那是上游的判据。
+        //
+        // ⚠️ **`include: ["reasoning.encrypted_content"]`**：本仓不用 `previous_response_id`
+        // （全量重放自己的时间线）⇒ 服务端那份推理拿不到，推理回传**只能**靠客户端带着密文重放。
+        // 没有这个字段，响应里的 reasoning 项就没有密文 ⇒ 下一轮发回去的只是一段摘要。
+        if (sendEffort || includeReasoning)
+        {
+            var reasoning = new JsonObject();
+            if (sendEffort) reasoning["effort"] = request.Effort;
+            if (reasoning.Count > 0) body["reasoning"] = reasoning;
+
+            if (includeReasoning)
+                body["include"] = new JsonArray("reasoning.encrypted_content");
+        }
+
         // ---- 显式缓存断点（2026-10-28，只在 provider 声明 `cacheMode: explicit` 时）----
         //
         // ⚠️ 与 Chat 同一条纪律：`prompt_cache_options.mode = "explicit"` 会**关掉隐式缓存**，
         // 所以打不上历史断点就**不写**这个键（宁可退回隐式，而不是变成「什么都不缓存」）。
         // ⚠️ `instructions`（头槽位）是**字符串**、挂不了断点 ⇒ Responses 这一族只有历史那一个断点。
         // 这是协议形状的限制，不是漏做。
-        if (explicitCache && OpenAiResponsesCache.Mark(input))
+        if (marked)
             body["prompt_cache_options"] = new JsonObject { ["mode"] = "explicit" };
 
         // ⚠️ **空工具表 ⇒ 不写这个键**（与 Chat / temperature 同一条判据）。
@@ -159,10 +193,7 @@ public static class OpenAiResponsesRequest
         // ⚠️ 2026-10-17：推理块在 Responses 里**不丢**——它们是独立的 `type:"reasoning"` 项
         // （见下面 `ReasoningItem`）。⚠️ 取自**原始** `message.Blocks`，不是过滤后的 `blocks`：
         // `FilterFor` 的职责正是把推理块挡在 content 之外，从它身上取会被自己挡掉。
-        var reasoning = message.Blocks.OfType<Block.ReasoningBlock>()
-            .Where(r => r.Kind == ReasoningKind.Text)
-            .Select(r => r.Text)
-            .ToList();
+        var reasoning = message.Blocks.OfType<Block.ReasoningBlock>().ToList();
         if (texts.Count == 0 && calls.Count == 0 && reasoning.Count == 0)
             throw new ArgumentException(
                 $"时间线里有空消息（speaker={message.From}），无法构造请求", nameof(message));
@@ -170,8 +201,7 @@ public static class OpenAiResponsesRequest
         var items = new List<JsonObject>();
 
         // ⚠️ **推理项在整条消息的项之前**（与响应里的次序一致：先思考，再说话 / 调工具）。
-        foreach (var r in reasoning)
-            items.Add(ReasoningItem(r));
+        items.AddRange(ReasoningItems(reasoning));
 
         // ⚠️ **没有正文时不发那条 message 项**（`content: []` 是另一回事，而且多半非法）。
         // 一条「只调工具」的 assistant 消息在 Responses 下**就是**若干 function_call 项，没有消息项。
@@ -205,24 +235,61 @@ public static class OpenAiResponsesRequest
     }
 
     /// <summary>
-    /// 推理块 → `{"type":"reasoning","summary":[{type:"summary_text",text:…}]}`。
+    /// 推理块 → `{"type":"reasoning", …}` 项。**一块一项**。
     ///
-    /// <para>⚠️ <b>为什么响应那条路会丢它、而这里要发</b>（2026-10-17）：推理项的价值在
-    /// **回传**——不是所有上游都强求（DeepSeek 的 Responses 有没有硬要求尚未实测），
-    /// 但「有就发」与「有就不发」的差别只在一条注释之外：另一条 OpenAI 协议（Chat）
-    /// **已经因为不发吃到了 400**（`reasoning_content must be passed back`）。
-    /// 推理块是**不可优化**的（`00` §7 判据 5），能在链路上原样保住就保住。</para>
+    /// <para>⚠️ <b>2026-10-28：这个方法补的是一个「只改了一半」的缺陷</b>。请求侧从 2026-10-17
+    /// 起就在发 `type:"reasoning"` 项（`OpenAiResponsesRequest.ReasoningItem`），而响应侧
+    /// 一直把推理项整个跳过 ⇒ 记录里<b>从来不会有</b>推理块 ⇒ 请求侧那段
+    /// `OfType&lt;Block.ReasoningBlock&gt;()` <b>永远枚举不到东西</b>。测试全绿，因为它们是
+    /// 手工 `new ReasoningBlock(...)` 造的输入——生产路径造不出来。</para>
     ///
-    /// <para>⚠️ <b>摘要形状是照 DeepSeek 的用例写的</b>（`type:"reasoning"` + `summary` 里的
-    /// `summary_text`），不是凭记忆拼的字段名。若上游文档后来换了形状，改的是**这一处**。</para>
+    /// <para>⚠️ <b>`Kind = Text` → `summary`；`Kind = Redacted` → `encrypted_content`</b>。
+    /// 两者是同一份协议项里的两格（可读摘要 / 不透明推理状态），而
+    /// <see cref="Block.ReasoningBlock"/> 只有 Text 一格装不下两样 ⇒ 响应侧记成两块，
+    /// 发回去时是<b>两条</b>项。</para>
+    ///
+    /// <para>⚠️ <b>为什么不把两半合回一条</b>：合并需要一个「这两块来自同一项」的凭据，而
+    /// 唯一可用的候选是协议给的 `id`（`rs_…`）——它只能存在
+    /// <see cref="Block.ReasoningBlock.Signature"/> 里，而那个格子是<b>Claude 的凭据</b>：
+    /// 往里写 OpenAI 的 id 会让「签名（Claude 的凭据）不属于 Responses 的 reasoning 项——不发」
+    /// 那条不变量静默失效（`OpenAiResponsesRequestTests.Build_NeverFabricatesReasoningIntoTheBody`
+    /// 钉的正是它）。发两条项的代价是零：真 OpenAI 对不相关的推理项
+    /// **接受但丢弃**（cookbook：「the API will simply discard any reasoning items that aren't
+    /// relevant for the current turn」），而 `encrypted_content` 本身就是自足的
+    /// （Azure 文档：无状态模式下「keep every output item, … and replay the complete history」，
+    /// 不要求带 id）。⇒ <b>宁可两条项，不伪造一个跨协议的字段</b>。</para>
+    ///
+    /// <para>⚠️ <b>`Signature` 一律不发</b>：那是 Claude 的凭据，两条 OpenAI 协议都不认识它。</para>
     /// </summary>
-    private static JsonObject ReasoningItem(string text) => new()
+    private static List<JsonObject> ReasoningItems(List<Block.ReasoningBlock> blocks)
     {
-        ["type"] = "reasoning",
-        ["summary"] = new JsonArray(new JsonObject
+        var items = new List<JsonObject>();
+
+        foreach (var block in blocks)
         {
-            ["type"] = "summary_text",
-            ["text"] = text,
-        }),
-    };
+            var item = new JsonObject { ["type"] = "reasoning" };
+
+            if (block.Kind == ReasoningKind.Redacted)
+            {
+                // 密文：原样放进 `encrypted_content`，一个字节都不动。
+                if (block.Text.Length > 0) item["encrypted_content"] = block.Text;
+                // ⚠️ `summary` 也要给（空数组）：它是这个项形状的一部分，省略会让某些网关报错。
+                // 但**绝不**把密文填进 summary——那是伪造（模型会读到一坨 base64）。
+                item["summary"] = new JsonArray();
+            }
+            else
+            {
+                // 可读摘要照旧走 `summary`（DeepSeek 形状的用例）。
+                item["summary"] = new JsonArray(new JsonObject
+                {
+                    ["type"] = "summary_text",
+                    ["text"] = block.Text,
+                });
+            }
+
+            items.Add(item);
+        }
+
+        return items;
+    }
 }

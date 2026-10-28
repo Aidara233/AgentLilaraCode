@@ -18,10 +18,18 @@ public sealed class OpenAiResponsesAdapter : IModelAdapter
     /// <inheritdoc />
     public bool ExplicitCache { get; }
 
+    /// <summary>这个端点上要不要发 `reasoning.effort`（`effortParam: reasoning`）。默认不发。</summary>
+    public bool SendEffort { get; }
+
+    /// <summary>这个端点上要不要 `include: ["reasoning.encrypted_content"]`（`reasoningInclude: include`）。默认不发。</summary>
+    public bool IncludeReasoning { get; }
+
     public OpenAiResponsesAdapter(ProviderDefinition provider)
     {
         ArgumentNullException.ThrowIfNull(provider);
         ExplicitCache = provider.CacheMode == CacheBreakpoint.Explicit;
+        SendEffort = provider.EffortParam == EffortParam.Reasoning;
+        IncludeReasoning = provider.ReasoningInclude == ReasoningInclude.Mode;
         if (provider.Protocol != ProtocolId)
             throw new ArgumentException(
                 $"OpenAiResponsesAdapter 只认协议 '{ProtocolId}'，收到 '{provider.Protocol}'", nameof(provider));
@@ -35,7 +43,7 @@ public sealed class OpenAiResponsesAdapter : IModelAdapter
         // 逃出去会变成未捕获异常。
         try
         {
-            var body = OpenAiResponsesRequest.Build(request, ExplicitCache);
+            var body = OpenAiResponsesRequest.Build(request, ExplicitCache, SendEffort, IncludeReasoning);
             var json = await _http.PostAsync(OpenAiResponsesRequest.Path, body, ct);
             return OpenAiResponsesResponse.Map(json);
         }
