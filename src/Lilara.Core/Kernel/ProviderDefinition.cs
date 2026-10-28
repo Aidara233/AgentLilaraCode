@@ -23,6 +23,18 @@ public sealed record ProviderDefinition
     public required string DefaultModel { get; init; }
 
     /// <summary>
+    /// **前缀缓存的显式断点**（2026-10-28）：`null` / `auto` = 不标记（默认，交给上游的隐式缓存）；
+    /// `explicit` = 在请求里标断点（Anthropic 全部模型、OpenAI GPT-5.6+、以及按同一语义实现的网关）。
+    ///
+    /// <para>⚠️ <b>为什么是 provider 级而不是全局</b>：三种实现差得很远——Anthropic **没有**隐式缓存
+    /// （不标就全价）、OpenAI 默认有隐式但只有 5.6+ 认显式断点、DeepSeek 系自动前缀缓存标了也没用。
+    /// ⇒ 按端点开，而不是按代码开。</para>
+    /// <para>⚠️ <b>可空是语义</b>：`null` = 「没声明」= `auto`。老 `providers/*.json` 里没有这个键，
+    /// 读出来就是 `null` ⇒ 三条链路发包的字节与加这个字段之前**逐字节相同**。</para>
+    /// </summary>
+    public string? CacheMode { get; init; }
+
+    /// <summary>
     /// 这个提供商**可选的**模型清单（头把会话的模型画成下拉，选项就从这里来）。
     ///
     /// <para>⚠️ **加法式可空**：缺失即反序列化成 `null`。可空是**语义**（「没声明清单」），

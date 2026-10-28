@@ -10,5 +10,14 @@ public interface IModelAdapter
     // 两者会因 provider set --protocol 分叉。
     string Protocol { get; }
 
+    /// <summary>
+    /// 这个端点上**要不要标显式缓存断点**（`ProviderDefinition.CacheMode == "explicit"`）。
+    ///
+    /// <para>⚠️ <b>默认 <c>false</c> = 与今天逐字节相同</b>：三族对缓存的默认行为不一样
+    /// （Anthropic 无隐式、OpenAI 有隐式但只有 5.6+ 认显式断点、DeepSeek 系自动）⇒ 这必须是
+    /// **按端点开的开关**，不能默认打开。判据与位置见 <see cref="CacheBreakpoint"/>。</para>
+    /// </summary>
+    bool ExplicitCache => false;
+
     Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct);
 }

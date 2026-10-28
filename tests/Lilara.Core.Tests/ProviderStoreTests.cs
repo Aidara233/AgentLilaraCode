@@ -222,15 +222,15 @@ public class ProviderStoreTests : IDisposable
                 .ToArray();
 
         Assert.Equal(
-            ["ApiKey:String", "AuthScheme:String", "DefaultModel:String", "EffectiveTimeoutSeconds:Nullable`1",
-             "Endpoint:String",
+            ["ApiKey:String", "AuthScheme:String", "CacheMode:String", "DefaultModel:String",
+             "EffectiveTimeoutSeconds:Nullable`1", "Endpoint:String",
              "HasApiKey:Boolean", "Id:String", "Modality:String", "Models:IReadOnlyList`1",
              "Protocol:String", "TimeoutSeconds:Nullable`1", "Version:Int32"],
             DeclaredShape(typeof(ProviderDefinition)));
 
         // HasApiKey / EffectiveTimeoutSeconds 刻意不在这条里——它们带 [JsonIgnore]。
         Assert.Equal(
-            ["ApiKey:String", "AuthScheme:String", "DefaultModel:String", "Endpoint:String",
+            ["ApiKey:String", "AuthScheme:String", "CacheMode:String", "DefaultModel:String", "Endpoint:String",
              "Id:String", "Modality:String", "Models:IReadOnlyList`1",
              "Protocol:String", "TimeoutSeconds:Nullable`1", "Version:Int32"],
             PersistedShape(typeof(ProviderDefinition)));

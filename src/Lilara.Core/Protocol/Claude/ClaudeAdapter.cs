@@ -25,9 +25,15 @@ public sealed class ClaudeAdapter : IModelAdapter
     /// <summary>实际采用的认证方式（解析后的，不是原始配置）。</summary>
     public string AuthScheme { get; }
 
+    /// <inheritdoc />
+    public bool ExplicitCache { get; }
+
     public ClaudeAdapter(ProviderDefinition provider)
     {
         ArgumentNullException.ThrowIfNull(provider);
+
+        // 显式缓存断点：按 provider 开（见 `CacheBreakpoint` 的类型注释）。
+        ExplicitCache = provider.CacheMode == CacheBreakpoint.Explicit;
 
         // 两种认证方式走不同属性：ApiKey → x-api-key，AuthToken → Authorization: Bearer。
         // 本机网关只认后者（ApiKey 打不通、AuthToken 通）。这是协议怪癖，不是可选优化。
@@ -67,7 +73,7 @@ public sealed class ClaudeAdapter : IModelAdapter
         // 都是「这次调用失败了」的一种，逃出包装会以未捕获异常崩掉，而不是给用户一句能读懂的话。
         try
         {
-            var parameters = ClaudeRequestBuilder.Build(request);
+            var parameters = ClaudeRequestBuilder.Build(request, ExplicitCache);
             var response = await _client.Messages.Create(parameters, cancellationToken: token);
             return ClaudeResponseMapper.Map(response);
         }

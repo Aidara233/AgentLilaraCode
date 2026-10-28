@@ -8,7 +8,7 @@ namespace Lilara.Core.Protocol.Claude;
 // canonical → Claude Messages 请求。纯函数：同一个 ModelRequest 必须构造出逐字节相同的请求（前缀稳定性）。
 public static class ClaudeRequestBuilder
 {
-    public static MessageCreateParams Build(ModelRequest request)
+    public static MessageCreateParams Build(ModelRequest request, bool explicitCache = false)
     {
         // ⚠️ **空时间线不是错误——前提是有槽位撑着**（2026-10-11 改，本批之前这里是无条件抛）。
         //
@@ -33,8 +33,8 @@ public static class ClaudeRequestBuilder
         {
             Model = request.ModelId,
             MaxTokens = request.MaxTokens,
-            Messages = BuildMessages(request.Timeline, request.Slots.Tail, request.Protocol),
-            System = BuildSystem(request.Slots.System, request.Slots.Premier),
+            Messages = BuildMessages(request.Timeline, request.Slots.Tail, request.Protocol, explicitCache),
+            System = BuildSystem(request.Slots.System, request.Slots.Premier, explicitCache),
 
             // ⚠️ 空工具表 ⇒ **不发这个键**（不是发一个空数组）：与 `System` 同一条判据——
             // 空值会改变前缀的字节，而「没有工具」的会话应当与加工具支持之前**逐字节相同**。
@@ -66,7 +66,8 @@ public static class ClaudeRequestBuilder
     // canonical 时间线 → 协议消息列表。合并相邻同角色的事件：拒答不写模型事件，
     // 于是时间线上会出现连着两条 user，而上游把 `roles must alternate` 列为 400。
     private static List<MessageParam> BuildMessages(
-        IReadOnlyList<TimelineEvent> timeline, IReadOnlyList<CanonicalBlock> tail, string protocol)
+        IReadOnlyList<TimelineEvent> timeline, IReadOnlyList<CanonicalBlock> tail, string protocol,
+        bool explicitCache)
     {
         var messages = new List<MessageParam>();
 
@@ -84,15 +85,20 @@ public static class ClaudeRequestBuilder
             pending = null;
         }
 
-        foreach (var evt in timeline)
+        // ⚠️ 断点②：**最后一条不受注入影响的对话消息**（`CacheBreakpoint.LastStableIndex`）。
+        // 浮动读数那对每步都在变，断点必须落在它们之前——否则等于把「每步都变」写进缓存前缀。
+        var breakpoint = explicitCache ? CacheBreakpoint.LastStableIndex(timeline) : -1;
+
+        for (var index = 0; index < timeline.Count; index++)
         {
+            var evt = timeline[index];
             // ⚠️ **两种事件在这里合流，而它们的角色不同**：模型消息是 assistant，
             // 而工具结果住在 **user** 角色的消息里（Claude 的 `tool_result` 就是这么定义的）
             // ⇒ 不能把它们当成一类。这个不对称是协议给的，`01` §3.6 那条「工具结果不是块、
             // 是它自己的事件类型」正是为了在类型层面把它分开。
             var (isUser, blocks) = evt switch
             {
-                TimelineEvent.MessageEvent m => (m.From == Speaker.User, ToContentBlocks(m, evt, protocol)),
+                TimelineEvent.MessageEvent m => (m.From == Speaker.User, ToContentBlocks(m, evt, protocol, index == breakpoint)),
                 TimelineEvent.ToolResultEvent r => (true, ToResultBlocks(r, evt)),
                 _ => throw new ArgumentException(
                     $"时间线里有无法翻译的事件（{evt.GetType().Name}）", nameof(timeline)),
@@ -196,15 +202,22 @@ public static class ClaudeRequestBuilder
     // 一条 canonical 消息 → 协议内容块列表。按原始顺序映射，绝不能只挑 text：
     // 推理块必须逐字回传（含签名），顺序或内容一动上游就 400 `invalid_request_error`。
     private static List<ContentBlockParam> ToContentBlocks(
-        TimelineEvent.MessageEvent message, TimelineEvent evt, string protocol)
+        TimelineEvent.MessageEvent message, TimelineEvent evt, string protocol, bool cache)
     {
         var content = new List<ContentBlockParam>();
+        // ⚠️ 断点②只能落在**最后一个文本块**上（`CacheControl` 是 init-only ⇒ 必须在构造时给）。
+        // 先算出它在 Blocks 里的下标；文本块可能前面还有推理块与 tool_use。
+        var lastText = -1;
+        for (var i = 0; i < message.Blocks.Count; i++)
+            if (message.Blocks[i] is CanonicalBlock.TextBlock) lastText = i;
+        var blockIndex = -1;
         foreach (var b in message.Blocks)
         {
             switch (b)
             {
                 case CanonicalBlock.TextBlock t:
-                    content.Add(new TextBlockParam { Text = t.Text });
+                    blockIndex++;
+                    content.Add(TextParam(t.Text, cache && blockIndex == lastText));
                     break;
 
                 case CanonicalBlock.ReasoningBlock r:
@@ -294,8 +307,14 @@ public static class ClaudeRequestBuilder
     // 这条前提作废，而它是失效半径那套论证（§2.3）的地基。
     //
     // 没有块时不设 System，而不是设成空串或空表：空值会变成一个真实的空 system 块，白白改变前缀。
+    /// 造一个文本块。⚠️ `CacheControl` 是 **init-only**：断点只能在构造时给，事后设不了
+    /// （SDK 的 `ContentBlockParam` 是带隐式转换的包装类型，也不能从中取回 `TextBlockParam`）。
+    private static TextBlockParam TextParam(string text, bool cache) => cache
+        ? new TextBlockParam { Text = text, CacheControl = new CacheControlEphemeral() }
+        : new TextBlockParam { Text = text };
+
     private static MessageCreateParamsSystem? BuildSystem(
-        IReadOnlyList<CanonicalBlock> system, IReadOnlyList<CanonicalBlock> premier)
+        IReadOnlyList<CanonicalBlock> system, IReadOnlyList<CanonicalBlock> premier, bool explicitCache)
     {
         // 先 materialize 再判空：输入非空但全是非文本块时过滤后是空列表，会发出一个空的 system 块。
         var text = system.Concat(premier)
@@ -305,6 +324,9 @@ public static class ClaudeRequestBuilder
 
         // 用早返回而不是三元：三元会让可空流经隐式转换触发 CS8604（本项目警告即错误）。
         if (text.Count == 0) return null;
+
+        // ⚠️ 断点①：头槽位的最后一块。它护住 header——历史再长、再变，只要预设没改就命中。
+        if (explicitCache) text[^1] = TextParam(text[^1].Text, cache: true);
 
         return text;
     }

@@ -15,9 +15,13 @@ public sealed class OpenAiChatAdapter : IModelAdapter
     /// <inheritdoc />
     public string Protocol => ProtocolId;
 
+    /// <inheritdoc />
+    public bool ExplicitCache { get; }
+
     public OpenAiChatAdapter(ProviderDefinition provider)
     {
         ArgumentNullException.ThrowIfNull(provider);
+        ExplicitCache = provider.CacheMode == CacheBreakpoint.Explicit;
         if (provider.Protocol != ProtocolId)
             throw new ArgumentException(
                 $"OpenAiChatAdapter 只认协议 '{ProtocolId}'，收到 '{provider.Protocol}'", nameof(provider));
@@ -40,7 +44,7 @@ public sealed class OpenAiChatAdapter : IModelAdapter
         // 逃出去会变成未捕获异常。
         try
         {
-            var body = OpenAiChatRequest.Build(request);
+            var body = OpenAiChatRequest.Build(request, ExplicitCache);
             var json = await _http.PostAsync(OpenAiChatRequest.Path, body, ct, transport);
             return OpenAiChatResponse.Map(json);
         }

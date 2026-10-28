@@ -10,7 +10,7 @@ public static class OpenAiChatRequest
 {
     public const string Path = "/v1/chat/completions";
 
-    public static string Build(ModelRequest request)
+    public static string Build(ModelRequest request, bool explicitCache = false)
     {
         // ⚠️ 判据与 Claude 那条**必须逐字相同**（空时间线 + 两槽位都空才早失败）——
         // 三条链路对「什么算合法的请求」各判一套的话，换个 provider 就会静默换一种行为。
@@ -55,6 +55,18 @@ public static class OpenAiChatRequest
             ["max_tokens"] = request.MaxTokens,
             ["messages"] = messages,
         };
+
+        // ---- 显式缓存断点（2026-10-28，只在这个 provider 声明 `cacheMode: explicit` 时）----
+        //
+        // ⚠️ **为什么必须同时打两个断点**：`prompt_cache_options.mode = "explicit"` 会**关掉隐式缓存**
+        // （OpenAI 文档原文：不放断点的请求完全不缓存/不写缓存）。所以只打 header 断点等于把
+        // 「整段历史的隐式缓存」换成「只有 header」，反而更差 ⇒ 打不上历史断点就**不开 explicit**。
+        //
+        // ⚠️ 断点落在**最后一条 content 是纯文本的 user/assistant 消息**上：
+        // 浮动读数那对（assistant 的 tool_use + role=tool 的结果）没有可挂的文本块，被自动跳过
+        // ⇒ 断点天然在它们之前，末尾每步变的那一段不污染前缀。
+        if (explicitCache && MarkCacheBreakpoints(messages))
+            body["prompt_cache_options"] = new JsonObject { ["mode"] = "explicit" };
 
         // ⚠️ **空工具表 ⇒ 不写这个键**（不是写一个空数组）：与 `temperature` 同一条判据，
         // 也是「没配工具的会话请求逐字节不变」的依据。
@@ -211,5 +223,51 @@ public static class OpenAiChatRequest
         }
 
         return obj;
+    }
+
+    /// <summary>
+    /// 给 system（header）与最后一条「content 是纯文本」的 user/assistant 消息各打一个断点；
+    /// 返回**历史那一条**是否打上了（打不上就不该开 explicit，见 `Build` 里那段）。
+    /// ⚠️ 浮动读数那对（assistant 的 tool_use + role=tool 的结果）没有可挂的纯文本块，被自动跳过
+    /// ⇒ 断点天然落在它们之前。
+    /// </summary>
+    private static bool MarkCacheBreakpoints(JsonArray messages)
+    {
+        static JsonObject Part(string text) => new()
+        {
+            ["type"] = "text",
+            ["text"] = text,
+            ["prompt_cache_breakpoint"] = new JsonObject { ["mode"] = "explicit" },
+        };
+
+        static string? RoleOf(JsonObject m) =>
+            m["role"] is JsonValue r && r.TryGetValue<string>(out var s) ? s : null;
+
+        static string? TextOf(JsonObject m) =>
+            m["content"] is JsonValue v && v.TryGetValue<string>(out var text) && text.Length > 0
+                ? text
+                : null;
+
+        var historyMarked = false;
+        for (var i = messages.Count - 1; i >= 0; i--)
+        {
+            if (messages[i] is not JsonObject m) continue;
+            if (RoleOf(m) is not ("user" or "assistant")) continue;
+            if (TextOf(m) is not { } text) continue;
+            m["content"] = new JsonArray(Part(text));
+            historyMarked = true;
+            break;
+        }
+
+        for (var i = 0; i < messages.Count; i++)
+        {
+            if (messages[i] is not JsonObject m) continue;
+            if (RoleOf(m) != "system") continue;
+            if (TextOf(m) is not { } text) continue;
+            m["content"] = new JsonArray(Part(text));
+            break;
+        }
+
+        return historyMarked;
     }
 }
