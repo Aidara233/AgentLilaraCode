@@ -15,9 +15,9 @@ namespace Lilara.Core.Session.Tools;
 /// 让「上下文里有没有这份读数」永远为真，于是描述里那句「看不到才调」的前置条件永远为假，
 /// 而模型手上唯一可执行的动作就是**再调一次**（同一位用户会话里连调十余次，每次同一份字节）。</para>
 ///
-/// <para>⚠️ <b>所以职责反过来</b>：真实读数由推进器插在**对话最前面**（`Stepper.FloatingContextPair`
+/// <para>⚠️ <b>所以职责反过来</b>：真实读数由推进器插在**对话最末**（`Stepper.FloatingContextPair`
 /// → `TimelineRender.RenderForModel`），而本类的 <see cref="RunAsync"/> 只回一句
-/// <see cref="ReclaimedBody"/>——「读数不在这里，在最前面」。调用变成一次**记账动作**：
+/// <see cref="ReclaimedBody"/>——「读数不在这里，在最末」。调用变成一次**记账动作**：
 /// 它不会带来新信息，这条由机械保证（返回值本身就是占位），不靠描述里的一句劝。</para>
 ///
 /// <para>⚠️ <b>记录里每步留一对占位</b>（`Stepper.SealFloatingCall`）：模型这一步真调了，
@@ -25,7 +25,7 @@ namespace Lilara.Core.Session.Tools;
 /// 不会出现「上一轮我没调用」这种它自己解释不了的缺口。</para>
 ///
 /// <para>⚠️ <b>占位结果不进回收候选</b>（`Reclaim.IsFloatingPlaceholder`）：它没有内容可收，
-/// 而换成回收注记会把「读数在最前面」那句话吃掉。</para>
+/// 而换成回收注记会把「读数在最末」那句话吃掉。</para>
 ///
 /// <para>⚠️ <b>权限是 <see cref="PermissionClass.ReadOnly"/></b>：它只读会话状态，
 /// 不改任何东西。挂成别的档位会让模型真调它时在 `standard` 档弹一次授权——
@@ -33,6 +33,19 @@ namespace Lilara.Core.Session.Tools;
 /// </summary>
 public sealed class FloatingContextTool : ITool
 {
+    /// <summary>
+    /// 这一份实例的形态：<c>true</c> = 缓存形态轴 <c>stable</c>（2026-10-27）。
+    ///
+    /// <para>⚠️ <b>为什么形态要住在实例上，而不是在 <see cref="RunAsync"/> 里读上下文</b>：
+    /// 它同时改**描述**（发给模型的工具表 = 前缀的一部分）与**返回**。描述是
+    /// <see cref="ITool.Description"/>——一个没有上下文的属性 ⇒ 只能由实例携带。
+    /// ⚠️ 于是工具表在 <c>stable</c> 会话里换的是**实例**，而 `NameOf` 不变
+    /// （推进器按名字找它，名字变了合成与查找就都断了）。</para>
+    /// </summary>
+    private readonly bool _stable;
+
+    /// <summary>默认 = <c>dynamic</c> 形态（`BuiltInTools.All` 用的就是它）。</summary>
+    public FloatingContextTool(bool stable = false) => _stable = stable;
     /// <summary>
     /// ⚠️ **名字是常量**：推进器合成那一对调用时按它挑工具名，而它拿不到实例
     /// （工具表是 `IReadOnlyList&lt;ITool&gt;`）。名字写成两遍就会漂，
@@ -71,11 +84,26 @@ public sealed class FloatingContextTool : ITool
     /// **占位正文**：模型自己要来的那一份、以及核心每步补进记录的那一份，内容都是这一句。
     ///
     /// <para>⚠️ **它必须点出真实读数在哪**：只说「已回收」会让模型去找一段不存在的产出，
-    /// 而那份读数此刻就在对话最前面。⚠️ 也不能什么都不说——空的工具结果读起来像一次空调用，
+    /// 而那份读数此刻就在对话最末。⚠️ 也不能什么都不说——空的工具结果读起来像一次空调用，
     /// 而「空的不能长得像有内容」是本仓的反面判据（<c>SystemBlock.Wrap</c> 同一条）。</para>
     /// </summary>
     public const string ReclaimedBody =
         "本轮读数不在这里：真实读数在对话最末那条 id 以 floating- 开头的结果里。这条只是占位。";
+
+    /// <summary>
+    /// `stable` 形态的框架头：读数**不再**「每步」，而是「变化时」。
+    /// ⚠️ 这条字段就是模型分辨两种形态的唯一线索（`dynamic` 是「每步」）。
+    /// </summary>
+    public static readonly ToolFraming StableFraming =
+        new(NameOf, [new ToolFramingField("节律", "变化时")]);
+
+    /// <summary>
+    /// `stable` 形态下**没有变化**时的正文。
+    /// <para>⚠️ 不能说「在最前面」——那个位置在 `stable` 里是空的（读数在历史里、且没变）。
+    /// </para>
+    /// </summary>
+    public const string StableNoChangeBody =
+        "读数没有变化：仍然与记录里最近一条 id 以 floating- 开头的读数相同，这里不再重复一遍。";
 
     public string Name => NameOf;
 
@@ -102,11 +130,15 @@ public sealed class FloatingContextTool : ITool
     /// 而矛盾唯一可行的补救动作是「再调一次看看」（实测：那套文案在位期间连调十二次，
     /// 十二次同一份字节）。⇒ 现在只说**它返回什么**，不说谁发起的。</para>
     /// </summary>
-    public string Description =>
-        "每一轮都调用一次：它是每轮的固定动作，不需要理由，也不必等到「需要它」的时候才调。"
-        + "本轮的浮动上下文（生效中的行为轴与插件贡献的字段）已经在对话最末那条 id 以 floating- 开头的结果里——"
-        + "调这个工具只是为了在记录里留下这一轮的调用。"
-        + "返回值是一句占位（已回收）：它不含任何读数，调它不会带来新信息。";
+    public string Description => _stable
+        ? "只在需要时调用：本会话的缓存形态是「前缀完全稳定」（`cache=stable`，默认），浮动上下文"
+          + "（生效中的行为轴与插件贡献的字段）只在**发生变化**时由核心作为一条普通读数写进历史"
+          + "（id 以 floating- 开头，框架头是 `[floating_context 节律 变化时]`）。"
+          + "调它只会重复一遍当前读数（若没有变化，就回一句「没有变化」），不会让核心改写历史。"
+        : "每一轮都调用一次：它是每轮的固定动作，不需要理由，也不必等到「需要它」的时候才调。"
+          + "本轮的浮动上下文（生效中的行为轴与插件贡献的字段）已经在对话最末那条 id 以 floating- 开头的结果里——"
+          + "调这个工具只是为了在记录里留下这一轮的调用。"
+          + "返回值是一句占位（已回收）：它不含任何读数，调它不会带来新信息。";
 
     /// <summary>
     /// 无参数。⚠️ **不给它加任何参数**：加一个「要哪一段」就等于把「浮动块长什么样」
@@ -127,7 +159,17 @@ public sealed class FloatingContextTool : ITool
             // 的那份就会**在形状上分叉**——而 `TheToolReturnsTheSameTextTheCoreInjected`
             // 钉的正是「不分叉」。合成那边写不到 `Framing` 字段（它追加在渲染之后），
             // 所以它在正文首块里现渲染一次；两处都只借这一个 Render 方法。
-            Framing = ReclaimedFraming,
-            Content = [new Block.TextBlock(ReclaimedBody)],
+            Framing = _stable ? StableFraming : ReclaimedFraming,
+            // ⚠️ `stable` 形态下**返回此刻的读数本身**（2026-10-27）：那个形态里末尾不插对，
+            // 占位那句「真实读数在最末」当场变成假话。而这一次的结果是**追加**的，
+            // 破不了前缀——所以按需给一份最新的，正好补上「变化之前不会自动出现」这个缺口。
+            Content =
+            [
+                new Block.TextBlock(_stable
+                    ? string.IsNullOrEmpty(context.FloatingContext)
+                        ? StableNoChangeBody
+                        : context.FloatingContext
+                    : ReclaimedBody),
+            ],
         });
 }

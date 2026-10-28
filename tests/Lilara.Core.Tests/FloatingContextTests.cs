@@ -59,7 +59,7 @@ public sealed class FloatingContextTests : IDisposable
     private SessionHandle NewSession() => SessionHandle.Create(_store, _work, new ModelSelection
     {
         ProviderId = "p", ModelId = "m", Protocol = Protocols.ClaudeMessages, Effort = "high", MaxTokens = 1000,
-    });
+    }).DynamicCache();
 
     private static ModelReply Say(string text) => new()
     {

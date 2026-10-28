@@ -104,7 +104,9 @@ public sealed record TailContext(
             Plan: handle.State.Plan,
             IterateReplan: iterateReplan ?? handle.PendingIterateReplan,
             // 上下文用量：与 `/sessions/{id}/context` 同一份测量（`ContextUsage`）。
-            UsageLine: ContextUsage.Line(usage, handle.SessionId),
+            // ⚠️ `stable` 下取「整 100k 才播报」（`TailLine` 的 `coarse`）：精确值每步都变，
+            // 而那一步的代价是**整段前缀缓存作废**（2026-10-27）。
+            UsageLine: ContextUsage.TailLine(usage, handle.SessionId, coarse: SystemBlock.CacheStable(handle)),
             // ⚠️ 越过那条硬线没有（2026-10-27）：**同一个谓词**也决定 `compact` 的授权
             // （`Stepper` 把它交进 `SessionToolContext.ContextFull`）——两处各算一次就会分叉，
             // 而分叉的表现是「尾块喊着快压，工具却说没有指令」。
@@ -126,6 +128,20 @@ public sealed record TailContext(
 /// </summary>
 public static class SystemBlock
 {
+    /// <summary>
+    /// 这个会话的缓存形态是不是 <c>stable</c>（2026-10-27）。⚠️ <b>判据只有这一处</b>：
+    /// 三处装配点（步开始 / 答复路径 / 头的槽位）与 `Stepper` 的注入形态、工具表投影都读它
+    /// ——各判一遍就会分叉，而分叉的表现是「头显示稳定形态、请求里却仍是每步一份」。
+    ///
+    /// <para>⚠️ <b>缺键 ⇒ <c>true</c></b>（2026-10-27 用户裁定：默认 <c>stable</c>）：
+    /// 老会话的 `state.json` 里没有这条轴，而 `SessionHandle.Load` 的 `CompleteAxes` 会把默认值
+    /// 补成 `stable` 进内存——这里再兜一层，是因为手工 `new SessionHandle`（测试与嵌入方）
+    /// 也可能不带 `Axes`。</para>
+    /// </summary>
+    public static bool CacheStable(SessionHandle handle) =>
+        handle.State.Axes is not { } axes
+        || string.Equals(axes.GetValueOrDefault(Axes.Cache), Axes.CacheStable, StringComparison.Ordinal);
+
     /// <summary>
     /// 这一次该带的三块。⚠️ <b>必须在「步开始」调一次并冻住，不是每次渲染时调</b>。
     ///

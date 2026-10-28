@@ -38,6 +38,8 @@ public class QueueSemanticsTests : IDisposable
             new CoreCommand.SessionCreate(), "c", false, CancellationToken.None).GetAwaiter().GetResult();
         var sessionId = ((Ack.Accepted)created.Ack).SessionId!;
         host.TryGetActivated(sessionId, out var handle);
+        // ⚠️ 这族用例钉的是 `dynamic` 形态的形状（一次调用 = 两条事件），而默认形态是 `stable`。
+        handle = handle!.DynamicCache();
 
         return (host, dispatcher, handle);
     }

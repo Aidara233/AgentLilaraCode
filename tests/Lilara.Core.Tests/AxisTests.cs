@@ -15,8 +15,24 @@ public class AxisTests
         // 表序同时是控制面 `/axes` 与人看的顺序，而 `01` §3.5 那张表还没为它腾位置
         // ⇒ 先按追加处理，等文档定序之后再一起搬（搬的时候这条与 `SlotTests` 那条要同时改）。
         Assert.Equal(
-            ["initiative", "permission", "safety", "verify", "network", "effort", "temperature", "mode"],
+            ["initiative", "permission", "safety", "verify", "network", "effort", "temperature", "cache", "mode"],
             Axes.Names);
+    }
+
+    /// <summary>
+    /// ⚠️ **`cache` 是第三条 `InContext = false` 的轴**（2026-10-27）：它改的是**请求的形状**
+    /// （读数怎么投递），不是模型该知道的行为 ⇒ 不进上下文轴表。
+    /// 但它必须是**会话上可切换的轴**（头面板 / `session.setAxis`）。
+    /// ⚠️ **默认是 `stable`**（用户裁定）：前缀稳定优先——缓存命中每轮都受益，
+    /// 而「读数永远在最上面」只是排版偏好。`dynamic` 成了显式选项。
+    /// </summary>
+    [Fact]
+    public void CacheAxis_IsMechanical_DefaultsToStable()
+    {
+        Assert.Equal(["dynamic", "stable"], Axes.ValuesOf(Axes.Cache));
+        Assert.Equal("stable", Axes.Defaults()[Axes.Cache]);
+        Assert.False(Axes.InContext(Axes.Cache));
+        Assert.Equal("缓存形态", Axes.LabelOf(Axes.Cache));
     }
 
     [Fact]

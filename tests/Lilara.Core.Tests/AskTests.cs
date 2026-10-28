@@ -188,7 +188,7 @@ public class AskTests : IDisposable
     /// 断言写不出来（见 `Create` 的 `sessionId` 参数注释）。</para>
     /// </summary>
     private SessionHandle NewSession() => SessionHandle.Create(
-        _store, _work, Model(), sessionId: "s-ask-1");
+        _store, _work, Model(), sessionId: "s-ask-1").DynamicCache();
 
     private static ModelReply Calls(params (string CallId, string Name, string Args)[] calls) => new()
     {
@@ -302,7 +302,7 @@ public class AskTests : IDisposable
     public async Task AskTimeout_ProducesADeadlineOnThePause()
     {
         var handle = SessionHandle.Create(
-            _store, _work, Model(), sessionId: "s-ask-to", askTimeout: TimeSpan.FromMinutes(5));
+            _store, _work, Model(), sessionId: "s-ask-to", askTimeout: TimeSpan.FromMinutes(5)).DynamicCache();
 
         _adapter.ReplyWith(_ => Calls(("c1", "write_thing", "{}")));
         var before = CoreClock.Now();

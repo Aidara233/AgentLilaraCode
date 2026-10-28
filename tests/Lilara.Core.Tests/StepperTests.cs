@@ -34,7 +34,12 @@ public class StepperTests : IDisposable
         MaxTokens = 16000,
     };
 
-    private SessionHandle NewSession() => SessionHandle.Create(_store, @"C:\work", Model());
+    /// <summary>建会话。⚠️ **显式钉住 `cache=dynamic`**：这一族用例钉的是 `dynamic` 形态的形状
+    /// （每步位置 0 一份读数 + 每步一对占位），而默认形态 2026-10-27 改成了 `stable`。
+    /// 默认形态的形状由 <c>CacheStableTests</c> 与 <c>FloatingContextTests</c> 的那一组钉。
+    /// </summary>
+    private SessionHandle NewSession() => SessionHandle.Create(_store, @"C:\work", Model())
+        .WithAxis(Axes.Cache, Axes.CacheDynamic);
 
     private static string TextOf(TimelineEvent e) =>
         ((Block.TextBlock)((TimelineEvent.MessageEvent)e).Blocks[0]).Text;
@@ -329,7 +334,7 @@ public class StepperRetryTests : IDisposable
         Protocol = Protocols.ClaudeMessages,
         Effort = "high",
         MaxTokens = 16000,
-    });
+    }).DynamicCache();
 
     // 一次失败之后成功：**记录里只有一步**（用户 + 模型两条消息），Turn 只 +1。
     // ⚠️ 这正是「重试在适配器里、不在步上」的可观测后果：要是把失败抛到步上再重跑，

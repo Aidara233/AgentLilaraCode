@@ -39,7 +39,11 @@ public sealed class PluginIntegrationTests : IDisposable
         var result = await commands.DispatchAsync(new CoreCommand.SessionCreate(), "create", false, CancellationToken.None);
         var id = Assert.IsType<Ack.Accepted>(result.Ack).SessionId!;
         Assert.True(host.TryGetActivated(id, out var handle));
-        return handle;
+        // ⚠️ 这族用例钉的是 `dynamic` 形态：读数每步在位置 0 一份、**历史里不留旧值**，
+        // 所以「改了插件字段之后 `before` 的那句不在 `after` 里」成立。
+        // `stable` 形态是**追加**的（旧读数留在历史里），那条断言在它下面本来就不成立
+        // ——默认形态的那一面由 `CacheStableTests` 钉。
+        return handle!.DynamicCache();
     }
 
     private static Task<DispatchResult> Set(CommandDispatcher d, SessionHandle h, string axis, string value) =>

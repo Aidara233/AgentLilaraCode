@@ -199,6 +199,13 @@ public sealed class Stepper(
         ModelReply reply;
         try
         {
+            // ⚠️ **`cache=stable` 的读数在这里落盘**（2026-10-27）：装配请求**之前**，
+            // 这样这一次请求里就已经有它（第一步的模型也得知道轴与计划），而它只会追加到
+            // 历史末尾——位置 0 保持为空，于是「没有变化」的两步请求逐字节相同。
+            // ⚠️ 它是一次**独立的**原子追加（不塞进本步那批事件）：读数说的是「装配这一刻」的状态，
+            // 而本步的模型回答与工具结果还没发生。崩在中间最坏是「多一条读数」，可见、无副作用。
+            AppendReadout(handle, slots, at);
+
             // 渲染：读回完整时间线 → canonical（核心永远发全量，00 §6）
             var request = new ModelRequest
             {
@@ -243,13 +250,19 @@ public sealed class Stepper(
                 // 第一版把那种会话的尾块**整块弄丢**了（只发合成对、又没有工具可声明），
                 // 三条插件集成测试当场变红。这是「下放」与「不丢」之间必须二选一时的正确取舍：
                 // 拿不到声明位置就还放回原位，而不是让内容消失。
+                // ⚠️ **`cache=stable` 走另一条路**（2026-10-27）：读数既不进尾槽位，也不进末尾的合成对，
+                // 而是**作为真实事件落到历史末尾、只在变化时写一次**（`AppendReadout` 就在下面，
+                // 而且它发生在装配这条时间线**之前** ⇒ 本次请求里就已经看得到）。
+                // ⇒ 尾槽位一律清空：留着它会与历史里那一份重复。
                 Slots = HasFloatingContextTool ? slots with { Tail = [] } : slots,
 
                 // ⚠️ 工具表**从工具表投影**，不是从 spec 读的——spec 里没有它，
                 // 而「这一步有哪些工具」是**派生**的（04 §1.3：工具表不是独立实体）。
                 // ⚠️ 它的顺序必须**确定**（前缀指纹按它算）；`_tools` 是构造时定下的一个列表，
                 // 不经过任何容器枚举。
-                Tools = [.. _tools.Select(t => new ToolSpec(t.Name, t.Description, t.ParametersSchemaJson))],
+                // ⚠️ **`cache=stable` 时 `floating_context` 换成另一份实例**（2026-10-27）：
+                // 它的描述与返回值都随形态变，而描述是前缀的一部分 ⇒ 必须按会话形态投影。
+                Tools = [.. ToolsFor(handle).Select(t => new ToolSpec(t.Name, t.Description, t.ParametersSchemaJson))],
 
                 // ⚠️ **去引用在这里做，不在适配器里**：记录里的快照可能是个
                 // `StoreBlock`（大对象进了库，`01` §8.4）⇒ 必须换成真内容再交给适配器。
@@ -270,6 +283,10 @@ public sealed class Stepper(
                 // ⚠️ **但喂模型的那一份多一条投递截断**（2026-10-17）：超过
                 // `ToolLimits.MaxResultBytes` 的结果只喂开头，尾部的注记给出稳定 id 与下一个偏移
                 // ⇒ 模型用 `fetch(id, offset)` 接着看，不必重跑那个工具。
+                // ⚠️ **`cache=stable`：读数在装配这条时间线之前就落盘**（2026-10-27，见上面
+                // `AppendReadout` 那次调用）。只有那个次序能同时满足两件事：① 本次请求里就看得到
+                // 当前读数（否则第一步的模型在不知道轴与计划的情况下干活）；② 读数的变化**不会**
+                // 出现在位置 0——它只追加到历史末尾，于是没变化的两步请求逐字节相同。
                 Timeline = TimelineRender.RenderForModel(_store, handle, StepFloatingPair(handle, slots, at)),
             };
 
@@ -292,7 +309,8 @@ public sealed class Stepper(
                 onRetry: NotifyRetry);
             reply = outcome.Reply;
             attempts = outcome.Attempts;
-            RecordUsage(handle, callId, outcome.StartedAt, reply, "completed", attempt: attempts);
+            RecordUsage(handle, callId, outcome.StartedAt, reply, "completed", attempt: attempts,
+                fingerprint: RequestFingerprint(request));
         }
         catch
         {
@@ -384,7 +402,7 @@ public sealed class Stepper(
             // 否则同一步里两条调用会按两个档位判，而记录里看不出为什么。
             // ⚠️ **模式同一条纪律**：它喂给 `ToolExecutor` 的**模式硬闸**（规划模式下拦改文件的工具）。
             var executor = new ToolExecutor(
-                _tools, blobs, handle.State.Axes![Axes.Permission],
+                ToolsFor(handle), blobs, handle.State.Axes![Axes.Permission],
                 new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId),
                 handle.State.Axes![Axes.Mode]);
             var context = new SessionToolContext(handle.Spec.WorkingDirectory, blobs, recorded,
@@ -576,7 +594,7 @@ public sealed class Stepper(
         // ⚠️ **不许出现第二对**：模型真调了就把那一条结果的内容换写成占位，而不是另补一对；
         // 否则同一轮里会有两条 `floating_context` 调用，配对与「一步几条事件」都跟着歪。
         // ⚠️ 它与模型消息、那批结果**同一次** `AppendEvents` 落盘 ⇒ 「一步 = 一个原子」没被拆开。
-        events.AddRange(SealFloatingCall(events, handle.State.Turn + 1, at));
+        events.AddRange(SealFloatingCall(handle, events, handle.State.Turn + 1, at));
         _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
 
         // ② + ③ + ④：检查点 → 清指令 → 回收窗口（见上面那段次序）。
@@ -694,7 +712,8 @@ public sealed class Stepper(
     private void RecordUsage(
         SessionHandle handle, string callId, DateTimeOffset startedAt,
         ModelReply? reply, string status, string purpose = "session",
-        int attempt = 1, DateTimeOffset? endedAt = null, string? error = null)
+        int attempt = 1, DateTimeOffset? endedAt = null, string? error = null,
+        string? fingerprint = null)
     {
         if (_usage is null) return;
 
@@ -721,6 +740,11 @@ public sealed class Stepper(
                 // 一次就成的行**逐字节**与加重试之前相同。
                 Attempt = attempt > 1 ? attempt : null,
                 Error = error,
+                // ⚠️ **请求指纹**（2026-10-27 补上——这个字段一直在，却从没被写过）：
+                // 它是「这一步发出去的请求，和上一步是不是同一份」这个问题的唯一机械答案。
+                // 缓存命中率一掉，第一件事就是看这个：相邻两步**相同** ⇒ 我们的字节没问题，
+                // 该查上游（缓存池/TTL/换模型）；**不同** ⇒ 是我们自己每步在变，那就有了下一步的方向。
+                RequestFingerprint = fingerprint,
             });
         }
         catch
@@ -728,6 +752,38 @@ public sealed class Stepper(
             // 统计故障不改变会话语义；控制面可在后续版本暴露丢账告警。
         }
     }
+
+    /// <summary>
+    /// **这一步请求「头部」的稳定指纹**——三块提示词 + 工具表。
+    ///
+    /// <para>⚠️ <b>为什么只算头部，不算历史</b>：历史**每步都在追加**，把它算进去指纹就永远在变，
+    /// 这个字段也就什么都不回答了。而缓存诊断真正要分清的是两件事：
+    /// ① <b>头部变了没有</b>（轴、预设、插件字段、工具表、缓存形态——都是外力，变了就是我们这边）；
+    /// ② <b>历史是不是纯追加</b>（那是另一条性质，由 `CacheStableTests` 的逐字节用例钉住）。
+    /// ⇒ 这个字段答的是①：相邻两步**相同** ⇒ 头部没动，缓存该命中头部；
+    /// **不同** ⇒ 有东西每步在改头部，方向立刻有了。</para>
+    ///
+    /// <para>⚠️ <b>不取时间戳</b>：它每步都不同，取进去等于把字段废掉。</para>
+    /// </summary>
+    private static string RequestFingerprint(ModelRequest request)
+    {
+        var builder = new System.Text.StringBuilder();
+        foreach (var block in request.Slots.System.Concat(request.Slots.Premier).Concat(request.Slots.Tail))
+            builder.Append(BlockText(block)).Append('\u0002');
+        foreach (var tool in request.Tools)
+            builder.Append(tool.Name).Append('\u0001').Append(tool.Description)
+                .Append('\u0001').Append(tool.ParametersSchemaJson).Append('\u0002');
+
+        return BlobStore.Sha256Of(System.Text.Encoding.UTF8.GetBytes(builder.ToString()));
+    }
+
+    private static string BlockText(Block block) => block switch
+    {
+        Block.TextBlock t => "t:" + t.Text,
+        Block.ToolUseBlock u => $"u:{u.CallId}:{u.Name}:{u.Arguments}",
+        Block.StoreBlock s => "s:" + s.Sha256,
+        _ => block.GetType().Name,
+    };
 
     /// <summary>
     /// **先记录、后 state，而那条「我可能欠一条」的痕迹跟着走**（`01` §12.8）。
@@ -943,7 +999,7 @@ public sealed class Stepper(
             // 两处各算一次会分叉（同 `StepAsync` 那条）。
             var subagents = SubagentScopeFor(handle);
             var executor = new ToolExecutor(
-                _tools, blobs, handle.State.Axes![Axes.Permission],
+                ToolsFor(handle), blobs, handle.State.Axes![Axes.Permission],
                 new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId),
                 // 同 `StepAsync`：模式硬闸按**答复这一刻**的模式值判。
                 handle.State.Axes![Axes.Mode]);
@@ -1089,6 +1145,18 @@ public sealed class Stepper(
     private bool HasFloatingContextTool =>
         _tools.Any(t => string.Equals(t.Name, FloatingContextTool.NameOf, StringComparison.Ordinal));
 
+    /// <summary>
+    /// **这一步的工具表**（2026-10-27）：`cache=stable` 时把 `floating_context` 换成「变化时」那一份实例。
+    ///
+    /// <para>⚠️ 为什么必须换实例：那一份的**描述**（发给模型的工具表 = 前缀的一部分）与**返回值**
+    /// 都随形态变，而描述是 `ITool.Description`（没有上下文的属性）⇒ 只能由实例携带。
+    /// ⚠️ 名字不变（推进器按名字找它合成那对调用，改名字会静默断掉合成）。</para>
+    /// </summary>
+    private IReadOnlyList<ITool> ToolsFor(SessionHandle handle) =>
+        !SystemBlock.CacheStable(handle) || !HasFloatingContextTool
+            ? _tools
+            : [.. _tools.Select(t => t is FloatingContextTool ? new FloatingContextTool(stable: true) : t)];
+
     private IReadOnlyList<TimelineEvent> FloatingContextPair(
         IReadOnlyList<TimelineEvent> timeline, IReadOnlyList<Block> tail, DateTimeOffset at, int turn)
     {
@@ -1147,9 +1215,16 @@ public sealed class Stepper(
     /// </summary>
     /// <returns>要追加的事件：没调时是一对占位；真调了就重写了那一份，返回空。</returns>
     private IReadOnlyList<TimelineEvent> SealFloatingCall(
-        List<TimelineEvent> events, int turn, DateTimeOffset at)
+        SessionHandle handle, List<TimelineEvent> events, int turn, DateTimeOffset at)
     {
         if (!HasFloatingContextTool) return [];
+
+        // ⚠️ **`cache=stable` 不补占位，也不改写模型调出来的那条**（2026-10-27）：
+        // 那个形态里的读数**本来就以真实内容落进过记录**（`AppendReadout`），而「每步留一对占位」
+        // 的存在理由是「形状一致、不让模型看到缺口」——它换来的代价是每步多两条事件、
+        // 并且把「变化才写」这半个承诺变成假的。模型若这一轮自己调了，那条结果就照实留着
+        // （它给的是当前读数或一句「没有变化」，都有内容，改写成占位反而抹掉信息）。
+        if (SystemBlock.CacheStable(handle)) return [];
 
         var callId = events
             .OfType<TimelineEvent.MessageEvent>()
@@ -1237,11 +1312,101 @@ public sealed class Stepper(
     /// 不要在别处另比轴字典。</para>
     /// </summary>
     private IReadOnlyList<TimelineEvent> StepFloatingPair(
-        SessionHandle handle, PromptSlots slots, DateTimeOffset at) =>
-        // ⚠️ **每步都插，而且只活在这一次请求里**（2026-10-26 用户裁定）：不落库、
-        // 也不比较「变了没有」——那套判据只在读数要落盘时才有意义。
+        SessionHandle handle, PromptSlots slots, DateTimeOffset at)
+    {
+        // ⚠️ **`stable` 形态：末尾什么都不插**（2026-10-27 用户裁定）。
+        // 理由只有一个，但足够：这一对的 id 是 `floating-{turn}…`，而 turn 每步都变
+        // ⇒ 请求的**第 1 个 token 起**就与上一步不同 ⇒ 任何严格前缀缓存 0 命中，
+        // 每步都是全量重算（"非 DeepSeek 那种分段缓存"的提供商上这是致命的）。
+        // `stable` 换形态：读数改成**变化才追加**的真实事件（`ReadoutEvent`），位置在历史末尾。
+        if (SystemBlock.CacheStable(handle)) return [];
+
+        // ⚠️ **`dynamic` 形态：每步都插，而且只活在这一次请求里**（2026-10-26 用户裁定）：
+        // 不落库、也不比较「变了没有」——那套判据只在读数要落盘时才有意义。
         // ⇒ 这里没有第二份判据可漂，模型每步看到的都是「此刻这一份」。
-        FloatingContextPair([], slots.Tail, at, handle.State.Turn + 1);
+        return FloatingContextPair([], slots.Tail, at, handle.State.Turn + 1);
+    }
+
+    /// <summary>
+    /// **`stable` 形态下的读数事件**：读数作为<b>真实内容</b>追加到历史末尾，**只在变化时**。
+    ///
+    /// <para>⚠️ 三个判据都在这里，一个都别挪走：</para>
+    /// <list type="number">
+    ///   <item><b>形态</b>：不是 <c>stable</c> ⇒ 空（那条路走位置 0 的合成对）。
+    ///   ⚠️ 必须与 <see cref="StepFloatingPair"/> 用**同一个**判据，否则两步都会插一份。</item>
+    ///   <item><b>有没有正文</b>：尾块为空 ⇒ 空（没有内容可播报）。</item>
+    ///   <item><b>变了没有</b>：与记录里最近一份读数正文逐字相同 ⇒ 空。
+    ///   ⚠️ 这是「前缀完全稳定」的全部秘密：没变就<b>一个字节都不写</b>，
+    ///   于是两步之间（外力没变）请求逐字节相同，缓存整段命中。</item>
+    /// </list>
+    ///
+    /// <para>⚠️ <b>它写的是真实内容，不是占位</b>（用户裁定）：这一条会像普通工具结果一样
+    /// 参与回收（`Reclaim` 的占位判据只认那句「读数不在这里」）。所以压缩/GC 之后它可能变成
+    /// 注记——那时记录里的原文本还在，故**不会**因此重复注入；而真到下次变化，
+    /// 会追加一份新的完整读数，模型于是重新拿到当前状态。</para>
+    /// </summary>
+    private void AppendReadout(SessionHandle handle, PromptSlots slots, DateTimeOffset at)
+    {
+        if (!SystemBlock.CacheStable(handle)) return;
+
+        if (FloatingBodyOf(slots.Tail) is not { } body) return;
+        if (string.Equals(body, RecordedReadoutBody(handle), StringComparison.Ordinal)) return;
+
+        _store.AppendEvents(handle.ProjectKey, handle.SessionId, ReadoutEvents(handle, body, at));
+    }
+
+    private static IReadOnlyList<TimelineEvent> ReadoutEvents(
+        SessionHandle handle, string body, DateTimeOffset at)
+    {
+        // ⚠️ id 里带 `turn`：记录里同号的两条 `tool_use` 会让上游按 `call_id` 配对时撞车。
+        // 这条只在变化时写一次，所以号不会每步都涨。
+        var id = $"floating-{handle.State.Turn + 1}-readout-result";
+
+        return
+        [
+            new TimelineEvent.MessageEvent
+            {
+                Id = id + "-call",
+                At = at,
+                From = Speaker.Model,
+                Blocks = [new Block.ToolUseBlock(id, FloatingContextTool.NameOf, "{}")],
+            },
+            new TimelineEvent.ToolResultEvent
+            {
+                Id = id,
+                At = at,
+                CallId = id,
+                // ⚠️ 与请求末尾那条合成对**同一形状**（框架头 + 正文）：读者靠形状认来源，
+                // 而这一份是**真的落进记录**了的（`节律` 说的也是「变化时」，不是「每步」）。
+                Content =
+                [
+                    new Block.TextBlock(FloatingContextTool.StableFraming.Render() + "\n"),
+                    new Block.TextBlock(body),
+                ],
+            },
+        ];
+    }
+
+    /// <summary>
+    /// **记录里最近一份读数正文**（`stable` 形态的那条真实事件；没有 ⇒ <c>null</c>）。
+    ///
+    /// <para>⚠️ <b>只读记录、不读内存</b>：判据的对象是「模型上一次真的看到过什么」，
+    /// 而那是记录里那一份——内存里留一份影子迟早会和盘面分叉（同 `Reclaim` 那条「不缓存判定」）。</para>
+    /// <para>⚠️ <b>认的是 id，不是内容</b>：`-readout-result` 是只有这条路会写的号；
+    /// `dynamic` 的占位（`-reclaim-result`）与它同前缀但不同后缀，两者不会混淆。</para>
+    /// </summary>
+    private string? RecordedReadoutBody(SessionHandle handle)
+    {
+        var last = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .LastOrDefault(r => r.Id.EndsWith("-readout-result", StringComparison.Ordinal));
+
+        // ⚠️ 首块是框架头（`[floating_context …]`），正文在**第二个**文本块——与请求末尾那条合成对
+        // 同形状，所以这里 `Skip(1)`。写成「取末块」也一样，但「跳过框架头」把意图说清了。
+        return last is null
+            ? null
+            : string.Concat(last.Content.OfType<Block.TextBlock>().Skip(1).Select(b => b.Text));
+    }
 
     /// <summary>
     /// **这一刻的尾块文本**——答复路径与控制面的探测点用（`01` §3.2）。

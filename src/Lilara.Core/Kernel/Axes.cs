@@ -55,6 +55,15 @@ public static class Axes
     public const string Mode = "mode";
     public const string Iterate = "iterate";
 
+    /// <summary>缓存形态轴的轴名（2026-10-27）：<b>请求长什么样</b>，不是「模型怎么想」。</summary>
+    public const string Cache = "cache";
+
+    /// <summary>每步在请求**末尾**插一份新读数（2026-10-28 起是末尾，不是最前面）。⚠️ 尾部每步换一次字节，见下面轴表里那段取舍。</summary>
+    public const string CacheDynamic = "dynamic";
+
+    /// <summary>读数只在<b>变化时</b>落成真实事件追加到历史末尾 ⇒ 两步之间请求逐字节相同。</summary>
+    public const string CacheStable = "stable";
+
     /// <summary>安全轴里代表「生产」的档名（`01` §3.5 的跨轴告警的一端）。</summary>
     public const string AlertSafety = "prod";
 
@@ -205,6 +214,30 @@ public static class Axes
         // 于是「从未设过温度的老会话」行为不变。⚠️ 这也是为什么默认值**不是**看着更讨喜的 0.7：
         // 那会把每一个既有会话的采样行为**悄悄改掉**，而用户从没要求过。
         Numeric(Temperature, "温度", TempRange, @default: "1.0"),
+
+        // 缓存形态。⚠️ **第三条 `InContext = false` 的轴**——它不进模型上下文（那是机制细节），
+        // 但它改的是**请求的形状**，所以必须能在会话上切换（头面板 / `session.setAxis`）。
+        //
+        // ⚠️ **前提变了（2026-10-28 用户裁定）**：浮动读数已经从「请求最前面」挪到「请求最末」。
+        // ⇒ 两种形态**都不再**破前缀缓存——头部 + 整段历史（纯追加）在两边都一样命中。
+        // 差别只剩下**代价**与**时效**：
+        //   `dynamic`：每步在末尾插一对新的（尾部 ~1–2 KB 每步换一次字节），并在记录里每步补
+        //              一对占位（每步 2 条事件，长期是实打实的历史体积）；读数**永远是最新的**。
+        //   `stable` ：末尾不插对；读数只在**变化时**以真实内容追加进历史（`Stepper.AppendReadout`，
+        //              判据是与记录里最近一份逐字相同），长度行按 100k 取整
+        //              （`ContextUsage.TailLine` 的 `coarse`）；它像普通工具结果一样参与回收。
+        //              ⇒ 省掉每步的读数与占位，代价是读数**可能落后**到下一次变化为止。
+        //
+        // ⚠️ **默认 `stable`**（2026-10-27 用户裁定）：省下来的 token 每轮都在付，
+        // 而「读数永远最新」只是时效偏好。⇒ `dynamic` 是显式选项；老会话缺这个键时
+        // `CompleteAxes` 补成 `stable`。
+        //
+        // ⚠️ 历史背景（别把这段当现状读）：位置还在最前面时（10-26～10-28），`dynamic` 那一对
+        // 每步变 ⇒ 它后面的整段历史都失配 ⇒ 实测 21 万上下文只命中 8k（正好是它前面的
+        // system+premier+tools）。那次是**位置**的错，不是形态的错——所以修的是位置。
+        new(Cache, "缓存形态",
+            Array.AsReadOnly<string>([CacheDynamic, CacheStable]),
+            CacheStable, InContext: false),
 
         Context(Mode, "工作模式", "act",
             ("plan", "规划模式：可调整普通计划树与 T0 长期任务说明；文件修改工具 write/update/delete/mkdir/git_write 会被模式硬闸拒绝，shell、dotnet、path 不在此模式闸范围内。权限轴仍独立决定其它工具。"),

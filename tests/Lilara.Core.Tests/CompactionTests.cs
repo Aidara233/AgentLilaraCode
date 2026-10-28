@@ -24,7 +24,7 @@ public sealed class CompactionTests : IDisposable
         {
             ProviderId = "provider", ModelId = "model", Protocol = Protocols.ClaudeMessages,
             Effort = "high", MaxTokens = 1000,
-        });
+        }).DynamicCache();
         _store.AppendEvent(_handle.ProjectKey, _handle.SessionId, new TimelineEvent.MessageEvent
         {
             Id = "user-1", At = CoreClock.Now(), From = Speaker.User,

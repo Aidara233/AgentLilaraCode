@@ -62,7 +62,11 @@ public sealed class KernelRuntimeContractTests : IDisposable
         Assert.Equal("echo: 你好", ((CanonicalBlock.TextBlock)outcome.Reply.Blocks[0]).Text);
         Assert.Equal(1, handle.State.Turn);
 
-        var timeline = runtime.ReadTimeline(handle);
+        // ⚠️ 滤掉浮动读数（`floating-` 前缀）：它是核心注入的状态快照，不是这一轮的对话内容。
+        // `stable` 形态下它会作为一条真实事件落进记录（首步就会有一条），这与「一步 = 用户 + 模型」
+        // 不是同一件事——契约要钉的是后者。
+        var timeline = runtime.ReadTimeline(handle)
+            .Where(e => !e.Id.StartsWith("floating-", StringComparison.Ordinal)).ToList();
         Assert.Equal(2, timeline.Count);
         Assert.Equal(Speaker.User, ((TimelineEvent.MessageEvent)timeline[0]).From);
         Assert.Equal(Speaker.Model, ((TimelineEvent.MessageEvent)timeline[1]).From);
@@ -92,7 +96,8 @@ public sealed class KernelRuntimeContractTests : IDisposable
         var loaded = reopened.LoadSession(projectKey, sessionId);
 
         Assert.Equal(1, loaded.State.Turn);
-        Assert.Equal(2, reopened.ReadTimeline(loaded).Count);
+        Assert.Equal(2, reopened.ReadTimeline(loaded)
+            .Count(e => !e.Id.StartsWith("floating-", StringComparison.Ordinal)));
         Assert.Equal("contract", reopened.Store.ReadSpec(projectKey, sessionId).Title);
     }
 

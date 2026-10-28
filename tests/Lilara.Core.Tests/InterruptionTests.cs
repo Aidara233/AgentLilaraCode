@@ -36,7 +36,7 @@ public class InterruptionTests : IDisposable
         _store = new SessionStore(Path.Combine(_tmp, "data"));
         _stepper = new Stepper(_store, _adapter);
 
-        _handle = SessionHandle.Create(_store, _work, Model());
+        _handle = SessionHandle.Create(_store, _work, Model()).DynamicCache();
     }
 
     public void Dispose()
@@ -392,7 +392,8 @@ public sealed class LiveSessionsTests : IDisposable
     {
         var work = Path.Combine(_tmp, "work");
         Directory.CreateDirectory(work);
-        return SessionHandle.Create(new SessionStore(Path.Combine(_tmp, "data")), work, Model());
+        return SessionHandle.Create(new SessionStore(Path.Combine(_tmp, "data")), work, Model())
+            .DynamicCache();
     }
 
     /// <summary>

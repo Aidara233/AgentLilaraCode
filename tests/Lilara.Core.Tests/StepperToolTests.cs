@@ -46,7 +46,7 @@ public class StepperToolTests : IDisposable
         ProviderId = "p", ModelId = "m", Protocol = Protocols.ClaudeMessages, Effort = "high", MaxTokens = 1000,
     };
 
-    private SessionHandle NewSession() => SessionHandle.Create(_store, _work, Model());
+    private SessionHandle NewSession() => SessionHandle.Create(_store, _work, Model()).DynamicCache();
 
     private static ModelReply Calls(params (string CallId, string Name, string Args)[] calls) => new()
     {

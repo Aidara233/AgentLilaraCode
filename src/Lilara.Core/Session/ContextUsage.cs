@@ -98,6 +98,32 @@ public static class ContextUsage
             ? $"上次调用上下文总长度：{total} tokens（上游报告的总输入，含缓存；不含输出，非本次估算）。"
             : UnknownLine;
 
+    /// <summary>
+    /// **尾块**里那一行。⚠️ <paramref name="coarse"/> = 缓存形态轴的 `stable`：
+    /// 数字每步都在变，精确值放进去等于每步换一次字节 ⇒ 前缀缓存整段作废
+    /// （2026-10-27 用户裁定：「token 统计整 100k 时播报」）。
+    ///
+    /// <para>⚠️ <b>取整方向是向下、口径是 100k</b>：向上取整会说「约 100k」而其实是 1 token，
+    /// 在「还要不要压」的判断上偏保守是安全的，在「已经用了多少」的陈述上就是假的。
+    /// ⚠️ 小于 100k 时**整行不给**（<c>null</c>），不是给「约 0k」——那一格没有任何可播报的档位。
+    /// ⚠️ 未知仍是未知那行（<c>null</c> 与「未知」是两件事：一个是不播报，一个是不知道）。</para>
+    /// </summary>
+    public static string? TailLine(UsageStore? usage, string sessionId, bool coarse)
+    {
+        if (!coarse) return Line(usage, sessionId);
+
+        var (_, _, measured) = Measure(usage, sessionId);
+        if (measured is not { } known) return UnknownLine;
+
+        var bucket = known / CoarseBucket * CoarseBucket;
+        return bucket == 0
+            ? null
+            : $"上次调用上下文总长度：约 {bucket / 1000}k tokens（上游报告的总输入，含缓存；不含输出，非本次估算）。";
+    }
+
+    /// <summary>`stable` 模式下播报的档位粒度（100k）。</summary>
+    public const long CoarseBucket = 100_000;
+
     /// <summary>一次的归一口径总输入；没报输入 ⇒ <c>null</c>。</summary>
     private static long? TotalOf(UsageCall call) =>
         call.Usage is { InputTokens: not null } recorded ? TotalOf(call, recorded) : null;

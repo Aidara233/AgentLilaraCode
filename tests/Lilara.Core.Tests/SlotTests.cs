@@ -301,12 +301,14 @@ public sealed class SlotTests : IDisposable
         // ⚠️ `mode`（2026-10-24 计划批）在 ordinal 序里落在 `initiative` 之后——那是**排序结果**，
         // 不是被人排到那儿的；表序里它仍追加在末尾（见下面那条与 `AxisTests` 的同款注释）。
         Assert.Equal(
-            ["effort", "initiative", "mode", "network", "permission", "safety", "temperature", "verify"],
+            ["cache", "effort", "initiative", "mode", "network", "permission", "safety", "temperature", "verify"],
             Axes.RenderOrder);
 
         // 表序**保持不变**：它是控制面 `/axes` 与人看的序（`Axes.Names` 的注释）。
+        // ⚠️ `cache`（2026-10-27）追加在 `temperature` 之后、`mode` 之前——它属于「请求参数」
+        // 那一组（`InContext: false`），而不是三条行为轴那一组。
         Assert.Equal(
-            ["initiative", "permission", "safety", "verify", "network", "effort", "temperature", "mode"],
+            ["initiative", "permission", "safety", "verify", "network", "effort", "temperature", "cache", "mode"],
             Axes.Names);
 
         // ⚠️ 再看文本里的**先后**与 `RenderOrder` 一致（而不是与表序一致）。

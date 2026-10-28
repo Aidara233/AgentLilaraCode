@@ -1072,8 +1072,7 @@ public class ControlServerTests : IAsyncLifetime
     [Fact]
     public async Task State_FloatingSlotCarriesThePlanTreeAndTheContextLine()
     {
-        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
-        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        var sid = await CreateDynamicSession("c");
 
         // 计划：一条叶子 + 一条分支（分支下的那条叶子用来钉「树真的渲染了」）。
         await _dispatcher.DispatchAsync(new CoreCommand.SessionPlanEdit(sid, "overwrite",
@@ -1116,8 +1115,7 @@ public class ControlServerTests : IAsyncLifetime
     [Fact]
     public async Task ContextEndpoint_ReportsTheSameNumberAsTheFloatingSlot()
     {
-        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
-        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        var sid = await CreateDynamicSession("c");
         new UsageStore(_root).Append(new UsageCall
         {
             CallId = "previous", SessionId = sid, ProviderId = "p", ModelId = "m",
@@ -1163,6 +1161,20 @@ public class ControlServerTests : IAsyncLifetime
             .EnumerateArray().Single().GetProperty("text").GetString()!;
 
         Assert.Contains(CorePrompts.ContextOverflowDirective, floating, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 建一个**显式 <c>cache=dynamic</c>** 的会话（2026-10-27 起默认是 <c>stable</c>）。
+    /// ⚠️ 少数用例要钉的是 <c>dynamic</c> 的字节形状（精确 token 数、历史里只有那两条事件），
+    /// 那在 <c>stable</c> 下本来就不成立（它按 100k 取整、并且会多一条读数事件）。
+    /// </summary>
+    private async Task<string> CreateDynamicSession(string key)
+    {
+        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), key, false, CancellationToken.None);
+        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        await _dispatcher.DispatchAsync(new CoreCommand.SessionSetAxis(sid, Axes.Cache, Axes.CacheDynamic),
+            key + "-cache", false, CancellationToken.None);
+        return sid;
     }
 
     [Fact]
@@ -1455,8 +1467,7 @@ public class ControlServerTests : IAsyncLifetime
     [Fact]
     public async Task Snapshot_History_CarriesExactlyTheseKeys()
     {
-        var created = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "c", false, CancellationToken.None);
-        var sid = ((Ack.Accepted)created.Ack).SessionId!;
+        var sid = await CreateDynamicSession("c");
         // 让步真的走完 ⇒ rendered 非空（空数组上钉「每项」是空真）。
         await _dispatcher.DispatchAsync(
             new CoreCommand.SessionSend(sid, [new Block.TextBlock("hi")]), "s", awaitCompletion: true, CancellationToken.None);

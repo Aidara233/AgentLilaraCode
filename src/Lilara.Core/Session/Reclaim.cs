@@ -149,19 +149,27 @@ public static class Reclaim
     /// 那会是一句「fetch 取回」的假话。</para>
     /// </summary>
     /// <summary>
-    /// **占位结果的 id**（`floating-` 前缀）：这类结果**永远不进回收候选**。
+    /// **占位结果的判据**：`floating-` 前缀 + 内容是那句「读数不在这里」。这类结果**永远不进回收候选**。
     ///
     /// <para>⚠️ 它没有可收的内容——正文就是一句「读数不在这里」；而把它换成回收注记，
     /// 那句话当场被吃掉，占位就从「指向读数」退化成「一条无意义的痕迹」。
     /// 判据只有这一处：<see cref="Decide"/> 与 <see cref="Resolve"/> 都调它。</para>
+    ///
+    /// <para>⚠️ <b>2026-10-27 收紧了：加了内容那半个判据</b>（原来只看 id 前缀）。
+    /// `cache=stable` 形态的读数也带 `floating-` 前缀，但它**是真内容**、而且用户裁定它
+    /// 「像普通工具结果一样参与回收」——只按前缀排除会让它在历史里永久不可回收。
+    /// ⇒ 「是不是占位」问的是<b>内容</b>，id 前缀只是先做一个便宜的前置筛。
+    /// ⚠️ 前缀筛不能删：它保证这个谓词对任何非浮动结果都是 O(1) 的字符串比较。</para>
     /// </summary>
-    private static bool IsFloatingPlaceholder(string id) =>
-        id.StartsWith("floating-", StringComparison.Ordinal);
+    private static bool IsFloatingPlaceholder(TimelineEvent.ToolResultEvent r) =>
+        r.Id.StartsWith("floating-", StringComparison.Ordinal)
+        && r.Content.OfType<Block.TextBlock>()
+            .Any(b => b.Text.Contains(Tools.FloatingContextTool.ReclaimedBody, StringComparison.Ordinal));
 
     public static IReadOnlySet<string> Decide(IReadOnlyList<TimelineEvent> timeline, BlobStore blobs)
     {
         var byId = timeline.OfType<TimelineEvent.ToolResultEvent>()
-            .Where(r => !IsFloatingPlaceholder(r.Id))
+            .Where(r => !IsFloatingPlaceholder(r))
             .ToDictionary(r => r.Id, StringComparer.Ordinal);
 
         var result = new HashSet<string>(StringComparer.Ordinal);
@@ -180,7 +188,7 @@ public static class Reclaim
         // 而「释放过就是释放过」是**单调的** ⇒ 回收集合只增不减，前缀只往前走。
         // ⇒ 把**所有**释放事件的作用域并起来（不是只看最后一条）。
         foreach (var r in LineCovers(timeline))
-            if (!IsFloatingPlaceholder(r.Id) && Recoverable(r.Content, blobs)) result.Add(r.Id);
+            if (!IsFloatingPlaceholder(r) && Recoverable(r.Content, blobs)) result.Add(r.Id);
 
         return result;
     }
@@ -204,7 +212,7 @@ public static class Reclaim
 
         // ---- 距离：末尾 ProtectedRecentResults 条是保护带，不动 ----
         var candidates = timeline.OfType<TimelineEvent.ToolResultEvent>()
-            .Where(r => !IsFloatingPlaceholder(r.Id)).ToList();
+            .Where(r => !IsFloatingPlaceholder(r)).ToList();
         for (var i = 0; i < candidates.Count - ProtectedRecentResults; i++)
         {
             var r = candidates[i];
