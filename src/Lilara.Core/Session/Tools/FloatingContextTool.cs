@@ -75,7 +75,7 @@ public sealed class FloatingContextTool : ITool
     /// 而「空的不能长得像有内容」是本仓的反面判据（<c>SystemBlock.Wrap</c> 同一条）。</para>
     /// </summary>
     public const string ReclaimedBody =
-        "本轮读数不在这里：真实读数在对话最前面那条 id 以 floating- 开头的结果里。这条只是占位。";
+        "本轮读数不在这里：真实读数在对话最末那条 id 以 floating- 开头的结果里。这条只是占位。";
 
     public string Name => NameOf;
 
@@ -104,7 +104,7 @@ public sealed class FloatingContextTool : ITool
     /// </summary>
     public string Description =>
         "每一轮都调用一次：它是每轮的固定动作，不需要理由，也不必等到「需要它」的时候才调。"
-        + "本轮的浮动上下文（生效中的行为轴与插件贡献的字段）已经在对话最前面那条 id 以 floating- 开头的结果里——"
+        + "本轮的浮动上下文（生效中的行为轴与插件贡献的字段）已经在对话最末那条 id 以 floating- 开头的结果里——"
         + "调这个工具只是为了在记录里留下这一轮的调用。"
         + "返回值是一句占位（已回收）：它不含任何读数，调它不会带来新信息。";
 

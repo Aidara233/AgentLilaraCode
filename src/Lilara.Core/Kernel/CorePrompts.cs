@@ -33,8 +33,8 @@ public static class CorePrompts
     /// </summary>
     public const string FloatingContextExplanation =
         """
-        浮动上下文是当前状态的一份读数，形式是对话最前面那条 floating_context 结果：首块是 [floating_context] 框架头，id 以 floating- 开头。
-        它每一步重建一次，只出现在请求的最前面，不进历史。历史里每一步留下的是同一形状的占位结果：首块是 [floating_context 状态 已回收]，内容说明读数不在这里。
+        浮动上下文是当前状态的一份读数，形式是对话最末那条 floating_context 结果：首块是 [floating_context] 框架头，id 以 floating- 开头。
+        它每一步重建一次，只出现在请求的最末，不进历史。历史里每一步留下的是同一形状的占位结果：首块是 [floating_context 状态 已回收]，内容说明读数不在这里。
         其中列出当前生效的行为轴等级及其解释，也可能包含已绑定插件的上下文。轴等级以本次请求里的值为准，不沿用先前请求的等级。
         轴解释不自行授予权限；工具能否执行以框架闸门和审批结果为准。安全与验证强度是行为提示，不代表框架已经执行了验证。
         """;

@@ -56,8 +56,16 @@ public static class TimelineRender
         // ⇒ 渲染层只管记录：少一条来源，就少一条会漂的判据。
         if (extra is not { Count: > 0 }) return rendered;
 
-        // ⚠️ **插在最前面**（2026-10-26 用户裁定）：这块是「此刻的读数」，不是历史里的一段——
-        // 追加在末尾会让它随对话增长越走越远，也与「最上面就是当前状态」的直觉相反。
+        // ⚠️ **追加在末尾**（2026-10-28 用户裁定，改掉 10-26 的「插在最前面」）。
+        // 理由两条，第二条是硬的：
+        // ① 「此刻的读数」本来就该是**最后读到的**那一份——放在最前面反而要求读者回头找它，
+        //    历史越长它离末尾越远，越容易被当成过时前言。
+        // ② **前缀缓存**（可验证，不是偏好）：这一对的 id 带步号（`floating-{turn}-*`）、
+        //    正文里带「上次调用上下文总长度」这类每步都变的数 ⇒ 只要它待在**历史之前**，
+        //    历史段就从它的第一个 token 起与上一步不匹配 ⇒ 除 system/premier/tools 之外
+        //    **一次都不命中**（实测：21 万上下文只命中 8k，恰好是头部那一段）。
+        //    挪到末尾之后，共同前缀 = 头部 + 整段历史（纯追加），变化被关在最后一对里，
+        //    **不挡任何东西**。
         //
         // ⚠️ **一次请求里只许出现一个真实块**：这一对的 id 由 turn 决定，记录里若已有同号
         // （崩溃后重放、或核心在步末补过占位），插进去就是**两条同 `CallId` 的 `tool_use`**
@@ -65,7 +73,8 @@ public static class TimelineRender
         // ⇒ 只要占用了同一个 id，这一条就不插。
         var taken = rendered.SelectMany(IdsOf).ToHashSet(StringComparer.Ordinal);
         var fresh = extra.Where(e => IdsOf(e).All(id => !taken.Contains(id))).ToList();
-        return fresh.Count == 0 ? rendered : [.. fresh, .. rendered];
+        // ⚠️ 末尾（不是开头）：见上面那段——顺序同时决定「读者在哪看到状态」与「缓存命中多少」。
+        return fresh.Count == 0 ? rendered : [.. rendered, .. fresh];
     }
 
     /// <summary>

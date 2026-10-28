@@ -12,12 +12,18 @@ using Block = Lilara.Core.Kernel.Block;
 namespace Lilara.Core.Tests;
 
 /// <summary>
-/// **`floating_context`：真实读数在对话最上面，历史里每步只留一条已回收占位**（2026-10-26 用户裁定）。
+/// **`floating_context`：真实读数在对话最末，历史里每步只留一条已回收占位**
+/// （2026-10-26 定形态；**2026-10-28 用户裁定把位置从「最前面」改到「最末」**）。
+///
+/// <para>⚠️ <b>位置为什么改</b>：这一对的 id 带步号、正文带每步都变的数 ⇒ 它待在**历史之前**时，
+/// 历史段就从它的第一个 token 起与上一步不匹配 ⇒ 除 system/premier/tools 之外
+/// **一次都不命中前缀缓存**（实测：21 万上下文只命中 8k）。挪到最末之后，共同前缀 = 头部 +
+/// 整段历史（纯追加），变化被关在最后一对里、不挡任何东西。</para>
 ///
 /// <para>⚠️ 这套契约四句话，每句都对应一个会被「看起来能用」掩盖的失败：</para>
 /// <list type="number">
-///   <item><b>真实读数插在最前面</b>：它是「此刻的状态」，不是历史里的一段——追加在末尾会随对话
-///     增长越走越远，也会与「最上面就是当前状态」的位置直觉相反。</item>
+///   <item><b>真实读数插在最末</b>：它是「此刻的状态」，是读者**最后读到**的那一份；
+///     放在最前面既要求回头找，又会让整段历史落在它之后（缓存视角下等于每步全变）。</item>
 ///   <item><b>记录里每步恰好一对占位</b>：无论模型这一轮真的调了没有，记录里都有「一次调用 +
 ///     一句已回收」。缺口会让下一步看到「上一轮我没调用」，而补那个缺口唯一可行的动作就是再调一次。</item>
 ///   <item><b>一组调用里不许出现两个块</b>：真实那对的 id 由 turn 决定，占位那对用另一个号段；
@@ -81,12 +87,12 @@ public sealed class FloatingContextTests : IDisposable
     // ---- 真实读数在哪 ----
 
     /// <summary>
-    /// ⚠️ **真实读数在请求的最前面，而且恰好一对**：`tool_use(floating_context)` 紧跟着
+    /// ⚠️ **真实读数在请求的最末，而且恰好一对**：`tool_use(floating_context)` 紧跟着
     /// 配对的 `tool_result`。位置与配对两条都要钉——
     /// 「紧挨着」不是排版：Claude 要求 `tool_result` **immediately after** 它的调用。
     /// </summary>
     [Fact]
-    public async Task Step_InsertsTheRealPairAtTheVeryTop()
+    public async Task Step_InsertsTheRealPairAtTheVeryEnd()
     {
         var handle = NewSession();
         _adapter.ReplyWith(_ => Say("好"));
@@ -95,13 +101,15 @@ public sealed class FloatingContextTests : IDisposable
         var request = Assert.Single(_adapter.Calls);
         Assert.True(request.Timeline.Count >= 3);
 
-        var call = Assert.IsType<TimelineEvent.MessageEvent>(request.Timeline[0]);
+        // ⚠️ **真实读数在请求的最末尾**（2026-10-28 用户裁定）：它是「此刻的读数」，
+        // 排在整个历史之后；也因此**不挡前缀缓存**（它变了，前面的历史一个字节都没动）。
+        var call = Assert.IsType<TimelineEvent.MessageEvent>(request.Timeline[^2]);
         Assert.Equal(Speaker.Model, call.From);
         var use = Assert.Single(call.Blocks.OfType<Block.ToolUseBlock>());
         Assert.Equal(FloatingContextTool.NameOf, use.Name);
         Assert.Equal("{}", use.Arguments);
 
-        var result = Assert.IsType<TimelineEvent.ToolResultEvent>(request.Timeline[1]);
+        var result = Assert.IsType<TimelineEvent.ToolResultEvent>(request.Timeline[^1]);
         Assert.Equal(use.CallId, result.CallId);
         Assert.Contains(CorePrompts.TailOpen, TextOf(result));
         Assert.Contains(CorePrompts.TailDeclaration, TextOf(result));
@@ -114,9 +122,9 @@ public sealed class FloatingContextTests : IDisposable
             TextOf(result));
         Assert.Contains(Axes.LabelOf(Axes.Permission), TextOf(result));
 
-        // 真实读数**只有一份**，而且**不在末尾**（末尾是这一步的记录，不是读数）。
+        // 真实读数**只有一份**，而且**在末尾**：它是最后读到的那一份，不是历史里的一段。
         Assert.Equal(1, Results(request).Count(r => TextOf(r).Contains(CorePrompts.TailOpen, StringComparison.Ordinal)));
-        Assert.Same(result, request.Timeline[1]);
+        Assert.Same(result, request.Timeline[^1]);
     }
 
     /// <summary>
@@ -192,11 +200,11 @@ public sealed class FloatingContextTests : IDisposable
         await _stepper.StepAsync(handle, "a", default);
         await _stepper.StepAsync(handle, [], default);
 
-        var firstMsg = Assert.IsType<TimelineEvent.MessageEvent>(_adapter.Calls[0].Timeline[0]);
+        var firstMsg = Assert.IsType<TimelineEvent.MessageEvent>(_adapter.Calls[0].Timeline[^2]);
         var first = Assert.Single(firstMsg.Blocks.OfType<Block.ToolUseBlock>());
         Assert.EndsWith("-call", firstMsg.Id);
         Assert.EndsWith("-result", first.CallId);
-        Assert.Equal(first.CallId, Assert.IsType<TimelineEvent.ToolResultEvent>(_adapter.Calls[0].Timeline[1]).CallId);
+        Assert.Equal(first.CallId, Assert.IsType<TimelineEvent.ToolResultEvent>(_adapter.Calls[0].Timeline[^1]).CallId);
 
         // ② 下一步换号：同一步内重复渲染要逐字节相同（`00` §5 铁律 1），
         // 而跨步必须不同——否则两步的读数会撞成同一条，配对会串。
@@ -208,12 +216,12 @@ public sealed class FloatingContextTests : IDisposable
     }
 
     /// <summary>
-    /// ⚠️ **下一步：顶上一条新的真实读数 + 历史里一条占位**，形状固定在这个数目上。
-    /// 三条判据：① 真实那条在最前面；② 占位那条来自上一轮；③ **没有同号重复**——
+    /// ⚠️ **下一步：末尾一条新的真实读数 + 历史里一条占位**，形状固定在这个数目上。
+    /// 三条判据：① 真实那条在**最末**；② 占位那条来自上一轮；③ **没有同号重复**——
     /// 「一组调用里出现两个块」正是这次改动要防的形态。
     /// </summary>
     [Fact]
-    public async Task NextStep_PutsTheFreshReadingOnTop_AndKeepsOneReclaimedPairInHistory()
+    public async Task NextStep_PutsTheFreshReadingAtTheEnd_AndKeepsOneReclaimedPairInHistory()
     {
         var handle = NewSession();
         _adapter.ReplyWith(_ => Say("一")).ReplyWith(_ => Say("二"));
@@ -227,11 +235,11 @@ public sealed class FloatingContextTests : IDisposable
         Assert.Equal(2, floating.Count);
         Assert.Equal(floating.Count, floating.Select(u => u.CallId).Distinct(StringComparer.Ordinal).Count());
 
-        // ① 真实那条在最前面。
-        var top = Assert.IsType<TimelineEvent.MessageEvent>(request.Timeline[0]);
-        var topUse = Assert.Single(top.Blocks.OfType<Block.ToolUseBlock>());
-        Assert.Equal(FloatingContextTool.NameOf, topUse.Name);
-        Assert.DoesNotContain("-reclaim-", topUse.CallId);
+        // ① 真实那条在**最末**（倒数第二条是调用，最后一条是它的结果）。
+        var tailMsg = Assert.IsType<TimelineEvent.MessageEvent>(request.Timeline[^2]);
+        var tailUse = Assert.Single(tailMsg.Blocks.OfType<Block.ToolUseBlock>());
+        Assert.Equal(FloatingContextTool.NameOf, tailUse.Name);
+        Assert.DoesNotContain("-reclaim-", tailUse.CallId);
 
         // ② 占位那条来自上一轮，且读的是占位。
         var reclaimed = Assert.Single(floating, u => u.CallId.Contains("-reclaim-", StringComparison.Ordinal));
@@ -312,11 +320,63 @@ public sealed class FloatingContextTests : IDisposable
         _adapter.ReplyWith(_ => Say("好"));
         await stepper.StepAsync(handle, "你好", default);
 
-        var readout = TextOf(Assert.IsType<TimelineEvent.ToolResultEvent>(_adapter.Calls[0].Timeline[1]));
+        var readout = TextOf(Assert.IsType<TimelineEvent.ToolResultEvent>(_adapter.Calls[0].Timeline[^1]));
         Assert.Contains("计划（剩余树", readout);
         Assert.Contains("▶ 读代码", readout);
         Assert.Contains("改一个文件", readout);
         Assert.Contains("上次调用上下文总长度：125 tokens", readout);
+    }
+
+    /// <summary>
+    /// ⚠️ **改位置的全部意义**（2026-10-28）：第二步请求必须**以第一步请求的历史部分为前缀**。
+    ///
+    /// <para>位置 0 时这条**不可能**成立：那对合成调一变，它后面的整段历史跟着失配。
+    /// 挪到最末之后，共同前缀 = 头部 + 第一步的全部历史，**只有末尾那一对**（约 1–2 KB）每步新写
+    /// —— 从「除头部外全不命中」变成「只有末尾一小段不命中」。</para>
+    ///
+    /// <para>⚠️ 断言刻意写成「第一步去掉末尾两条」而不是「第一步全部」：浮动对**不落库**，
+    /// 第一步把那对放在末尾，第二步的位置上是那一步的真实记录——所以它俩本来就不该相等。
+    /// 把这一点钉住，才不会有人为了「让前缀完全相等」去把这玩意塞进记录。</para>
+    /// </summary>
+    [Fact]
+    public async Task SecondStep_ReusesTheWholeFirstHistoryAsPrefix()
+    {
+        var handle = NewSession();
+        _adapter.ReplyWith(_ => Say("一")).ReplyWith(_ => Say("二"));
+        await _stepper.StepAsync(handle, "a", default);
+        await _stepper.StepAsync(handle, [], default);
+
+        var first = Shape(_adapter.Calls[0]).ToList();
+        var second = Shape(_adapter.Calls[1]).ToList();
+
+        // 第一步末尾那两条是浮动对（不落库），所以历史部分的长度是 Count - 2。
+        var history = first.Count - 2;
+        Assert.True(second.Count > history);
+
+        for (var i = 0; i < history; i++)
+            Assert.Equal(first[i], second[i]);
+
+        // 而第二步末尾那两条**是**这一次的浮动对（新号段，不是第一步那份）。
+        Assert.NotEqual(first[^2], second[^2]);
+        Assert.DoesNotContain(first[^2], second);
+
+        static IEnumerable<string> Shape(ModelRequest request) =>
+            request.Timeline.Select(e => e switch
+            {
+                TimelineEvent.MessageEvent m =>
+                    $"{m.Id}|{m.From}|" + string.Join("\u0001", m.Blocks.Select(BlockText)),
+                TimelineEvent.ToolResultEvent r =>
+                    $"{r.Id}|{r.CallId}|" + string.Join("\u0001", r.Content.Select(BlockText)),
+                _ => e.Id,
+            });
+
+        static string BlockText(Block block) => block switch
+        {
+            Block.TextBlock t => "t:" + t.Text,
+            Block.ToolUseBlock u => $"u:{u.CallId}:{u.Name}:{u.Arguments}",
+            Block.StoreBlock s => "s:" + s.Sha256,
+            _ => block.GetType().Name,
+        };
     }
 
     // ---- 工具本身 ----
@@ -338,8 +398,8 @@ public sealed class FloatingContextTests : IDisposable
 
         Assert.Equal(FloatingContextTool.ReclaimedBody, TextOf(executed));
 
-        // 而真实读数仍在本次请求的最前面，一个字都没少。
-        var injected = Assert.IsType<TimelineEvent.ToolResultEvent>(_adapter.Calls[0].Timeline[1]);
+        // 而真实读数仍在本次请求的最末，一个字都没少。
+        var injected = Assert.IsType<TimelineEvent.ToolResultEvent>(_adapter.Calls[0].Timeline[^1]);
         Assert.Contains(CorePrompts.TailOpen, TextOf(injected));
         Assert.Contains(Axes.LabelOf(Axes.Permission), TextOf(injected));
     }
