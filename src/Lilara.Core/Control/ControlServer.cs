@@ -111,6 +111,95 @@ public sealed class ControlServer(
 
     // ---- 快照 / 查询（HTTP，一次性） ----
 
+    private IResult SessionRows(bool archivedOnly)
+    {
+        IReadOnlyList<string> projectKeys;
+        try { projectKeys = ProjectKeys(); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return Results.Problem("无法枚举项目目录：" + ex.Message, statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+
+        // SessionId 的概率碰撞极低，但身份在存储中实际是 (ProjectKey, SessionId)。
+        // 不要用 SessionId 单独 ToDictionary：一个合法碰撞会令列表整个返回 500。
+        var activated = host.Activated
+            .GroupBy(handle => (handle.ProjectKey, handle.SessionId))
+            .ToDictionary(group => group.Key, group => group.First());
+        var rows = new List<object>();
+
+        foreach (var projectKey in projectKeys)
+        {
+            IReadOnlyList<string> sessionIds;
+            try { sessionIds = host.Store.ListSessions(projectKey); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // 一个项目目录正在被搬动或不可读，不应挡住其他项目的会话列表。
+                continue;
+            }
+
+            foreach (var sessionId in sessionIds)
+            {
+                try
+                {
+                    var spec = host.Store.TryReadSpec(projectKey, sessionId);
+                    if (spec is null || (spec.ArchivedAt is not null) != archivedOnly) continue;
+
+                    if (activated.TryGetValue((projectKey, sessionId), out var live))
+                    {
+                        rows.Add(Row(sessionId, projectKey, active: true, live.State, spec));
+                        continue;
+                    }
+
+                    SessionState disk;
+                    try { disk = host.Store.ReadState(projectKey, sessionId); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                                  or JsonException or FileFormatException)
+                    {
+                        // 坏状态文件或较新格式只影响这一条会话；其它会话仍可列出。
+                        continue;
+                    }
+
+                    rows.Add(Row(sessionId, projectKey, active: false, disk, spec));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                              or JsonException or FileFormatException)
+                {
+                    // 文件可能在列表扫描期间被删除、替换，或内容损坏。隔离单条后继续扫描。
+                }
+            }
+        }
+
+        return Results.Json(rows, WireJson.Options);
+
+        static object Row(string sid, string pk, bool active, SessionState state, SessionSpec spec) => new
+        {
+            SessionId = sid,
+            ProjectKey = pk,
+            Active = active,
+            state.Status,
+            state.Turn,
+            Title = spec.Title,
+            ParentSessionId = spec.ParentSessionId ?? "",
+            ArchivedAt = spec.ArchivedAt,
+            Ask = state.Ask is { } ask
+                ? new
+                {
+                    AskId = (string?)ask.AskId,
+                    ToolName = (string?)ask.ToolName,
+                    Kind = (AskKind?)ask.Kind,
+                    ask.DeadlineAt,
+                }
+                : new
+                {
+                    AskId = (string?)null,
+                    ToolName = (string?)null,
+                    Kind = (AskKind?)null,
+                    DeadlineAt = (DateTimeOffset?)null,
+                },
+            Goal = new { Active = Session.GoalMode.IsActive(state) },
+        };
+    }
+
     private void MapSnapshots(WebApplication app)
     {
         // 自检**最先**列：核心跑在哪个数据根、哪个工作目录、几个会话在内存里。
@@ -214,9 +303,15 @@ public sealed class ControlServer(
         app.MapGet("/projects/{pk}/sessions", (string pk) =>
             Results.Json(host.Store.ListSessions(pk), WireJson.Options));
 
-        // 全部会话的**运行状态**，一次拿全（`01` §3.8）。
+        // 未归档会话的**运行状态**，一次拿全（`01` §3.8）。
+        // 归档数据由 `/sessions/archived` 单独读取；`/sessions` 的 URL 与响应数组形状保持原样，
+        // 旧版头无需改请求就仍可读取活动会话。
+        app.MapGet("/sessions", () => SessionRows(archivedOnly: false));
+        app.MapGet("/sessions/archived", () => SessionRows(archivedOnly: true));
+
+        // 状态行构建与逐会话隔离见 SessionRows。
         //
-        // ⚠️ **它绝不 `Activate`** —— 这是这个端点唯一真的容易写错的地方：
+        // ⚠️ **它绝不 `Activate`** —— 这是这两个端点唯一真的容易写错的地方：
         // `/sessions/{id}/state` 那条路在激活表 miss 时会**载入并登记**那个会话，
         // 而那是**有副作用的读**。照着它写这个端点 ⇒ **打开一次列表 = 全库载入**，
         // 而载入会触发回收（`01` §11.7 那次事故：把「顺手捡」做成了「花钱买」）。
@@ -224,107 +319,6 @@ public sealed class ControlServer(
         //
         // ⚠️ **四种状态里有两种是内存事实**：`Running` 只写内存、`不活跃` 是「不在激活表里」。
         // 盘上只存 `Idle` / `WaitingForInput` ⇒ 这个端点必须两个来源都看。
-        app.MapGet("/sessions", () =>
-        {
-            var activated = host.Activated.ToDictionary(h => h.SessionId, StringComparer.Ordinal);
-            var rows = new List<object>();
-
-            // 项目序 + 项目内序都由各自的既有实现定（`ListProjects` / `ListSessions` 都是有序列举）
-            // ⇒ 本端点不引入第二个排序判据。
-            foreach (var pk in ProjectKeys())
-            {
-                foreach (var sid in host.Store.ListSessions(pk))
-                {
-                    var spec = host.Store.TryReadSpec(pk, sid);
-                    if (spec is null) continue;     // 坏 spec 的会话列不出来（同 `ListSessions` 的取舍）
-
-                    if (activated.TryGetValue(sid, out var live))
-                    {
-                        rows.Add(Row(sid, pk, active: true, live.State, spec.Title, spec.ParentSessionId,
-                            spec.ArchivedAt));
-                        continue;
-                    }
-
-                    // ⚠️ 读不出来就**跳过**，不抛：一个坏 `state.json` 不该让整个列表 500
-                    // （同 `/claims` 那条「坏文件不让它打死核心」）。
-                    SessionState? disk = null;
-                    try { disk = host.Store.ReadState(pk, sid); }
-                    catch (Exception ex) when (ex is IOException or FileNotFoundException
-                                                  or UnauthorizedAccessException)
-                    {
-                        // 跳过。
-                    }
-
-                    if (disk is not null) rows.Add(Row(sid, pk, active: false, disk, spec.Title,
-                        spec.ParentSessionId, spec.ArchivedAt));
-                }
-            }
-
-            return Results.Json(rows, WireJson.Options);
-
-            static object Row(
-                string sid, string pk, bool active, SessionState state, string? title,
-                string? parentSessionId, DateTimeOffset? archivedAt) => new
-            {
-                SessionId = sid,
-                ProjectKey = pk,
-                // ⚠️ 「不活跃」是**内存事实**（盘上没有它的痕迹）。头要它，因为
-                // 「没在内存里」与「没在跑」不是一回事（后者还要看 `status`）。
-                Active = active,
-                state.Status,
-                state.Turn,
-                Title = title,
-                // ⚠️ **派生关系**（2026-10-24）：头靠它把子会话挂在父下面。
-                // `null` = 顶层。⚠️ 这里交的是 spec 里的**出生事实**，不是「父还在不在」——
-                // 父被删掉之后这个 id 仍然指着它（`01` §10.3「父停：子停止推进，记录保留」），
-                // 而头的处理是「挂不上就按顶层画」，不是「当作没这回事」。
-                ParentSessionId = parentSessionId ?? "",
-                // ⚠️ **归档态**（2026-10-26）：交出去，头的折叠才真的生效。
-                // 那个折叠逻辑（`app.js` 的 `showArchived` / 每项目计数）**早就在**，
-                // 而这个端点一直没给这个字段、头上又把它硬填成 `null`
-                // ⇒ 归档会话一直混在列表与计数里，两边都看着正常。
-                // ⚠️ 这里**不过滤**：`/sessions` 回答的是「项目下有哪些会话」，
-                // 与 `ListSessions` 同一条取舍（见 `SessionSpec.ArchivedAt`）；
-                // 滤掉的那一份是**派生关系**（`SessionStore.ChildrenOf`）。
-                ArchivedAt = archivedAt,
-                // ⚠️ **待办的那次询问**：头据此在列表上标出「哪个会话在等我」，
-                // 不必再去逐个 `GET /approvals`。
-                //
-                // ⚠️ **「没在等」是 `{}`，不是 `null`、也不是省略**。三个都试过：
-                //   · `null` ⇒ `WhenWritingNull` 把**整个键**省掉 ⇒ 头的 `row.ask` 是
-                //     `undefined`（同 `/claims` 的 `stale` 那条教训）
-                //   · 内层可空字段 ⇒ 同一个开关把内层也写成 `{}`
-                // ⇒ **契约是：头判 `row.ask?.askId`**（`{}` 本身是 truthy，不能拿它当判据）。
-                // 这条**必须写在这里**，因为 `{}` 看着像「有个对象」，而它是「什么都没有」。
-                //
-                // ⚠️ 只交出**外部要看的三格**——`ArgsHash` / `CallId` 是内部配对用的，
-                // 交出去等于把实现细节写进线上 schema。
-                Ask = state.Ask is { } a
-                    ? new
-                    {
-                        // ⚠️ 显式 `(string?)` / `(AskKind?)` 不是多余的：两个分支的匿名类型
-                        // **必须逐字段同名同型**才会被编译器合并成同一个类型——否则这里是一个
-                        // CS8619（可空性不匹配），而解法不是 `!`（那会撒谎），是让两支**真的是同一个形状**。
-                        //
-                        // ⚠️ **`Kind` 直接交枚举，不 `.ToString()`**（2026-10-11 改）：
-                        // 手写的 `.ToString()` **绕开了 `WireJson.Options`**（那是 `JsonStringEnumConverter(camelCase)`）
-                        // ⇒ 线上一半 `"Permission"`、一半 `"permission"`（同一条 `/state` 响应里两种都有，
-                        // 见下面那个 `Ask`）。头拿 PascalCase 去比 ⇒ 「？授权」徽标画成「？提问」。
-                        // ⇒ 让序列化器接管：线上拼法此后只有一个来源。
-                        AskId = (string?)a.AskId,
-                        ToolName = (string?)a.ToolName,
-                        Kind = (AskKind?)a.Kind,
-                        a.DeadlineAt,
-                    }
-                    : new { AskId = (string?)null, ToolName = (string?)null, Kind = (AskKind?)null,
-                            DeadlineAt = (DateTimeOffset?)null },
-                // ⚠️ **goal 永远是对象**（照 `Ask` 的 `{}` 纪律）：`WhenWritingNull` 会把 null 键
-                // 整个省掉，头就分不清「不在 goal」与「这个核心不认识 goal」。
-                // 判据只有一处：主动性轴是不是 `goal`（`GoalMode`）。
-                Goal = new { Active = Session.GoalMode.IsActive(state) },
-            };
-        });
-
         app.MapGet("/sessions/{id}/state", (string id) =>
         {
             if (!TryFind(id, out var handle)) return Results.NotFound();

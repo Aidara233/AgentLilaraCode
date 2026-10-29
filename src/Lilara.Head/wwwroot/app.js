@@ -50,9 +50,7 @@ let usageCalls = [];
 let usageAsOf = null;
 let usageSkip = 0;
 const usagePageSize = 100;
-// 归档的会话默认**折叠**在左栏里（⚠️ 过滤只发生在这里——核心的 `ListSessions`
-// **照列**归档会话，理由见 `SessionSpec.ArchivedAt` 的注释：那是「一个项目下有哪些会话」
-// 的唯一定义，而 `/claims` 也走它）。
+// 归档会话按需从独立 `/sessions/archived` 端点拉取；首屏和常规刷新只加载未归档会话。
 let showArchived = false;
 const provNotes = new Map();        // providerId -> { text, ok }（最近一次自检的结果）
 const testCmd = new Map();          // 命令 id -> providerId（回执认得回来）
@@ -303,12 +301,15 @@ function hideOnboarding() {
 // 全局会话列表 = 对 GET /projects 的每个 pk 取 sessions 的并集；分组名从 spec.workingDirectory 反推。
 
 async function loadSessions() {
-  // ⚠️ **一个端点拿全**（`GET /sessions`，2026-08 询问批加的）：它一次给出每条的
-  // 运行状态与待办询问。旧写法是 `/projects` + 每个 pk 的 `/projects/{pk}/sessions`
-  // + **每个会话一次** `/sessions/{id}/state`——N+1 次往返，而这个列表是**每次
-  // 事件都要重画**的。⚠️ 旧写法里那个 `/state` 还**有副作用**（核心会 Activate），
-  // 新端点刻意不载入（见核心里那段注释）。
-  const rows = await (await fetch(core + "/sessions")).json();
+  // 默认只取未归档会话。归档列表独立按需拉取，旧版头请求 /sessions 仍得到原有数组结构。
+  const response = await fetch(core + "/sessions");
+  if (!response.ok) throw new Error(`会话列表读取失败（HTTP ${response.status}）`);
+  const rows = await response.json();
+  if (showArchived) {
+    const archivedResponse = await fetch(core + "/sessions/archived");
+    if (!archivedResponse.ok) throw new Error(`归档会话读取失败（HTTP ${archivedResponse.status}）`);
+    rows.push(...await archivedResponse.json());
+  }
   sessions.clear();
   projects.clear();
   for (const r of rows) {
@@ -365,6 +366,9 @@ function shortTime(iso) {
 function renderSessions() {
   const box = $("sessions");
   box.innerHTML = "";
+  const archivedToggle = $("sessions-archived-toggle");
+  archivedToggle.textContent = showArchived ? "隐藏归档会话" : "显示归档会话";
+  archivedToggle.setAttribute("aria-expanded", String(showArchived));
   if (sessions.size === 0) {
     box.innerHTML = '<div class="muted" style="padding:8px 0">还没有会话</div>';
     return;
@@ -397,11 +401,8 @@ function renderSessions() {
     const cnt = document.createElement("span");
     cnt.className = "pcount";
 
-    // 归档的**默认折叠**（见 `showArchived` 的注释：过滤只发生在这个显示层）。
-    const archived = ids.filter((id) => (info.get(id)?.spec || {}).archivedAt);
-    const visible = showArchived ? ids : ids.filter((id) => !archived.includes(id));
-
-    // 计数只说**看得见的那部分**，否则「折叠着却显示 5」是个谎。
+    // 服务端默认只给活动会话；切换归档视图时，活动与归档数组在 loadSessions 中合并。
+    const visible = ids;
     cnt.textContent = visible.length;
     head.append(nm, key, cnt);
 
@@ -432,13 +433,6 @@ function renderSessions() {
     };
     for (const r of roots) walk(r, 0);
 
-    if (archived.length) {
-      const toggle = document.createElement("button");
-      toggle.className = "archtoggle";
-      toggle.textContent = showArchived ? `隐藏归档 (${archived.length})` : `显示归档 (${archived.length})`;
-      toggle.onclick = (e) => { e.stopPropagation(); showArchived = !showArchived; renderSessions(); };
-      head.appendChild(toggle);
-    }
     g.appendChild(head);
 
     for (const id of ordered) {
@@ -2386,6 +2380,18 @@ $("new-project").addEventListener("keydown", (e) => {
 });
 
 $("new-project").addEventListener("blur", () => hideDirList());
+
+$("sessions-archived-toggle").onclick = async () => {
+  const previous = showArchived;
+  showArchived = !showArchived;
+  renderSessions();
+  try { await loadSessions(); }
+  catch (error) {
+    showArchived = previous;
+    renderSessions();
+    renderMeta("✗ " + error.message, "error");
+  }
+};
 
 $("new-go").onclick = async () => {
   const note = $("new-note");

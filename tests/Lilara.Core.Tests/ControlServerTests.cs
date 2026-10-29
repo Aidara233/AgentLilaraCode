@@ -84,6 +84,46 @@ public class ControlServerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SessionsEndpoints_SeparateArchivedRowsAndSkipCorruptStateWithoutChangingLegacyShape()
+    {
+        var active = Assert.IsType<Ack.Accepted>((await _dispatcher.DispatchAsync(
+            new CoreCommand.SessionCreate(), "active", true, CancellationToken.None)).Ack).SessionId!;
+        var archived = Assert.IsType<Ack.Accepted>((await _dispatcher.DispatchAsync(
+            new CoreCommand.SessionCreate(), "archived", true, CancellationToken.None)).Ack).SessionId!;
+        var corrupt = Assert.IsType<Ack.Accepted>((await _dispatcher.DispatchAsync(
+            new CoreCommand.SessionCreate(), "corrupt", true, CancellationToken.None)).Ack).SessionId!;
+
+        Assert.IsType<Ack.Accepted>((await _dispatcher.DispatchAsync(
+            new CoreCommand.SessionArchive(archived, Archived: true), "archive", true, CancellationToken.None)).Ack);
+        foreach (var sid in new[] { active, archived, corrupt })
+            await _dispatcher.DispatchAsync(new CoreCommand.SessionDeactivate(sid), "deactivate-" + sid, true,
+                CancellationToken.None);
+
+        var projectKey = ProjectKey.FromPath(_work);
+        var corruptStatePath = Path.Combine(_host.Store.SessionDirectory(projectKey, corrupt), "state.json");
+        File.WriteAllText(corruptStatePath, "{ malformed state");
+
+        using var activeResponse = await Client.GetAsync(Http("/sessions"));
+        Assert.Equal(System.Net.HttpStatusCode.OK, activeResponse.StatusCode);
+        using var activeJson = JsonDocument.Parse(await activeResponse.Content.ReadAsStringAsync());
+        var activeRows = activeJson.RootElement.EnumerateArray().ToList();
+        Assert.Contains(activeRows, row => row.GetProperty("sessionId").GetString() == active);
+        Assert.DoesNotContain(activeRows, row => row.GetProperty("sessionId").GetString() == archived);
+        Assert.DoesNotContain(activeRows, row => row.GetProperty("sessionId").GetString() == corrupt);
+        Assert.All(activeRows, row => Assert.True(!row.TryGetProperty("archivedAt", out var archivedAt)
+                                        || archivedAt.ValueKind == JsonValueKind.Null));
+
+        using var archivedResponse = await Client.GetAsync(Http("/sessions/archived"));
+        Assert.Equal(System.Net.HttpStatusCode.OK, archivedResponse.StatusCode);
+        using var archivedJson = JsonDocument.Parse(await archivedResponse.Content.ReadAsStringAsync());
+        var archivedRows = archivedJson.RootElement.EnumerateArray().ToList();
+        Assert.Contains(archivedRows, row => row.GetProperty("sessionId").GetString() == archived);
+        Assert.DoesNotContain(archivedRows, row => row.GetProperty("sessionId").GetString() == active);
+        Assert.True(archivedRows.All(row => row.TryGetProperty("archivedAt", out _)
+                                            && row.GetProperty("archivedAt").ValueKind == JsonValueKind.String));
+    }
+
+    [Fact]
     public async Task JobOutput_PagesAndRejectsForeignJobsWithoutActivatingSession()
     {
         var session = await _dispatcher.DispatchAsync(new CoreCommand.SessionCreate(), "create1", true, CancellationToken.None);

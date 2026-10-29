@@ -938,6 +938,8 @@ button:disabled:hover { border-color: var(--rule); }
     </div>
     <div id="new-note" class="note"></div>
   </div>
+  <!-- 会话列表默认只加载未归档项；归档列表由单独端点按需读取。 -->
+  <button id="sessions-archived-toggle" class="archtoggle" type="button" aria-expanded="false">显示归档会话</button>
   <!-- 分组与刻度都由 renderSessions() 画；这里只给一个容器。 -->
   <div id="sessions"></div>
 </aside>
