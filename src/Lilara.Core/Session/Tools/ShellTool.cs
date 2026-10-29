@@ -84,8 +84,10 @@ public sealed class ShellTool : ITool
         + "超时会杀掉整棵进程树并如实报告；输出超过上限时只保留开头。"
         + "要读文件优先用 read / search，要改文件优先用 write / update——它们的结果更省上下文。"
         + "⚠️ 这是**前台**执行：它占着这一步，直到命令结束或超时。"
-        + "要跑持续很久的东西（起服务、盯日志、长构建），用 background: true 起成后台任务；"
-        + "它会立刻返回一个任务 id，之后用 job_output 读进展、jobs 看还在不在、job_kill 停掉。"
+        + "要跑耗时命令，用 background: true 起成后台任务；它会立刻返回任务 id。"
+        + "若后续工作依赖命令结果，下一步立即调用 wait(task=id) 等它结束；不要用 jobs / job_output 反复轮询。"
+        + "只有要并行做独立工作时才先继续别的事，之后用 wait 等结果；长期服务可用 timeoutSeconds 限时等待。"
+        + "jobs 用于确实需要盘点任务，job_output 用于查看日志，job_kill 用于停止任务。"
         + "⚠️ 后台任务**不随这一步结束，也不会被 session.interrupt 打断**——停它只能靠 job_kill。";
 
     public string ParametersSchemaJson => """
@@ -192,9 +194,8 @@ public sealed class ShellTool : ITool
                 new Block.TextBlock(
                     $"已在后台启动（任务 {job.Id}，pid {job.ProcessId}）。它不随这一步结束，也不会被 session.interrupt 打断。"
                     + (job.TimeoutSeconds is { } s ? $"它会在 {s} 秒后被自动停掉（到点写进原因）。\n" : "\n")
-                    + "用 job_output 读输出（可反复读，每次只取新的一段）；jobs 看它还在不在；job_kill 停掉它。\n"
-                    + $"⏳ 想等它跑完再继续，就调 wait(task=\"{job.Id}\")。\n"
-                    + "⚠️ 现在别干等：先去干别的，回头再来看。"),
+                    + $"⏳ 如果后续工作依赖它的结果，下一步直接调 wait(task=\"{job.Id}\")；这会自动等到结束，不要用 jobs / job_output 轮询。\n"
+                    + "只有要并行做独立工作时才先继续别的事，之后用 wait 等；需要看日志时用 job_output，需要停止时用 job_kill。"),
             ],
             // ⚠️ **不可重演**：再跑一次就是第二个进程。同前台那条判据。
             Fingerprint = null,

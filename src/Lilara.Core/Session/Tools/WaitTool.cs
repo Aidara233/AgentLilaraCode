@@ -11,7 +11,8 @@ public sealed class WaitTool : ITool
     public PermissionClass PermissionClass => PermissionClass.ReadOnly;
     public string Description =>
         "等待后台任务结束。task 接受后台进程的 job-… id 或 spawn 返回的子会话 id。"
-        + "省略 timeoutSeconds 就一直等到结束；提供时限则到点返回当前状态，不会停止任务。"
+        + "后台进程若是后续工作的前置条件，启动后应立即调用本工具并省略 timeoutSeconds，核心会自动等待结束，不需要 jobs/job_output 轮询。"
+        + "只有任务本身会长期运行，或需要并行推进独立工作时才提供 timeoutSeconds 或暂缓等待。"
         + "子会话需要用户回答时立即返回阻塞状态。中断当前步只取消等待，后台任务继续运行。";
     public string ParametersSchemaJson => """
         {"type":"object","properties":{

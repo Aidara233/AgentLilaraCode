@@ -119,8 +119,9 @@ internal static class DotnetRunner
                 new Block.TextBlock(
                     $"已在后台启动（任务 {job.Id}，pid {job.ProcessId}）：dotnet {verb} {project}。"
                     + (job.TimeoutSeconds is { } s ? $"它会在 {s} 秒后被自动停掉。\n" : "\n")
-                    + "用 job_output 读它跑到哪了；jobs 看它还在不在；job_kill 停掉它。\n"
-                    + "⚠️ 不要在这一步等它：先去干别的，回头再来看结果。"),
+                    + "⏳ 如果后续工作依赖构建或测试结果，下一步直接调 wait(task=\"" + job.Id
+                    + "\") 等它结束；不要用 jobs / job_output 轮询。\n"
+                    + "只有要并行做独立工作时才先继续别的事，之后用 wait 等；需要看日志时用 job_output，需要停止时用 job_kill。"),
             ],
             Fingerprint = null,
             DependsOn = null,
@@ -598,7 +599,9 @@ public sealed class DotnetBuildTool : ITool
         + "会先还原依赖（可能联网）；`noRestore` 跳过还原。"
         + "`noIncremental` 强制重新编译——改完代码想确认「真的能编过」时用它。"
         + "只编译，不跑测试；不开放其他 dotnet 参数。"
-        + "构建可能要几分钟：`background: true` 让它转到后台，立刻拿到任务 id（之后用 jobs / job_output / job_kill）；"
+        + "构建可能要几分钟：`background: true` 让它转到后台，立刻拿到任务 id。"
+        + "若后续工作依赖构建结果，下一步立即调用 wait(task=id) 等它结束；不要用 jobs / job_output 反复轮询。"
+        + "只有要并行做独立工作时才先继续别的事，之后用 wait 等；jobs 用于盘点任务，job_output 看日志，job_kill 停止任务。"
         + "`timeoutSeconds` 给这一次的超时。";
 
     public string ParametersSchemaJson => """

@@ -424,6 +424,8 @@ public sealed class BackgroundJobTests : IDisposable
         // 从任务表里取 id——结果正文里也有，但「真的起了」只有表能证明。
         var jobId = _host.List("s1").Single().Id;
         Assert.Contains(jobId, text);
+        Assert.Contains($"wait(task=\"{jobId}\")", text);
+        Assert.Contains("不要用 jobs / job_output 轮询", text);
         Assert.Equal(BackgroundJobState.Running, _host.Find("s1", jobId)!.State);
     }
 
