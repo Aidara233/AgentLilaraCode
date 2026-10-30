@@ -140,6 +140,8 @@ public static class PlanTree
             // 而真正的原因是「这一条是叶子」。两种失败给同一个理由 = 一条查不下去的错误。
             else if (parent.Children.Count == 0)
                 return (null, $"父节点 '{edit.ParentId}' 是叶子（没有子节点），不能往里插入。要分组请先给它一个子节点，或直接插到根 / 别的分支下。");
+            else if (!InsertUnder(roots, edit.ParentId, edit.Index, edit.Nodes))
+                return (null, $"找不到可插入的分支 '{edit.ParentId}'。");
             var (inserted, insertError) = Create(roots, now);
             return insertError is not null ? (null, insertError) : (WithT0(inserted, current?.T0, now), null);
         }
