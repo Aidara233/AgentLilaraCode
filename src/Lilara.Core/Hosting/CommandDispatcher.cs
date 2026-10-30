@@ -2973,6 +2973,13 @@ public sealed class CommandDispatcher(
 
         ClearPause(handle);
 
+        // ⚠️ **`approval.resolved` 不是会话相位事件**：取消 / 超时不续跑，所以后面没有
+        // `step.begin` 或 `session.state` 替我们把头从 Waiting 拉回 Idle。若不在这里发，
+        // Cadenza 会一直保留最后一次 `session.phase=Waiting`，卡片虽消失，节目单与状态栏
+        // 仍显示「候场」（`e2e/7-sync.txt` 的 3 条断言稳定失败）。
+        // 批准那条路随后会续跑，`RunStepAsync` 会发相位；取消 / 超时的终点就是这里。
+        if (cancelled || expired) PublishPhase(handle, SessionPhase.Idle);
+
         _bus.Publish(EventBus.SessionTopic(c.SessionId), new WireEvent.ApprovalResolved(c.SessionId, c.AskId, c.Outcome));
         _bus.Publish(EventBus.ApprovalsTopic, new WireEvent.ApprovalResolved(c.SessionId, c.AskId, c.Outcome));
 
