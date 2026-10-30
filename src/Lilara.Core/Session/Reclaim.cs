@@ -168,9 +168,12 @@ public static class Reclaim
 
     public static IReadOnlySet<string> Decide(IReadOnlyList<TimelineEvent> timeline, BlobStore blobs)
     {
-        var byId = timeline.OfType<TimelineEvent.ToolResultEvent>()
-            .Where(r => !IsFloatingPlaceholder(r))
-            .ToDictionary(r => r.Id, StringComparer.Ordinal);
+        // ⚠️ 同 `CompactionStore.LatestValid`：**不许 `ToDictionary(r => r.Id)`**——
+        // 重复 id 会让整条渲染路径抛异常（回收决策在渲染热路径上）。
+        // ⇒ first-wins，重复项不参与索引。
+        var byId = new Dictionary<string, TimelineEvent.ToolResultEvent>(StringComparer.Ordinal);
+        foreach (var candidate in timeline.OfType<TimelineEvent.ToolResultEvent>())
+            if (!IsFloatingPlaceholder(candidate)) byId.TryAdd(candidate.Id, candidate);
 
         var result = new HashSet<string>(StringComparer.Ordinal);
 

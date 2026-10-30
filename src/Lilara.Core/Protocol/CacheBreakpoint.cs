@@ -44,6 +44,32 @@ public static class CacheBreakpoint
         evt.Id.StartsWith("floating-", StringComparison.Ordinal);
 
     /// <summary>
+    /// 这条记录**挂得住断点吗**——必须是消息事件，且带至少一个**文本块**（2026-10-30）。
+    ///
+    /// <para>⚠️ <b>为什么这不是「实现细节」而是判据的一半</b>：三族的方言都只能挂在**文本**上
+    /// （Claude 的 `cache_control` 在 `TextBlockParam` 上、Chat 的 `prompt_cache_breakpoint` 在
+    /// `{type:"text"}` 分片上、Responses 在 `input_text` 上）。而「最后一条消息」**不一定带文本**：</para>
+    /// <list type="bullet">
+    ///   <item><b>只有 `tool_use` 的模型消息</b>——模型连着调工具、一句话都没说时就是它，而这在
+    ///   工具链上是**常态**（`read` → `read` → `edit` 一路到底）。</item>
+    ///   <item><b>只有图片的用户消息</b>——2026-10-29 起 `session.send` 收 `image` 块，纯图提问合法。</item>
+    /// </list>
+    /// <para>不判这一条时，位置判据会把断点指给它们，而三族的 builder 只能**静默不打**
+    /// （Markdown 里没有可挂的块）：于是那一步**根本没写历史缓存**，下一步只能命中
+    /// system+premier 那点头部。表现就是「大部分步命中、**隔一阵子**掉一次」——掉的时机取决于
+    /// 模型那一步说了话没有，而它和缓存毫无关系。⇒ 位置判据往前挪一条到**最近一条挂得住的**
+    /// 消息上（多半是用户那句话），代价只是尾段晚一步进缓存。</para>
+    ///
+    /// <para>⚠️ Chat / Responses 那两条链路**本来就这么做**（它们在自己的消息数组上从后往前
+    /// 找「content 是纯字符串」的那一条，`MarkCacheBreakpoints` / `OpenAiResponsesCache`）——
+    /// 也就是说：同一个问题它们早答对了，只有 Claude 这条照「最后一条消息」直取。
+    /// **同一个判据三处各写一份，就是它漂掉的方式。**</para>
+    /// </summary>
+    public static bool CanCarryBreakpoint(TimelineEvent evt) =>
+        evt is TimelineEvent.MessageEvent m
+        && m.Blocks.Any(b => b is Block.TextBlock);
+
+    /// <summary>
     /// **最后一个可以当断点的历史事件**的索引（没有 ⇒ -1）。
     ///
     /// <para>⚠️ 从末尾往前跳过 <see cref="IsVolatile"/> —— 断点落在它们之后等于把「每步都在变的字节」
@@ -56,7 +82,9 @@ public static class CacheBreakpoint
         for (var i = timeline.Count - 1; i >= 0; i--)
         {
             if (IsVolatile(timeline[i])) continue;
-            if (timeline[i] is TimelineEvent.MessageEvent) return i;
+            // ⚠️ **「是消息」不够**（2026-10-30）：还要「挂得住」。只有 `tool_use` 的模型消息
+            // 与纯图用户消息都**没有文本块**，断点指过去只能静默丢掉（见 CanCarryBreakpoint）。
+            if (CanCarryBreakpoint(timeline[i])) return i;
         }
 
         return -1;

@@ -76,6 +76,55 @@ public sealed class CacheBreakpointTests
         Assert.Equal(-1, CacheBreakpoint.LastStableIndex(timeline));
     }
 
+    /// <summary>
+    /// ⚠️ **只有 `tool_use` 的模型消息挂不住断点，位置判据要往前挪一条**（2026-10-30）。
+    ///
+    /// <para>那种消息在工具链上是**常态**（`read` → `read` → `edit` 一路不说话）。旧判据把断点
+    /// 指给它 ⇒ Claude 那条链路上一个文本块都没有 ⇒ `cache_control` **一个都不打**（只剩 system）
+    /// ⇒ 那一步根本没写历史缓存，下一步只命中头部。表现正是「大部分步命中、隔一阵子掉一次」，
+    /// 而掉的时机取决于模型那一步说没说话——和缓存毫无关系。</para>
+    /// </summary>
+    [Fact]
+    public void LastStableIndex_SkipsAMessageWithNoTextBlock()
+    {
+        var timeline = new TimelineEvent[]
+        {
+            Say("u1", Speaker.User, "你好"),
+            new TimelineEvent.MessageEvent
+            {
+                Id = "m1", At = CoreClock.Now(), From = Speaker.Model,
+                // 一句正文都没有，只有一条调用——模型「只动手不动嘴」的那一步。
+                Blocks = [new Block.ToolUseBlock("c1", "read", """{"path":"a.cs"}""")],
+            },
+            Result("r1", "文件内容"),
+        };
+
+        Assert.True(CacheBreakpoint.CanCarryBreakpoint(timeline[0]));
+        Assert.False(CacheBreakpoint.CanCarryBreakpoint(timeline[1]));
+        Assert.Equal(0, CacheBreakpoint.LastStableIndex(timeline));
+    }
+
+    /// <summary>
+    /// ⚠️ **纯图用户消息同样挂不住**（`session.send` 自 2026-10-29 收 `image` 块）：
+    /// 断点不许指给它，否则「贴张图问一句」的那一步会静默丢掉整个历史断点。
+    /// </summary>
+    [Fact]
+    public void LastStableIndex_SkipsAnImageOnlyMessage()
+    {
+        var timeline = new TimelineEvent[]
+        {
+            Say("u1", Speaker.User, "看这张图"),
+            new TimelineEvent.MessageEvent
+            {
+                Id = "u2", At = CoreClock.Now(), From = Speaker.User,
+                Blocks = [new Block.ImageBlock(new string('a', 64), "image/png")],
+            },
+        };
+
+        Assert.False(CacheBreakpoint.CanCarryBreakpoint(timeline[1]));
+        Assert.Equal(0, CacheBreakpoint.LastStableIndex(timeline));
+    }
+
     // ---- 三族各自的方言 ----
 
     [Fact]

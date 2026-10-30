@@ -349,4 +349,132 @@ public sealed class CacheStableTests : IDisposable
         Assert.Contains(readout.Id, decided);
         Assert.DoesNotContain(placeholder.Id, decided);
     }
+
+    /// <summary>
+    /// ⚠️ **同一 `turn` 被写两次，读数事件 id 也必须不同**（2026-10-29 实测事故的回归）。
+    ///
+    /// <para>旧实现把 id 拼成 <c>floating-{turn+1}-readout-result</c>，而 `turn` 不是持久唯一序号：
+    /// 「历史写了、state 没写成」那一格重试时，两次追加会撞号 —— 于是
+    /// <c>CompactionStore.LatestValid</c> 当场抛「同一键已存在」，整个会话加载不出来。</para>
+    /// </summary>
+    [Fact]
+    public async Task ReadoutEvents_StayUnique_EvenWhenTheSameTurnIsWrittenTwice()
+    {
+        var handle = NewSession();
+        _adapter.ReplyWith(_ => Say("好"));
+        await NewStepper().StepAsync(handle, "一", CancellationToken.None);
+
+        // 把 Turn 拨回去：模拟「历史已追加、state 没落成」之后的重试。
+        // 轴值同时改一格，好让第二份读数正文与第一份不同（否则 `AppendReadout` 合法地不写）。
+        handle.UpdateState(s => s with
+        {
+            Turn = 0,
+            Axes = new Dictionary<string, string>(s.Axes!, StringComparer.Ordinal) { [Axes.Safety] = "prod" },
+        });
+        _adapter.ReplyWith(_ => Say("好"));
+        await NewStepper().StepAsync(handle, "二", CancellationToken.None);
+
+        var timeline = Recorded(handle);
+
+        Assert.True(Readouts(timeline).Count() >= 2, "两次都要落下读数，否则这条用例测不到撞号");
+        Assert.Equal(timeline.Count, timeline.Select(e => e.Id).Distinct(StringComparer.Ordinal).Count());
+
+        var calls = timeline.SelectMany(e => e is TimelineEvent.MessageEvent m
+            ? m.Blocks.OfType<Block.ToolUseBlock>().Select(u => u.CallId) : []).ToList();
+        Assert.Equal(calls.Count, calls.Distinct(StringComparer.Ordinal).Count());
+    }
+
+    /// <summary>
+    /// ⚠️ **重复事件 id 不许打死读取**：`Decide` 与 `LatestValid` 都在渲染热路径上，
+    /// 旧的 `ToDictionary(r => r.Id)` 遇到重号直接抛 ⇒ 用户看到的是「会话加载失败」。
+    /// </summary>
+    [Fact]
+    public void Decide_ToleratesDuplicateEventIds()
+    {
+        var blobs = new BlobStore(_store.DataRoot);
+        TimelineEvent.ToolResultEvent Result(string id) => new()
+        {
+            Id = id, At = CoreClock.Now(), CallId = id, Content = [new Block.TextBlock("正文")],
+        };
+
+        var first = Result("same");
+        var second = Result("same");
+
+        var decided = Reclaim.Decide([first, second, Reclaim.Window("session.gc", ["same"], null)], blobs);
+
+        Assert.Contains("same", decided);
+    }
+
+    /// <summary>
+    /// ⚠️ **长程：读数变过几次之后，历史仍然只是「追加」**（2026-10-30）。
+    ///
+    /// <para>这条补的是现有用例的空档：`TwoQuietSteps_*` 只覆盖「两步都安静」，而**真正会写新事件**
+    /// 的时刻——拨轴、改计划、跨 100k 档——一个都没覆盖。而恰恰是那些时刻最容易被实现成
+    /// 「把旧读数换掉」（本仓真有过那样一版：`TimelineRender` 里的 `SupersedeFloating`，
+    /// 见那儿留下的注释）：于是请求从**旧读数那个位置**起与上一步不同 ⇒ 用户看到的是
+    /// 「绝大部分步命中、隔一阵子掉一大块」，而掉的那块大小毫无规律。</para>
+    ///
+    /// <para>⇒ 判据是**逐字节前缀**。⚠️ 并且这条用例自带一个前提检查：读数必须真的变过 ≥2 次，
+    /// 否则它什么也没测到（安静的两步本来就相同）。</para>
+    /// </summary>
+    [Fact]
+    public async Task ReadoutChanges_ArePureAppends_OverManySteps()
+    {
+        var handle = NewSession();
+        var usage = new UsageStore(_store.DataRoot);
+        var shapes = new List<List<string>>();
+
+        for (var step = 0; step < 8; step++)
+        {
+            // 第 3 步拨一条行为轴、第 5 步让「上次调用长度」跨过 100k 那一档
+            // ⇒ 读数至少变两次——`stable` 下那是唯一「真的会追加事件」的时刻。
+            if (step == 3) handle.WithAxis(Axes.Verify, "strict");
+            if (step == 5)
+                usage.Append(new UsageCall
+                {
+                    CallId = Ids.New(), SessionId = handle.SessionId, ProviderId = "p", ModelId = "m",
+                    Protocol = Protocols.ClaudeMessages, StartedAt = CoreClock.Now(), Status = "completed",
+                    Usage = new TokenUsage { InputTokens = 250_000 },
+                });
+
+            _adapter.ReplyWith(_ => Say($"第 {step} 步"));
+            await NewStepper(usage).StepAsync(handle, $"第 {step} 句", CancellationToken.None);
+            shapes.Add(ShapeOf(_adapter.Calls[step]).ToList());
+        }
+
+        var readouts = Readouts(Recorded(handle)).Count();
+        Assert.True(readouts >= 3, $"读数只落了几份（{readouts}），这条用例没测到「变化」那一格");
+
+        for (var step = 1; step < shapes.Count; step++)
+        {
+            var previous = shapes[step - 1];
+            var current = shapes[step];
+            Assert.True(current.Count > previous.Count, $"第 {step} 步的请求没有变长");
+
+            for (var i = 0; i < previous.Count; i++)
+                Assert.True(string.Equals(previous[i], current[i], StringComparison.Ordinal),
+                    $"第 {step - 1} → {step} 步在事件 {i} 处分叉（前缀缓存从那里整段作废）：\n"
+                    + $"  前：{Trim(previous[i])}\n  后：{Trim(current[i])}");
+        }
+
+        static string Trim(string s) => s.Length <= 160 ? s : s[..160] + "…";
+
+        static IEnumerable<string> ShapeOf(ModelRequest request) =>
+            request.Timeline.Select(e => e switch
+            {
+                TimelineEvent.MessageEvent m =>
+                    $"{m.Id}|{m.From}|" + string.Join("\u0001", m.Blocks.Select(BlockText)),
+                TimelineEvent.ToolResultEvent r =>
+                    $"{r.Id}|{r.CallId}|" + string.Join("\u0001", r.Content.Select(BlockText)),
+                _ => e.Id,
+            });
+
+        static string BlockText(Block block) => block switch
+        {
+            Block.TextBlock t => "t:" + t.Text,
+            Block.ToolUseBlock u => $"u:{u.CallId}:{u.Name}:{u.Arguments}",
+            Block.StoreBlock s => "s:" + s.Sha256,
+            _ => block.GetType().Name,
+        };
+    }
 }

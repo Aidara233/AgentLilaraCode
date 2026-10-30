@@ -208,6 +208,28 @@ public sealed class CompactionTests : IDisposable
         Assert.Null(Latest());
     }
 
+    // ⚠️ **重复事件 id 不许打死读取**（实测事故：`floating-{turn}` 拼 id 的重试撞了号，
+    // 于是 `ToDictionary` 抛「同一键已存在」，整个会话的 `/history` 500）。
+    // 这条钉的是「历史里有重号时，取检查点只变弱、不抛」。
+    [Fact]
+    public void LatestValid_ToleratesDuplicateEventIds()
+    {
+        var dup = new TimelineEvent.MessageEvent
+        {
+            Id = "dup", At = CoreClock.Now(), From = Speaker.User,
+            Blocks = [new Block.TextBlock("同一组 id 被写了两次")],
+        };
+        _store.AppendEvents(_handle.ProjectKey, _handle.SessionId, [dup, dup]);
+
+        var history = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId);
+
+        var checkpoint = new CompactionStore(_store).LatestValid(
+            _handle.ProjectKey, _handle.SessionId, history);
+
+        Assert.Null(checkpoint);   // 没有可用检查点——但**不抛**
+        Assert.Equal(2, history.Count(e => e.Id == "dup"));
+    }
+
     private void RequestCompaction() =>
         _handle.UpdateStateAndPersist(_store, s => s with { PendingCompact = true }, diskStatus: SessionStatus.Idle);
 

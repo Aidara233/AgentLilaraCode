@@ -50,12 +50,18 @@ public sealed class CompactionStore
         // 做「找边界」，而调用含义已经不同了（压缩后保留区可以暂时为空）。
         if (history.Count == 0) return null;
 
-        var byId = history.ToDictionary(e => e.Id, StringComparer.Ordinal);
+        // ⚠️ **不能 `ToDictionary(e => e.Id)`**：历史里一旦出现重复的事件 id（旧版读数事件用
+        // `floating-{turn}` 拼 id，重试会撞），`ToDictionary` 当场抛「同一键已存在」
+        // ⇒ 渲染整条挂掉，用户看到的是「会话加载失败」。✅ 这里是**渲染热路径**，
+        // 输入的容忍度必须比写入侧的纪律更宽：坏数据只该削弱判断，不该打死读取。
+        // ⇒ 取**首次出现**（与下面 `TakeWhile` 的边界语义一致），重复项不参与索引。
+        var index = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var i = 0; i < history.Count; i++) index.TryAdd(history[i].Id, i);
+
         foreach (var checkpoint in ReadAll(projectKey, sessionId).OrderByDescending(c => c.CreatedAt))
         {
-            if (!byId.ContainsKey(checkpoint.CoveredThroughEventId)) continue;
-            var through = history.TakeWhile(e => e.Id != checkpoint.CoveredThroughEventId).Append(
-                byId[checkpoint.CoveredThroughEventId]).ToList();
+            if (!index.TryGetValue(checkpoint.CoveredThroughEventId, out var boundary)) continue;
+            var through = history.Take(boundary + 1).ToList();
             if (string.Equals(ComputeDigest(through), checkpoint.HistoryDigest, StringComparison.Ordinal))
                 return checkpoint;
         }
