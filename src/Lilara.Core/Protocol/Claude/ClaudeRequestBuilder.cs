@@ -172,21 +172,54 @@ public static class ClaudeRequestBuilder
         // 理由见那个类）。⇒ 这里原先有一条「`Ref` 非空 ⇒ 抛」的守卫，它已经**永远到不了**，
         // 删掉它。⚠️ 而**留着它更坏**：`fetch` 一上线，那句话会变成一条指着错方向的假诊断。
         //
-        // ⚠️ 若哪天真有引用漏到这里，下面那个 `switch` 的默认分支会响亮地抛
-        // （「工具结果里有无法翻译的块」）——**不需要额外的守卫**，那正是这一行的职责。
+        // ⚠️ 若哪天真有引用漏到这里，下面那个 `switch` 的默认分支会给一句占位
+        // （见 `UnsupportedBlock`）——**不需要额外的守卫**，那正是这一行的职责。
         //
         // ⚠️ **直接拼文本，不走 `content` 那个联合列表再 OfType 回来**。
         // 那个写法看着更「统一」，但它错得**静默**：`new TextBlockParam{…}` 是**隐式**转成
         // `ContentBlockParam` 才进列表的，所以 `content.OfType<TextBlockParam>()` **永远是空**
         // ⇒ 每一条结果（包括正常读到内容的）都会被换成 `(无输出)`。
         // 这不是我推出来的——是 CA2021 抓到的（分析器说「此调用将始终导致空序列」）。
+
+        // ⚠️ **带图的结果走块列表那条**（2026-10-29）：`read` 一张图之后，那条结果就是
+        // 「一张图」本身，而协议允许 `tool_result.content` 是一串块。⚠️ 只在**真的有图**时
+        // 才换形状：纯文本结果仍旧走字符串那条，**逐字节不变**（前缀缓存按字节算）。
+        if (result.Content.Any(b => b is CanonicalBlock.ImageBlock image && ImagePayload.CanSend(image)))
+        {
+            // ⚠️ **整条 `tool_result` 也走 raw**（同 `ImageParam` 的理由）：它的 `Content`
+            // 在 SDK 里同样是联合类型，而「一串块」那一支的元素类型不是 `ContentBlockParam`。
+            // ⇒ 直接给协议形状（`03` 里那五个键），少一层翻译。
+            var parts = new List<object>();
+            foreach (var b in result.Content)
+            {
+                if (b is CanonicalBlock.TextBlock tb) parts.Add(new { type = "text", text = tb.Text });
+                else if (b is CanonicalBlock.ImageBlock image && ImagePayload.CanSend(image))
+                    parts.Add(new
+                    {
+                        type = "image",
+                        source = new { type = "base64", media_type = image.MediaType, data = ImagePayload.Base64(image) },
+                    });
+                else parts.Add(new { type = "text", text = UnsupportedBlock.Note(b) });
+            }
+
+            return
+            [
+                ToolResultBlockParam.FromRawUnchecked(new Dictionary<string, JsonElement>
+                {
+                    ["type"] = JsonSerializer.SerializeToElement("tool_result"),
+                    ["tool_use_id"] = JsonSerializer.SerializeToElement(result.CallId),
+                    ["content"] = JsonSerializer.SerializeToElement(parts),
+                }),
+            ];
+        }
+
         var text = string.Concat(result.Content.Select(b => b switch
         {
             CanonicalBlock.TextBlock t => t.Text,
 
-            // 图 / 库对象要等库那条读取路径接上（今天没有任何工具产得出它们）。
-            _ => throw new ArgumentException(
-                $"工具结果里有无法翻译的块（{b.GetType().Name}）", nameof(evt)),
+            // ⚠️ **翻译不了也要给一句话，不能抛**（2026-10-29，见 `UnsupportedBlock`）：
+            // 抛会把「一条坏记录」升级成「一个永远发不出消息的会话」，而记录只追加。
+            _ => UnsupportedBlock.Note(b),
         }));
 
         // 内容为空 = 「这个工具什么都没返回」，而协议**不允许**一个空的 content。
@@ -234,8 +267,7 @@ public static class ClaudeRequestBuilder
                     });
                     break;
 
-                case CanonicalBlock.ToolUseBlock u:
-                    // ⚠️ **模型的调用必须原样回传**，与推理块同一条理由：上游按 `tool_use`
+                case CanonicalBlock.ToolUseBlock u:                    // ⚠️ **模型的调用必须原样回传**，与推理块同一条理由：上游按 `tool_use`
                     // 与 `tool_result` 配对，少了它那条结果就是悬空的 ⇒ 400（`01` §3.6）。
                     // ⚠️ 参数走 `Input`——SDK 的值类型（`Dictionary<string, JsonElement?>`），
                     // **不是**原始文本。这是本批**唯一**一处参数要过一遍类型的地方；
@@ -248,10 +280,21 @@ public static class ClaudeRequestBuilder
                     });
                     break;
 
+                // ⚠️ **图文是兄弟块**（`01` §3.6）：图片必须作为**自己的块**发出去，
+                // 而它前面那块文本仍然是一块文本。⚠️ 字节由 `TimelineRender` 贴
+                // （`ImageBlock.Bytes`）——**适配器不认识库**，见那边注释。
+                case CanonicalBlock.ImageBlock image when ImagePayload.CanSend(image):
+                    content.Add(ImageParam(image));
+                    break;
+
                 default:
-                    // 认不出的块抛，不静默丢。
-                    throw new ArgumentException(
-                        $"时间线里有无法翻译的块（{b.GetType().Name}），无法构造请求", nameof(evt));
+                    // 不该让这个会话此后**再也发不出消息**（记录只追加，改不掉）。
+                    // ⚠️ 但它**不是**静默丢：这段话会作为正文进请求，模型读得到「这里有一块被省略了」。
+                    // ⚠️ 而 `blockIndex` **不动**：它是「第几个**文本块**」的计数（缓存断点按它挑），
+                    // 一句占位不是可以挂断点的正文。
+                    if (UnsupportedBlock.Skippable(b) is { } note)
+                        content.Add(TextParam(note, false));
+                    break;
             }
         }
 
@@ -302,6 +345,30 @@ public static class ClaudeRequestBuilder
         }).ToList();
     }
 
+    /// <summary>
+    /// **一块图片 → 协议原生图片块**（2026-10-29）。
+    ///
+    /// <para>⚠️ <b>为什么走 `FromRawUnchecked` 而不是强类型构造</b>：SDK 把 `source` 做成了
+    /// 一个带隐式转换的联合类型（`ImageBlockParamSource`），而它的 `MediaType` 是
+    /// `ApiEnum`——用强类型那条路要为「png/jpeg/gif/webp → 枚举成员」再写一张映射表；
+    /// 而这张表**本来就不该存在**：协议那一格就是**媒体类型字符串**（`BlockKinds.ImageMediaTypes`
+    /// 已经在入口判过白名单了）。⇒ 直接给协议形状，少一层会漂的翻译。</para>
+    ///
+    /// <para>⚠️ <b>调用点必须先用 <see cref="ImagePayload.CanSend"/> 判过</b>：没有字节时这里
+    /// 拼出来的是一串空的 base64，而上游只会回一句「图片无效」，不会告诉你图根本没发出去。</para>
+    /// </summary>
+    private static ContentBlockParam ImageParam(CanonicalBlock.ImageBlock image) =>
+        ImageBlockParam.FromRawUnchecked(new Dictionary<string, JsonElement>
+        {
+            ["type"] = JsonSerializer.SerializeToElement("image"),
+            ["source"] = JsonSerializer.SerializeToElement(new
+            {
+                type = "base64",
+                media_type = image.MediaType,
+                data = ImagePayload.Base64(image),
+            }),
+        });
+
     // 两块头槽位 → `system`。**顺序是契约**：系统块在前、首要块在后（`01` §3.1
     // 「头槽位 = [系统提示词块][首要提示词块]」）——倒过来会让「位置 0 是核心的字节」
     // 这条前提作废，而它是失效半径那套论证（§2.3）的地基。
@@ -309,8 +376,7 @@ public static class ClaudeRequestBuilder
     // 没有块时不设 System，而不是设成空串或空表：空值会变成一个真实的空 system 块，白白改变前缀。
     /// 造一个文本块。⚠️ `CacheControl` 是 **init-only**：断点只能在构造时给，事后设不了
     /// （SDK 的 `ContentBlockParam` 是带隐式转换的包装类型，也不能从中取回 `TextBlockParam`）。
-    private static TextBlockParam TextParam(string text, bool cache) => cache
-        ? new TextBlockParam { Text = text, CacheControl = new CacheControlEphemeral() }
+    private static TextBlockParam TextParam(string text, bool cache) => cache        ? new TextBlockParam { Text = text, CacheControl = new CacheControlEphemeral() }
         : new TextBlockParam { Text = text };
 
     private static MessageCreateParamsSystem? BuildSystem(

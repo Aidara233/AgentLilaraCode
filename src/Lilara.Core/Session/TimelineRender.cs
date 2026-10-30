@@ -24,7 +24,11 @@ public static class TimelineRender
     public static IReadOnlyList<TimelineEvent> Render(SessionStore store, SessionHandle handle)
     {
         var raw = store.ReadTimeline(handle.ProjectKey, handle.SessionId);
-        return Render(store, handle, raw, truncateForDelivery: false);
+
+        // ⚠️ **头这份不解图片字节**（2026-10-29）：它有 `GET /store/{sha256}` 自己去取，
+        // 而一次历史渲染要为每张图读一遍盘是没道理的（一屏几张 5 MB 的图）。
+        // 「谁需要字节」只有一条判据：**要发给模型的那一份**。
+        return Render(store, handle, raw, truncateForDelivery: false, materializeImages: false);
     }
 
     /// <summary>
@@ -49,7 +53,13 @@ public static class TimelineRender
         SessionStore store, SessionHandle handle, IReadOnlyList<TimelineEvent>? extra = null)
     {
         var raw = store.ReadTimeline(handle.ProjectKey, handle.SessionId);
-        var rendered = Render(store, handle, raw, truncateForDelivery: true);
+
+        // ⚠️ **图在这里"解成字节"，不吃的提供商在这里降级成占位**（2026-10-29，`03` §9.2）。
+        // 两条判据都只有这一处：
+        //   · 要字节 ⇒ 因为适配器只看得见块、看不见库（`04` §5）；
+        //   · 不吃图 ⇒ 因为**历史上留下的图**在换提供商之后仍然在记录里，而记录只追加
+        //     ——不降级的话，那个会话从此每一步都被上游拒（用户无从补救：他删不掉那些块）。
+        var rendered = Render(store, handle, raw, truncateForDelivery: true, materializeImages: true);
 
         // ⚠️ **浮动块不经过这里**（2026-10-26 用户裁定）：它由推进器在**装配请求时**现插
         // （`Stepper.FloatingContextPair`），不落库、也不从任何文件读回来。
@@ -112,18 +122,24 @@ public static class TimelineRender
     /// </summary>
     private static IReadOnlyList<TimelineEvent> Render(
         SessionStore store, SessionHandle handle, IReadOnlyList<TimelineEvent> raw,
-        bool truncateForDelivery)
+        bool truncateForDelivery, bool materializeImages)
     {
         // ⚠️ **压缩投影**（`75efa1a`）：换的是「看哪一段历史」，不是「怎么渲染」。
         var projection = ContextCompaction.Project(store, handle, raw);
         var visible = projection.Suffix;
         var blobs = new BlobStore(store.DataRoot);
 
+        // ⚠️ **这个提供商吃不吃图**（2026-10-29，`03` §9.2 的实现）。⚠️ 判据只有这一处：
+        // 声明缺席（旧 providers/*.json / 已删除的定义）**按吃图处理**——那批会话以前
+        // 可能就靠图工作，把「没声明」读成「不许」会静默改变它们的行为。
+        var vision = !materializeImages || DeclaresVision(store, handle);
+
         // ⚠️ **判定只读记录里的窗口**（2026-10-17）：窗口在什么地方被写下来，
         // 回收就只在什么地方发生。渲染本身是纯的、不碰文件系统、不做时间判定。
         var reclaimed = new HashSet<string>(Reclaim.Decide(visible, blobs), StringComparer.Ordinal);
 
-        var applied = Reclaim.Apply([.. visible.Select(e => Dereference(e, blobs))], reclaimed);
+        var applied = Reclaim.Apply(
+            [.. visible.Select(e => Dereference(e, blobs, materializeImages, vision))], reclaimed);
 
         // ⚠️ 工具名要从 `tool_use` 取：投递预算按工具分（`fetch` 例外），
         // 而 `ToolResultEvent` 只有协议 `CallId`。⚠️ 从 `visible` 取（不是 `raw`）：
@@ -243,71 +259,23 @@ public static class TimelineRender
     /// ——两个方括号贴在一起，「一个块套另一个块」在形状上当场失效（`01` §3.3）。
     /// ⚠️ 合成对那边（`Stepper.FloatingContextPair`）逐字加同一个换行，否则两份分叉。</para>
     /// </summary>
-    /// <summary>
-    /// **旧浮动读数 → 一行注记；最新那一份原样留着**（2026-10-23 用户裁定）。
-    ///
-    /// <para>⚠️ <b>为什么必须「整对去掉」而不是「只换结果的内容」</b>：一条 <c>tool_result</c>
-    /// 必须紧跟它的 <c>tool_use</c>。留下结果、删掉调用 ⇒ 上游直接 400。</para>
-    ///
-    /// <para>⚠️ <b>注记写在最新那一份的首块之前</b>（而不是单独造一条事件）：单独造一条
-    /// <c>tool_result</c> 就又变成上面那个孤儿问题；写成一条 <c>user</c> 消息又会让模型
-    /// 以为用户说了句话。⇒ 挂在最新读数里，是唯一不新增协议形状的位置。</para>
-    ///
-    /// <para>⚠️ <b>注记必须给「步段 + 次数感」</b>：只说「已取代」的话，模型看到的是
-    /// 「我上一步做过一件事，被抹掉了」——那是**新的怀疑源**；说「第 a–b 步各一次，均已取代」
-    /// 才是把它读成**例行**。⚠️ 合并成一行，所以它的体积**不随步数增长**（O(1)）。</para>
-    /// </summary>
-    private static IReadOnlyList<TimelineEvent> SupersedeFloating(IReadOnlyList<TimelineEvent> events)
-    {
-        var results = events.OfType<TimelineEvent.ToolResultEvent>()
-            .Where(r => r.Id.StartsWith("floating-", StringComparison.Ordinal))
-            .ToList();
-
-        // 0 或 1 份：没有可取代的（第一条读数永远原样留着）。
-        if (results.Count <= 1) return events;
-
-        var newest = results[^1];
-        var older = results.Take(results.Count - 1).ToList();
-
-        var turns = older
-            .Select(r => r.Id.Split('-') is [_, var middle, ..] && int.TryParse(middle, out var n) ? n : 0)
-            .Where(n => n > 0)
-            .ToList();
-
-        var note = turns.Count == 0
-            ? "[floating_context · 此前的读数均已取代]"
-            : turns.Min() == turns.Max()
-                ? $"[floating_context · 第 {turns.Min()} 步的读数已取代]"
-                : $"[floating_context · 第 {turns.Min()}–{turns.Max()} 步的读数已取代]";
-
-        var dropResults = new HashSet<string>(older.Select(r => r.Id), StringComparer.Ordinal);
-        var dropCalls = new HashSet<string>(
-            older.Select(r => r.Id.Replace("-result", "-call", StringComparison.Ordinal)), StringComparer.Ordinal);
-
-        return
-        [
-            .. events
-                .Where(e => e is not TimelineEvent.ToolResultEvent r || !dropResults.Contains(r.Id))
-                .Where(e => e is not TimelineEvent.MessageEvent m || !dropCalls.Contains(m.Id))
-                .Select(e => ReferenceEquals(e, newest)
-                    ? e is TimelineEvent.ToolResultEvent r
-                        // ⚠️ 注记排在**框架头之后**（框架头是这一条结果自己的形状，必须打头），
-                        // 且末尾带 `\n`——否则两个方括号会粘成
-                        // `[...已取代][floating_context 节律 每步]`，形状当场失效
-                        // （与 `WithFraming` 那条同一个实测教训，2026-10-23）。
-                        ? r with
-                        {
-                            Content =
-                            [
-                                .. r.Content.Take(1),
-                                new Block.TextBlock(note + "\n"),
-                                .. r.Content.Skip(1),
-                            ],
-                        }
-                        : e
-                    : e),
-        ];
-    }
+    // ⚠️ **这里曾经有一个 `SupersedeFloating`（2026-10-23 加、2026-10-30 删）：它把
+    // 旧浮动读数整对从**渲染**里摘掉，并给最新那份加一行「第 a–b 步的读数已取代」。**
+    //
+    // 它为什么必须消失（而不是「留着不用也行」）——**它是这个仓唯一一处「在历史中段改写字节」**：
+    //   · 每多一份读数，就把上一份从渲染里拿掉 ⇒ 请求从**那份旧读数的位置**起与上一步不同；
+    //   · 那个位置离末尾多远，完全取决于「上一次读数变化」发生在多久以前（改轴、改计划、
+    //     嵌 100k 档都会触发）⇒ 用户看到的是**绝大部分步命中、隔一阵子掉一大块**，
+    //     而掉的那一块大小毫无规律。实测账本（`~/.lilara/usage.jsonl`，385 步那个会话）：
+    //     `cached` 从 154,496 一下退到 143,616、再退到 156,672 —— `requestFingerprint` 两次都**没变**
+    //     （头部没动），掉的就是历史中段那一段。⇒ 症状与「每步都破前缀」不同，更隐蔽。
+    //   · 而被它摘掉的内容**模型再也看不见**（记录里还有，渲染里没有），这也和
+    //     「回收只换渲染、且只在失效窗口里动手」那条纪律冲突。
+    //
+    // ⇒ 今天的规矩：**读数只在变化时**追加一份到历史末尾（`Stepper.AppendReadout`），
+    // 旧读数**原样留着**；要把它们收起来，走 `Reclaim` 的窗口（`session.gc` / 压缩），
+    // 也就是说「什么时候允许破中段前缀」永远由一条**落盘的窗口**回答，不在这里现算。
+    // 需要「旧读数不该无限堆积」的判据时，请加在 `Reclaim.Resolve` 里，**不要**加回渲染。
 
     private static TimelineEvent WithFraming(TimelineEvent evt) =>
         evt is TimelineEvent.ToolResultEvent { Framing: { } framing } r
@@ -333,8 +301,30 @@ public static class TimelineRender
     /// <para>⚠️ <b>读不出来时给一段说得清的话，不抛</b>：抛会让**整个会话再也发不出消息**
     /// （记录只追加，那条坏引用永远在）。而「库对象没了」是**可以自愈的**。</para>
     /// </summary>
-    private static IReadOnlyList<Block> Dereference(Block block, BlobStore blobs)
+    private static IReadOnlyList<Block> Dereference(
+        Block block, BlobStore blobs, bool materializeImages = false, bool vision = true)
     {
+        // ⚠️ **图片块那条路**（2026-10-29）：记录里那块是**地址**，而适配器要**字节**。
+        // 三个出口都在这一个 switch 里，因为它们必须**同进同出**（谁也不会漏一条）：
+        //   · 要字节、字节在、提供商吃图 ⇒ 贴 `Bytes`（JSON 形状不变，见 `ImageBlock`）；
+        //   · 要字节、字节没了 ⇒ 一句「这张图找不到了」（可自愈，不抛）；
+        //   · 提供商不吃图 ⇒ 一句占位（`03` §9.2 的渲染降级）——**记录里的图仍然在**，
+        //     换回吃图的提供商就又能看见。
+        if (block is Block.ImageBlock image)
+        {
+            if (!materializeImages) return [block];
+
+            if (!vision)
+                return [new Block.TextBlock(
+                    $"（这里有一张图片（{image.MediaType}），但当前提供商的模态声明不是 vision，"
+                    + "这张图没有随请求发出去。）")];
+
+            var imageBytes = blobs.TryGet(image.Sha256);
+            return imageBytes is null
+                ? [new Block.TextBlock($"（这里本该有一张图片，但库对象 {image.Sha256[..8]}… 找不到了）")]
+                : [image with { Bytes = imageBytes }];
+        }
+
         if (block is not Block.StoreBlock store) return [block];
 
         var bytes = blobs.TryGet(store.Sha256);
@@ -349,8 +339,10 @@ public static class TimelineRender
             {
                 var blocks = System.Text.Json.JsonSerializer.Deserialize<IReadOnlyList<Block>>(
                     bytes, Json.Options);
-                // 反序列化可能是 null（字面的 "null"）⇒ 退回下面那句提示，别让调用点拿到 null。
-                if (blocks is { Count: > 0 }) return blocks;
+                // ⚠️ 解析出来的块**还要再过一遍**（2026-10-29）：一份混排结果里可以带图片，
+                // 而图片的字节在**另一个**库对象里 ⇒ 不解这一步，适配器拿到的是没有字节的图。
+                if (blocks is { Count: > 0 })
+                    return [.. blocks.SelectMany(b => Dereference(b, blobs, materializeImages, vision))];
             }
             catch (System.Text.Json.JsonException)
             {
@@ -369,10 +361,41 @@ public static class TimelineRender
     }
 
     /// <summary>事件里的每个块都过一遍 <see cref="Dereference"/>；消息事件与工具结果**都要**。</summary>
-    private static TimelineEvent Dereference(TimelineEvent evt, BlobStore blobs) => evt switch
+    private static TimelineEvent Dereference(
+        TimelineEvent evt, BlobStore blobs, bool materializeImages = false, bool vision = true) => evt switch
     {
-        TimelineEvent.MessageEvent m => m with { Blocks = [.. m.Blocks.SelectMany(b => Dereference(b, blobs))] },
-        TimelineEvent.ToolResultEvent r => r with { Content = [.. r.Content.SelectMany(b => Dereference(b, blobs))] },
+        TimelineEvent.MessageEvent m => m with
+        {
+            Blocks = [.. m.Blocks.SelectMany(b => Dereference(b, blobs, materializeImages, vision))],
+        },
+        TimelineEvent.ToolResultEvent r => r with
+        {
+            Content = [.. r.Content.SelectMany(b => Dereference(b, blobs, materializeImages, vision))],
+        },
         _ => evt,
     };
+
+    /// <summary>
+    /// **这个会话绑定的提供商声明自己吃图吗**（`ProviderDefinition.Modality`）。
+    ///
+    /// <para>⚠️ <b>这是这个字段第一次有读取点</b>（2026-10-29，写它的时候注释就写着
+    /// 「最小闭环用不到」——它一直是个没有消费者的声明）。判据是 `modality == "vision"`；
+    /// 今天头那边的选项只有 vision / text 两档。</para>
+    ///
+    /// <para>⚠️ <b>「读不到」按吃图处理</b>：定义被删了、文件坏了、老文件里没有这一格……
+    /// 这些情形的共同点是**我们不知道**。而两个方向的代价不对称——猜「吃图」最坏是上游
+    /// 拒一次（可见、可改配置）；猜「不吃」会让一批本来能看的会话**静默看不见图**。</para>
+    /// </summary>
+    private static bool DeclaresVision(SessionStore store, SessionHandle handle)
+    {
+        try
+        {
+            var provider = new Providers.ProviderStore(store.DataRoot).Load(handle.Spec.Model.ProviderId);
+            return provider is null || !string.Equals(provider.Modality, "text", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return true;   // 读不出来 ⇒ 不知道 ⇒ 不改变既有行为（见上面那条）。
+        }
+    }
 }

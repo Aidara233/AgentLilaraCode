@@ -117,6 +117,8 @@ public sealed class AskTool : ITool
                 // ⚠️ **空 = 不问「记不记住」**：授权可以记住，问意见没有「记住」这回事
                 // （下次还是得问，因为答案本身是内容、不是许可）。
                 Remember = [],
+                // ⚠️ **这一问替这一条调用问的**——答完要靠它配对（见 `AskRequest.CallIds`）。
+                CallIds = [call.CallId],
             },
         });
     }
@@ -146,17 +148,33 @@ public sealed class AskTool : ITool
     /// </param>
     public static IReadOnlyList<AskItem> ItemsOf(
         Storage.SessionStore store, string projectKey, string sessionId, string callId,
+        string? permissionLevel = null) =>
+        ItemsOf(store, projectKey, sessionId, [callId], permissionLevel);
+
+    /// <summary>
+    /// 多条调用那一版：一张卡可以**同时**替好几条调用问（`ToolExecutor.Merge`），
+    /// 而答复要按**那张卡上出现过的问题 id** 归位 ⇒ 这几条的问题得**一起**解出来。
+    ///
+    /// <para>⚠️ <b>只解前一条会静默丢问题</b>：那条路下模型只会看到第一问的答案落成结果，
+    /// 其余几问在 `Reply.Compose` 里落成「（未回答）」——而用户明明答了。</para>
+    /// </summary>
+    public static IReadOnlyList<AskItem> ItemsOf(
+        Storage.SessionStore store, string projectKey, string sessionId, IReadOnlyList<string> callIds,
         string? permissionLevel = null)
     {
+        var wanted = new HashSet<string>(callIds, StringComparer.Ordinal);
+        var items = new List<AskItem>();
+
         foreach (var e in store.ReadTimeline(projectKey, sessionId))
         {
             if (e is not TimelineEvent.MessageEvent m) continue;
 
             foreach (var b in m.Blocks.OfType<Block.ToolUseBlock>())
             {
-                if (!string.Equals(b.CallId, callId, StringComparison.Ordinal)) continue;
+                if (!wanted.Contains(b.CallId)) continue;
 
-                return string.Equals(b.Name, "ask", StringComparison.Ordinal)
+                // ⚠️ 顺序就是记录里的顺序（同一批里的次序是事实），别按 `callIds` 重排。
+                items.AddRange(string.Equals(b.Name, "ask", StringComparison.Ordinal)
                     // `ask` 那条：问题原文在**工具参数**里，解出来就是。
                     ? Parse(b.Arguments).Items
                     // 闸门那条（`Gate.AskFor`）。
@@ -171,11 +189,11 @@ public sealed class AskTool : ITool
                     // ⚠️ **它是跑真模型实测抓出来的**（2026-10-11）——单元测试碰不到它，
                     // 因为那条路要「挂起之后重开进程」。而在此之前它**根本不可达**
                     // （闸门那两格没有生产者），所以这个洞一直没有露出来。
-                    : Gate.SecondHalfOf(b, permissionLevel);
+                    : Gate.SecondHalfOf(b, permissionLevel));
             }
         }
 
-        return [];
+        return items;
     }
 
     /// <summary>

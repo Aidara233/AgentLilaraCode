@@ -187,8 +187,13 @@ public sealed record PendingIntent(int Turn, string CallId);
 /// </summary>
 /// <param name="AskId">稳定 id。⚠️ 它与下面那个 <paramref name="CallId"/> **不是一回事**（见 `01` 的 id 分工）。</param>
 /// <param name="Kind">授权 / 问意见。</param>
-/// <param name="CallId">被挂起的那个调用的**协议 id**（`tool_use.callId`）。回答时要靠它配对。</param>
-/// <param name="ToolName">哪个工具的调用。</param>
+/// <param name="CallId">
+/// 被挂起的那个调用的**协议 id**（`tool_use.callId`）。回答时要靠它配对。
+/// ⚠️ **它是「这一问替哪条调用问的」（`AskRequest.CallIds` 的第一条），不是「这批里的第一条」**
+/// ——2026-10-29 修的那条死循环就是这一格取错了：答复被配到**别的**调用上，
+/// 真正被问的那条永远等不到回答，于是下一轮又问一次。见 `Stepper.PausedOf`。
+/// </param>
+/// <param name="ToolName">哪个工具的调用（⚠️ 同上：是**被问的那条**的工具名）。</param>
 /// <param name="ArgsHash">
 /// 参数原文的哈希（`ApprovalStore.HashArgs`）。⚠️ **两个用途**：① 记忆的键；
 /// ② 用户**改写**过参数之后，用它和原来那个比，就知道要不要标 `ArgumentsAmended`。

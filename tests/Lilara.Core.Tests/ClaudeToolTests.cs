@@ -148,28 +148,43 @@ public class ClaudeToolTests
         Assert.NotNull(got!.Content);   // 占位串在（协议不允许空 content）
     }
 
-    // ⚠️ 认不出的形状**响亮地失败**，不静默给个空结果——空结果会让模型以为
-    // 「那个工具什么都没返回」，而它其实是被丢弃了。
+    // ⚠️ **认不出的形状：给一句看得见的话，不抛**（2026-10-29 改判）。
     //
-    // ⚠️ **这条测试换过一次靶子**（2026-10-06）：它原先钉的是「带 `Ref` 的结果 ⇒ 抛」，
-    // 而那条守卫**已经删了**——`fetch` 的引用由 `TimelineRender` 在**进适配器之前**解掉
-    // （理由见那个类），所以 `Ref` 根本到不了这里。留着那条守卫会让 `fetch` 一上线
-    // 就抛出一句**指着错方向的假诊断**。
-    // ⇒ 现在钉的是**真的**还翻译不了的形状：一张图片（协议那条路今天没有读图的实现）。
+    // <para>⚠️ <b>这条测试的判定换过三次，每次都跟着那一刻的事实</b>：
+    // ① 原先钉的是「带 `Ref` 的结果 ⇒ 抛」——那条守卫删了（`fetch` 的引用在进适配器之前就解掉）；
+    // ② 然后钉「图片 ⇒ 抛」——那是「协议那条路没有读图的实现」的诚实表达；
+    // ③ 而 <b>现在连抛本身也不成立了</b>：记录只追加，一条翻译不了的块一旦落盘，
+    // 那个会话此后**每一次**构造请求都会抛 ⇒ 一条坏记录换一个坏会话，而盘上没有删除键。
+    // ⇒ 判据变成「模型**看得见**这里少了一块」，而不是「整步失败」。</para>
     [Fact]
-    public void UnrecognizedResultShape_Throws()
+    public void UnrecognizedResultShape_BecomesAVisibleNote()
     {
-        var withImage = new TimelineEvent.ToolResultEvent
+        // 用一个**永远**翻译不了的形状：库对象漏到了这里（正常情况下 `TimelineRender`
+        // 会在进适配器之前把它解开）。图片那条已经在另一边被真正翻译了（见 `ImageRequestTests`）。
+        var withStore = new TimelineEvent.ToolResultEvent
         {
             Id = "r1",
             At = DateTimeOffset.UnixEpoch,
             CallId = "c1",
-            Content = [new Block.ImageBlock(new string('a', 64), "image/png")],
+            Content = [new Block.StoreBlock(new string('a', 64), "application/octet-stream")],
         };
 
         var call = new Block.ToolUseBlock("c1", "read", """{"path":"a.txt"}""");
-        Assert.Throws<ArgumentException>(
-            () => ClaudeRequestBuilder.Build(Req([UserMsg("x"), ModelMsg(call), withImage])));
+        var request = ClaudeRequestBuilder.Build(Req([UserMsg("x"), ModelMsg(call), withStore]));
+
+        // ⚠️ 工具结果的 `Content` 在 SDK 里是**联合类型**（一串块 / 一个纯字符串）——
+        // 我们只产字符串那条（见 `ToToolResult` 的注释），所以这里取字符串那一支。
+        var texts = new List<string>();
+        foreach (var m in request.Messages)
+        {
+            if (!m.Content.TryPickContentBlockParams(out var cs)) continue;
+            foreach (var c in cs!)
+                if (c.TryPickToolResult(out var tr) && tr.Content is { } content
+                    && content.TryPickString(out var s))
+                    texts.Add(s);
+        }
+
+        Assert.Contains("没有被解开", string.Concat(texts), StringComparison.Ordinal);   // 模型读得到「这里少了一块」
     }
 
     // ---- 线 ④：收 tool_use（响应 → canonical） ----

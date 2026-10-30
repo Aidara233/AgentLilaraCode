@@ -151,7 +151,7 @@ public static class Recovery
             // ⇒ 只配一条会让其余的悬着，而悬空的 `tool_use` 会让下一条请求 400。
             if (calls.Count > 1)
                 store.AppendEvents(handle.ProjectKey, handle.SessionId, Stepper.Blocked(
-                    calls, first: 1,
+                    calls, ask.CallId,
                     "（这一批里的这次调用和它一起被作废了：等待超时，没有人回答。）"));
 
             handle.AwaitingInput = null;

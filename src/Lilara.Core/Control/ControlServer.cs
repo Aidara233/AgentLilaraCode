@@ -60,6 +60,38 @@ public sealed class ControlServer(
     public string BindAddress { get; } =
         string.IsNullOrWhiteSpace(bindAddress) ? DefaultBindAddress : bindAddress.Trim();
 
+    /// <summary>
+    /// `POST /files` 一次最多收多少字节（2026-10-29）。
+    ///
+    /// <para>⚠️ **占位值**，与 <see cref="Tools.ToolLimits"/> 那几处同一条纪律：这是
+    /// **安全阀**（防一次上传把盘写满），不是设计结论。取 32 MiB 的理由：它容得下一张
+    /// 手机原图与一份 PDF，又远小于「出事时才发现」的量级。</para>
+    /// </summary>
+    private const int MaxUploadBytes = 32 * 1024 * 1024;
+
+    /// <summary>
+    /// 读请求体，**有界**。返回 (字节, 是否超限)。
+    ///
+    /// <para>⚠️ <b>不能 `CopyToAsync` 到 `MemoryStream` 了事</b>：那会把一整段不受限的
+    /// body 先吃进内存再看长度——超限就成了「先炸内存，再说太大」。</para>
+    /// </summary>
+    private static async Task<(byte[] Bytes, bool TooLarge)> ReadBodyAsync(HttpRequest request, int limit)
+    {
+        using var buffer = new MemoryStream();
+        var chunk = new byte[81920];
+
+        while (true)
+        {
+            var read = await request.Body.ReadAsync(chunk, request.HttpContext.RequestAborted);
+            if (read == 0) break;
+
+            if (buffer.Length + read > limit) return ([], true);
+            buffer.Write(chunk, 0, read);
+        }
+
+        return (buffer.ToArray(), false);
+    }
+
     /// <summary>绑在环回之外 ⇒ 本机之外也能连进来。⚠️ 没有鉴权，启动横幅据此报警。</summary>
     public bool IsExternallyBound => !BindAddressResolver.IsLoopbackOnly(BindAddress);
 
@@ -232,6 +264,51 @@ public sealed class ControlServer(
         // 每个快照都带该 topic 的 seq 高水位：头拿它去 subscribe(since:)，
         // 「拉快照 → 订阅」之间落的事件才不漏不重。
         app.MapGet("/projects", () => Results.Json(ProjectKeys(), WireJson.Options));
+
+        // ---- 库的两个端点（2026-10-29，`03` §9.1 / §9.4）----
+        //
+        // ⚠️ **没有它们，"看图片"这条路根本不通**：`ImageBlock` 只带地址，而客户端必须先
+        // 把字节**放进库**才能发那个地址（`BlockKinds.Reject` 会验「地址在不在库里」），
+        // 头也要有一个**取字节**的通道才显示得出历史里的图。
+        //
+        // ⚠️ 与其余快照端点同一个信任面：默认只绑 127.0.0.1、CORS `*`（`09` §1 认下的取舍）。
+
+        // 上传：body 是**原始字节**，`Content-Type` 就是媒体类型。
+        // ⚠️ **不走命令通道**（`03` §9.1）：大字节不该进命令流，而命令要能重放。
+        app.MapPost("/files", async (HttpRequest request) =>
+        {
+            var declared = request.ContentType?.Split(';')[0].Trim();
+            if (string.IsNullOrEmpty(declared))
+                return Results.Problem("要带 Content-Type（它就是媒体类型）。", statusCode: StatusCodes.Status400BadRequest);
+
+            var (bytes, tooLarge) = await ReadBodyAsync(request, MaxUploadBytes);
+            if (tooLarge)
+                return Results.Problem(
+                    $"太大了：一次最多 {MaxUploadBytes / (1024 * 1024)} MB。", statusCode: StatusCodes.Status413PayloadTooLarge);
+
+            if (bytes.Length == 0)
+                return Results.Problem("空 body——没有要存的东西。", statusCode: StatusCodes.Status400BadRequest);
+
+            var sha = new BlobStore(host.DataRoot).Put(bytes);
+            return Results.Json(new
+            {
+                // ⚠️ 名字是 `Ref`（`03` §9.1 的契约）：它就是 `ImageBlock.Sha256` 那一格。
+                Ref = sha,
+                MediaType = declared,
+                Bytes = bytes.Length,
+            }, WireJson.Options);
+        });
+
+        // 取字节：头显示历史里的图、以及任何「手里只有地址」的客户端。
+        // ⚠️ **只读、不可变**（内容寻址）⇒ 可以放心 `Cache-Control: immutable`。
+        // ⚠️ 媒体类型**按 magic 现认**（库里不存类型：同一个对象可能被两处以两种名义引用）。
+        app.MapGet("/store/{sha256}", (string sha256) =>
+        {
+            var bytes = new BlobStore(host.DataRoot).TryGet(sha256);
+            if (bytes is null) return Results.NotFound();
+
+            return Results.File(bytes, MediaTypes.Sniff(bytes), lastModified: null, entityTag: null);
+        });
 
         // 目录浏览只在 core 设备上发生：head 只提交 core 看到的路径，不调用浏览器本机选择器。
         // 缺省返回文件系统根（Windows 盘符 / Unix 根目录），可浏览任意可读目录；不创建目录、不激活会话。

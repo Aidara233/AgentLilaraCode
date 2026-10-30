@@ -528,14 +528,7 @@ public sealed class Stepper(
                 new PendingIntent(handle.State.Turn + 1, toolCalls[0].CallId), _store, s => s with
             {
                 Status = SessionStatus.WaitingForInput,
-                Ask = new PausedAsk(
-                    pending.Id, pending.Kind,
-                    // ⚠️ 一条询问今天只可能属于**一个** Kind，而 `CallId` 那一格只装得下一个。
-                    // 取第一条；真正的配对靠 `PendingAsk.Calls`（它是列表）。
-                    toolCalls[0].CallId,
-                    toolCalls[0].Name,
-                    ApprovalStore.HashArgs(toolCalls[0].Arguments),
-                    DeadlineOf(handle.Spec.AskTimeout)),
+                Ask = PausedOf(pending, toolCalls, handle.Spec.AskTimeout),
                 Turn = s.Turn + 1,
                 // ⚠️ **挂起这条也要落计划**（2026-10-24）：同一批里「改计划 + 要问」是合法的，
                 // 而这条分支在压缩之前就返回了 ⇒ 不在这里写，那次编辑会**静默丢掉**
@@ -974,6 +967,19 @@ public sealed class Stepper(
         SessionHandle handle, IReadOnlyList<Block.ToolUseBlock> calls,
         ToolExecutor.Reply reply, CancellationToken ct, PausedAsk paused, Action<string>? onPhase = null)
     {
+        // ⚠️ **已经配上对的那几条不再进这一趟**（2026-10-29）。
+        //
+        // <para>一批里有两种询问时（授权 + 提问），它们**一轮一轮**地被回答：第一张卡答完
+        // ⇒ 它的结果落了盘、剩下的几条重新挂起。⚠️ 那时手里的 `calls` 仍是**整批**
+        // （它来自 `AwaitingInput` 或盘上那条模型消息），于是**已经答完的那条会被重新问一次**
+        // ——用户看到的是「同一句话被反复要求回答」，而它永远走进不了收敛。</para>
+        //
+        // <para>⚠️ 判据只能是**记录**：`tool_use` 已经有配对的结果 ⇒ 它这一生已经结束了
+        // （`01` §3.6 ① 的一条对一条）。内存里的 `calls` 是缓存，重启之后更不可信
+        // （`RecordedCalls` 给的是整批）。⇒ 在**进来的第一件事**上剔掉它们，
+        // 于是「还剩谁没答」这件事只有一个答案。</para>
+        calls = Unpaired(handle, calls);
+
         var events = new List<TimelineEvent>();
         var releasedClaims = new List<Claim>();
         var releasedLines = new List<TimelineEvent.ReleaseEvent>();
@@ -1072,24 +1078,30 @@ public sealed class Stepper(
 
             // ⚠️ **还有没答到的**（一张卡只答了一部分）⇒ 重新挂起，那些 `tool_use` 继续悬着
             // ——而这次悬着是**对的**：它们确实还没被回答。
+            // ⚠️ 已经答到的那几条**照常落结果**（`events` 里就有）：这一步不再整批作废
+            // ——那是「反复要求询问」的另一半（见 `ToolExecutor` 第三趟那条注释）。
             if (batch.Pending is { } again)
             {
                 _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
 
-                handle.AwaitingInput = new SessionHandle.PendingAsk(again, calls);
+                // ⚠️ **只把还没配对的那几条交给下一次**（这一轮刚答完的那几条已经落盘了）：
+                // `AwaitingInput.Calls` 的语义是「这些 `tool_use` 还在等回答」，把答过的留在里面
+                // 会让「还剩谁没答」有两个互相矛盾的答案（另一个由 `ResumeAsync` 入口那个
+                // `Unpaired` 从记录里算）。⇒ 这里落盘之后再算，两处得出同一个集合。
+                handle.AwaitingInput = new SessionHandle.PendingAsk(again, Unpaired(handle, calls));
                 handle.UpdateStateAndPersist(_store, s => s with
                 {
                     Status = SessionStatus.WaitingForInput,
-                    Ask = new PausedAsk(
-                        again.Id, again.Kind, calls[0].CallId, calls[0].Name,
-                        ApprovalStore.HashArgs(calls[0].Arguments),
-                        DeadlineOf(handle.Spec.AskTimeout)),
+                    Ask = PausedOf(again, calls, handle.Spec.AskTimeout),
                     Turn = s.Turn + 1,
                     Axes = WithMode(goalEnded ? WithStandardInitiative(s.Axes) : s.Axes, modeChanged ? modeAfter : null),
                     Plan = planChanged ? planAfter : s.Plan,
                 }, diskStatus: SessionStatus.WaitingForInput);
 
+                // ⚠️ **结果也要交给头**：这一批里已经跑掉的那几条有内容，
+                // 而「实时流里那批调用看起来没有下文」是本仓修过一次的老毛病。
                 return new StepOutcome(NoReply, again, handle.State.Ask?.DeadlineAt,
+                    ToolResults: toolResults,
                     ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
                     GoalEnded: goalEnded, Spawns: spawns, Tells: tells, Archives: archives,
                     PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
@@ -1358,9 +1370,13 @@ public sealed class Stepper(
     private static IReadOnlyList<TimelineEvent> ReadoutEvents(
         SessionHandle handle, string body, DateTimeOffset at)
     {
-        // ⚠️ id 里带 `turn`：记录里同号的两条 `tool_use` 会让上游按 `call_id` 配对时撞车。
-        // 这条只在变化时写一次，所以号不会每步都涨。
-        var id = $"floating-{handle.State.Turn + 1}-readout-result";
+        // ⚠️ **id 必须每次追加都唯一，不能只用 `turn`**（实测事故两次：`floating-8539-…`、
+        // `floating-8974-…` 各出现两遍 ⇒ `CompactionStore.LatestValid` 的 `ToDictionary`
+        // 抛「同一键已存在」⇒ 整个会话的 `/history` 500）。
+        // `turn` 不是持久唯一序号：凡是「先写历史、后写 state」之间出岔子的那一格
+        // （失败重试、崩溃后补写、同一步里写两次），下一次都会拿到同一个 `turn`。
+        // ⇒ 唯一性由生成器保证，不由调用点推理保证；后缀不变（`RecordedReadoutBody` 靠它认）。
+        var id = $"floating-{Ids.New()}-readout-result";
 
         return
         [
@@ -1766,6 +1782,57 @@ public sealed class Stepper(
         timeout is { } t ? CoreClock.Now() + t : null;
 
     /// <summary>
+    /// **这批调用里还有哪几条没有配对的结果**（`01` §3.6 ①）。
+    ///
+    /// <para>⚠️ <b>判据只能是记录，不能是内存</b>：`AwaitingInput.Calls` 与
+    /// `RecordedCalls` 给的都可能是**整批**（含已经答完、结果已经落盘的那几条）
+    /// ⇒ 拿它当「还剩谁没答」会让答过的那条被重新问一次（死循环的一半，见 `ResumeAsync`）。</para>
+    ///
+    /// <para>⚠️ <b>顺序保持入参那序</b>：批内次序是事实（`01` §3.6 ③），这里只做过滤。</para>
+    /// </summary>
+    private IReadOnlyList<Block.ToolUseBlock> Unpaired(
+        SessionHandle handle, IReadOnlyList<Block.ToolUseBlock> calls)
+    {
+        if (calls.Count == 0) return calls;
+
+        var paired = _store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .Select(r => r.CallId)
+            .ToHashSet(StringComparer.Ordinal);
+
+        return [.. calls.Where(c => !paired.Contains(c.CallId))];
+    }
+
+    /// <summary>
+    /// **盘面那份「在等谁」**（`PausedAsk`）——两条挂起路径（新的一步 / 答复之后又挂起）
+    /// **共用这一个**，因为各写一份就会漂，而漂的代价见下面那条。
+    ///
+    /// <para>⚠️ <b>判据是「这一次询问是替哪条调用问的」（<see cref="AskRequest.CallIds"/> 的第一条），
+    /// 而不是「这批里的第一条调用」</b>。后者看着差不多，但它把答案配到**别的**调用上：
+    /// 实测（2026-10-29）一批里同时有 `plan` 与 `ask` 时，`ask` 不是第一条 ⇒ 答复落到 `plan` 上 ⇒
+    /// 真正被问的那条**永远等不到答复** ⇒ 下一轮又问同一句，**永不收敛**（用户只能作废）。</para>
+    ///
+    /// <para>⚠️ <paramref name="calls"/> 里找不到那条（从盘上载入的批、或询问来自别处）⇒
+    /// 退回批里第一条：宁可「说不准是谁」，也不要造一条不在记录里的调用。</para>
+    /// </summary>
+    private static PausedAsk PausedOf(
+        AskRequest ask, IReadOnlyList<Block.ToolUseBlock> calls, TimeSpan? timeout)
+    {
+        var callId = ask.CallIds.Count > 0 ? ask.CallIds[0] : calls.Count > 0 ? calls[0].CallId : "";
+        var call = calls.FirstOrDefault(c => string.Equals(c.CallId, callId, StringComparison.Ordinal))
+                   ?? calls.FirstOrDefault();
+
+        return new PausedAsk(
+            ask.Id, ask.Kind,
+            // ⚠️ `CallId` 那一格只装得下一个；真正的配对靠 `PendingAsk.Calls` 与
+            // `AskRequest.CallIds`（两者都是列表）。
+            call?.CallId ?? callId,
+            call?.Name ?? "",
+            ApprovalStore.HashArgs(call?.Arguments ?? "{}"),
+            DeadlineOf(timeout));
+    }
+
+    /// <summary>
     /// **把一次询问的答复落成一条结果**（`01` §3.8）——用户答完 / 超时之后走这条路。
     ///
     /// <para>⚠️ <b>它只落<b>一条</b> <c>ToolResultEvent</c>，哪怕那次询问盖住了好几个调用</b>。
@@ -1816,9 +1883,11 @@ public sealed class Stepper(
     /// **下一条请求当场 400**（上游原话：「`tool_use` ids were found without
     /// `tool_result` blocks immediately after」，`Supersede` 那条注释里记着实测）。</para>
     ///
-    /// <para>⚠️ <b>`first` 那一格是「跳过几条」</b>：调用方已经用
-    /// <see cref="Answer"/> 给第一条配过了（那是真正的答复），这里从第
-    /// <c>first</c> 条之后开始补。⇒ 两条路**合起来**才凑齐这一批。</para>
+    /// <para>⚠️ <b><paramref name="answered"/> 那一格是「哪一条已经配过了」</b>：调用方已经用
+    /// <see cref="Answer"/> 给它配过（那是真正的答复），这里跳过**那一条**、其余全补。
+    /// ⚠️ 从前这一格是「跳过几条」（整数），而那个判据假设了「被答的总是第一条」——
+    /// 2026-10-29 起不再成立（`PausedAsk.CallId` 指的是**被问的那条**，它未必排第一）。
+    /// 按 id 跳过才对：按序号跳会**漏掉一条、重复另一条**。</para>
     ///
     /// <para>⚠️ <b>只用在「这批不跑了」的三种收尾上</b>（拒绝 / 超时 / 作废）——
     /// 那时「这些调用被一起作废」是**真话**。
@@ -1828,20 +1897,22 @@ public sealed class Stepper(
     /// 因为那些调用**全都真的执行了**。</para>
     /// </summary>
     /// <param name="calls">被挂住的那些调用（`SessionHandle.PendingAsk.Calls`）。</param>
-    /// <param name="first">从第几条之后开始补（调用方已配过的那条不算）。</param>
+    /// <param name="answered">已经被 <see cref="Answer"/> 配过的那条（`PausedAsk.CallId`）。</param>
     /// <param name="said">写进每一条结果的话（三条收尾各有各的措辞）。</param>
     public static IReadOnlyList<TimelineEvent.ToolResultEvent> Blocked(
-        IReadOnlyList<Block.ToolUseBlock> calls, int first, string said) =>
-        [.. calls.Skip(first).Select(call => new TimelineEvent.ToolResultEvent
-        {
-            // ⚠️ 一条结果一个稳定 id（同 `Answer` 那条：它不是某一步的产物）。
-            Id = Ids.New(),
-            At = CoreClock.Now(),
-            // ⚠️ **配对键是这条调用自己的 `CallId`**——不是 `paused.CallId`。
-            // 用后者会配到同一条上两次，而真正的悬空那条还是悬着。
-            CallId = call.CallId,
-            Content = [new Block.TextBlock(said)],
-        })];
+        IReadOnlyList<Block.ToolUseBlock> calls, string? answered, string said) =>
+        [.. calls
+            .Where(call => !string.Equals(call.CallId, answered, StringComparison.Ordinal))
+            .Select(call => new TimelineEvent.ToolResultEvent
+            {
+                // ⚠️ 一条结果一个稳定 id（同 `Answer` 那条：它不是某一步的产物）。
+                Id = Ids.New(),
+                At = CoreClock.Now(),
+                // ⚠️ **配对键是这条调用自己的 `CallId`**——不是 `paused.CallId`。
+                // 用后者会配到同一条上两次，而真正的悬空那条还是悬着。
+                CallId = call.CallId,
+                Content = [new Block.TextBlock(said)],
+            })];
 
     /// <summary>
     /// **用户没有回答，而是说了别的**（`01` §3.8 的 `Superseded`）。

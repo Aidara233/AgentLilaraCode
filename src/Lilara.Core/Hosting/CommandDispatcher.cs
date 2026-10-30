@@ -1751,6 +1751,13 @@ public sealed class CommandDispatcher(
     {
         if (!TryFind(s.SessionId, out var handle, out var notFound)) return Reject(id, notFound!);
 
+        // ⚠️ **块种类在入口就得判**（2026-10-29）：记录**只追加**，一条翻译不了的块会留在
+        // `history.jsonl` 里**永远**——于是那个会话此后每一次构造请求都在适配器里抛，
+        // 用户看到的是「这个会话发什么都说不出话」，而盘上没有任何东西能删掉它。
+        // 这不是假想的：在本次改动之前，`session.send` 对块的种类**一个字都不查**。
+        if (BlockKinds.Reject(s.Blocks, new Storage.BlobStore(_host.Store.DataRoot)) is { } rejected)
+            return Reject(id, rejected);
+
         // ⚠️ **撞上「正在等回答」⇒ 先顶替那次询问**（`01` §3.8 的 `Superseded`）。
         //
         // ⚠️ **不顶替的话，下一条请求会 400**，而**这次是实测的**（2026-10-08）：
@@ -2840,17 +2847,34 @@ public sealed class CommandDispatcher(
         var waiting = awaiting?.Calls
             ?? Stepper.RecordedCalls(_host.Store, handle.ProjectKey, handle.SessionId, paused.CallId);
 
+        // ⚠️ **这张卡盖住哪几条调用** = 它自己问的那几条（`AskRequest.CallIds`）。
+        //
+        // <para>⚠️ <b>从前两个 Kind 各写一份判据，而两份都错</b>（2026-10-29 修）：
+        // 提问那条只盖 `paused.CallId`，授权那条盖「等待中的全部」。表现就是用户报的那个
+        // 「反复要求询问、只能作废」：</para>
+        //   · <b>提问</b>：`paused.CallId` 若是**别的**调用（`ask` 不是这批的第一条），
+        //     答案就落到那条上、真正被问的那条**永远等不到答复** ⇒ 下一轮又问一次，死循环。
+        //   · <b>授权</b>：把它一起「批准」⇒ 那条 `ask` 照常执行、而**它的问题是空的**
+        //     （那张卡根本没给用户看过），模型于是再问一次。
+        //
+        // <para>⚠️ 重启之后内存那半没了 ⇒ 只认盘上那一条（`PausedAsk.CallId` 现在指的正是
+        // **被问的那条**，见 `Stepper.PausedOf`）——一张合并的卡会退化成「一轮答一条」，
+        // 但**不会再循环**：答过的那条真的执行、真的配对。</para>
+        IReadOnlyList<string> cardCallIds = awaiting?.Ask.CallIds is { Count: > 0 } ids
+            ? ids
+            : [paused.CallId];
+
         IReadOnlyList<string> covered =
             (expired || cancelled || (paused.Kind == AskKind.Permission && !IsApproved(c)))
                 ? []
-                : paused.Kind == AskKind.Question
-                    ? [paused.CallId]
-                    : waiting.Count > 0 ? [.. waiting.Select(x => x.CallId)] : [paused.CallId];
+                : [.. cardCallIds];
 
         var reply = new Lilara.Core.Session.Tools.ToolExecutor.Reply(
             paused.Kind, covered,
+            // ⚠️ 问题**按那张卡盖住的全部调用**解（一张卡可以同时替好几条问）：
+            // 只解第一条的话，后面那几问的答案在 `Reply.Compose` 里会落成「没回答」。
             paused.Kind == AskKind.Question
-                ? Session.Tools.AskTool.ItemsOf(_host.Store, handle.ProjectKey, handle.SessionId, paused.CallId)
+                ? Session.Tools.AskTool.ItemsOf(_host.Store, handle.ProjectKey, handle.SessionId, cardCallIds)
                 : [],
             c.Answers);
 
@@ -2944,7 +2968,7 @@ public sealed class CommandDispatcher(
                     : "（这一批里的这次调用和它一起被作废了：用户拒绝了。）";
 
             _host.Store.AppendEvents(handle.ProjectKey, handle.SessionId,
-                Stepper.Blocked(awaiting.Calls, first: 1, said));
+                Stepper.Blocked(awaiting.Calls, paused.CallId, said));
         }
 
         ClearPause(handle);

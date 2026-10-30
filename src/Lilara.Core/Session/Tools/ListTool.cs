@@ -290,9 +290,13 @@ public sealed class ReadTool : ITool
 
 
     public string Description =>
-        "读一个文本文件。路径相对于工作目录。"
-        + "默认返回全文；文件很大时只返回**开头一段**，并在结果第一行写明这一段是整个文件的哪一部分"
+        "读一个文件。路径相对于工作目录。"
+        + "**文本**：默认返回全文；文件很大时只返回**开头一段**，并在结果第一行写明这一段是整个文件的哪一部分"
         + "——那行的**总长度**告诉你还有多少没看到，接着读就加 `offset`。"
+        + "**图片**（png / jpeg / gif / webp）：返回的是那张图本身，你能直接看它；"
+        + "图片不能按字节分段读，也不要加 `offset` / `limit`。"
+        + "**文档**（pdf / docx / xlsx / pptx）：返回抽出来的**文字**（表格会走样、版面会丢，"
+        + "扫描版 PDF 没有文字层）；同样不支持 `offset` / `limit`。"
         + "只想看目录里有什么，用 ls。";
 
     public string ParametersSchemaJson => """
@@ -369,6 +373,115 @@ public sealed class ReadTool : ITool
             // 而它其实只是**读过头了**（同 `fetch` 取不回时那条判据）。
             return Task.FromResult(ToolText.Of(
                 $"'{rel}' 一共 {length} 字节，从第 {offset} 字节之后就没有内容了。"));
+        }
+
+        // ⚠️ **先认类型，再决定怎么读**（2026-10-29）：把一张 PNG 按 UTF-8 解码得到的是
+        // 一屏 U+FFFD，而那段乱码会被当成「文件内容」入档、还会算指纹——**静默的假信息**。
+        // 判据只能落在字节上（扩展名是人定的），`MediaTypes` 一处认。
+        var mediaType = Storage.MediaTypes.Sniff(ReadRange(full, 0, Math.Min(4096, length)));
+
+        if (Storage.MediaTypes.IsImage(mediaType))
+        {
+            // ⚠️ **图片不按字节窗口读**：`offset` / `limit` 对一张图没有语义（切一半的 PNG
+            // 不是「前一段内容」）。⇒ 说清这一点，而不是静默忽略参数——忽略会让模型以为
+            // 它只拿到了图的一部分。
+            if (offset > 0 || limit is not null)
+                return Task.FromResult(ToolText.Of(
+                    $"'{rel}' 是一张图片（{mediaType}），不能按字节分段读——它要么整张发出去，要么不发。"
+                    + "去掉 `offset` / `limit` 再读一次。")) ;
+
+            // ⚠️ **同一个保存上限**（`ToolLimits.MaxToolOutputBytes`）：一张 200 MB 的图
+            // 一次读进内存再进库，等于替用户把盘写满。判据与文本那条**逐字同一个数**。
+            if (length > ToolLimits.MaxToolOutputBytes)
+                return Task.FromResult(ToolText.Of(
+                    $"'{rel}' 是一张 {length} 字节的图片，超过单次上限 "
+                    + $"{ToolLimits.MaxToolOutputBytes} 字节，没有读。先把它缩小一点。"));
+
+            byte[] imageBytes;
+            try
+            {
+                imageBytes = File.ReadAllBytes(full);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return Task.FromResult(ToolText.Of($"读 '{rel}' 失败：{ex.Message}"));
+            }
+
+            // ⚠️ **进库，记录里只留地址**（`01` §8.4）：`ImageBlock` 带的是 sha256，
+            // 而字节由 `TimelineRender` 在**发给模型之前**贴回去（见那边的注释）。
+            var sha = context.EnsureStored(imageBytes);
+
+            return Task.FromResult(new ToolOutcome
+            {
+                // ⚠️ **一块图，不是一段描述**：折成文字就是「多一条假信息」
+                // （`01` §3.6，见 `Block.ImageBlock` 的注释）。
+                Content = [new Block.ImageBlock(sha, mediaType)],
+                Framing = new ToolFraming(rel.Replace('\\', '/'),
+                [
+                    new ToolFramingField("图片", mediaType),
+                    new ToolFramingField("共", length.ToString()),
+                ]),
+                DependsOn = rel.Replace('\\', '/'),
+                Fingerprint = FingerprintOf(rel.Replace('\\', '/'), imageBytes),
+            });
+        }
+
+        // ⚠️ **文档（pdf / docx / xlsx / pptx）走抽取那条**（2026-10-29）：它们的字节里
+        // 确实"有文字"，但**不在字节表面上**（压缩流 / 共享字符串表 / 字体编码）。
+        // ⇒ 按文本读出来只会是一屏噪声，而模型会把这屏噪声当成文档内容。
+        if (mediaType is Storage.MediaTypes.Pdf or Storage.MediaTypes.Zip)
+        {
+            if (offset > 0 || limit is not null)
+                return Task.FromResult(ToolText.Of(
+                    $"'{rel}' 是一份文档，不能按字节分段读——它要么整份抽出来，要么不读。"
+                    + "去掉 `offset` / `limit` 再读一次。如果文档太大，抽取结果会在上限处截断并明说。"));
+
+            // ⚠️ 与图片同一个理由、同一个数：先判大小，再读进内存。
+            if (length > ToolLimits.MaxToolOutputBytes)
+                return Task.FromResult(ToolText.Of(
+                    $"'{rel}' 是一份 {length} 字节的文档，超过单次上限 "
+                    + $"{ToolLimits.MaxToolOutputBytes} 字节，没有读。"));
+
+            byte[] documentBytes;
+            try
+            {
+                documentBytes = File.ReadAllBytes(full);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return Task.FromResult(ToolText.Of($"读 '{rel}' 失败：{ex.Message}"));
+            }
+
+            // ⚠️ **两条抽取路径，各说各的失败**：PDF 要能区分「没有文字层（扫描件）」，
+            // zip 要能区分「是压缩包但不是 Office 文档」。⇒ 理由文本由抽取器给，这里只转交。
+            Session.DocumentText.Extraction? document = null;
+            string? why = null;
+
+            var ok = mediaType == Storage.MediaTypes.Pdf
+                ? Session.PdfText.TryExtract(documentBytes, out document, out why)
+                : Session.DocumentText.TryExtract(documentBytes, out document, out why);
+
+            if (!ok || document is null)
+                return Task.FromResult(ToolText.Of(
+                    $"'{rel}' 读不出来：" + (why ?? "这是一个压缩包，但不是支持的文档类型（docx / xlsx / pptx）。")));
+
+            // ⚠️ **框架里要写清「这是抽出来的」**：模型看到的是正文，而它必须知道
+            // 这段文字来自**抽取**（表格会走样、版面会丢、扫描件干脆没有）。不写的话，
+            // 它会把一份"读丢了半张表"的抽取结果当成原文引用。
+            var framingFields = new List<ToolFramingField>
+            {
+                new("文档", document.Kind),
+                new("共", length.ToString()),
+                new("抽取", document.Truncated ? "到上限为止" : "全文"),
+            };
+
+            return Task.FromResult(new ToolOutcome
+            {
+                Content = [new Block.TextBlock(document.Text)],
+                Framing = new ToolFraming(rel.Replace('\\', '/'), framingFields),
+                DependsOn = rel.Replace('\\', '/'),
+                Fingerprint = FingerprintOf(rel.Replace('\\', '/'), documentBytes),
+            });
         }
 
         // ⚠️ **上限封顶在这里，而且它从 `ToolLimits` 读**（本仓的 G17：

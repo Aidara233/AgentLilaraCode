@@ -212,4 +212,22 @@ public sealed record AskRequest
     /// （<see cref="AskKind.Question"/> 就是这样——**问意见没有「记住」这回事**）。
     /// </summary>
     public IReadOnlyList<AskMemory> Remember { get; init; } = [];
+
+    /// <summary>
+    /// **这一问是替哪几条调用问的**（协议 id，`tool_use.callId`）。
+    ///
+    /// <para>⚠️ <b>它是「答完之后谁算被答过了」的唯一判据</b>，而这件事**推不出来**：
+    /// 问题（<see cref="Items"/>）与调用不是一一对应（一条 `ask` 可以问好几个问题，
+    /// 一张卡可以盖住同一批里的好几条调用），而「批里的第一条」也不是答案。</para>
+    ///
+    /// <para>⚠️ <b>不加它的时候，本仓在混批上栽的是死循环</b>（实测 2026-10-29，
+    /// 用户报的是「`plan` 修改与 `ask` 一起发时反复要求询问，只能作废」）：
+    /// 挂起时拿 `calls[0].CallId` 当「在等哪一条」，于是 `ask` 不是第一条时答案落到
+    /// **另一条**调用上，真正被问的那条永远等不到答复 ⇒ 下一轮又问一次，永不收敛。
+    /// ⇒ 生产者<b>必须</b>填它（`ask` / 闸门 / `switch_plan_mode` 各填自己那条）。</para>
+    ///
+    /// <para>⚠️ 空 = 造这一问的地方没说（今天只有「从盘上解不出来」那条退化路）——
+    /// 那时调用方退回「只认 <c>PausedAsk.CallId</c> 那一条」。</para>
+    /// </summary>
+    public IReadOnlyList<string> CallIds { get; init; } = [];
 }

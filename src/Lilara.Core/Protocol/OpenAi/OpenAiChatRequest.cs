@@ -169,11 +169,40 @@ public static class OpenAiChatRequest
         // ⇒ 这里原先那条「`Ref` 非空 ⇒ 抛」的守卫已经**永远到不了**，删掉。
         // ⚠️ **留着它比删掉坏**：`fetch` 一上线，那句话会变成一条指着错方向的假诊断。
         // ⚠️ 若哪天真有引用漏到这里，下面 `switch` 的默认分支会响亮地抛——不需要额外守卫。
+        // ⚠️ **带图的结果走片数组那条**（2026-10-29）：Chat 的 tool 消息 `content`
+        // 也可以是片数组。⚠️ 只在真的有图时换形状 —— 纯文本结果逐字节不变。
+        if (r.Content.Any(b => b is Block.ImageBlock image && ImagePayload.CanSend(image)))
+        {
+            var parts = new JsonArray();
+            foreach (var b in r.Content)
+            {
+                if (b is Block.TextBlock tb)
+                    parts.Add(new JsonObject { ["type"] = "text", ["text"] = tb.Text });
+                else if (b is Block.ImageBlock image && ImagePayload.CanSend(image))
+                    parts.Add(new JsonObject
+                    {
+                        ["type"] = "image_url",
+                        ["image_url"] = new JsonObject { ["url"] = ImagePayload.DataUrl(image) },
+                    });
+                else
+                    parts.Add(new JsonObject { ["type"] = "text", ["text"] = UnsupportedBlock.Note(b) });
+            }
+
+            return new JsonObject
+            {
+                ["role"] = "tool",
+                ["tool_call_id"] = r.CallId,
+                ["content"] = parts,
+            };
+        }
+
         var text = string.Concat(r.Content.Select(b => b switch
         {
             Block.TextBlock t => t.Text,
-            _ => throw new ArgumentException(
-                $"工具结果里有无法翻译的块（{b.GetType().Name}）", nameof(r)),
+
+            // ⚠️ **不再抛**（2026-10-29，见 `UnsupportedBlock`）：一条翻译不了的结果不该让
+            // 这个会话此后每一次请求都炸（记录只追加）。占位是**模型看得见的**，不是静默丢。
+            _ => UnsupportedBlock.Note(b),
         }));
 
         if (text.Length == 0) text = "(无输出)";
@@ -196,6 +225,13 @@ public static class OpenAiChatRequest
         var blocks = ReasoningPolicy.FilterFor(message.Blocks, protocol);
         var texts = blocks.OfType<Block.TextBlock>().Select(b => b.Text).ToList();
 
+        // ⚠️ **翻译不了的块要留一句话**（2026-10-29，见 `UnsupportedBlock`）：原先这里
+        // `OfType<TextBlock>()` 把它们**静默丢了**——而「图不见了、模型也不知道少了什么」
+        // 是比抛更坏的那种失败（多一条假信息：它以为自己看到了全部）。
+        // ⚠️ 正文 / 工具调用 / 推理块都由各自的路径表达，`Skippable` 对它们返回 null。
+        foreach (var note in blocks.Select(UnsupportedBlock.Skippable).OfType<string>())
+            texts.Add(note);
+
         // 模型的工具调用走 `tool_calls`（Chat 把它挂在 assistant 消息上）。
         var calls = blocks.OfType<Block.ToolUseBlock>().ToList();
 
@@ -217,6 +253,41 @@ public static class OpenAiChatRequest
 
         if (reasoning is not null) obj["reasoning_content"] = reasoning;
 
+        // ⚠️ **带图的消息走"片数组"那条**（2026-10-29）：Chat 的多模态 content 是
+        // `[{type:"text"},{type:"image_url"}]`。⚠️ 只在**真的有图**时才换形状：
+        // 纯文本历史仍旧走「字符串 / {type:text} 数组」，**逐字节不变**（前缀缓存按字节算）。
+        if (blocks.Any(b => b is Block.ImageBlock image && ImagePayload.CanSend(image)))
+        {
+            var parts = new List<JsonNode>();
+            foreach (var b in blocks)
+            {
+                switch (b)
+                {
+                    case Block.TextBlock text:
+                        parts.Add(new JsonObject { ["type"] = "text", ["text"] = text.Text });
+                        break;
+                    case Block.ImageBlock image when ImagePayload.CanSend(image):
+                        parts.Add(new JsonObject
+                        {
+                            ["type"] = "image_url",
+                            ["image_url"] = new JsonObject { ["url"] = ImagePayload.DataUrl(image) },
+                        });
+                        break;
+                    case Block.ToolUseBlock:
+                    case Block.ReasoningBlock:
+                        break;   // 各自走 `tool_calls` / `reasoning_content` 那条（见下）
+                    default:
+                        if (UnsupportedBlock.Skippable(b) is { } note)
+                            parts.Add(new JsonObject { ["type"] = "text", ["text"] = note });
+                        break;
+                }
+            }
+
+            obj["content"] = new JsonArray(parts.ToArray());
+            AppendToolCalls(obj, calls);
+            return obj;
+        }
+
         // ⚠️ 有 tool_calls 而 content 为空时，**发 `null` 而不是空串或省略**：
         // 省略 content 字段会被上游当成格式错误（它要求这个键存在）。
         if (texts.Count == 0) obj["content"] = null;
@@ -229,24 +300,28 @@ public static class OpenAiChatRequest
                     ["text"] = t,
                 }).ToArray());
 
-        if (calls.Count > 0)
-        {
-            obj["tool_calls"] = new JsonArray(calls.Select(c => (JsonNode)new JsonObject
-            {
-                ["id"] = c.CallId,
-                ["type"] = "function",
-                ["function"] = new JsonObject
-                {
-                    ["name"] = c.Name,
-                    // ⚠️ **`arguments` 在协议里是字符串**（不是对象）——而我们的 `Arguments`
-                    // 本来就是一串 JSON 原文 ⇒ **逐字塞进去**，中间没有人解析过它。
-                    // 这是两条链路里**唯一**一处参数不需要过类型的（Claude 那边必须过）。
-                    ["arguments"] = c.Arguments,
-                },
-            }).ToArray());
-        }
-
+        AppendToolCalls(obj, calls);
         return obj;
+    }
+
+    /// <summary>`tool_calls` 那一格（模型输出的一部分）。⚠️ 两条分支共用，别各写一遍。</summary>
+    private static void AppendToolCalls(JsonObject obj, IReadOnlyList<Block.ToolUseBlock> calls)
+    {
+        if (calls.Count == 0) return;
+
+        obj["tool_calls"] = new JsonArray(calls.Select(c => (JsonNode)new JsonObject
+        {
+            ["id"] = c.CallId,
+            ["type"] = "function",
+            ["function"] = new JsonObject
+            {
+                ["name"] = c.Name,
+                // ⚠️ **`arguments` 在协议里是字符串**（不是对象）——而我们的 `Arguments`
+                // 本来就是一串 JSON 原文 ⇒ **逐字塞进去**，中间没有人解析过它。
+                // 这是两条链路里**唯一**一处参数不需要过类型的（Claude 那边必须过）。
+                ["arguments"] = c.Arguments,
+            },
+        }).ToArray());
     }
 
     /// <summary>

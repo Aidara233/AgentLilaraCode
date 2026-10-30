@@ -83,8 +83,27 @@ public abstract record Block
     /// <para>⚠️ **图片永远不许折进文本**（`01` §3.6）：协议把「图文」表示成数组 ⇒
     /// 文本与图片是**兄弟块**。折了之后图没了而描述还在 ⇒ 多一条**假信息**
     /// （图上写着 42，图已经不在了）。</para>
+    ///
+    /// <para>⚠️ <b><see cref="Bytes"/> 是<b>运行期那一份</b>，不进 JSON、也不进记录</b>
+    /// （2026-10-29）：记录里那块是**地址**（内容寻址，`01` §8.4），而适配器需要**字节**
+    /// 才能拼出协议的原生图片块。填充点在 <see cref="Session.TimelineRender"/>——那是
+    /// 唯一的「记录 → 请求」通道，也是**唯一**该碰库的地方（`04` §5：适配器不认识库）。
+    /// </para>
+    ///
+    /// <para>⚠️ <b>为什么不干脆让适配器去查库</b>：那会把「库」这个控制面概念泄漏进协议层
+    /// （与 `StoreBlock` 那条注释同一条理由），而且适配器连 `dataRoot` 都没有——
+    /// 它们只该看见「一块内容」。⇒ 用 <c>with { Bytes = … }</c> 在渲染期贴上去，
+    /// 记录与 `JsonSerializer` 的输出**一个字节都不变**。</para>
     /// </summary>
-    public sealed record ImageBlock(string Sha256, string MediaType) : Block;
+    public sealed record ImageBlock(string Sha256, string MediaType) : Block
+    {
+        /// <summary>
+        /// 库里的那串字节（渲染期填）。⚠️ <c>null</c> = 没解引用（头那份渲染 / 记录里那份），
+        /// 而 <b>不是</b>「这张图不存在」——存在性看 <see cref="Sha256"/> 在不在库里。
+        /// </summary>
+        [JsonIgnore]
+        public byte[]? Bytes { get; init; }
+    }
 
     /// <summary>
     /// 一个**库对象**的引用（不限于图片：PDF 等原生模态内容同理）。

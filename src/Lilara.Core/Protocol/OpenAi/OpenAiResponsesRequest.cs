@@ -157,11 +157,39 @@ public static class OpenAiResponsesRequest
         // ⚠️ **`Ref` 到不了这里**（2026-10-06）：理由与 Chat 那条链路**逐字相同**
         // （见 `OpenAiChatRequest.ResultToJson`）。⚠️ 这三条链路必须**一起**看待：
         // 只删一条会留下两条指着相反方向的假诊断，而它们分叉的那一刻没人会红。
+        // ⚠️ **带图的结果走片数组那条**（2026-10-29）：`function_call_output.output` 可以
+        // 是字符串，也可以是一串内容片。⚠️ 只在真的有图时换形状 —— 纯文本逐字节不变。
+        if (r.Content.Any(b => b is Block.ImageBlock image && ImagePayload.CanSend(image)))
+        {
+            var parts = new JsonArray();
+            foreach (var b in r.Content)
+            {
+                if (b is Block.TextBlock tb)
+                    parts.Add(new JsonObject { ["type"] = "input_text", ["text"] = tb.Text });
+                else if (b is Block.ImageBlock image && ImagePayload.CanSend(image))
+                    parts.Add(new JsonObject
+                    {
+                        ["type"] = "input_image",
+                        ["image_url"] = ImagePayload.DataUrl(image),
+                    });
+                else
+                    parts.Add(new JsonObject { ["type"] = "input_text", ["text"] = UnsupportedBlock.Note(b) });
+            }
+
+            return new JsonObject
+            {
+                ["type"] = "function_call_output",
+                ["call_id"] = r.CallId,
+                ["output"] = parts,
+            };
+        }
+
         var text = string.Concat(r.Content.Select(b => b switch
         {
             Block.TextBlock t => t.Text,
-            _ => throw new ArgumentException(
-                $"工具结果里有无法翻译的块（{b.GetType().Name}）", nameof(r)),
+
+            // ⚠️ **不再抛**（2026-10-29，见 `UnsupportedBlock`）：三条链路同一条判据。
+            _ => UnsupportedBlock.Note(b),
         }));
 
         // 空输出给出占位串：与另两条链路同一种行为（换个 provider 不该改变模型看到的东西）。
@@ -185,6 +213,11 @@ public static class OpenAiResponsesRequest
         var blocks = ReasoningPolicy.FilterFor(message.Blocks, protocol);
         var texts = blocks.OfType<Block.TextBlock>().Select(b => b.Text).ToList();
 
+        // ⚠️ **翻译不了的块要留一句话**（2026-10-29，见 `UnsupportedBlock`）：与 Chat 那条
+        // 逐字同一个理由——`OfType<TextBlock>()` 的静默丢是「多一条假信息」。
+        foreach (var note in blocks.Select(UnsupportedBlock.Skippable).OfType<string>())
+            texts.Add(note);
+
         // ⚠️ 与 Chat 同一条判据：一个只调工具、不说话的 assistant 消息 content 是空的，
         // 而那是常态 ⇒ 判据要连调用一起看。
         var calls = blocks.OfType<Block.ToolUseBlock>().ToList();
@@ -207,16 +240,42 @@ public static class OpenAiResponsesRequest
         // 一条「只调工具」的 assistant 消息在 Responses 下**就是**若干 function_call 项，没有消息项。
         if (texts.Count > 0)
         {
-            // 用户用 input_text、助手用 output_text（上游两者都收）。
-            // 始终发 part 数组（单块也是）：数组对单块/多块是同一条路径，少一处无覆盖的代码。
+            // ⚠️ **带图时 content 是片数组**（2026-10-29）：用户用 `input_text`、助手用
+            // `output_text`，而图片一律 `input_image`（`image_url` 是**字符串**，与 Chat
+            // 的 `{url:…}` 对象不同——两条 OpenAI 协议的形状**不可互换**）。
+            // ⚠️ 纯文本那条仍然发「全 `input_text`」的数组，**逐字节不变**。
+            var withImages = blocks.Any(b => b is Block.ImageBlock image && ImagePayload.CanSend(image));
             var blockType = message.From == Speaker.User ? "input_text" : "output_text";
+
+            var parts = new JsonArray();
+            if (!withImages)
+            {
+                foreach (var t in texts)
+                    parts.Add(new JsonObject { ["type"] = blockType, ["text"] = t });
+            }
+            else
+            {
+                foreach (var b in blocks)
+                {
+                    if (b is Block.TextBlock tb)
+                        parts.Add(new JsonObject { ["type"] = blockType, ["text"] = tb.Text });
+                    else if (b is Block.ImageBlock image && ImagePayload.CanSend(image))
+                        parts.Add(new JsonObject
+                        {
+                            ["type"] = "input_image",
+                            ["image_url"] = ImagePayload.DataUrl(image),
+                        });
+                    else if (b is not (Block.ToolUseBlock or Block.ReasoningBlock)
+                             && UnsupportedBlock.Skippable(b) is { } note)
+                        parts.Add(new JsonObject { ["type"] = blockType, ["text"] = note });
+                }
+            }
+
             items.Add(new JsonObject
             {
                 ["type"] = "message",   // 必须——少了它上游报 upstream_error
                 ["role"] = role,
-                ["content"] = new JsonArray(
-                    texts.Select(t => (JsonNode)new JsonObject { ["type"] = blockType, ["text"] = t })
-                        .ToArray()),
+                ["content"] = parts,
             });
         }
 

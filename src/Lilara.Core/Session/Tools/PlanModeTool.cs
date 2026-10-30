@@ -147,6 +147,8 @@ public sealed class PlanModeTool : ITool
                     ],
                     // ⚠️ 空 = 不给「记住」（见上）。
                     Remember = [],
+                    // ⚠️ 这一问替**退出模式**那条调用问的（答完只执行它）。
+                    CallIds = [call.CallId],
                 },
             });
         }

@@ -2258,4 +2258,56 @@ public class ControlServerTests : IAsyncLifetime
         // ⇒ 现在头把这句话画在**重拉之后**，前提正是它随事件一起来。
         Assert.Equal(ackNote, eventReason);
     }
+
+    // ---- 库的两个端点（2026-10-29，`03` §9.1 / §9.4）----
+    //
+    // ⚠️ **这两条一起构成了"看图片"的入口**：上传把字节放进库、发送时用它的地址，
+    // 而头显示历史里的图要能从地址取回字节。少一条，那条链就断在两头中间。
+
+    [Fact]
+    public async Task Files_UploadThenFetch_GivesBackTheSameBytes()
+    {
+        var png = Convert.FromBase64String(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==");
+
+        using var content = new ByteArrayContent(png);
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("image/png");
+
+        var upload = await Client.PostAsync(Http("/files"), content);
+        upload.EnsureSuccessStatusCode();
+
+        var receipt = JsonDocument.Parse(await upload.Content.ReadAsStringAsync()).RootElement;
+        var sha = receipt.GetProperty("ref").GetString()!;
+        Assert.Equal(png.Length, receipt.GetProperty("bytes").GetInt32());
+
+        // ⚠️ 地址就是**内容哈希**（内容寻址）：同一串字节再传一次必须得到同一个 ref。
+        using var again = new ByteArrayContent(png);
+        again.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("image/png");
+        var second = JsonDocument.Parse(
+            await (await Client.PostAsync(Http("/files"), again)).Content.ReadAsStringAsync()).RootElement;
+        Assert.Equal(sha, second.GetProperty("ref").GetString());
+
+        var fetched = await Client.GetAsync(Http($"/store/{sha}"));
+        fetched.EnsureSuccessStatusCode();
+        Assert.Equal(png, await fetched.Content.ReadAsByteArrayAsync());
+        Assert.Equal("image/png", fetched.Content.Headers.ContentType?.MediaType);   // 按 magic 认出来的
+    }
+
+    [Fact]
+    public async Task Files_RejectsAnEmptyOrUnlabelledBody()
+    {
+        using var empty = new ByteArrayContent([]);
+        empty.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("image/png");
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest,
+            (await Client.PostAsync(Http("/files"), empty)).StatusCode);
+
+        using var unlabelled = new ByteArrayContent([1, 2, 3]);
+        unlabelled.Headers.ContentType = null;   // 没有 Content-Type ⇒ 不知道它是什么
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest,
+            (await Client.PostAsync(Http("/files"), unlabelled)).StatusCode);
+
+        // 库里没有的地址：404（不是 500，也不是一段空 body）。
+        Assert.Equal(System.Net.HttpStatusCode.NotFound,
+            (await Client.GetAsync(Http($"/store/{new string('f', 64)}"))).StatusCode);
+    }
 }

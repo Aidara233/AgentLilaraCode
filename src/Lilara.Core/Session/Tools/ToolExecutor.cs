@@ -203,6 +203,11 @@ public sealed class ToolExecutor(
 
         var asks = new List<AskRequest>();
 
+        // ⚠️ **这一轮在问的那几条调用**（协议 id）。它们**不跑、也不落结果**——那一条结果要等回答。
+        // 它同时是「哪几条**不用**跑」的判据（见第三趟），所以**产出 `Ask` 的那一刻**就得记下，
+        // 而不是事后从 `AskRequest.CallIds` 猜（那个字段是给**答复**那条路用的）。
+        var asked = new HashSet<string>(StringComparer.Ordinal);
+
         // ---- 第二趟：收问。 ----
         foreach (var plan in plans)
         {
@@ -215,6 +220,7 @@ public sealed class ToolExecutor(
             if (plan.Verdict is Verdict.Ask)
             {
                 asks.Add(Gate.AskFor(plan.Tool, plan.Call, permissionLevel));
+                asked.Add(plan.Call.CallId);
                 continue;
             }
 
@@ -225,12 +231,25 @@ public sealed class ToolExecutor(
                 var outcome = await plan.Tool.RunAsync(
                     new ToolCall(plan.Call.CallId, plan.Call.Name, plan.Call.Arguments), context, ct);
 
-                if (outcome.Ask is { } ask) asks.Add(ask);
+                if (outcome.Ask is { } ask)
+                {
+                    asks.Add(ask);
+                    asked.Add(plan.Call.CallId);
+                }
             }
         }
 
         // ---- 第三趟：有问 ⇒ 一条都不跑；否则全部执行。 ----
-        if (asks.Count > 0) return new Batch([], Merge(asks));
+        //
+        // ⚠️ **那个「一条都不跑」只对<b>新的一步</b>成立**（`reply is null`）：那时一条都没执行过，
+        // 「先判全」保住的正是「记录不会出现半批」。⚠️ <b>答复那一步（`reply != null`）必须分开</b>
+        // ——用户已经就**已经答到的那几条**说过话了：
+        //   · 让它们照常跑完、落结果，答案才留得下来；
+        //   · 只把**这一轮才要问**的那几条挂起。
+        // ⚠️ 不分开的话，实测（2026-10-29）就是那个死循环：一批里同时有 `plan` 与 `ask` 时，
+        // 答复之后**又**冒出一条要问的 ⇒ 整批不跑 ⇒ 上一次的答案**一个字都没落盘** ⇒
+        // 下一轮又问同一句，永不收敛（用户看到的「反复要求询问，只能作废」）。
+        if (asks.Count > 0 && reply is null) return new Batch([], Merge(asks));
 
         var results = new List<TimelineEvent.ToolResultEvent>(calls.Count);
 
@@ -246,6 +265,11 @@ public sealed class ToolExecutor(
         var executed = new List<string>(calls.Count);
         foreach (var plan in plans)
         {
+            // ⚠️ **这一轮在问的那几条：不跑、也不配对**（见上面那个 `asked`）。
+            // 它们的结果要等用户回答，所以这一批里一条都不能有——而其余那几条照常跑，
+            // 于是「答复之后又冒出一条要问」不再让整批作废（2026-10-29）。
+            if (asked.Contains(plan.Call.CallId)) continue;
+
             // ⚠️ **问意见（`Question`）那条：用户答复过的不跑**（`01` §3.8）。
             //
             // <para>`ask` 问的不是「准不准跑」——它问的是「你怎么想」，而**答案本身就是内容**
@@ -305,7 +329,7 @@ public sealed class ToolExecutor(
             });
         }
 
-        return new Batch(results, null)
+        return new Batch(results, asks.Count > 0 ? Merge(asks) : null)
         {
             ExecutedCallIds = executed,
             Spawns = spawns,
@@ -315,11 +339,18 @@ public sealed class ToolExecutor(
     }
 
     /// <summary>
-    /// 一趟执行的两个产出（`01` §3.8）。⚠️ <b>两者互斥</b>：
-    /// <see cref="Pending"/> 非 null ⇒ <see cref="Results"/> 必然是空的（一条都没跑）。
-    /// <para>⚠️ 挂起时 <see cref="Batch.ExecutedCallIds"/> 也是空的：那一趟**一条都没跑**。</para>
+    /// 一趟执行的两个产出（`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>它们**不是**互斥的</b>（2026-10-29 改，而这一格是那条死循环的一半）：
+    /// <see cref="Results"/> 非空、<see cref="Pending"/> 也非 null ⇒ 这是<b>答复那一步</b>
+    /// ——已经答到的那几条跑完了（结果在这里），而**这一轮才要问**的那几条还没配对
+    /// （等用户回答）。⚠️ <b>新的一步里仍然互斥</b>（`reply == null` ⇒ 有问则一条都不跑），
+    /// 因为那时一条都还没执行过，而「记录里出现半批」正是要防的东西。</para>
     /// </summary>
-    /// <param name="Results">按调用序的结果。⚠️ 有问时恒空——见类型注释。</param>
+    /// <param name="Results">
+    /// 按调用序的结果。⚠️ 新的一步里有问时恒空；答复那一步里可以非空（见类型注释）。
+    /// ⚠️ <b>被问的那几条在这里<b>没有</b>结果</b>——它们的 `tool_use` 继续悬着，等回答。
+    /// </param>
     /// <param name="Pending">要问用户的那件事。⚠️ <c>null</c> = 没问。</param>
     public sealed record Batch(
         IReadOnlyList<TimelineEvent.ToolResultEvent> Results, AskRequest? Pending)
@@ -336,8 +367,10 @@ public sealed class ToolExecutor(
         ///
         /// <para>⚠️ <b>它是执行器唯一知道、而调用方无法重建的事实</b>：拒绝理由与补丁正文
         /// 都是内容，但「这条到底跑没跑」只有这一步知道。⇒ 由执行器交回，而不是让
-        /// 推进器拿结果去猜。⚠️ 只有真正执行的分支会填它；拒绝 / 不存在 / 挂起 / 提问答复
-        /// （答案由核心拼，工具没跑）**一律为空**。</para>
+        /// 推进器拿结果去猜。⚠️ 只有真正执行的分支会填它；拒绝 / 不存在 / 被这一轮问住的 /
+        /// 提问答复（答案由核心拼，工具没跑）**一律为空**。
+        /// ⚠️ 答复那一步可以<b>同时</b>有内容与一个 <see cref="Pending"/>（已答到的那几条跑了，
+        /// 这一轮才要问的那几条没跑）：名单只说**跑过的**，所以推进器照它落地不会漏也不会多。</para>
         /// </summary>
         public IReadOnlyList<string> ExecutedCallIds { get; init; } = [];
 
@@ -374,8 +407,10 @@ public sealed class ToolExecutor(
     /// 用户分不清「我答的是不是要它去做」——而那个区别是**整套设计的分界线**。
     /// 今天两条路不会同时出现（`Permission` 只来自闸门、`Question` 只来自 `ask` 工具），
     /// 但**判据必须写下来**，否则将来放宽时没人知道它曾经是个约束。
-    /// ⚠️ 真出现混合时按**先到的那个 Kind** 走，剩下的自然留到下一张卡
-    /// （它们的 `tool_use` 也还没配对，下一趟会再问一次）。</para>
+    /// ⚠️ 真出现混合时按**先到的那个 Kind** 走，剩下的留到**下一张卡**
+    /// （它们的 `tool_use` 还没配对，下一趟会再问一次）。⚠️ 而「留到下一张卡」只在
+    /// **答复那一步不再整批作废**时才成立——2026-10-29 之前它不成立，于是混合批次
+    /// 变成「反复问同一句」（见 <see cref="ExecuteAsync"/> 第三趟那条注释）。</para>
     /// </summary>
     private static AskRequest Merge(IReadOnlyList<AskRequest> asks)
     {
@@ -389,6 +424,9 @@ public sealed class ToolExecutor(
             Items = [.. same.SelectMany(a => a.Items)],
             // ⚠️ 记忆档位取**并集**：同一批里两个调用的可记忆性不同，而卡片只画一次。
             Remember = [.. same.SelectMany(a => a.Remember).Distinct()],
+            // ⚠️ **盖住的调用也取并集**（2026-10-29）：一张卡同时替这几条调用问的，
+            // 答完要盖住的正是它们——而「这一批里的第一条」不是答案（见 `AskRequest.CallIds`）。
+            CallIds = [.. same.SelectMany(a => a.CallIds).Distinct(StringComparer.Ordinal)],
         };
     }
 

@@ -175,6 +175,8 @@ public static class Gate
             Items = SecondHalfOf(call, cls, current),
             // ⚠️ 两档都给，**粗的那档由卡片负责写明**（见 `AskMemory`）。
             Remember = [AskMemory.Args, AskMemory.Tool],
+            // ⚠️ 这一问只替**这一条**调用问的（答完只执行它——见 `AskRequest.CallIds`）。
+            CallIds = [call.CallId],
         };
     }
 
