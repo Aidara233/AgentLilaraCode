@@ -351,15 +351,28 @@
 ["9eac068ae472", "c0ffee123456"]
 ```
 
-某个项目下的会话 id 列表（`SessionStore.ListSessions`）。**包含归档会话**。
+某个项目下的会话 id 列表（`SessionStore.ListSessions`）。**包含归档会话**——
+这是「一个项目下有哪些会话」的唯一定义（`/claims` 也走它）。
+⚠️ 别拿它当「列表」用：`GET /sessions` 那两个端点**只给一侧**（未归档 / 归档，见 §3.6），
+而这里的取舍是「列全」，滤掉的那一份在别处（`SessionStore.ChildrenOf`）。
 排序：`createdAt` **降序**（最新的在前），同一时刻按 id 升序（`SessionStore.cs:161-173`）。
 不存在的 pk ⇒ `[]`（不报 404）。
 ⚠️ `spec.json` 读不出来的会话**不列**（版本太新或损坏都算）。
 证据：`ControlServer.cs:214-215`。
 
-### 3.6 `GET /sessions`
+### 3.6 `GET /sessions` · `GET /sessions/archived`
 
-**一次拿全**所有会话的运行状态（`ControlServer.cs:227-316`）。
+**一次拿全某一侧的会话运行状态**（两个端点同一个行构建器 `ControlServer.SessionRows`）：
+
+- `GET /sessions` ⇒ **未归档**的会话（`spec.archivedAt` 空的那些）。
+- `GET /sessions/archived` ⇒ **已归档**的会话（`archivedAt` 有值）。
+
+⚠️ **归档会话 2026-10-29 起不再出现在 `/sessions` 里**（`b1d6df9`）。
+`/sessions` 的 URL 与**响应数组形状都没变**，所以旧客户端不改请求也仍能读到活动会话；
+但「一个端点拿全 + 本地按 `archivedAt` 过滤」的写法在新核心上会**一条归档都画不出来**
+——过滤逻辑还在，那几行根本不在列表里。要看归档的就**单独**读 `/sessions/archived`
+（两边形状逐字相同，只是 `archivedAt` 不同）。别在客户端把两边「顺手」合并成一份全量：
+首屏与轮询不该背归档那一坨。
 
 ```jsonc
 [
@@ -371,6 +384,7 @@
     "turn": 3,
     "title": "重构",             // 可空 ⇒ 键可能整个不存在
     "parentSessionId": "",      // 顶层会话 = 空串；子会话 = 父的 sessionId
+    "archivedAt": "2026-10-29T04:45:06+00:00",  // 未归档 ⇒ 键不存在（只在 /sessions/archived 上有值）
     "ask": {                    // 没在等的时候是 {}
       "askId": "…",
       "toolName": "write",
@@ -386,13 +400,18 @@
   `{}` 在 JS 里是 truthy，`if (row.ask)` 会误判。
 - ⚠️ `goal` 同理**永远是对象**（判 `row.goal?.active`）。它只是主动性轴的投影：
   `goal.active === (axes.initiative === "goal")`，没有第二份目标状态。
-- ⚠️ `title` 未起名时**键不存在**（`WhenWritingNull`）。判据是 `row.title`。
+- ⚠️ `title` / `archivedAt` 为空时**键不存在**（`WhenWritingNull`）。判据是 `row.title` / `row.archivedAt`。
+- ⚠️ `parentSessionId` 交的是 spec 里的**出生事实**，不是「父还在不在」：父被删掉之后这个 id
+  仍然指着它 ⇒ 客户端该「挂不上就按顶层画」，不是「当作没这回事」。
 - `status` 与 `active` 是**两件事**：`active` = 载入内存了；`running` 是 `status`。
   今天两者恰好同延（队列随内存一起丢），但别当同一个概念。
-- ⚠️ **这个端点绝不激活会话**（与 `/state` 不同）。读它不会把会话载入内存、不会触发回收。
+- ⚠️ **这两个端点都绝不激活会话**（与 `/state` 不同）。读它不会把会话载入内存、不会触发回收。
 - 顺序：项目序 × 项目内会话序，由既有的 `ListProjects` / `ListSessions` 定。
-- 坏 `state.json` 的会话**跳过**（不 500）。坏 `spec.json` 的会话**列不出来**。
-- 证据：`ControlServer.cs:227-316`；键集守卫 `ControlServerTests.Snapshot_Sessions_CarriesExactlyTheseKeys`。
+- **失败隔离到单条**（`b1d6df9`）：坏 `state.json` / 坏 `spec.json` / 较新的格式都只让**那一条**不出现，
+  其余照列；一个项目目录整个读不出来（`IOException` / `UnauthorizedAccessException`）⇒ 那一个项目跳过；
+  连项目列表都枚举不了 ⇒ `503`（`{"error": "无法枚举项目目录：…"}`），不是空数组。
+- 证据：`ControlServer.cs` 的 `SessionRows`；
+  守卫 `ControlServerTests.SessionsEndpoints_SeparateArchivedRowsAndSkipCorruptStateWithoutChangingLegacyShape`。
 
 ### 3.7 `GET /sessions/{id}/state`
 
@@ -1207,6 +1226,8 @@ PUT  /sessions/{id}/plan      ← { operation, nodes?, parentId?, index?, ids? }
 6. `approval.respond` 的授权判决放在 `answers.decision`（`"allow"`），
    `remember` 发 `"tool"` 就是工具级放开。
 7. `GET /sessions` 的 `ask` 空值是 `{}`，判据是 `ask?.askId`；`title` 可能整个不存在。
+   ⚠️ 归档会话**不在** `GET /sessions` 里（2026-10-29 起），归档那份单独读
+   `GET /sessions/archived`；两边行形状逐字相同，`archivedAt` 未归档时那个键不存在。
 8. `GET /directories` 的 `error` 成功时是显式 `null`，不是省略。
 9. `GET /sessions/{id}/history` 的 `nextCursor` 到头时是 `""`；
    `GET /sessions/{id}/context` 的 `preview` 今天恒为 `null`（键在）。
@@ -1218,7 +1239,7 @@ PUT  /sessions/{id}/plan      ← { operation, nodes?, parentId?, index?, ids? }
 | 位置 | 写的 | 实际 |
 |---|---|---|
 | `03` §6 `/history`「分页未实现」、§11「零个 `Request.Query`」 | 无分页 | 有 `limit` / `before` / `hasMore` / `nextCursor`（§3.8） |
-| `03` §6 端点清单 | 缺 4 条 usage / context | 实际共 **19** 个 `MapGet`（§3.14–§3.17 是 usage / context；§3.18 是 `/network-config`；§3.19 是 `/shell-config`） |
+| `03` §6 端点清单 | 缺 4 条 usage / context | 实际共 **23** 条 `MapGet`（截至 `b1d6df9`；`/sessions` 与 `/sessions/archived` 各一条）（§3.14–§3.17 是 usage / context；§3.18 是 `/network-config`；§3.19 是 `/shell-config`） |
 | `03` §4.2 事件载荷表 | 缺新事件 | 缺 `session.reclaimed`、`release.recorded`、`tool.result.appended`、`usage.updated`、`session.compaction.completed`，缺 `message.appended.historyId` |
 | `03` §4「已上线」表 | 20 个事件名 | 20 个类型（`WireEvent.cs:8-28`）✅ 数对，但 §4.2 载荷表没跟上 |
 | `03` §7「hello(lastSeq)」 | 有这个帧 | ❌ 不存在（§2.2） |
