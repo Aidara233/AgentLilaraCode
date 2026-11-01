@@ -23,16 +23,17 @@
 
 | 项 | 值 | 证据 |
 |---|---|---|
-| 监听地址 | **默认仅 `127.0.0.1`**；环境变量 `LILARA_BIND` 可显式改成 `0.0.0.0` / 某个网卡地址 / `::` | `ControlServer.DefaultBindAddress`（`Control/ControlServer.cs:57`）、`BindAddressResolver`（`Control/BindAddressResolver.cs`） |
-| 默认端口 | `17988`；环境变量 `LILARA_PORT` 覆盖 | `ControlServer.DefaultPort`（`:40`）、`Program.cs` |
-| HTTP 基址 | `http://{监听地址}:{port}`（默认即 `http://127.0.0.1:17988`） | `ControlServer.Url`（`:69`） |
-| WS 端点 | `ws://{监听地址}:{port}/ws` | `ControlServer.cs:956` |
-| 鉴权 | **没有**。「本机唯一核心、本机进程即可信」（`03` §10）——所以**默认只监听本机**就是唯一边界 | — |
-| CORS | `Access-Control-Allow-Origin: *`；允许动词 `GET, POST, PUT, DELETE, OPTIONS`；预检 `OPTIONS` 回 `204` | `ControlServer.cs:94` |
+| 监听地址 | **默认 `0.0.0.0`（对局域网开放）**；环境变量 `LILARA_BIND` 可改回 `127.0.0.1` 或指定某个网卡地址 | `ControlServer.DefaultBindAddress`（`Control/ControlServer.cs`）、`BindAddressResolver`（`Control/BindAddressResolver.cs`） |
+| 默认端口 | `17988`；环境变量 `LILARA_PORT` 覆盖 | `ControlServer.DefaultPort`、`Cli/Program.cs` |
+| HTTP 基址 | `http://{监听地址}:{port}`（默认即 `http://0.0.0.0:17988`） | `ControlServer.Url` |
+| WS 端点 | `ws://{监听地址}:{port}/ws`（鉴权开启时再带 `?token=…`） | `ControlServer.MapWebSocket` |
+| 鉴权 | **可选**：`LILARA_AUTH=1` 时校验访问 token（`ControlAuth`）。token 启动时生成并打印在控制台；HTTP 用 `Authorization: Bearer <token>`，WS 用 `?token=<token>`。**默认不校验** | `Control/ControlAuth.cs`、`Cli/Program.cs` |
+| CORS | `Access-Control-Allow-Origin: *`；允许头 `content-type, authorization`；允许动词 `GET, POST, PUT, DELETE, OPTIONS`；预检 `OPTIONS` 回 `204` | `ControlServer.StartAsync` |
 
-⚠️ **`LILARA_BIND` 一设成非环回地址，边界就只剩网络可达性**：核心没有鉴权，也没有请求限速——
+⚠️ **默认状态没有任何网络边界**：默认绑 `0.0.0.0` 且默认不校验 token ⇒
 任何能路由到该端口的人/程序都能建会话、发消息、执行工具、读本机能读到的文件、花掉 provider 的额度。
-`safety` / `permission` 轴挡的是**模型**，不是**连接者**。只在自己信得过的网络里这样跑；启动横幅会复述这段代价。
+`safety` / `permission` 轴挡的是**模型**，不是**连接者**。启动横幅每次都会复述这段代价，并给出两条收回路：
+`LILARA_BIND=127.0.0.1`（只本机）与 `LILARA_AUTH=1`（要 token）。
 - 判定「是不是只在本机」用的是 `BindAddressResolver.IsLoopbackOnly`；主机名 / 通配符**判不出来时按对外算**
   （警告宁可多响一次）。
 - IPv6 字面量在 URL 里自动补方括号（`::` ⇒ `http://[::]:17988`），`/info` 与横幅交出的地址可以直接用。
@@ -40,15 +41,29 @@
 ### 1.1 WS 握手的 Origin 闸
 
 - 请求**不带** `Origin` 头 ⇒ **放行**（curl / 脚本 / 测试都不带）。
-- 带了 ⇒ 必须**逐字等于**生效的 allowed origin（默认 `http://127.0.0.1:17990`，
-  即头的默认端口；由 `LILARA_ALLOWED_ORIGIN` 或 `LILARA_HEAD_PORT` 推导），否则 **403**。
-- ⚠️ 对外开放（`LILARA_BIND`）之后，页面 origin 是**它实际被访问的地址**（如 `http://192.168.1.5:17990`）；
-  `LILARA_HEAD_PORT` 推导出来的永远是 `127.0.0.1` 那个 ⇒ 必须用 `LILARA_ALLOWED_ORIGIN` 显式指定。
-  它**只收一个值**：本机页面与远端页面不能同时放行（要么只开一边，要么从同一个 origin 进）。
-- ⚠️ `localhost` 与 `127.0.0.1` **不是同一个 origin**（按浏览器的判法），`localhost` 会被拒。
-- ⚠️ 这是**防网页**，不是鉴权：非浏览器客户端可以伪造 `Origin`。
+- 带了 ⇒ 必须**匹配**生效的 allowed-origin 模式（默认 `http://*:17990`：**任意主机 + 头端口**；
+  由 `LILARA_ALLOWED_ORIGIN` 或 `LILARA_HEAD_PORT` 推导），否则 **403**。匹配规则见 `Control/OriginMatcher.cs`。
+- ⚠️ **为什么主机段是 `*`**：头绑 `0.0.0.0` 之后，页面会从 `http://192.168.1.5:17990`、`http://localhost:17990`
+  等多种措辞打开，逐字相等会把它们全部**静默**拒绝（握手 403 时浏览器不把响应体交给页面 JS）。
+  放开的只有主机这一维，**端口仍然钉死** ⇒ 随便一个网页（端口对不上）照样进不来。
+- 要回到「只认一个 origin」：`LILARA_ALLOWED_ORIGIN=http://127.0.0.1:17990`（字面量走逐字相等，`localhost` 会被拒）。
+  `LILARA_ALLOWED_ORIGIN=*` 放行任意 origin，只该在调试时用。
+- ⚠️ 这是**防网页**，不是鉴权：非浏览器客户端可以伪造 `Origin`。要拦人用 `LILARA_AUTH`。
 - 403 的响应体只有非浏览器客户端看得到（浏览器不把 WS 握手的响应体交给页面 JS）。
-  想知道核心接受了哪个 origin，读 `GET /info` 的 `allowedOrigin`。
+  想知道核心接受了哪个模式，读 `GET /info` 的 `allowedOrigin`。
+
+### 1.2 访问 token（`LILARA_AUTH`）
+
+- **总是生成、总是打印**：核心启动横幅里有一行 `访问 token …`（32 字节随机数的 base64url）。
+  打印没有额外代价——看得到控制台的人本来就能驱动核心；不打印的话，开了鉴权就没人知道该填什么。
+- **只有 `LILARA_AUTH` 为真值**（`1` / `true` / `on` / `yes`）时才真的校验。默认不校验。
+- 两种交法，缺一不可：HTTP 的 `Authorization: Bearer <token>`（页面用 `fetch` 包装统一加），
+  以及查询参数 `?token=<token>`——浏览器的 `WebSocket` 构造函数**不能自定义请求头**，WS 握手只有这一条路。
+- **豁免两处**：`OPTIONS` 预检（浏览器不会带凭据）与 `GET /info`
+  （页面与头靠它知道「要不要填 token」）。未授权的 `/info` **只交最小一格**：
+  `authRequired` / `coreVersion` / `allowedOrigin` / `endpoints`，**不交**本机路径。
+- **它是明文 HTTP**：同一局域网里的嗅探者能看到 token 本身。它的用途是「拦住随手连上来的人」，
+  不是加密；要防嗅探得上 TLS 或隧道。
 
 ## 2. WS 线格式
 
@@ -287,9 +302,9 @@
 ```
 
 - `sessions` 是**在内存里的**会话数（`CoreHost.Activated`），不是盘上的总数。
-- ⚠️ `dataRoot` / `workingDirectory` 是本机绝对路径。CORS 是 `*`，任何本机网页都读得到。
-  这是接受过的取舍——边界是**默认只绑本机**；`LILARA_BIND` 对外之后，这些路径也一并对外（见 §1）。
-- 证据：`ControlServer.cs:121-128`。
+- ⚠️ `dataRoot` / `workingDirectory` 是本机绝对路径。CORS 是 `*`，任何能连上来的网页都读得到。
+  这是接受过的取舍（默认绑 `0.0.0.0`，见 §1）；开了 `LILARA_AUTH=1` 之后，未授权的请求连这个端点都被 401 挡住。
+- 证据：`ControlServer.cs` 的 `MapSnapshots`。
 
 ### 3.2 `GET /info`
 
@@ -298,16 +313,20 @@
   "dataRoot": "…",
   "workingDirectory": "…",
   "coreVersion": "1.0.0.0",
-  "allowedOrigin": "http://127.0.0.1:17990",
-  "endpoints": { "http": "http://127.0.0.1:17988", "ws": "ws://127.0.0.1:17988/ws" }
+  "allowedOrigin": "http://*:17990",
+  "authRequired": false,
+  "endpoints": { "http": "http://0.0.0.0:17988", "ws": "ws://0.0.0.0:17988/ws" }
 }
 ```
 
-- `allowedOrigin` 是**生效值**，不是默认常量。
-- `endpoints` 交的是**实际绑定的地址**：用 `LILARA_BIND` 对外时这里会是 `0.0.0.0` / 网卡地址（IPv6 带方括号），
-  不一定是客户端该填的那个可达地址。
+- `allowedOrigin` 是**生效值**（可能是带 `*` 的模式），不是默认常量。
+- `authRequired` 是页面「要不要弹 token 输入框」的唯一依据（鉴权闸**放行**本端点，见 §1.2）。
+  ⚠️ 开启鉴权且请求**未授权**时，本端点只交最小一格：
+  `authRequired` / `coreVersion` / `allowedOrigin` / `endpoints`，**不交** `dataRoot` / `workingDirectory`。
+- `endpoints` 交的是**实际绑定的地址**：默认绑 `0.0.0.0` 时这里就是 `0.0.0.0`（IPv6 带方括号），
+  **不是**客户端该填的那个可达地址——页面用的是头推导出来的地址（`/config.json`）。
 - WS 握手被拒的浏览器页面看不到 403 响应体 ⇒ 头部应该拉这个端点、跟 `location.origin` 比对后显示原因。
-- 证据：`ControlServer.cs:134-141`。
+- 证据：`ControlServer.cs` 的 `MapSnapshots`。
 
 ### 3.3 `GET /projects`
 

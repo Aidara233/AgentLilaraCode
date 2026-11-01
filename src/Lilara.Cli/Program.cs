@@ -150,17 +150,28 @@ var port = int.TryParse(Environment.GetEnvironmentVariable("LILARA_PORT"), out v
 // WS 的 Origin 白名单跟随头自己的端口配置。
 var allowedOrigin = AllowedOriginResolver.Resolve();
 
-// ⚠️ 监听地址**默认仍是本机**；对外是一条显式决定（核心没有鉴权，见下面 `PrintExternalBindWarning`）。
+// ⚠️ 监听地址**默认对局域网开放**（0.0.0.0）；要收回本机设 `LILARA_BIND=127.0.0.1`。
 var bind = BindAddressResolver.Resolve();
 
-var controlServer = new ControlServer(host, dispatcher, bus, port, allowedOrigin.Origin, bind.Address);
+// ⚠️ **访问 token 总是生成、总是打印，只有 `LILARA_AUTH` 为真值时才真的校验**（`ControlAuth`）。
+// 打印它没有额外代价（看得到控制台的人本来就能驱动核心）；不打印的话，开了鉴权就没人知道该填什么。
+var authToken = ControlAuth.GenerateToken();
+var authEnforced = ControlAuth.IsEnforced();
+
+var controlServer = new ControlServer(
+    host, dispatcher, bus, port, allowedOrigin.Origin, bind.Address,
+    authEnforced ? authToken : null);
 WebApplication? api = null;
 try
 {
     api = await controlServer.StartAsync(CancellationToken.None);
     Console.WriteLine($"  控制面 {controlServer.Url}（{BindAddressResolver.Describe(bind.Source)}）");
-    Console.WriteLine($"  WS 只接受来自 {allowedOrigin.Origin} 的页面（{AllowedOriginResolver.Describe(allowedOrigin.Source)}）。");
-    PrintExternalBindWarning(controlServer);
+    Console.WriteLine($"  WS 只接受来自 {allowedOrigin.Origin} 的页面（{AllowedOriginResolver.Describe(allowedOrigin.Source)}）——{OriginMatcher.Describe(allowedOrigin.Origin)}。");
+    Console.WriteLine($"  访问 token {authToken}");
+    Console.WriteLine(authEnforced
+        ? $"  鉴权已开启（{ControlAuth.EnforceEnvVar}）：所有请求都要带它——HTTP 用 `Authorization: Bearer <token>`，WebSocket 用 `?{ControlAuth.QueryParam}=<token>`。"
+        : $"  鉴权未开启（默认放行）：任何能连到这个端口的人/程序都能驱动核心。要拦：设 {ControlAuth.EnforceEnvVar}=1 重启，再把上面那行 token 填进页面。");
+    PrintExternalBindWarning(controlServer, authEnforced);
 }
 catch (Exception ex)
 {
@@ -232,19 +243,25 @@ try { File.Delete(heartbeatFile); } catch (IOException) { /* 删不掉最多误�
 return 0;
 
 /// <summary>
-/// 绑在环回之外时把代价说出来。⚠️ 核心**没有鉴权**（`03` §10）：能连到这个端口的人/程序
-/// 就能驱动模型、执行工具、读本机能读到的文件。默认不让它发生；发生时必须说得出来
-/// （`09` §1 把这条取舍写成了文档，这里负责让**不读文档的人**也看得见）。
+/// 绑在环回之外时把代价说出来。⚠️ 默认对局域网开放、而 token **默认不校验**：
+/// 能连到这个端口的人/程序就能驱动模型、执行工具、读本机能读到的文件。
+/// 这是默认值带来的代价（不是「用户手滑」），所以每次启动都要说；也每次都给出两条收回的路。
 /// </summary>
-static void PrintExternalBindWarning(ControlServer server)
+static void PrintExternalBindWarning(ControlServer server, bool authEnforced)
 {
     if (!server.IsExternallyBound) return;
 
-    Console.Error.WriteLine("  ⚠️ 控制面不只监听本机 —— 核心没有鉴权：任何能访问该端口的人/程序都能驱动它。");
-    Console.Error.WriteLine($"     只在自己信得过的网络里这样跑。要收回：不设 {BindAddressResolver.EnvVar} 重启。");
-    Console.Error.WriteLine("     浏览器页面还要把它**自己**的 origin 配进 LILARA_ALLOWED_ORIGIN，否则 WS 握手会被拒。");
+    // ⚠️ 这两句**必须随鉴权状态切换**：开了鉴权还说「默认不校验」，
+    // 用户会以为自己刚开了个寂寞（或者以为我这里印错）——两种都不该发生。
+    Console.Error.WriteLine(authEnforced
+        ? "  ⚠️ 控制面对局域网开放 —— 但 token 校验已开启：没有 token 的人连不进来。"
+        : "  ⚠️ 控制面对局域网开放 —— 任何能访问该端口的人/程序都能驱动它（默认不校验 token）。");
+    Console.Error.WriteLine($"     只在自己信得过的网络里这样跑。要收回本机：设 {BindAddressResolver.EnvVar}=127.0.0.1 重启。");
+    Console.Error.WriteLine(authEnforced
+        ? $"     要关掉鉴权：不设 {ControlAuth.EnforceEnvVar} 重启（那时任何人连上来都能驱动核心）。"
+        : $"     要拦人：设 {ControlAuth.EnforceEnvVar}=1 重启（上方那行 token 就是要填进页面的那个）。");
 
-    // 通配符绑定时把本机 IPv4 列出来：另一台机器上的头/脚本要填的就是这些地址之一。
+    // 通配符绑定时把本机 IPv4 列出来：另一台机器上的浏览器要打开的就是这些地址之一。
     if (server.BindAddress is not ("0.0.0.0" or "*" or "::" or "[::]")) return;
 
     try

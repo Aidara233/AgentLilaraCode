@@ -48,7 +48,7 @@ public class AllowedOriginResolverTests
 
         var resolved = AllowedOriginResolver.Resolve(getEnv);
 
-        Assert.Equal("http://127.0.0.1:7791", resolved.Origin);
+        Assert.Equal("http://*:7791", resolved.Origin);
         Assert.Equal(AllowedOriginSource.Environment, resolved.Source);
     }
 
@@ -57,7 +57,7 @@ public class AllowedOriginResolverTests
     {
         var resolved = AllowedOriginResolver.Resolve(HeadPort("7791"));
 
-        Assert.Equal("http://127.0.0.1:7791", resolved.Origin);
+        Assert.Equal("http://*:7791", resolved.Origin);
         Assert.Equal(AllowedOriginSource.Environment, resolved.Source);
     }
 
@@ -82,7 +82,7 @@ public class AllowedOriginResolverTests
     {
         var resolved = AllowedOriginResolver.Resolve(_ => null);
 
-        Assert.Equal("http://127.0.0.1:17990", resolved.Origin);
+        Assert.Equal("http://*:17990", resolved.Origin);
         Assert.Equal(AllowedOriginSource.Default, resolved.Source);
     }
 
@@ -110,7 +110,7 @@ public class AllowedOriginResolverTests
     [Fact]
     public void Default_ComesFromControlServer_NotASecondLiteral()
     {
-        Assert.Equal("http://127.0.0.1:17990", ControlServer.DefaultAllowedOrigin);
+        Assert.Equal("http://*:17990", ControlServer.DefaultAllowedOrigin);
     }
 
     // ---- 同一个 origin、两种来源，调用方必须能分开 ----
@@ -118,7 +118,7 @@ public class AllowedOriginResolverTests
     [Fact]
     public void Resolve_SameOriginFromDifferentSourcesIsDistinguishable()
     {
-        var explicitSame = AllowedOriginResolver.Resolve(Env(AllowedOriginResolver.OriginEnvVar, "http://127.0.0.1:17990"));
+        var explicitSame = AllowedOriginResolver.Resolve(Env(AllowedOriginResolver.OriginEnvVar, "http://*:17990"));
         var byDefault = AllowedOriginResolver.Resolve(_ => null);
 
         Assert.Equal(explicitSame.Origin, byDefault.Origin);

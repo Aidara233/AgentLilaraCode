@@ -23,7 +23,8 @@ namespace Lilara.Core.Control;
 public sealed class ControlServer(
     CoreHost host, CommandDispatcher dispatcher, EventBus bus, int port,
     string allowedOrigin = ControlServer.DefaultAllowedOrigin,
-    string? bindAddress = null)
+    string? bindAddress = null,
+    string? authToken = null)
 {
     /// <summary>
     /// 控制面默认端口。
@@ -40,21 +41,25 @@ public sealed class ControlServer(
     public const int DefaultPort = 17988;
 
     /// <summary>
-    /// 默认只放行头自己的 origin。
+    /// 默认放行的 Origin 模式：**任意主机，但端口必须是头那个**。
     ///
     /// <para>⚠️ <b>它必须与 <c>src/Lilara.Head/Program.cs</c> 的默认头端口是同一个数</b>——
     /// 两份副本，而 `AllowedOriginResolver` 会在环境变量缺席时用这里兜底。</para>
+    ///
+    /// <para>⚠️ <b>主机段是 <c>*</c>（2026-11-05 随监听地址一起放开）</b>：头默认绑 <c>0.0.0.0</c>，
+    /// 页面会从局域网 IP / localhost 等**多种措辞**打开，逐字相等会把它们全部静默拒绝。
+    /// 钉住端口这一维，是「局域网能用」与「随便一个网页连不进来」之间那条线。</para>
     /// </summary>
-    internal const string DefaultAllowedOrigin = "http://127.0.0.1:17990";
+    internal const string DefaultAllowedOrigin = "http://*:17990";
 
     /// <summary>
-    /// 默认只监听本机（核心是本设备唯一的，本机进程即可信）。
+    /// 默认对局域网开放（2026-11-05 用户裁定；原先是 <c>127.0.0.1</c>）。
     ///
-    /// <para>⚠️ <b>对外监听是一条显式决定</b>（<c>LILARA_BIND</c>，见 <see cref="BindAddressResolver"/>）：
-    /// 核心没有鉴权（`03` §10），绑到对外地址等于把模型、工具与可读文件交给任何能路由到该端口的人。
-    /// 这个常量是**默认值**；真正生效的地址是实例值 <see cref="BindAddress"/>。</para>
+    /// <para>⚠️ <b>这个默认值不提供任何保护</b>：默认不校验 token，任何能路由到该端口的人/程序
+    /// 都能驱动本机的模型与工具、读本机能读到的文件。要收回本机：<c>LILARA_BIND=127.0.0.1</c>；
+    /// 要拦人：<c>LILARA_AUTH=1</c>（token 每次都打印在启动横幅里，见 <see cref="ControlAuth"/>）。</para>
     /// </summary>
-    public const string DefaultBindAddress = "127.0.0.1";
+    public const string DefaultBindAddress = "0.0.0.0";
 
     /// <summary>本实例真正绑定的地址（不是默认常量）——`/info`、启动横幅与 WS 端点都读它。</summary>
     public string BindAddress { get; } =
@@ -92,7 +97,10 @@ public sealed class ControlServer(
         return (buffer.ToArray(), false);
     }
 
-    /// <summary>绑在环回之外 ⇒ 本机之外也能连进来。⚠️ 没有鉴权，启动横幅据此报警。</summary>
+    /// <summary>
+    /// 绑在环回之外 ⇒ 本机之外也能连进来。启动横幅据此说明「谁能连」与「开没开 token」。
+    /// ⚠️ 默认就是这个状态（<c>0.0.0.0</c>，见 <see cref="DefaultBindAddress"/>），所以横幅**每次**都会说话。
+    /// </summary>
     public bool IsExternallyBound => !BindAddressResolver.IsLoopbackOnly(BindAddress);
 
     /// <summary>配置的端口（`0` 会在启动时由 OS 分配，那时以 `StartAsync` 返回的 `Urls` 为准）。</summary>
@@ -102,6 +110,30 @@ public sealed class ControlServer(
 
     // 给启动横幅读闸真正在接受的那个值（实例值，不是默认常量）；internal 只给同程序集读。
     internal string AllowedOrigin => allowedOrigin;
+
+    /// <summary>本实例要不要校验访问 token（构造时给了 token 才要）。</summary>
+    public bool AuthRequired { get; } = !string.IsNullOrWhiteSpace(authToken);
+
+    /// <summary>
+    /// 这次请求有没有带对 token。
+    ///
+    /// <para>两种交法：HTTP 的 <c>Authorization: Bearer &lt;token&gt;</c>，
+    /// 以及查询参数 <c>?token=</c>——后者是**必须**的，因为浏览器的 <c>WebSocket</c>
+    /// 构造函数不能自定义请求头，WS 握手没有第二种办法带凭据。</para>
+    /// </summary>
+    private bool IsAuthorized(HttpContext ctx)
+    {
+        if (!AuthRequired) return true;   // 没开鉴权：一律放行（默认）
+
+        string? presented = null;
+        var header = ctx.Request.Headers.Authorization.ToString();
+        if (header.StartsWith(ControlAuth.BearerPrefix, StringComparison.OrdinalIgnoreCase))
+            presented = header[ControlAuth.BearerPrefix.Length..].Trim();
+        else if (ctx.Request.Query.TryGetValue(ControlAuth.QueryParam, out var query))
+            presented = query.ToString().Trim();
+
+        return ControlAuth.Matches(presented, authToken);
+    }
 
     // 用 StartAsync 而不是 RunAsync：后者阻塞，端口起不来时用户先看到提示符、进程才死。
     public async Task<WebApplication> StartAsync(CancellationToken ct)
@@ -124,12 +156,44 @@ public sealed class ControlServer(
         app.Use(async (ctx, next) =>
         {
             ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
-            ctx.Response.Headers["Access-Control-Allow-Headers"] = "content-type";
+            // ⚠️ `authorization` 必须在这里：开了鉴权之后页面每条请求都带 `Authorization: Bearer`，
+            // 而**自定义头会让浏览器先发预检**——预检的响应里没有它，真正的请求根本不会被发出去
+            //（页面只能看到 “Failed to fetch”，看起来像核心没起来）。
+            ctx.Response.Headers["Access-Control-Allow-Headers"] = "content-type, authorization";
             // 允许的动词要覆盖 MapSnapshots 的真实端点：GET 快照 / PUT 计划 / DELETE 清 T0 / OPTIONS 预检。
             // 少一个的后果不是 403，而是预检阶段就失败——浏览器里的 fetch 只会报 “Failed to fetch”。
             ctx.Response.Headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
             if (ctx.Request.Method == "OPTIONS") { ctx.Response.StatusCode = 204; return; }
             await next();
+        });
+
+        // 访问 token 闸（`ControlAuth`）：**默认关**，设了 `LILARA_AUTH=1` 才真的校验。
+        //
+        // ⚠️ **两条豁免，都是必需的**：
+        //   · `OPTIONS` —— 预检请求**不带** `Authorization`（浏览器根本不发），拦它等于关掉整个跨域调用；
+        //   · `/info`   —— 它是页面与头**发现「要不要填 token」**的唯一渠道，拦了就没有入口，
+        //                  页面只能靠一次失败的请求去猜。⚠️ 未授权时它只交 `authRequired` 那几格，
+        //                  `dataRoot` / `workingDirectory` 这些本机路径**不交**（见 `MapSnapshots`）。
+        app.Use(async (ctx, next) =>
+        {
+            if (!AuthRequired || ctx.Request.Method == "OPTIONS"
+                || ctx.Request.Path.Equals("/info", StringComparison.OrdinalIgnoreCase))
+            {
+                await next();
+                return;
+            }
+
+            if (IsAuthorized(ctx))
+            {
+                await next();
+                return;
+            }
+
+            ctx.Response.StatusCode = (int)HttpStatusCode.Unauthorized;
+            ctx.Response.Headers.WWWAuthenticate = ControlAuth.BearerPrefix.Trim();
+            await ctx.Response.WriteAsync(
+                "需要访问 token（核心启动横幅里打印的那一行）。"
+                + $"HTTP 用 `Authorization: Bearer <token>`，WebSocket 用 `?{ControlAuth.QueryParam}=<token>`。");
         });
 
         app.UseWebSockets();
@@ -252,14 +316,33 @@ public sealed class ControlServer(
         // ⚠️ 构造参数今天由 `AllowedOriginResolver` 与 `BindAddressResolver` 从环境变量解析（`Program.cs` 的调用点）。
         // **核心不解析任何命令行参数**——所以这里没有 `--allowed-origin` / `--bind` 那样的旗标，
         // 配置一律走环境变量。别在这一行写一个不存在的旗标名：那会让读注释的人以为有这么个入口。
-        app.MapGet("/info", () => Results.Json(new
+        //
+        // ⚠️ **这个端点是鉴权闸的唯一豁免**（见 `StartAsync` 那道中间件）：页面与头要靠它
+        // 知道「要不要填 token」。所以**未授权时它只交最小一格**——`dataRoot` / `workingDirectory`
+        // 是本机绝对路径，白送给局域网里的陌生人纯属白送。
+        app.MapGet("/info", (HttpContext ctx) =>
         {
-            DataRoot = host.DataRoot,
-            WorkingDirectory = host.WorkingDirectory,
-            CoreVersion = typeof(ControlServer).Assembly.GetName().Version?.ToString() ?? "?",
-            AllowedOrigin = allowedOrigin,
-            Endpoints = new { Http = Url, Ws = $"ws://{BindAddressResolver.HostForUrl(BindAddress)}:{port}/ws" },
-        }, WireJson.Options));
+            var version = typeof(ControlServer).Assembly.GetName().Version?.ToString() ?? "?";
+
+            if (!IsAuthorized(ctx))
+                return Results.Json(new
+                {
+                    AuthRequired = true,
+                    CoreVersion = version,
+                    AllowedOrigin = allowedOrigin,
+                    Endpoints = new { Http = Url, Ws = $"ws://{BindAddressResolver.HostForUrl(BindAddress)}:{port}/ws" },
+                }, WireJson.Options);
+
+            return Results.Json(new
+            {
+                DataRoot = host.DataRoot,
+                WorkingDirectory = host.WorkingDirectory,
+                CoreVersion = version,
+                AllowedOrigin = allowedOrigin,
+                AuthRequired = AuthRequired,
+                Endpoints = new { Http = Url, Ws = $"ws://{BindAddressResolver.HostForUrl(BindAddress)}:{port}/ws" },
+            }, WireJson.Options);
+        });
 
         // 每个快照都带该 topic 的 seq 高水位：头拿它去 subscribe(since:)，
         // 「拉快照 → 订阅」之间落的事件才不漏不重。
@@ -1110,10 +1193,13 @@ public sealed class ControlServer(
         // Origin 白名单是 apiKey 可选的硬前置：网页能改 endpoint 就能把流量（含 key）转到攻击者主机。
         // 放行「无 Origin」、拒绝别的 origin——浏览器握手必带 Origin，curl / 测试 / CLI 不带。
         // 这是防网页、不是鉴权（非浏览器客户端可伪造 Origin）。
-        // localhost 与 127.0.0.1 不是同一个 origin（浏览器这么判），拒 localhost 是刻意的。
+        //
+        // ⚠️ **判据是模式匹配，不是逐字相等**（2026-11-05）：默认模式 `http://*:<头端口>` 放行
+        // 「任何主机名/地址 + 头端口」，因为头绑 0.0.0.0 之后页面会从局域网 IP / localhost 打开，
+        // 逐字相等会把它们全部**静默**拒绝。端口这一维仍然钉死 ⇒ 随便一个网页（端口对不上）照样进不来。
+        // 要回到只认一个 origin：`LILARA_ALLOWED_ORIGIN`（见 `OriginMatcher`）。
         var origin = ctx.Request.Headers["Origin"].ToString();
-        if (!string.IsNullOrEmpty(origin)
-            && !string.Equals(origin, allowedOrigin, StringComparison.OrdinalIgnoreCase))
+        if (!string.IsNullOrEmpty(origin) && !OriginMatcher.Matches(allowedOrigin, origin))
         {
             // 失败要能自解释：响应体说明被接受的是哪个页面（启动横幅里也印了同一个值）。
             // ⚠️ **但这句只有非浏览器客户端看得到**：WS 握手被拒时浏览器**不把响应体交给页面 JS**，
@@ -1121,7 +1207,7 @@ public sealed class ControlServer(
             // 头那边会去拉 `/info` 比对 `location.origin`，把原因显示在页面上。
             ctx.Response.StatusCode = (int)HttpStatusCode.Forbidden;
             await ctx.Response.WriteAsync(
-                $"本核心只接受来自 {allowedOrigin} 的页面。若是浏览器页面，"
+                $"本核心只接受来自 {allowedOrigin} 的页面（{OriginMatcher.Describe(allowedOrigin)}）。若是浏览器页面，"
                 + "请对照核心启动横幅里印的那一行（页面本身看不到这句响应体）。");
             return;
         }

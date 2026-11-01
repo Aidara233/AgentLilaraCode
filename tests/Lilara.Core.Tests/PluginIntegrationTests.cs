@@ -236,7 +236,11 @@ public sealed class PluginIntegrationTests : IDisposable
         await Set(commands, h, "demo.style", "detailed");
         var (fresh, d, bus, _) = Harness(null);
         await using var app = await new ControlServer(fresh, d, bus, 0).StartAsync(CancellationToken.None);
-        using var client = new HttpClient { BaseAddress = new Uri(app.Urls.First()), Timeout = TimeSpan.FromSeconds(10) };
+        // ⚠️ Kestrel 交出来的 `Urls` 是**监听地址**（默认 `0.0.0.0`），而 `0.0.0.0` 是
+        // 「未指定地址」，`HttpClient` 拒绝把它当目标（`ArgumentException`）。
+        // ⇒ 客户端一律连 `127.0.0.1`，只从 `Urls` 取**端口**（端口才是被测的那一格）。
+        var port = new Uri(app.Urls.First()).Port;
+        using var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}"), Timeout = TimeSpan.FromSeconds(10) };
         using var state = JsonDocument.Parse(await client.GetStringAsync($"/sessions/{h.SessionId}/state"));
         Assert.Equal("detailed", state.RootElement.GetProperty("axes").GetProperty("demo.style").GetString());
         var definition = Assert.Single(state.RootElement.GetProperty("axisDefinitions").EnumerateArray(),
@@ -253,7 +257,9 @@ public sealed class PluginIntegrationTests : IDisposable
         var h = await Create(host, commands);
         await Set(commands, h, "demo.style", "detailed");
         await using var app = await new ControlServer(host, commands, bus, 0).StartAsync(CancellationToken.None);
-        using var client = new HttpClient { BaseAddress = new Uri(app.Urls.First()), Timeout = TimeSpan.FromSeconds(10) };
+        // 同上：`0.0.0.0` 不能当客户端目标，只取端口。
+        var port = new Uri(app.Urls.First()).Port;
+        using var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}"), Timeout = TimeSpan.FromSeconds(10) };
         using var axes = JsonDocument.Parse(await client.GetStringAsync("/axes"));
         Assert.Contains(axes.RootElement.GetProperty("axes").EnumerateArray(), a => a.GetProperty("name").GetString() == "demo.style");
         using var state = JsonDocument.Parse(await client.GetStringAsync($"/sessions/{h.SessionId}/state"));

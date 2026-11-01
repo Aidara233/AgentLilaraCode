@@ -12,14 +12,16 @@ public class BindAddressResolverTests
     private static Func<string, string?> Env(string? value) =>
         n => n == BindAddressResolver.EnvVar ? value : null;
 
-    // ---- 默认：仍是本机 ----
-
+    // ---- 默认：对局域网开放（2026-11-05 用户裁定，原先是 127.0.0.1）----
+    //
+    // ⚠️ 这条**不再是安全判据**，而是「默认值是什么」的钉子：默认开放意味着
+    // 「任何能路由到这个端口的人/程序都能驱动核心」是**默认状态**，所以横幅必须每次都说。
     [Fact]
-    public void Resolve_NothingSetGivesTheLoopbackDefault()
+    public void Resolve_NothingSetGivesTheOpenDefault()
     {
         var resolved = BindAddressResolver.Resolve(_ => null);
 
-        Assert.Equal("127.0.0.1", resolved.Address);
+        Assert.Equal("0.0.0.0", resolved.Address);
         Assert.Equal(BindAddressSource.Default, resolved.Source);
     }
 
@@ -38,7 +40,7 @@ public class BindAddressResolverTests
     // 兜底那条走 `ControlServer.DefaultBindAddress`（不是就地再写一个字面量）⇒ 改默认值只改一处。
     [Fact]
     public void Default_ComesFromControlServer_NotASecondLiteral() =>
-        Assert.Equal("127.0.0.1", ControlServer.DefaultBindAddress);
+        Assert.Equal("0.0.0.0", ControlServer.DefaultBindAddress);
 
     // ---- 显式设定：照抄，并交出「是它赢了」 ----
 

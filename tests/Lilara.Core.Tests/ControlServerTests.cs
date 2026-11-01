@@ -191,10 +191,12 @@ public class ControlServerTests : IAsyncLifetime
 
     private static readonly HttpClient Client = new() { Timeout = TimeSpan.FromSeconds(10) };
 
-    // 默认只监听本机（鉴权最小）——对外必须是**显式**设定，不是默认行为。
+    // 默认对局域网开放（2026-11-05 用户裁定，原先是 127.0.0.1）。
+    // ⚠️ 这条**不是**安全判据：默认开放意味着「谁能连进来」的边界只由 token 决定，
+    // 而 token 默认不校验 ⇒ 横幅每次都必须把代价说出来（`PrintExternalBindWarning`）。
     [Fact]
-    public void BindAddress_DefaultsToLoopbackOnly() =>
-        Assert.Equal("127.0.0.1", ControlServer.DefaultBindAddress);
+    public void BindAddress_DefaultsToOpenForTheLan() =>
+        Assert.Equal("0.0.0.0", ControlServer.DefaultBindAddress);
 
     // 显式绑定的地址必须落到 Url 里：头/脚本拿它去连，写死 127.0.0.1 会让远端连错地方。
     [Fact]
@@ -643,11 +645,18 @@ public class ControlServerTests : IAsyncLifetime
 
     // WS 的 Origin 白名单：放行无 Origin，拒绝别的 origin（不是「要求 Origin」）——
     // 浏览器发的握手永远带 Origin，而 curl / 测试驱动 / 未来的 CLI 头不带，要求它等于把它们全部误伤。
+    //
+    // ⚠️ **默认模式从「逐字 127.0.0.1:17990」变成了 `http://*:17990`**（2026-11-05）：
+    // 头绑 0.0.0.0 之后，页面会从局域网 IP / localhost 打开，逐字相等会把它们全部**静默**拒绝。
+    // ⇒ 本条里 `localhost:17990`、`192.168.x:17990` 现在是**放行**；被拒的是端口对不上与方案不对的。
     [Theory]
     [InlineData(null)]                     // 无 Origin（curl / 测试驱动）⇒ 放行
     [InlineData("http://127.0.0.1:17990")]  // 头自己的 origin ⇒ 放行
-    [InlineData("http://evil.example")]    // ⇒ 拒绝
-    [InlineData("http://localhost:17990")]  // ⚠️ 同机不同写法：**拒绝**——见下
+    [InlineData("http://localhost:17990")]  // 同机另一种写法 ⇒ 放行（端口对得上）
+    [InlineData("http://192.168.1.5:17990")] // 局域网里另一台设备打开页面 ⇒ 放行（默认模式的意义）
+    [InlineData("http://evil.example")]    // 端口对不上（80）⇒ 拒绝
+    [InlineData("http://192.168.1.5:17988")] // 核心端口当 origin ⇒ 拒绝（端口不是头端口）
+    [InlineData("https://192.168.1.5:17990")] // 方案不同 ⇒ 拒绝（头只发 http）
     [InlineData("null")]                   // `file://` 页面与沙箱 iframe 的 Origin 字面量是 "null"
     public async Task WebSocket_OriginPolicy(string? origin)
     {
@@ -656,7 +665,9 @@ public class ControlServerTests : IAsyncLifetime
         if (origin is not null) socket.Options.SetRequestHeader("Origin", origin);
 
         var connect = socket.ConnectAsync(new Uri(Ws()), CancellationToken.None);
-        if (origin is null or "http://127.0.0.1:17990")
+        var allowed = origin is null or "http://127.0.0.1:17990" or "http://localhost:17990"
+            or "http://192.168.1.5:17990";
+        if (allowed)
         {
             await connect;                                    // 放行 ⇒ 握上手
             Assert.Equal(WebSocketState.Open, socket.State);
@@ -664,8 +675,6 @@ public class ControlServerTests : IAsyncLifetime
         else
         {
             // 握手被拒时 ConnectAsync 抛 WebSocketException（服务端回了 403）。
-            // localhost 在拒绝之列是刻意的：它与 127.0.0.1 不是同一个 origin，
-            // 且放行 localhost 等于放行一个任何本机程序都能抢占的名字（hosts 文件 / DNS）。
             await Assert.ThrowsAnyAsync<WebSocketException>(() => connect);
         }
     }
@@ -702,8 +711,107 @@ public class ControlServerTests : IAsyncLifetime
         }
     }
 
+    // ---- 访问 token（`LILARA_AUTH=1`；默认不校验）----
+    //
+    // ⚠️ 这一组是**线上真连**：token 闸的错法大多是「形状对但接不上」
+    //（预检被拦、WS 的查询参数没读、401 但状态码写成 403），桩测不出来。
+
+    [Fact]
+    public async Task Auth_RequiresTheTokenOnHttpAndWebSocket()
+    {
+        const string token = "test-token-abc";
+        var server = new ControlServer(_host, _dispatcher, _bus, 0, authToken: token);
+        var app = await server.StartAsync(CancellationToken.None);
+        var port = new Uri(app.Urls.First()).Port;
+        try
+        {
+            var http = $"http://127.0.0.1:{port}";
+
+            // ① 不带 token ⇒ 401（不是 403：403 会把「你被 origin 拒了」和「你缺凭据」混成一个症状）
+            using (var noToken = await Client.GetAsync($"{http}/sessions"))
+                Assert.Equal(System.Net.HttpStatusCode.Unauthorized, noToken.StatusCode);
+
+            // ② Bearer 头 ⇒ 放行
+            using (var req = new HttpRequestMessage(HttpMethod.Get, $"{http}/sessions"))
+            {
+                req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+                using var ok = await Client.SendAsync(req);
+                Assert.Equal(System.Net.HttpStatusCode.OK, ok.StatusCode);
+            }
+
+            // ③ 查询参数 ⇒ 也放行（`<img>` / EventSource 那种没法加头的客户端只有这一条路）
+            using (var query = await Client.GetAsync($"{http}/sessions?token={token}"))
+                Assert.Equal(System.Net.HttpStatusCode.OK, query.StatusCode);
+
+            // ④ 错误的 token ⇒ 401
+            using (var req = new HttpRequestMessage(HttpMethod.Get, $"{http}/sessions"))
+            {
+                req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", "wrong");
+                using var bad = await Client.SendAsync(req);
+                Assert.Equal(System.Net.HttpStatusCode.Unauthorized, bad.StatusCode);
+            }
+
+            // ⑤ 预检**必须**放行：浏览器发 OPTIONS 时**不带** Authorization，
+            //    拦它的后果不是 403，而是真正的请求根本发不出去（页面只看到 “Failed to fetch”）。
+            using (var preflight = await Client.SendAsync(new HttpRequestMessage(HttpMethod.Options, $"{http}/projects")))
+                Assert.Equal(System.Net.HttpStatusCode.NoContent, preflight.StatusCode);
+
+            // ⑥ 预检响应要放行 `authorization` 这个头，否则浏览器不肯发带它的请求。
+            using (var preflight = await Client.SendAsync(new HttpRequestMessage(HttpMethod.Options, $"{http}/projects")))
+                Assert.Contains("authorization", string.Join(",", preflight.Headers.GetValues("Access-Control-Allow-Headers")));
+
+            // ⑦ WS：查询参数是**唯一**能带凭据的路（浏览器 WebSocket 不能自定义头）
+            using (var okSocket = new ClientWebSocket())
+            {
+                await okSocket.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws?token={token}"), CancellationToken.None);
+                Assert.Equal(WebSocketState.Open, okSocket.State);
+            }
+
+            using (var noTokenSocket = new ClientWebSocket())
+                await Assert.ThrowsAnyAsync<WebSocketException>(
+                    () => noTokenSocket.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws"), CancellationToken.None));
+        }
+        finally
+        {
+            await app.StopAsync(CancellationToken.None);
+            await app.DisposeAsync();
+        }
+    }
+
+    // ⚠️ `/info` 是闸的**唯一豁免**：页面与头靠它知道「要不要填 token」。
+    // 但豁免不等于全交——未授权时**不许**交出本机绝对路径。
+    [Fact]
+    public async Task Auth_InfoStaysReachableButRedacted()
+    {
+        var server = new ControlServer(_host, _dispatcher, _bus, 0, authToken: "t");
+        var app = await server.StartAsync(CancellationToken.None);
+        var port = new Uri(app.Urls.First()).Port;
+        try
+        {
+            using var doc = JsonDocument.Parse(await Client.GetStringAsync($"http://127.0.0.1:{port}/info"));
+            var root = doc.RootElement;
+
+            Assert.True(root.GetProperty("authRequired").GetBoolean());
+            Assert.False(string.IsNullOrWhiteSpace(root.GetProperty("allowedOrigin").GetString()));
+            // 本机路径不交：连 token 都还没给的人不该知道这台机器的目录结构。
+            Assert.False(root.TryGetProperty("dataRoot", out _));
+            Assert.False(root.TryGetProperty("workingDirectory", out _));
+
+            // 带 token ⇒ 恢复完整自述（头/底栏用的就是它）。
+            using var req = new HttpRequestMessage(HttpMethod.Get, $"http://127.0.0.1:{port}/info");
+            req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", "t");
+            using var ok = await Client.SendAsync(req);
+            using var full = JsonDocument.Parse(await ok.Content.ReadAsStringAsync());
+            Assert.Equal(_root, full.RootElement.GetProperty("dataRoot").GetString());
+        }
+        finally
+        {
+            await app.StopAsync(CancellationToken.None);
+            await app.DisposeAsync();
+        }
+    }
+
     /// <summary>
-    /// 收一帧，**超时就返回 <c>null</c> 而不是抛**。
     /// ⚠️ 存在的理由：有几条测试要证的正是「**它不再发了**」，而静默的表现就是超时——
     /// 用会抛的 <see cref="ReceiveAsync"/> 只能把它写成「等 10 秒然后失败」（实测踩过：
     /// 那条退订测试因此整条超时，而它其实**已经**证明了要证的东西）。
@@ -1424,13 +1532,16 @@ public class ControlServerTests : IAsyncLifetime
     public async Task Snapshot_Info_CarriesExactlyTheseKeys()
     {
         var root = await GetJson("/info");
-        AssertKeysOf(root, "dataRoot", "workingDirectory", "coreVersion", "allowedOrigin", "endpoints");
+        AssertKeysOf(root, "dataRoot", "workingDirectory", "coreVersion", "allowedOrigin", "authRequired", "endpoints");
 
         // 嵌套那层也要钉：`endpoints` 里加个字段，顶层键集**看不见**。
         AssertKeysOf(root.GetProperty("endpoints"), "http", "ws");
 
         // ⚠️ `/info` 交的 origin 必须来自 AllowedOriginResolver，供 head 解释 WS 拒绝原因。
         Assert.Equal(AllowedOriginResolver.Resolve().Origin, root.GetProperty("allowedOrigin").GetString());
+
+        // 默认不校验 token ⇒ 这个字段是页面「要不要弹输入框」的唯一依据，默认必须是 false。
+        Assert.False(root.GetProperty("authRequired").GetBoolean());
     }
 
     // 数组型端点的「每项是字符串」——不伪造键集断言。

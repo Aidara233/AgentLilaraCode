@@ -7,15 +7,30 @@ using Microsoft.Extensions.Logging;
 
 // 头是独立进程，只托管静态资源：页面 JS 直连核心，头不代理、不缓存、不理解协议（头是可替换件）。
 
-// ⚠️ **这两个默认值与核心侧是同一事实的两份副本**，改一个要跟着改另一个：
+// ⚠️ **这几个默认值与核心侧是同一事实的多份副本**，改一个要跟着改另一个：
 //   · 头端口 17990 ←→ `ControlServer.DefaultAllowedOrigin`
 //   · 核心地址 17988 ←→ `ControlServer.DefaultPort`
+//   · 头监听地址 0.0.0.0 ←→ `ControlServer.DefaultBindAddress`（两者默认为同一取舍：对局域网开放）
 // ⚠️ 从 7790 / 7788 改过来是**实测**的结果（2026-10-06）：那两个数落在了 Windows 的
 // **保留端口段**里（本机实测 7681-7780 / 7781-7880 / 7881-7980，通常由 Hyper-V/WSL/Docker 的
 // NAT 预留）⇒ 绑定直接 `SocketException 10013`。⚠️ **保留段会在重启后变**，
 // 所以这不是永久解——真正管用的是下面那句人话报错与那两个环境变量。
 var port = int.TryParse(Environment.GetEnvironmentVariable("LILARA_HEAD_PORT"), out var p) ? p : 17990;
-var core = Environment.GetEnvironmentVariable("LILARA_CORE") ?? "http://127.0.0.1:17988";
+
+// ⚠️ **监听地址默认对局域网开放（2026-11-05 用户裁定；原先是 127.0.0.1）**：
+// 页面要能从手机/平板上打开，头就必须绑 0.0.0.0。代价写在下面那句横幅里——头只发静态文件，
+// **真正能被驱动的是核心**，所以「要不要拦人」的开关在核心那边（`LILARA_AUTH`）。
+// 要收回本机：设 `LILARA_HEAD_BIND=127.0.0.1`（记得核心那边也要跟着 `LILARA_BIND`）。
+var bind = Environment.GetEnvironmentVariable("LILARA_HEAD_BIND") is { Length: > 0 } configuredBind
+    ? configuredBind.Trim()
+    : "0.0.0.0";
+
+// 核心端口 / 地址：页面直连核心，头只负责把地址递过去。
+var corePort = int.TryParse(Environment.GetEnvironmentVariable("LILARA_PORT"), out var cp)
+    ? cp
+    : 17988;
+var coreEnv = Environment.GetEnvironmentVariable("LILARA_CORE");
+var core = string.IsNullOrWhiteSpace(coreEnv) ? $"http://127.0.0.1:{corePort}" : coreEnv.Trim();
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 {
@@ -23,7 +38,7 @@ var builder = WebApplication.CreateBuilder(new WebApplicationOptions
     ContentRootPath = AppContext.BaseDirectory,
     WebRootPath = "wwwroot",
 });
-builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
+builder.WebHost.UseUrls($"http://{HostForUrl(bind)}:{port}");
 builder.Logging.ClearProviders();
 
 var app = builder.Build();
@@ -45,7 +60,20 @@ app.UseStaticFiles(new StaticFileOptions
 });
 
 // /config.json 把核心地址递给页面——唯一需要从环境传进去的东西。头不做反向代理。
-app.MapGet("/config.json", () => Results.Json(new { core }));
+//
+// ⚠️ **核心地址必须跟着「页面是从哪台机器打开的」走**（2026-11-05，与 0.0.0.0 一起改）：
+// 头绑 0.0.0.0 之后，局域网里的手机打开 `http://192.168.1.5:17990`，页面若仍去连
+// `http://127.0.0.1:17988`，那个 `127.0.0.1` 指的是**手机自己** ⇒ 永远连不上，
+// 而页面上只会显示「已断开·3 秒后重连」（症状与核心没起来**完全一样**）。
+// ⇒ 没显式设 `LILARA_CORE` 时，用**这次请求的 Host** 拼核心地址（同一个地址，核心端口）。
+// ⚠️ 设了 `LILARA_CORE` 就照抄——那是「核心在别的机器上 / 走了隧道」那条路，头不许改写它。
+app.MapGet("/config.json", (HttpRequest request) =>
+{
+    var url = coreEnv is not null && !string.IsNullOrWhiteSpace(coreEnv)
+        ? core
+        : $"http://{HostForUrl(string.IsNullOrWhiteSpace(request.Host.Host) ? "127.0.0.1" : request.Host.Host)}:{corePort}";
+    return Results.Json(new { core = url });
+});
 
 // **页面自述**：它是由哪个构建的 `wwwroot` 提供的、那份 `app.js` 有多大。
 // ⚠️ 这一条是为了终结「我改了、你说没效果」那类对话：底栏显示的那两个数就是
@@ -75,20 +103,27 @@ try
 }
 catch (Exception ex) when (ex is System.Net.Sockets.SocketException or IOException)
 {
-    Console.Error.WriteLine($"✗ 头起不来（http://127.0.0.1:{port}）：{ex.Message}");
+    Console.Error.WriteLine($"✗ 头起不来（http://{HostForUrl(bind)}:{port}）：{ex.Message}");
     Console.Error.WriteLine("  端口被占**或**落在 Windows 保留段（`netsh int ipv4 show excludedportrange protocol=tcp`）。");
     Console.Error.WriteLine($"  换个端口：设环境变量 LILARA_HEAD_PORT（并让核心跟着走——同名变量，核心读它推 WS 白名单）。");
     Console.Error.WriteLine("  ⚠️ 内核换了端口而**核心没跟着换**时，WS 握手会被**静默拒绝**（浏览器不把 403 交给页面 JS）。");
     return 1;
 }
 
-// ⚠️ 端口**必须印**，而且要说清「这就是核心要放行的那个 origin」：
-// 核心的 WS 白名单要跟着这个端口走（`LILARA_HEAD_PORT`），对不上时**握手会被静默拒绝**
+// ⚠️ 端口**必须印**，而且要说清「这就是核心要放行的那个端口」：
+// 核心的 WS 白名单按**头端口**匹配（`http://*:<头端口>`），端口对不上时**握手会被静默拒绝**
 //（浏览器不把 403 响应体交给页面 JS）⇒ 用户只能靠对这两行横幅来排查。
-// 核心那边会印它实际接受的那个 origin，两行放在一起看即可。
-Console.WriteLine($"LILARA 头 — http://127.0.0.1:{port}");
-Console.WriteLine($"  页面 origin http://127.0.0.1:{port}（核心的 WS 白名单必须包含它）");
+// 核心那边会印它实际接受的那个模式，两行放在一起看即可。
+Console.WriteLine($"LILARA 头 — http://{HostForUrl(bind)}:{port}（{(bind == "0.0.0.0" ? "对局域网开放，默认" : "由 LILARA_HEAD_BIND 指定")}）");
+Console.WriteLine($"  页面 origin 形如 http://<这台机器的地址>:{port}（核心的 WS 白名单必须覆盖它）");
 Console.WriteLine($"  核心 {core}（页面直连它，头不代理）");
+if (bind is "0.0.0.0" or "*" or "::" or "[::]")
+{
+    // 默认就是对外 ⇒ 每次都说一句代价，并列出这台机器上可用的地址（别的设备照着输）。
+    Console.Error.WriteLine("  ⚠️ 头对局域网开放：同一网络里的设备都能打开这个页面。");
+    Console.Error.WriteLine($"     要收回本机：设 LILARA_HEAD_BIND=127.0.0.1（核心那边同样设 LILARA_BIND=127.0.0.1）。");
+    foreach (var address in LanAddresses(port)) Console.WriteLine($"     可达地址 {address}");
+}
 
 // ⚠️ **启动时就把「连不上」说出来**（2026-10-06）。
 // 原先这里什么都不问：核心没起 / origin 对不上时，页面只会「已断开 · 3 秒后重连」，
@@ -103,11 +138,15 @@ static async Task CheckCoreAsync(string core)
 {
     using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
     string allowed;
+    bool authRequired;
     try
     {
         var body = await http.GetStringAsync($"{core.TrimEnd('/')}/info");
         using var doc = System.Text.Json.JsonDocument.Parse(body);
         allowed = doc.RootElement.GetProperty("allowedOrigin").GetString() ?? "?";
+        // ⚠️ 未授权时 `/info` 只交最小一格（含这个字段），所以 `TryGetProperty` 而不是索引器。
+        authRequired = doc.RootElement.TryGetProperty("authRequired", out var flag)
+                       && flag.ValueKind == System.Text.Json.JsonValueKind.True;
     }
     catch (Exception ex)
     {
@@ -116,11 +155,44 @@ static async Task CheckCoreAsync(string core)
         return;
     }
 
-    // ⚠️ 判据与核心**逐字相同**：`AllowedOriginResolver` 解析出来的那个 origin。
-    // 头只知道**自己**的 origin（`127.0.0.1:{port}`），而用户可能用 `localhost` 打开——
-    // 那**不是**同一个 origin（浏览器这么判）⇒ 握手照样会被静默拒绝。
-    // ⇒ 这里只说头自己那个，并点名 localhost 那条路。
+    // ⚠️ 判据与核心**逐字相同**：`AllowedOriginResolver` 解析出来的那个模式。
+    // 默认是 `http://*:<头端口>`（任意主机 + 头端口）⇒ 用局域网 IP 或 localhost 打开都能握手成功；
+    // 用户若显式设成了某个具体 origin，头也没法在启动时替他判断（他不知道别的设备用什么地址打开）。
     Console.WriteLine($"  ✓ 核心在，WS 白名单 = {allowed}");
-    Console.WriteLine("     ⚠️ 请用上面的 `127.0.0.1` 地址打开页面——用 `localhost` 打开时");
-    Console.WriteLine("        origin 会变成 http://localhost:…，与白名单**不是同一个**，握手会被静默拒绝。");
+    Console.WriteLine("     页面用哪个地址打开都行，但**端口必须是上面那个**——端口对不上时握手会被静默拒绝。");
+
+    // ⚠️ 开了鉴权而页面不知道 = 「页面一片空白，没有任何人能说出为什么」。
+    // token 只在核心的控制台里（头是独立进程，拿不到也不该去读），所以这句话只指路，不复述。
+    if (authRequired)
+    {
+        Console.WriteLine("  ⚠️ 核心开了鉴权（LILARA_AUTH=1）：页面第一次连会要求填 token。");
+        Console.WriteLine("     token 在**核心**的控制台启动横幅里（`访问 token …` 那一行）。");
+    }
+}
+
+static IEnumerable<string> LanAddresses(int port)
+{
+    try
+    {
+        return System.Net.Dns.GetHostAddresses(System.Net.Dns.GetHostName())
+            .Where(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                        && !System.Net.IPAddress.IsLoopback(a))
+            .Select(a => $"http://{a}:{port}")
+            .Distinct()
+            .ToList();
+    }
+    catch (System.Net.Sockets.SocketException)
+    {
+        // 解析不出来就不列：地址列不出来不该影响启动。
+        return [];
+    }
+}
+
+// IPv6 字面量在 URL 里必须带方括号，否则 `http://::1:17990` 解析不出来。
+// 同理，`Request.Host.Host` 交出来的 IPv6 是**不带**方括号的。
+static string HostForUrl(string address)
+{
+    var a = address.Trim();
+    if (a.Length > 2 && a[0] == '[' && a[^1] == ']') return a;
+    return a.Contains(':') ? $"[{a}]" : a;
 }

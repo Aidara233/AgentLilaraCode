@@ -20,6 +20,84 @@ const $ = (id) => document.getElementById(id);
 // ⚠️ 这是**兜底值**——正常路径是启动时拉 `/config.json`（见下方 `core = ...core`）。
 // 它必须与 `head/Program.cs` 的默认核心地址一致（两份副本，改一个要跟着改另一个）。
 let core = "http://127.0.0.1:17988";
+
+// ---- 访问 token（`LILARA_AUTH=1` 时才需要；默认核心不校验）----
+//
+// ⚠️ 存 localStorage 而不是只放内存：刷新一次就要重新粘一遍 token，用户会很快把鉴权关掉。
+// ⚠️ **HTTP 与 WS 的交法不同**：HTTP 走 `Authorization: Bearer`（下面的 `fetch` 包装），
+// WS 只能走查询参数——浏览器的 `WebSocket` 构造函数**不能自定义请求头**，没有第二种办法。
+const TOKEN_KEY = "lilara.accessToken";
+
+// ⚠️ **必须与核心的 `ControlAuth.QueryParam` 逐字相同**（跨进程契约，名字写错 = 握手被拒，
+// 而浏览器不会告诉你为什么）。有测试钉它（`ControlAuthTests`）。
+const TOKEN_PARAM = "token";
+
+let authToken = localStorage.getItem(TOKEN_KEY) || "";
+let tokenPromptOpen = false;
+
+/// 要 token 时的输入框（原生 DOM，零构建）。⚠️ 只在**核心真要** token 时出现：
+/// 默认（不校验）的机器上弹这一下就是把所有人挡在门外多问一句。
+/// 存下之后**整页重载**——此刻所有快照/订阅都按「未授权」拿过一遍，逐条补比重新引导更不可靠。
+function askForToken(detail) {
+  if (tokenPromptOpen) return;
+  tokenPromptOpen = true;
+
+  const wrap = document.createElement("div");
+  wrap.className = "token-gate";
+  wrap.innerHTML = `
+    <form>
+      <h3>核心要求访问 token</h3>
+      <p>核心启动时把它打印在控制台里（<code>访问 token …</code> 那一行）。</p>
+      <p class="muted">开了鉴权（<code>LILARA_AUTH=1</code>）才会要它；留空保存则清掉已存的 token。</p>
+      <input type="text" autocomplete="off" spellcheck="false" placeholder="粘在这里">
+      <button type="submit">保存并重连</button>
+      <p class="bad"></p>
+    </form>`;
+  document.body.appendChild(wrap);
+  const input = wrap.querySelector("input");
+  const err = wrap.querySelector(".bad");
+  if (detail) err.textContent = detail;
+  input.focus();
+
+  wrap.querySelector("form").onsubmit = (e) => {
+    e.preventDefault();
+    const value = input.value.trim();
+    if (value) localStorage.setItem(TOKEN_KEY, value);
+    else localStorage.removeItem(TOKEN_KEY);
+    authToken = value;
+    location.reload();
+  };
+}
+
+// ⚠️ **一处包装胜过三十处调用点**：页面里有三十来个 `fetch(...)`，逐个加 header
+// 必然漏一个，而漏掉的那个恰好是某个「平时不走」的分支（建会话、上传、计划写回）——
+// 那种漏法是*静默*的：401 在页面上只会变成一句话都说不清的失败。
+// ⇒ 只在**发往核心**的请求上加（`/config.json`、`/build.json` 是头自己的，不该带 token）。
+const nativeFetch = window.fetch.bind(window);
+window.fetch = async (input, init) => {
+  const url = typeof input === "string" ? input : (input && input.url) || "";
+  const toCore = url.startsWith(core);
+
+  let merged = init;
+  if (toCore && authToken) {
+    merged = { ...(init || {}) };
+    const headers = new Headers(merged.headers || (input && input.headers) || {});
+    headers.set("Authorization", "Bearer " + authToken);
+    merged.headers = headers;
+  }
+
+  const response = await nativeFetch(input, merged);
+
+  // ⚠️ 判据只看**发往核心的 401**，与「有没有带 token」无关：
+  // 没带 token 的第一次请求正是发现「核心要鉴权」的唯一途径（默认机器上永远走不到这里）。
+  if (toCore && response.status === 401) {
+    // token 错了或被核心换掉了（核心每次启动都会重新生成）⇒ 清掉旧的，重新问。
+    localStorage.removeItem(TOKEN_KEY);
+    authToken = "";
+    askForToken("token 不对（核心每次启动都会换一个新的）。");
+  }
+  return response;
+};
 let ws = null;
 let wsReady = false;                // 唯一的「可以发帧了吗」判据（见 connect()）
 let current = null;                 // 当前会话 id（视图，非真相）
@@ -1490,7 +1568,21 @@ async function diagnoseOrigin() {
   let i;
   try { i = await (await fetch(core + "/info")).json(); } catch { return; }
   if (wsReady) return;   // 这趟 fetch 期间重连成功了，别拿过期的诊断盖掉「已连接」
-  if (!i.allowedOrigin || i.allowedOrigin === location.origin) return;
+  if (!i.allowedOrigin) return;
+
+  // ⚠️ **判据要认通配**（2026-11-05）：核心默认交出来的是 `http://*:17990` ——
+  // 逐字比较会把它判成「对不上」，于是**每次断开都把正确的配置诬告成错配**。
+  // 这里只做一件事：把核心接受的模式原样说出来，让用户自己比对（页面不做核心那套匹配的第二份副本）。
+  if (i.allowedOrigin.includes("*")) {
+    const port = (location.origin.split(":").pop() || "").trim();
+    const want = i.allowedOrigin.split(":").pop();
+    if (port === want) return;   // 端口对上 ⇒ 不是 origin 的问题，别乱指方向
+    $("status").textContent = `连不上：核心只接受端口 ${want} 的页面（当前 ${location.origin}）`;
+    $("status").className = "chip down";
+    return;
+  }
+
+  if (i.allowedOrigin === location.origin) return;
   $("status").textContent = `连不上：核心只接受来自 ${i.allowedOrigin} 的页面（当前 ${location.origin}）`;
   $("status").className = "chip down";
 }
@@ -1846,7 +1938,10 @@ function connected() {
 }
 
 function connect() {
-  ws = new WebSocket(core.replace("http", "ws") + "/ws");
+  // ⚠️ token 只能走查询参数：浏览器的 `WebSocket` 构造函数**不能自定义请求头**
+  //（这是 WebSocket API 的限制，不是我们的选择）。核心那边两种交法都认。
+  ws = new WebSocket(
+    core.replace("http", "ws") + "/ws" + (authToken ? `?${TOKEN_PARAM}=${encodeURIComponent(authToken)}` : ""));
 
   // new WebSocket 是异步的：这行返回时 readyState 还是 CONNECTING，
   // 不能拿 readyState === OPEN 当「能发帧了吗」的判据 ⇒ 发送凭据交给显式开关 wsReady

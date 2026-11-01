@@ -72,9 +72,15 @@ public static class AllowedOriginResolver
         // ⚠️ **判据与头逐字相同**（`head/Program.cs` 里也是裸 `int.TryParse`、而且没有范围检查）——
         // 「两边对同一个输入给出同一个答案」正是这个类的全部目的，所以这里**刻意不加**头的判据里没有的检查。
         // ⇒ 非数字（含空串）两边一起回落到各自默认；数字（含越界）两边一起采用，由 `UseUrls` 去抱怨。
+        //
+        // ⚠️ **主机段是通配的（`*`）**（2026-11-05，与监听地址一起改）：头现在绑 0.0.0.0，
+        // 页面可能从 `http://192.168.1.5:17990`、`http://10.0.0.7:17990`、`http://localhost:17990` 打开，
+        // 而**逐字相等**只认 127.0.0.1 那一个 ⇒ 别的写法全部被静默拒绝。
+        // 放开主机、钉住端口，是在「局域网任意设备能用」与「随便哪个网页连不进来」之间取的那条线
+        // （判据与代价见 `OriginMatcher`）。要回到只认一个 origin：设 `LILARA_ALLOWED_ORIGIN`。
         var headPort = getEnv(HeadPortEnvVar);
         if (int.TryParse(headPort, out var port))
-            return new ResolvedAllowedOrigin($"http://127.0.0.1:{port}", AllowedOriginSource.Environment);
+            return new ResolvedAllowedOrigin($"http://{OriginMatcher.AnyHost}:{port}", AllowedOriginSource.Environment);
 
         return new ResolvedAllowedOrigin(ControlServer.DefaultAllowedOrigin, AllowedOriginSource.Default);
     }
