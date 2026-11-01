@@ -21,3 +21,25 @@ public interface IModelAdapter
 
     Task<ModelReply> CallAsync(ModelRequest request, CancellationToken ct);
 }
+
+/// <summary>可选的增量生成能力；适配器仍返回完整且权威的最终回复。</summary>
+public interface IStreamingModelAdapter
+{
+    /// <summary>这个提供商是否开启了增量（`provider.Streaming`）。关闭时与既有调用路径逐字节相同。</summary>
+    bool Streaming { get; }
+
+    /// <summary>
+    /// 发一次流式请求：`onDelta` 收到**只供显示**的正文增量，返回值仍是权威的完整回复。
+    /// `onDelta` 为 null = 不关心增量（探针），此时可以直接走非流式路径。
+    /// </summary>
+    Task<ModelReply> StreamAsync(
+        ModelRequest request, Action<ModelDelta>? onDelta, CancellationToken ct);
+}
+
+/// <summary>
+/// 只供实时显示的文本增量。⚠️ 不含工具参数（半截 JSON 没有显示价值，
+/// 也会让「参数逐字原文」那条纪律多一种形态）。
+/// </summary>
+/// <param name="BlockIndex">这一块在最终回复 `Blocks` 里的序号，头据此把增量放对位置。</param>
+/// <param name="Kind">`text` / `reasoning`，与 <see cref="Kernel.Block"/> 的判别式同名。</param>
+public sealed record ModelDelta(int BlockIndex, string Kind, string Text);

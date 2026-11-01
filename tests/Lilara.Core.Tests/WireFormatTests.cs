@@ -188,14 +188,42 @@ public class WireFormatTests
         // 20 → 21：`retry.attempt`（2026-10-21，重试上报——头不能只看到一直等待）。
         // 21 → 22：`session.phase`（2026-10-25，四态由核心判、头只显示）。
         // 22 → 23：`plan.updated`（2026-10-24 计划批，计划树变了）。
-        Assert.Equal(23, declared.Length);
+        // 23 → 24：`term.delta`（2026-11 流式批，正文 / 思考的实时增量——只供显示、不保留）。
+        Assert.Equal(24, declared.Length);
 
-        var dispatcher = File.ReadAllText(Path.Combine(
-            RepoRoot(), "src", "Lilara.Core", "Hosting", "CommandDispatcher.cs"));
+        // ⚠️ **扫整个 Hosting 目录，不只 `CommandDispatcher.cs`**（2026-11 改）：
+        // 第一处不经分派器发出的类型出现了——`term.delta` 由 `DeltaPump`（攒批器）发出。
+        // 这不是放宽守卫：它问的仍是「有没有人真的 `new` 它」，只是不再假定**只有一处**能发。
+        // ⚠️ 别把它缩回单个文件：那样下一次「换个类发」会被判成死投递，而修法会是「在分派器里
+        // 补一句假发射」——那正好把守卫要防的东西做成真的。
+        var sources = Directory
+            .EnumerateFiles(Path.Combine(RepoRoot(), "src", "Lilara.Core", "Hosting"), "*.cs",
+                SearchOption.AllDirectories)
+            .Select(File.ReadAllText)
+            .ToList();
 
-        var silent = declared.Where(name => !dispatcher.Contains($"new WireEvent.{name}(", StringComparison.Ordinal)).ToList();
+        var silent = declared
+            .Where(name => !sources.Any(s => s.Contains($"new WireEvent.{name}(", StringComparison.Ordinal)))
+            .ToList();
 
-        Assert.Empty(silent.Select(n => $"`{n}` 在 WireEvent 的表里，但 CommandDispatcher 里没有发射点（死投递）。"));
+        Assert.Empty(silent.Select(n => $"`{n}` 在 WireEvent 的表里，但 Hosting 里没有发射点（死投递）。"));
+    }
+
+    // ⚠️ **流式增量的载荷形状**（2026-11）：头按字段名取值（`p.deltaKind` / `p.blockIndex` /
+    // `p.text` / `p.turn`）。⚠️ 它尤其要一条守卫，因为**字段名是 `deltaKind` 而不是 `kind`**——
+    // `kind` 与多态判别式同名会让 STJ 抛 `PropertyConflictsWithMetadataPropertyName`，
+    // 而那不是「这条事件坏了」，是**整个 `WireJson.Options` 解析失败、所有帧一起炸**。
+    [Fact]
+    public void WireEvent_TermDelta_CarriesItsDiscriminatorAndFields()
+    {
+        var json = WireEvent.StableSerialize(
+            new WireEvent.TermDelta("s1", 3, 1, "reasoning", "想"));
+
+        Assert.Contains("\"kind\":\"term.delta\"", json);
+        Assert.Contains("\"deltaKind\":\"reasoning\"", json);
+        Assert.Contains("\"blockIndex\":1", json);
+        Assert.Contains("\"turn\":3", json);
+        Assert.Contains("\"text\":\"想\"", json);
     }
 
     // 同族的探针守卫：`03` §4 的数条数那句的自动化版。
@@ -206,7 +234,8 @@ public class WireFormatTests
     {
         // 21 → 22：`session.phase`（2026-10-25）。
         // 22 → 23：`plan.updated`（2026-10-24 计划批）。
-        Assert.Equal(23, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+        // 23 → 24：`term.delta`（2026-11 流式批）。
+        Assert.Equal(24, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
     }
 
     // ⚠️ 重试上报的**载荷形状**（2026-10-21）：头按字段名取值（`p.attempt` / `p.maxAttempts` /

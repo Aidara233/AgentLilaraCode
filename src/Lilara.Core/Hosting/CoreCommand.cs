@@ -40,6 +40,9 @@ public abstract record CoreCommand
         /// </summary>
         public int? TimeoutSeconds { get; init; }
 
+        /// <summary>null 表示保留已有设置；非 null 则明确设置 provider 流式能力。</summary>
+        public bool? Streaming { get; init; }
+
         /// <summary>
         /// **前缀缓存的显式断点**（2026-10-28）：`null` = 本次没提到 = **保留旧值**（同 <see cref="Models"/>）；
         /// `auto` / `explicit` 二选一，其余值在这里被拒。

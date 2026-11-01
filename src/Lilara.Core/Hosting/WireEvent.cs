@@ -29,6 +29,7 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(CompactionCompleted), "session.compaction.completed")]
 [JsonDerivedType(typeof(PlanUpdated), "plan.updated")]
 [JsonDerivedType(typeof(PhaseChanged), "session.phase")]
+[JsonDerivedType(typeof(TermDelta), "term.delta")]
 public abstract record WireEvent
 {
     public sealed record SessionCreated(string SessionId, string ProjectKey) : WireEvent;
@@ -278,6 +279,29 @@ public abstract record WireEvent
     /// 同一条约定）——同值重复发会让头的相位动画无谓地重放。</para>
     /// </summary>
     public sealed record PhaseChanged(string SessionId, string Phase, int Turn) : WireEvent;
+
+    /// <summary>
+    /// **模型正文 / 思考的实时增量**（2026-11 流式批）。⚠️ <b>只供显示，不是事实。</b>
+    ///
+    /// <para>⚠️ <b>它不进补发缓冲</b>（<c>Publish(retained: false)</c>）：重连之后重放一段半截正文
+    /// 只会让头画出两条重叠的气泡。这一条正是「流式期间只在内存、步末才落盘、不支持断线续传」
+    /// 那三句（`01` §11.9 / `03` §4.1）在控制面上的落点。</para>
+    ///
+    /// <para>⚠️ <b>权威事实仍是 <see cref="MessageAppended"/></b>：头收到它时必须**整块替换**
+    /// 临时气泡。增量名对不上、少一段、多一段，都只影响那一瞬间的画面。</para>
+    ///
+    /// <para>⚠️ <b>不含工具参数</b>：半截 JSON 没有显示价值，而它会把「参数是逐字原文」
+    /// 那条纪律多出一种形态（见 <see cref="Protocol.ModelDelta"/>）。</para>
+    ///
+    /// <para>⚠️ <b>字段名是 <c>DeltaKind</c>，不是 <c>Kind</c></b>——后者与多态判别式同名，
+    /// 会让 STJ 抛 <c>PropertyConflictsWithMetadataPropertyName</c>，而那不是「这条事件坏了」，
+    /// 是**整个 <c>WireJson.Options</c> 解析失败、所有帧一起炸**
+    /// （同 <see cref="ApprovalRequested.AskKind"/> 那条注释的教训）。</para>
+    /// </summary>
+    /// <param name="BlockIndex">这一块在最终回复 `Blocks` 里的序号。</param>
+    /// <param name="DeltaKind">`text` / `reasoning`，与块的判别式同名。</param>
+    public sealed record TermDelta(
+        string SessionId, int Turn, int BlockIndex, string DeltaKind, string Text) : WireEvent;
 
     // 参数类型必须是 WireEvent（基类）：泛型版在静态类型推断成子类时会静默丢掉判别式。
     public static string StableSerialize(WireEvent value) =>

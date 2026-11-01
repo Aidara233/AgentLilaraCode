@@ -108,6 +108,59 @@ public class EventBusTests
         Assert.Equal([4L, 5L], got);
     }
 
+    // ⚠️ **不保留的事件不算丢**（2026-11 流式批）：`retained: false` 的帧照样拿 seq、
+    // 照样投递给当时在听的订阅者，但**不进补发缓冲**。判据必须是「有没有**保留**事件被淘汰」，
+    // 而不是「缓冲里最早那条的 seq 是多少」——后者会把这种正常空洞判成丢事件，
+    // 让每个重连的头都收到一次假的 resync，而 resync 意味着全量重拉。
+    [Fact]
+    public void Subscribe_NonRetainedEventsInTheGap_DoNotCauseResync()
+    {
+        var bus = new EventBus(topicCapacity: 8);
+
+        bus.Publish(EventBus.SessionTopic("s1"), Evt("a"));                 // seq 1（保留）
+        for (var i = 0; i < 50; i++)
+            bus.Publish(EventBus.SessionTopic("s1"), Evt("d"), retained: false);   // seq 2..51（不保留）
+        bus.Publish(EventBus.SessionTopic("s1"), Evt("b"));                 // seq 52（保留）
+
+        // 从头补：两条保留事件都还在缓冲里（容量 8 远没满）⇒ 没有任何东西真的丢了。
+        using var sub = bus.Subscribe(EventBus.SessionTopic("s1"), since: 0);
+
+        Assert.False(sub.NeedsResync);
+        var got = new List<long>();
+        while (sub.Reader.TryRead(out var p)) got.Add(p.Seq);
+        // 只补保留的那两条（`a` 与 `b`）——不保留的本来就不该被重放。
+        Assert.Equal([1L, 52L], got);
+    }
+
+    // 反面：**保留事件**被淘汰之后仍然必须 resync（这条守卫防「顺手把判据去掉」）。
+    [Fact]
+    public void Subscribe_RetainedEventsEvicted_StillRequiresResync()
+    {
+        var bus = new EventBus(topicCapacity: 4);
+
+        for (var i = 0; i < 10; i++) bus.Publish(EventBus.SessionTopic("s1"), Evt($"{i}"));
+
+        using var sub = bus.Subscribe(EventBus.SessionTopic("s1"), since: 1);
+
+        Assert.True(sub.NeedsResync);
+    }
+
+    // 不保留的事件照样投递给**当时在听**的订阅者（攒批是为了少发帧，不是为了不发）。
+    [Fact]
+    public async Task NonRetainedEvents_AreStillDeliveredLive()
+    {
+        var bus = new EventBus();
+        using var sub = bus.Subscribe(EventBus.SessionTopic("s1"));
+
+        bus.Publish(EventBus.SessionTopic("s1"), Evt("a"));
+        bus.Publish(EventBus.SessionTopic("s1"), Evt("delta"), retained: false);
+
+        var got = new List<long>();
+        await foreach (var p in sub.Reader.ReadAllAsync()) { got.Add(p.Seq); if (got.Count == 2) break; }
+
+        Assert.Equal([1L, 2L], got);
+    }
+
     // 慢订阅者不许拖住发布方：队列满就丢并标记待重建，否则一个卡住的头会拖死所有发布方。
     [Fact]
     public void SlowSubscriber_IsDroppedNotBlockingThePublisher()

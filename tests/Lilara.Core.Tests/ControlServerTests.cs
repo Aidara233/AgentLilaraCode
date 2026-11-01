@@ -1808,7 +1808,7 @@ public class ControlServerTests : IAsyncLifetime
             .Single(e => e.GetProperty("id").GetString() == "full");
 
         AssertKeysOf(item, "id", "protocol", "defaultModel", "endpoint", "authScheme", "modality", "models",
-            "cacheMode", "effortParam", "reasoningInclude", "hasApiKey");
+            "cacheMode", "effortParam", "reasoningInclude", "streaming", "hasApiKey");
     }
 
     // 缺省供应商（可空字段全不设）的键集**更小**——这条把「省略」也钉住：
@@ -1821,7 +1821,9 @@ public class ControlServerTests : IAsyncLifetime
 
         // ⚠️ `effortParams` / `reasoningIncludes` **不在这里**：它们是 `/provider-schema` 的键
         // （合法取值），不是 `/providers` 的（那份是每个 provider 的实例值）。
-        AssertKeysOf(item, "id", "protocol", "defaultModel", "modality", "hasApiKey");
+        // ⚠️ `streaming` **在这条里也是常驻键**：它是 `bool`（不可空）⇒ 永远有一个 `false`，
+        // 与前面那批「没配就整个键不存在」的可空字段不同一条规则。
+        AssertKeysOf(item, "id", "protocol", "defaultModel", "modality", "streaming", "hasApiKey");
     }
 
     [Fact]

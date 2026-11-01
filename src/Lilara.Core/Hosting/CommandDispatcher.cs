@@ -31,6 +31,12 @@ public sealed class CommandDispatcher(
 {
     private readonly CoreHost _host = host;
     private readonly EventBus _bus = bus;
+
+    /// <summary>
+    /// 增量攒批器（2026-11 流式批）。⚠️ **进程级一个**：它自己带定时器，
+    /// 每步各造一个会让「谁在负责这一批」随步数变多而无从解释。
+    /// </summary>
+    private readonly DeltaPump _deltas = new(bus);
     // 上一次发出的相位：只在真的变了才发（与 axis.changed 同一条约定）。
     private readonly Dictionary<string, string> _lastPhase = new();
 
@@ -59,6 +65,10 @@ public sealed class CommandDispatcher(
             new WireEvent.RetryAttempt(
                 handle.SessionId, notice.Attempt, RetryPolicy.MaxRetries,
                 notice.Reason, (int)notice.Wait.TotalMilliseconds));
+        // ⚠️ 增量同样在**解析口接一次**（见上面 `OnRetry` 的理由）。攒批、不保留、
+        // 以及与最终消息的先后次序都在 `DeltaPump` 里判；这里只把事实交过去。
+        stepper.OnDelta = delta => _deltas.Push(handle.SessionId, handle.State.Turn + 1, delta);
+
         return stepper;
     }
 
@@ -563,6 +573,7 @@ public sealed class CommandDispatcher(
             Models = p.Models ?? existing?.Models,
             // 同上：没提到就保留旧的（`null` 在这里是「本次没提到」，不是「清回默认」）。
             TimeoutSeconds = p.TimeoutSeconds ?? existing?.TimeoutSeconds,
+            Streaming = p.Streaming ?? existing?.Streaming ?? false,
             // 缓存形态同理。⚠️ 它进的是**请求字节**：值写错会让整条前缀缓存失效而不报错，
             // 所以校验在上一段（dispatcher），这里只负责「没提到 = 保留」。
             CacheMode = p.CacheMode ?? existing?.CacheMode,
@@ -1917,6 +1928,11 @@ public sealed class CommandDispatcher(
                 replyForLoop = step.Reply;
                 goalEnded = step.GoalEnded;
 
+                // ⚠️ **增量到此收尾**，且必须在 `message.appended` **之前**：
+                // 尾部那几个字若晚于最终消息到达，头会先画完整气泡、再往临时气泡里补字
+                // ——屏幕上就闪一下多出来的重复正文。
+                _deltas.Flush(handle.SessionId);
+
                 // 模型消息由这里发（`Stepper` 不碰事件总线）；判据与它落盘时一致：拒答 / 空块不产生模型消息。
                 if (!reply.Refused && reply.Blocks.Count > 0)
                     _bus.Publish(EventBus.SessionTopic(handle.SessionId),
@@ -2027,6 +2043,9 @@ public sealed class CommandDispatcher(
         catch (OperationCanceledException) when (stepCts.IsCancellationRequested)
         {
             // 中断不是失败：用户消息已落盘、Turn 不递增 ⇒ 发 `state` 回到 Idle，不发 `error`。
+            // ⚠️ 中止时也要收尾增量：`StateChanged(Idle)` 会让头清掉临时气泡，
+            // 而缓冲区里剩下的那点字若晚一步发出，会在清空之后画出一个新的半截气泡。
+            _deltas.Flush(handle.SessionId);
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                             new WireEvent.StateChanged(handle.SessionId, SessionStatus.Idle, handle.State.Turn));
 
@@ -2039,6 +2058,8 @@ public sealed class CommandDispatcher(
         catch (Exception ex)
         {
             // 真失败走事件，不走回执。
+            // ⚠️ 收尾顺序与成功路径同一条：先把增量发完，再发 `error`（头据它清掉临时气泡）。
+            _deltas.Flush(handle.SessionId);
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                 new WireEvent.Error(handle.SessionId, ex.Message));
 

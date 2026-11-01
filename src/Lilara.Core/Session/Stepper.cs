@@ -61,6 +61,16 @@ public sealed class Stepper(
     public Action<RetryNotice>? OnRetry { get; set; }
 
     /// <summary>
+    /// **模型正在吐的正文增量**（2026-11 流式批）。与 <see cref="OnRetry"/> 同一个形状：
+    /// 解析口赋值一次，所有入口自动带上。
+    ///
+    /// <para>⚠️ <b>它只供显示</b>：不落盘、不进最终回复。哪怕一个增量都没送到，
+    /// 这一步的结果也**完全一样**——权威事实是 <see cref="StepOutcome.Reply"/>。
+    /// 这是「流式失败不影响会话正确性」的全部依据。</para>
+    /// </summary>
+    public Action<ModelDelta>? OnDelta { get; set; }
+
+    /// <summary>
     /// **子会话的活状态**（2026-10-26）：id ⇒ <c>SessionStatus</c> 的一个值，或 <c>null</c>
     /// （= 那一刻没激活 ⇒ 调用方回落到盘面那份）。
     ///
@@ -306,7 +316,9 @@ public sealed class Stepper(
                     RecordUsage(handle, callId, failed.StartedAt, reply: null, "failed",
                         attempt: failed.Index, endedAt: failed.EndedAt, error: failed.Failure.Message);
                 },
-                onRetry: NotifyRetry);
+                onRetry: NotifyRetry,
+                // ⚠️ 判据全在 `RetryPolicy` 里（含「吐过就不重试」）——这里只转交。
+                onDelta: OnDelta);
             reply = outcome.Reply;
             attempts = outcome.Attempts;
             RecordUsage(handle, callId, outcome.StartedAt, reply, "completed", attempt: attempts,

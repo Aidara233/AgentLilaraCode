@@ -857,6 +857,8 @@ public sealed class ControlServer(
                 // 合法取值在 `/provider-schema`（见那边同一条注释）。
                 p.EffortParam,
                 p.ReasoningInclude,
+                // 是否接收模型正文增量（2026-11 流式批）。默认 false = 与既有调用逐字节相同。
+                p.Streaming,
                 // key 只回 HasApiKey（能改不能看）：表单能显示「已配置」而不是空框。
                 HasApiKey = p.HasApiKey,
             }), WireJson.Options));

@@ -13,7 +13,8 @@ public static class OpenAiResponsesRequest
     public const string Path = "/v1/responses";
 
     public static string Build(
-        ModelRequest request, bool explicitCache = false, bool sendEffort = false, bool includeReasoning = false)
+        ModelRequest request, bool explicitCache = false, bool sendEffort = false,
+        bool includeReasoning = false, bool stream = false)
     {
         // ⚠️ 判据与另两条**必须逐字相同**（空时间线 + 两槽位都空才早失败）。
         if (request.Timeline.Count == 0
@@ -111,6 +112,8 @@ public static class OpenAiResponsesRequest
         // 这是协议形状的限制，不是漏做。
         if (marked)
             body["prompt_cache_options"] = new JsonObject { ["mode"] = "explicit" };
+
+        if (stream) body["stream"] = true;
 
         // ⚠️ **空工具表 ⇒ 不写这个键**（与 Chat / temperature 同一条判据）。
         // Responses 的工具是**扁平**的（Chat 多一层 `function`）——两条 OpenAI 协议**形状不同**，

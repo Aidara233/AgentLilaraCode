@@ -4,7 +4,7 @@ using Lilara.Core.Kernel;
 namespace Lilara.Core.Protocol.Claude;
 
 // Claude Messages 适配器：走官方 C# SDK，不手搓 HTTP。构造请求 → 发出去 → 映射回来，翻译逻辑全在两个纯函数里。
-public sealed class ClaudeAdapter : IModelAdapter
+public sealed class ClaudeAdapter : IModelAdapter, IStreamingModelAdapter
 {
     public const string ProtocolId = Protocols.ClaudeMessages;
 
@@ -28,12 +28,16 @@ public sealed class ClaudeAdapter : IModelAdapter
     /// <inheritdoc />
     public bool ExplicitCache { get; }
 
+    /// <summary>这个提供商是否接收增量（`provider.Streaming`）。</summary>
+    public bool Streaming { get; }
+
     public ClaudeAdapter(ProviderDefinition provider)
     {
         ArgumentNullException.ThrowIfNull(provider);
 
         // 显式缓存断点：按 provider 开（见 `CacheBreakpoint` 的类型注释）。
         ExplicitCache = provider.CacheMode == CacheBreakpoint.Explicit;
+        Streaming = provider.Streaming;
 
         // 两种认证方式走不同属性：ApiKey → x-api-key，AuthToken → Authorization: Bearer。
         // 本机网关只认后者（ApiKey 打不通、AuthToken 通）。这是协议怪癖，不是可选优化。
@@ -92,6 +96,89 @@ public sealed class ClaudeAdapter : IModelAdapter
     // 转发到 Cancellation.ShouldWrap——判据只有一份，别在这里加逻辑。
     internal static bool ShouldWrap(Exception ex, CancellationToken ct) =>
         Cancellation.ShouldWrap(ex, ct);
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// ⚠️ **最终回复仍由 SDK 的聚合器产出**（`Aggregate`），不自己拼一份 `Message`：
+    /// 聚合要处理 thinking 签名、`input_json_delta` 的分片、usage 的两次上报——
+    /// 手写第二套只会让「聚合到什么」有两个出处。
+    /// ⇒ 这里的做法是：自己逐事件走一遍（同时转发增量），把事件**收下来**，
+    /// 再让聚合器消费同一串事件。
+    /// </remarks>
+    public async Task<ModelReply> StreamAsync(
+        ModelRequest request, Action<ModelDelta>? onDelta, CancellationToken ct)
+    {
+        if (!Streaming || onDelta is null) return await CallAsync(request, ct);
+
+        using var deadline = _timeout is { } limit ? CancellationTokenSource.CreateLinkedTokenSource(ct) : null;
+        if (deadline is not null) deadline.CancelAfter(_timeout!.Value);
+        var token = deadline?.Token ?? ct;
+
+        var seen = new List<Anthropic.Models.Messages.RawMessageStreamEvent>();
+
+        try
+        {
+            var parameters = ClaudeRequestBuilder.Build(request, ExplicitCache);
+
+            await foreach (var e in _client.Messages.CreateStreaming(parameters, cancellationToken: token))
+            {
+                // ⚠️ **每收到一个事件就把时限推后**——流式的时限是「多久没动静算挂」，
+                // 不是「整个回答必须在 N 秒内结束」（那会把长回答腰斩，而报错像上游的问题）。
+                deadline?.CancelAfter(_timeout!.Value);
+
+                seen.Add(e);
+
+                // 只转发正文与思考增量；工具参数不在其中（半截 JSON 不显示）。
+                if (e.TryPickContentBlockDelta(out var block)
+                    && DeltaOf(block, out var kind, out var text))
+                    onDelta(new ModelDelta((int)block.Index, kind, text));
+            }
+
+            // ⚠️ 聚合器要的是「一整串事件」；这里给它同一批（已收到的），
+            // 于是最终回复与不走流式时**由同一段代码**得出。
+            var message = await Replay(seen).Aggregate();
+            return ClaudeResponseMapper.Map(message);
+        }
+        catch (Exception ex) when (ShouldWrap(ex, ct))
+        {
+            var why = deadline is { IsCancellationRequested: true } && !ct.IsCancellationRequested
+                ? $"模型调用超时（{_timeout!.Value.TotalSeconds:0} 秒）。"
+                  + "慢模型可以给该提供商调大 timeoutSeconds（`provider set <id> --timeout <秒>`）。"
+                : Describe(ex);
+            throw new ModelCallFailedException(why, ex) { Transient = IsTransient(ex) };
+        }
+    }
+
+    /// <summary>从一块增量里取显示文本。`false` = 这一块没有可显示的东西（签名 / 参数 / 引用）。</summary>
+    private static bool DeltaOf(
+        Anthropic.Models.Messages.RawContentBlockDeltaEvent block, out string kind, out string text)
+    {
+        kind = "text";
+        text = "";
+
+        if (block.Delta.TryPickText(out var t) && t.Text is { Length: > 0 } body)
+        {
+            text = body;
+            return true;
+        }
+
+        if (block.Delta.TryPickThinking(out var thinking) && thinking.Thinking is { Length: > 0 } thought)
+        {
+            kind = "reasoning";
+            text = thought;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>把已收到的事件重新当成一串喂给聚合器（`Aggregate` 只吃 `IAsyncEnumerable`）。</summary>
+    private static async IAsyncEnumerable<Anthropic.Models.Messages.RawMessageStreamEvent> Replay(
+        List<Anthropic.Models.Messages.RawMessageStreamEvent> events)
+    {
+        foreach (var e in events) yield return e;
+        await Task.CompletedTask;
+    }
 
     /// <summary>
     /// **这次失败值不值得再发一次**（`RetryPolicy` 读它）。

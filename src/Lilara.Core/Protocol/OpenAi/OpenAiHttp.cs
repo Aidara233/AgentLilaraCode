@@ -118,6 +118,86 @@ public sealed class OpenAiHttp
                 : $"模型调用失败：{ex.Message}";
     }
 
+    /// <summary>
+    /// 流式请求：按 SSE 逐帧回调 <paramref name="onData"/>（每帧的 `data:` 原文，含 `[DONE]`），
+    /// 返回**上游给的最后一份完整响应原文**（Chat 由适配器自行拼装，这里只负责字节）。
+    /// ⚠️ 超时在这里是**首帧超时 + 帧间空闲**，不是「整个回答要在 <see cref="_timeout"/> 内结束」——
+    /// 后者会把长回答腰斩，而报错看起来像上游的问题。
+    /// </summary>
+    public async Task PostStreamAsync(
+        string path, string body, Func<string, Task> onData, CancellationToken ct,
+        HttpMessageHandler? transport = null)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, ComposeUrl(Endpoint.Url, path));
+        request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+
+        if (AuthScheme == AuthSchemes.Bearer)
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _key);
+        else
+            request.Headers.TryAddWithoutValidation("x-api-key", _key);
+
+        using var oneOff = transport is null ? null : new HttpClient(transport, disposeHandler: false);
+        var client = oneOff ?? Client;
+
+        // 空闲计时器：每收到一帧就重置。与 ct 链接，所以调用方取消照样立刻生效。
+        using var idle = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        idle.CancelAfter(_timeout);
+        var sawFrame = false;
+
+        try
+        {
+            LastStatus = null;
+            using var response = await client.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, idle.Token);
+            LastStatus = response.StatusCode;
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var text = await response.Content.ReadAsStringAsync(idle.Token);
+                throw new ModelCallFailedException(Describe(response.StatusCode, text))
+                {
+                    Transient = RetryPolicy.IsTransientStatus(response.StatusCode),
+                };
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync(idle.Token);
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+
+            while (true)
+            {
+                var line = await reader.ReadLineAsync(idle.Token);
+                if (line is null) break;
+
+                if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
+
+                idle.CancelAfter(_timeout);   // 收到东西了 ⇒ 空闲窗口重新起算
+                sawFrame = true;
+
+                var data = line[5..].Trim();
+                if (data.Length == 0) continue;
+
+                await onData(data);
+                if (data == "[DONE]") return;
+            }
+
+            if (!sawFrame) throw new ModelCallFailedException("流式响应里没有任何数据帧。") { Transient = true };
+        }
+        catch (ModelCallFailedException) { throw; }
+        catch (Exception ex) when (ShouldWrap(ex, ct))
+        {
+            throw new ModelCallFailedException(Why(ex), ex) { Transient = true };
+        }
+
+        string Why(Exception ex) =>
+            idle.IsCancellationRequested && !ct.IsCancellationRequested
+                ? sawFrame
+                    ? $"流式回答中途停顿超过 {_timeout.TotalSeconds:0} 秒，已放弃。"
+                    : $"模型调用超时（{_timeout.TotalSeconds:0} 秒内没有收到任何数据）。"
+                      + "慢模型可以给该提供商调大 timeoutSeconds（`provider set <id> --timeout <秒>`）。"
+                : $"模型调用失败：{ex.Message}";
+    }
+
     // 转发到 Cancellation.ShouldWrap——判据只有一份，别在这里加逻辑。
     internal static bool ShouldWrap(Exception ex, CancellationToken ct) =>
         Cancellation.ShouldWrap(ex, ct);

@@ -10,7 +10,8 @@ public static class OpenAiChatRequest
 {
     public const string Path = "/v1/chat/completions";
 
-    public static string Build(ModelRequest request, bool explicitCache = false, bool sendEffort = false)
+    public static string Build(
+        ModelRequest request, bool explicitCache = false, bool sendEffort = false, bool stream = false)
     {
         // ⚠️ 判据与 Claude 那条**必须逐字相同**（空时间线 + 两槽位都空才早失败）——
         // 三条链路对「什么算合法的请求」各判一套的话，换个 provider 就会静默换一种行为。
@@ -76,6 +77,14 @@ public static class OpenAiChatRequest
 
         // ⚠️ **断点已在上面（尾槽位追加之前）打过了**——这里不再重复。
         // 那一处有完整理由；删掉这里的第二份是为了让「位置判据只有一处」兑现。
+
+        // ---- 流式（由 provider 明确开启；默认请求字节不变）----
+        if (stream)
+        {
+            body["stream"] = true;
+            // 不带它的话流里**没有 usage** ⇒ 账本静默归零。
+            body["stream_options"] = new JsonObject { ["include_usage"] = true };
+        }
 
         // ---- 思考强度（2026-10-28）----
         //

@@ -686,6 +686,9 @@ async function openSessionInner(id) {
   // 画上去，回收条数那个回声就是这么丢的（见 openSession 里那段）。逐条追加会把旧内容
   // **留在上面、叠成两遍**。
   // ⚠️ 用 `replaceChildren`（不是 `innerHTML = ""` 再逐条）：一条语句换完，中间不留空白帧。
+  // ⚠️ 时间线整个换掉 ⇒ 临时气泡的引用也要清（否则后续增量会往一个**已经不在树上**的节点里写，
+  // 页面上看起来就是「流式没了」，而它其实还在往内存里堆）。
+  clearLive();
   $("timeline").replaceChildren();
   renderHistoryPage(history, false);
 
@@ -804,6 +807,58 @@ async function loadOlderHistory() {
 function renderTurn(from, blocks, cls, historyId) {
   const item = { kind: "message", id: historyId || `live-${Date.now()}-${Math.random()}`, from, blocks };
   renderHistoryItem(item, cls);
+}
+
+// ---- 流式增量（term.delta，2026-11）----
+//
+// ⚠️ **临时气泡不是事实**：它只是「模型正在说」的画面临时状态，收到 `message.appended`
+// 时**整块丢掉**，由最终气泡取代。⇒ 这里少画一段、多画一段都不影响记录。
+// ⚠️ 所以它**不写** `data-history-id`：写了就会与随后到达的正式消息抢同一个身份，
+// 而 `renderHistoryItem` 是按 id 去重的 ⇒ 正式消息会被当成重复丢掉。
+let live = null;   // { sessionId, turn, el, parts: Map<key, HTMLElement> }
+
+function clearLive() {
+  if (!live) return;
+  // ⚠️ 只摘自己那一块：`timeline` 可能已经被 `openSession` 整体换过，
+  // 那时这个节点早就不在树上了（`remove()` 对已摘除的节点是 no-op，安全）。
+  live.el.remove();
+  live = null;
+}
+
+function appendDelta(p) {
+  if (!live || live.sessionId !== p.sessionId || live.turn !== p.turn) {
+    clearLive();
+
+    const el = document.createElement("div");
+    // 类名与正式气泡同形（`.turn.model`），好让样式与位置一致。
+    el.className = "turn model";
+    el.dataset.live = "1";
+
+    const who = document.createElement("div");
+    who.className = "who";
+    who.textContent = "⏺";
+
+    const body = document.createElement("div");
+    body.className = "body";
+
+    el.append(who, body);
+    appendTimeline(el);
+
+    live = { sessionId: p.sessionId, turn: p.turn, el, parts: new Map() };
+  }
+
+  const key = `${p.blockIndex}:${p.deltaKind}`;
+  let part = live.parts.get(key);
+  if (!part) {
+    part = document.createElement("div");
+    // 思考与正文分开：与正式气泡里「先想、再说」的次序一致。
+    part.className = p.deltaKind === "reasoning" ? "msg-text reasoning" : "msg-text";
+    live.el.querySelector(".body").appendChild(part);
+    live.parts.set(key, part);
+  }
+
+  part.textContent += p.text;
+  $("timeline").scrollTop = $("timeline").scrollHeight;
 }
 
 function detail(label, text, cls) {
@@ -1063,6 +1118,8 @@ function providerCard(p) {
       ["认证", p.authScheme],
       // 一次模型调用的超时：没配 = 由协议自己的默认值管（OpenAI 100 秒 / Claude 由 SDK 定）。
       ["调用超时", p.timeoutSeconds ? `${p.timeoutSeconds} 秒` : "(默认)"],
+      // 流式输出（2026-11）：关着的时候请求体与开启之前逐字节相同。
+      ["流式输出", p.streaming ? "开" : "关"],
       ["密钥", p.hasApiKey ? "已配置" : "未配置", !p.hasApiKey],
     ]);
     card.appendChild(dl);
@@ -1106,6 +1163,11 @@ function providerCard(p) {
   fTimeout.input.type = "number";
   fTimeout.input.min = "1";
   fTimeout.input.placeholder = "留空 = 协议默认（OpenAI 100 秒；Claude 由 SDK 定）";
+
+  // 流式输出（2026-11）。⚠️ **三态**：`(默认)` / 开 / 关——与超时同一条语义，
+  // 「不发这个键」= 保留旧值；只是它的默认值是「关」（既有行为）。
+  const fStream = selectField("stream", "流式输出", ["on", "off"],
+    isNew ? "" : (p.streaming ? "on" : "off"), /* allowEmpty */ true);
   const fEndpoint = field("endpoint", "端点", isNew ? "" : (p.endpoint || ""), "mono");
   fEndpoint.input.placeholder = "留空 = 官方地址";
   const fAuth = selectField("auth", "认证方式", SCHEMA.authSchemes,
@@ -1121,6 +1183,7 @@ function providerCard(p) {
   form.append(fEndpoint.wrap);
   form.append(fModels.wrap);
   form.append(fTimeout.wrap);
+  form.append(fStream.wrap);
   form.append(fKey.wrap);
   card.appendChild(form);
 
@@ -1157,6 +1220,10 @@ function providerCard(p) {
         }
         payload.timeoutSeconds = seconds;
       }
+
+      // 流式：与超时同一条三态语义——`(默认)` ⇒ 不发这个键（= 保留旧值）。
+      const streamRaw = fStream.select.value;
+      if (streamRaw !== "") payload.streaming = streamRaw === "on";
 
       const r = await commandNow(crypto.randomUUID().slice(0, 8), payload);
       if (!r.accepted) { showCardError(card, r.reason); return; }
@@ -2096,8 +2163,18 @@ async function refreshSessionInfo(id) {
 function handleEvent(p) {
   switch (p.kind) {
     case "message.appended":
-      if (p.sessionId === current)
+      if (p.sessionId === current) {
+        // ⚠️ **先丢掉临时气泡，再画正式那条**（2026-11）：两者是同一段话的两种形态，
+        // 留着就是屏幕上两遍。次序不能反——反了会先画出正式气泡、再把临时气泡追加到它后面。
+        if (p.from === "model") clearLive();
         renderTurn(p.from, p.blocks, null, p.historyId);
+      }
+      break;
+
+    // ⚠️ **流式增量**（2026-11）。它只供显示：`blockIndex` + `deltaKind` 决定塞进哪一格，
+    // 而**任何**后续的 `message.appended` / `step.end` / `state` / `error` 都会把它整块丢掉。
+    case "term.delta":
+      if (p.sessionId === current) appendDelta(p);
       break;
 
     // ⚠️ **工具结果的实时出口**（2026-10-17）。此前核心只在步末发模型消息，
@@ -2111,7 +2188,9 @@ function handleEvent(p) {
 
     case "session.step.begin":
       // 「在跑」的信号源是它：session.state 是磁盘的镜像，而磁盘从不存 Running。
-      if (p.sessionId === current) setStatus("Running", p.turn - 1);
+      // ⚠️ 新的一步开始了 ⇒ 上一段临时正文作废（正常路径上它已被 `message.appended` 收掉；
+      // 这一步保证「残留的临时气泡不会跨步活着」）。
+      if (p.sessionId === current) { clearLive(); setStatus("Running", p.turn - 1); }
       break;
 
     // ⚠️ **重试上报**（2026-10-21，`retry.attempt`）。没有它的话，一次十次退避的失败在头这边
@@ -2128,6 +2207,9 @@ function handleEvent(p) {
 
     case "session.step.end":
       if (p.sessionId === current) {
+        // 这一步结束了 ⇒ 临时气泡该让位（正常路径上 `message.appended` 已经清过它；
+        // 拒答 / 空块那两条不会发模型消息，临时气泡得在这里收掉）。
+        clearLive();
         setStatus("Idle", p.turn);
         if (p.refused) renderMeta("⚠️ 模型拒绝了这次请求");
         else if (["max_tokens", "length", "incomplete"].includes(p.stopReason))
@@ -2251,7 +2333,12 @@ function handleEvent(p) {
       break;
 
     case "error":      // 业务失败走这里（不是 rejected：命令本身没写错）。
-      if (p.sessionId === current) renderMeta("✗ " + p.message, "error");
+      if (p.sessionId === current) {
+        // 失败 ⇒ 这一段话**没有成为事实**（拒答 / 抛异常的步不落模型消息）。
+        // 临时气泡留着就是对没发生的事撒谎。
+        clearLive();
+        renderMeta("✗ " + p.message, "error");
+      }
       break;
 
     // ⚠️ **计划改了**（2026-10-24）：载荷里的 `plan` 与 `/state.plan` **同形**

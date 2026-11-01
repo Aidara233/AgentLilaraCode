@@ -78,11 +78,27 @@ public sealed class EventBus(
         /// <summary>最近若干条，供补发。只由泵（锁内）写。</summary>
         public readonly LinkedList<Published> Buffer = new();
 
+        /// <summary>
+        /// **已经被淘汰出缓冲的那条保留事件的 seq**（0 = 一条都没淘汰过）。
+        ///
+        /// <para>⚠️ 判据是它、不是「缓冲里最早那条的 seq」：从 2026-11 起有**不保留**的事件
+        /// （流式增量，见 <see cref="Publish"/> 的 <c>retained</c> 参数），它们的 seq 不进缓冲
+        /// ⇒ 缓冲里的 seq 会出现**正常的空洞**。拿「最早那条」去判会把这种空洞误判成丢事件、
+        /// 让每个订阅者都收到一次<em>假的 resync</em>。</para>
+        /// </summary>
+        public long DroppedThrough;
+
         public readonly List<EventSubscription> Subs = [];
     }
 
     /// <summary>发布一条事件。任何线程都能调，**立即返回**（不阻塞在订阅者身上）。</summary>
-    public void Publish(string topic, WireEvent payload)
+    /// <param name="retained">
+    /// 是否留在补发缓冲里。⚠️ <c>false</c> = **转发给当前订阅者，但不给补发**——
+    /// 这条流式增量专用：它只对「此刻正看着的人」有意义，重连之后重放一段半截正文
+    /// 只会让头画出两条重叠的气泡（最终回复才是事实）。
+    /// ⚠️ 它**照样拿 seq**（否则头那边的单调游标会出现倒退），只是不进缓冲。
+    /// </param>
+    public void Publish(string topic, WireEvent payload, bool retained = true)
     {
         lock (_gate)
         {
@@ -90,8 +106,16 @@ public sealed class EventBus(
             var seq = ++state.Seq;
 
             var published = new Published(topic, seq, payload);
-            state.Buffer.AddLast(published);
-            while (state.Buffer.Count > topicCapacity) state.Buffer.RemoveFirst();
+
+            if (retained)
+            {
+                state.Buffer.AddLast(published);
+                while (state.Buffer.Count > topicCapacity)
+                {
+                    state.DroppedThrough = state.Buffer.First!.Value.Seq;
+                    state.Buffer.RemoveFirst();
+                }
+            }
 
             // fan-out 在**同一把锁里**——这是「投递有序」的全部依据，别把它挪出去。
             foreach (var sub in state.Subs)
@@ -142,10 +166,11 @@ public sealed class EventBus(
                 {
                     var wanted = state.Buffer.Where(p => p.Seq > from).ToList();
 
-                    // 判据一句话：**「要补发的起点已不在缓冲里」**——
-                    // 缓冲里最早那条的 seq 若大于 from+1，中间那段已经丢了。
-                    var oldest = state.Buffer.Count > 0 ? state.Buffer.First!.Value.Seq : state.Seq + 1;
-                    if (from + 1 < oldest)
+                    // 判据一句话：**「有保留事件被淘汰掉了」**——
+                    // `DroppedThrough` 是被挤出缓冲的那条保留事件的 seq；`from` 还在它之前
+                    // ⇒ 中间那段真的没了。（⚠️ 不能拿「缓冲里最早那条」判：不保留的流式增量
+                    // 会在缓冲里留下**正常空洞**，那样判会让每个订阅者收到一次假的 resync。）
+                    if (from < state.DroppedThrough)
                     {
                         sub.NeedsResync = true;
                         sub.Channel.Writer.TryComplete();

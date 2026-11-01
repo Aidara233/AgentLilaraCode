@@ -673,4 +673,41 @@ public class ParserTests
         Assert.Null(cmd);
         Assert.NotNull(err);
     }
+
+    // `--stream on|off` → 这个提供商收不收增量（2026-11 流式批）。
+    [Theory]
+    [InlineData("on", true)]
+    [InlineData("off", false)]
+    [InlineData("true", true)]
+    [InlineData("0", false)]
+    public void ProviderSet_WithStream_ParsesTheFlag(string value, bool expected)
+    {
+        var (cmd, err) = CoreCommandParser.Parse($"provider set p --stream {value}");
+
+        Assert.Null(err);
+        Assert.Equal(expected, Assert.IsType<CoreCommand.ProviderUpsert>(cmd).Streaming);
+    }
+
+    // 省略 ⇒ null（= 保留旧值）。⚠️ 默认值是「关」，但「没说」与「说关」不是一件事：
+    // 前者要保留盘上那份，后者要真的改。
+    [Fact]
+    public void ProviderSet_WithoutStream_LeavesItNull()
+    {
+        var (cmd, _) = CoreCommandParser.Parse("provider set p --key k");
+
+        Assert.Null(((CoreCommand.ProviderUpsert)cmd!).Streaming);
+    }
+
+    // ⚠️ 认不出的值要报错：静默当成「没给」会让一次手误变成「保留旧值」并回 ✓。
+    [Theory]
+    [InlineData("yes")]
+    [InlineData("开")]
+    [InlineData("")]
+    public void ProviderSet_WithAnUnknownStreamValue_IsAnError(string value)
+    {
+        var (cmd, err) = CoreCommandParser.Parse($"provider set p --stream {value}");
+
+        Assert.Null(cmd);
+        Assert.NotNull(err);
+    }
 }

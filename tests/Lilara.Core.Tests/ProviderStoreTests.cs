@@ -225,7 +225,8 @@ public class ProviderStoreTests : IDisposable
             ["ApiKey:String", "AuthScheme:String", "CacheMode:String", "DefaultModel:String",
              "EffectiveTimeoutSeconds:Nullable`1", "EffortParam:String", "Endpoint:String",
              "HasApiKey:Boolean", "Id:String", "Modality:String", "Models:IReadOnlyList`1",
-             "Protocol:String", "ReasoningInclude:String", "TimeoutSeconds:Nullable`1", "Version:Int32"],
+             "Protocol:String", "ReasoningInclude:String", "Streaming:Boolean",
+             "TimeoutSeconds:Nullable`1", "Version:Int32"],
             DeclaredShape(typeof(ProviderDefinition)));
 
         // HasApiKey / EffectiveTimeoutSeconds 刻意不在这条里——它们带 [JsonIgnore]。
@@ -233,7 +234,8 @@ public class ProviderStoreTests : IDisposable
             ["ApiKey:String", "AuthScheme:String", "CacheMode:String", "DefaultModel:String",
              "EffortParam:String", "Endpoint:String",
              "Id:String", "Modality:String", "Models:IReadOnlyList`1",
-             "Protocol:String", "ReasoningInclude:String", "TimeoutSeconds:Nullable`1", "Version:Int32"],
+             "Protocol:String", "ReasoningInclude:String", "Streaming:Boolean",
+             "TimeoutSeconds:Nullable`1", "Version:Int32"],
             PersistedShape(typeof(ProviderDefinition)));
     }
 }

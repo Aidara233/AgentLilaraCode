@@ -640,7 +640,7 @@ public static class CoreCommandParser
     }
 
     // `provider set <id> [--key <k>] [--model <m>] [--protocol <p>] [--endpoint <u>] [--auth <a>]
-    //                     [--models a,b,c] [--timeout <秒>]`
+    //                     [--models a,b,c] [--timeout <秒>] [--stream on|off]`
     // 这里只管拆词：省略 --key ⇒ null，语义是「保留旧 key」；
     // 「新 provider 省 key 要拒」的守卫在 dispatcher，不在这里。
     private static (CoreCommand?, string?) ParseProviderSet(string line)
@@ -651,6 +651,7 @@ public static class CoreCommandParser
         string? key = null, model = null, protocol = null, endpoint = null, auth = null;
         IReadOnlyList<string>? models = null;
         int? timeout = null;
+        bool? streaming = null;
 
         // 从 3 起每次跳两格（标志与值成对；parts[1] == "set"）。
         // 守卫是「值长得像标志位」而非「位置上像」：--key --model m 里 key 缺值必须报错，
@@ -689,6 +690,16 @@ public static class CoreCommandParser
                     timeout = seconds;
                     break;
 
+                case "--stream":
+                    streaming = value.ToLowerInvariant() switch
+                    {
+                        "on" or "true" or "1" => true,
+                        "off" or "false" or "0" => false,
+                        _ => null,
+                    };
+                    if (streaming is null) return (null, "`--stream` 只接受 on / off。");
+                    break;
+
                 // 未知标志必须拒绝：拼错的 --protcol 会被静默吞掉、照常保存并回 ✓，协议悄悄落成默认。
                 default: return (null, $"未知参数 '{parts[i]}'。");
             }
@@ -699,6 +710,7 @@ public static class CoreCommandParser
         {
             Models = models,
             TimeoutSeconds = timeout,
+            Streaming = streaming,
         }, null);
     }
 

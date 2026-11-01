@@ -136,17 +136,32 @@ public static class RetryPolicy
         IModelAdapter adapter, ModelRequest request, CancellationToken ct,
         Func<TimeSpan, CancellationToken, Task>? delay = null,
         Action<FailedAttempt>? onFailedAttempt = null,
-        Action<FailedAttempt, TimeSpan>? onRetry = null)
+        Action<FailedAttempt, TimeSpan>? onRetry = null,
+        Action<ModelDelta>? onDelta = null)
     {
         delay ??= static (d, token) => Task.Delay(d, token);
+
+        // 增量只在「适配器支持且真的有人在看」时才启用；否则与既有路径逐字节相同。
+        var streaming = onDelta is null ? null : adapter as IStreamingModelAdapter;
+        if (streaming is { Streaming: false }) streaming = null;
 
         for (var retry = 0; ; retry++)
         {
             var startedAt = CoreClock.Now();
             ModelReply reply;
+
+            // ⚠️ **这一次尝试吐过增量没有**。吐过之后就不能再重试了：
+            // 重发会把同一段话在客户端屏幕上**再打一遍**，而客户端没有「撤回」这个概念。
+            var emitted = false;
+            Action<ModelDelta>? sink = streaming is null
+                ? null
+                : delta => { emitted = true; onDelta!(delta); };
+
             try
             {
-                reply = await adapter.CallAsync(request, ct);
+                reply = streaming is null
+                    ? await adapter.CallAsync(request, ct)
+                    : await streaming.StreamAsync(request, sink, ct);
             }
             catch (Exception ex)
             {
@@ -154,6 +169,11 @@ public static class RetryPolicy
                 // 的账本里少了真正决定去留的那一次。
                 var failed = new FailedAttempt(startedAt, CoreClock.Now(), retry + 1, ex);
                 onFailedAttempt?.Invoke(failed);
+
+                // ⚠️ **吐过增量 ⇒ 不再重试**：重发的字会在屏幕上叠成两遍（`onDelta` 只增不改，
+                // 客户端没有撤回语义）。判据在这里而不是在上层，因为只有看得见 sink 的这层
+                // 知道「这一次有没有吐过」。
+                if (emitted) throw;
 
                 if (!ShouldRetry(ex)) throw;
                 if (retry >= MaxRetries) throw Exhausted(ex);

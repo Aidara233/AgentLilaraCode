@@ -107,6 +107,9 @@ public sealed record ProviderDefinition
     /// </summary>
     public int? TimeoutSeconds { get; init; }
 
+    /// <summary>是否接收并转发模型正文增量；默认关闭以保持既有调用方式。</summary>
+    public bool Streaming { get; init; }
+
     /// <summary>这个提供商**实际生效**的超时秒数（`null` ⇒ 协议自己的默认，见调用点）。</summary>
     [JsonIgnore]
     public int? EffectiveTimeoutSeconds => ProviderLimits.Normalize(TimeoutSeconds);
