@@ -1497,6 +1497,16 @@ public sealed class ControlServer(
                 // 同 network.configure：数字走 OptNumber → ToInt（`Opt` 只收字符串）。
                 // 键缺失 ⇒ null = 保留旧值；区间判据在 dispatcher（两个前端共用同一道闸）。
                 TimeoutSeconds = ToInt(OptNumber(payload, "timeoutSeconds")),
+                // ⚠️ **这四个必须在这里逐个列出来**：`CoreCommand.ProviderUpsert` 上的 `init` 属性不会
+                // 自己从 payload 变出来——本方法是**第三条解析线**（另外两条是控制台
+                // `CoreCommandParser` 与 dispatcher 的语义），漏一个的症状是「头填了、盘上没变、
+                // 还不报错」：dispatcher 收到的就是 null（= 保留旧值）⇒ 照样回 ✓。
+                // 2026-11：`cacheMode` / `effortParam` / `reasoningInclude` 三个此前一直漏在这里
+                //（控制台那条路有、浏览器那条没有）；`streaming`（流式批）补进来时一并补齐。
+                Streaming = OptBool(payload, "streaming"),
+                CacheMode = Opt(payload, "cacheMode"),
+                EffortParam = Opt(payload, "effortParam"),
+                ReasoningInclude = Opt(payload, "reasoningInclude"),
             },
             // 同 provider.upsert / claim.release：线上解析是第三条线。
             "provider.delete" => new CoreCommand.ProviderDelete(
