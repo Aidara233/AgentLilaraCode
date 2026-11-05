@@ -361,6 +361,37 @@ public class ClaudeRequestBuilderTests
         Assert.Equal(expected, p.OutputConfig!.Effort!.Value());
     }
 
+    /// <summary>
+    /// **`off` 档：发 `thinking.type = "disabled"`，不发 `output_config`**（2026-11-03）。
+    ///
+    /// <para>⚠️ 这条钉住的是「两根杆」：`thinking` 管**要不要**思考（这次发 `disabled`），
+    /// `output_config.effort` 管**多深**（这次整块不发——`off` 下没有「多深」可言）。
+    /// ⚠️ 第一版把 `off` 实现成「什么都不发」，是因为只看了 SDK 的 `Effort` 枚举；
+    /// `thinking` 这根杆的证据与 `none` 一侧的出处都在 `Axes.EffortOff` 那段里。</para>
+    /// </summary>
+    [Fact]
+    public void Build_EffortOff_SendsThinkingDisabled_AndOmitsOutputConfig()
+    {
+        var request = Request(Msg(Speaker.User, "hi")) with { Effort = Axes.EffortOff };
+
+        // ⚠️ `p.Thinking` 是联合类型 `ThinkingConfigParam`（隐式转换把它包了一层），
+        // 所以判据是 `TryPickDisabled` 而不是 `IsType<ThinkingConfigDisabled>`（实测）。
+        var p = ClaudeRequestBuilder.Build(request);
+
+        Assert.True(p.Thinking!.TryPickDisabled(out _));
+        Assert.Null(p.OutputConfig);
+    }
+
+    /// <summary>其余五档**不发** `thinking`：那些档是「思考多深」，由 `output_config` 表达。</summary>
+    [Fact]
+    public void Build_OtherEfforts_DoNotTouchThinking()
+    {
+        var p = ClaudeRequestBuilder.Build(Request(Msg(Speaker.User, "hi")) with { Effort = "high" });
+
+        Assert.Null(p.Thinking);
+        Assert.Equal(Effort.High, p.OutputConfig!.Effort!.Value());
+    }
+
     [Fact]
     public void Build_RejectsUnknownEffortInsteadOfSilentlyDowngrading()
     {

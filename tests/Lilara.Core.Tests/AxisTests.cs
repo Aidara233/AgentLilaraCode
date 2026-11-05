@@ -91,6 +91,25 @@ public class AxisTests
     [Fact]
     public void UnknownAxis_IsNotKnown() => Assert.False(Axes.IsKnown("mood"));
 
+    /// <summary>
+    /// **`effort` 的 `off` 档**（2026-11-03）：能解析、置首（从最省到最费的显示顺序）、
+    /// 而**默认值不动**（仍是 `high`——老会话与新建会话的行为都不该因为多一档而变）。
+    /// ⚠️ 顺带钉住它**有等级解释**：头要在轴旁边显示「这不是物理开关」那句话。
+    /// </summary>
+    [Fact]
+    public void Effort_OffIsParseable_FirstInDisplayOrder_ButNotTheDefault()
+    {
+        Assert.True(Axes.TryParse(Axes.Effort, Axes.EffortOff, out var canonical));
+        Assert.Equal(Axes.EffortOff, canonical);
+
+        var values = Axes.ValuesOf(Axes.Effort)!;
+        Assert.Equal(Axes.EffortOff, values[0]);
+        Assert.Equal(6, values.Count);
+        Assert.Equal("high", Axes.Defaults()[Axes.Effort]);
+
+        Assert.False(string.IsNullOrWhiteSpace(Axes.DescriptionOf(Axes.Effort, Axes.EffortOff)));
+    }
+
     [Fact]
     public void UnknownValue_IsRefused_AndTheAxisIsUnchanged()
     {

@@ -96,10 +96,15 @@ public static class OpenAiChatRequest
         // `reasoning_effort` 不是所有端点都认（GLM / doubao / 网关代理对未知参数的处理不一致，
         // 有的 400 有的静默忽略）。判据与理由见 `EffortParam`。
         //
-        // ⚠️ 档名**原样发**：本仓 5 档是真 OpenAI 与 DeepSeek 合法值的子集，中间不插映射表
+        // ⚠️ 档名**原样发**：本仓的档名是真 OpenAI 与 DeepSeek 合法值的子集，中间不插映射表
         // （再写一张就是 G10 那种第二份副本）。
+        // ⚠️ **`off` 发 `none`**（2026-11-03）：那是 OpenAI 自己的「关思考」档
+        // （gpt-5.1 起 `none` 就是默认值；见 `Axes.EffortOff` 里那两处出处）。
+        // 判据在 `EffortParam.IsOff`——三条链路共用，不能只改这里。
+        // ⚠️ 它仍受这个 provider 的开关管：没开 `effortParam: reasoning` 就什么都不发（默认），
+        // 所以「多一个档」不会给未开启的端点带来任何新字节。
         if (sendEffort)
-            body["reasoning_effort"] = request.Effort;
+            body["reasoning_effort"] = EffortParam.IsOff(request.Effort) ? "none" : request.Effort;
 
         // ⚠️ **空工具表 ⇒ 不写这个键**（不是写一个空数组）：与 `temperature` 同一条判据，
         // 也是「没配工具的会话请求逐字节不变」的依据。

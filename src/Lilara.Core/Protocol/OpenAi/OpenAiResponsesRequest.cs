@@ -97,7 +97,10 @@ public static class OpenAiResponsesRequest
         if (sendEffort || includeReasoning)
         {
             var reasoning = new JsonObject();
-            if (sendEffort) reasoning["effort"] = request.Effort;
+            // ⚠️ **`off` 发 `none`**（2026-11-03，与 Chat 那条同一个判据 `EffortParam.IsOff`）：
+            // `none` 是 OpenAI 自己的「关思考」档。⚠️ `includeReasoning` 那一支**不受影响**——
+            // 它管的是「响应里的推理项要不要带密文回来」，与本档要不要请求思考无关。
+            if (sendEffort) reasoning["effort"] = EffortParam.IsOff(request.Effort) ? "none" : request.Effort;
             if (reasoning.Count > 0) body["reasoning"] = reasoning;
 
             if (includeReasoning)

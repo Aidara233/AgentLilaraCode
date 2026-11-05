@@ -33,6 +33,38 @@ public static class Axes
     public const string Effort = "effort";
 
     /// <summary>
+    /// **思考强度的 `off` 档**（2026-11-03 用户要求「禁用思考」）：**发各家的关闭值**。
+    ///
+    /// <para>⚠️ <b>这里改过一次口径，别把被否掉的那个说法捡回来</b>：第一版实现成「不发这个字段」
+    /// （理由当时写成「三族都没有关的取值」）——**那句是错的**，它只查了 Anthropic SDK 的
+    /// <c>Effort</c> 枚举（`low/medium/high/xhigh/max`），漏了另一根杆：
+    /// <list type="bullet">
+    ///   <item><b>Claude</b>：`thinking: {"type": "disabled"}` 是官方的关闭写法
+    ///   （platform.claude.com/docs/en/build-with-claude/thinking），SDK 12.51.0 里就是
+    ///   <c>ThinkingConfigDisabled</c> 这个专门类型（`Anthropic.xml` 里有，且
+    ///   <c>MessageCreateParams.Thinking</c> 的摘要写着「Configuration for enabling Claude's
+    ///   extended thinking」）。⚠️ 与 `output_config.effort` 是**两根杆**：那根是「思考多深」，
+    ///   这根是「要不要思考」。</item>
+    ///   <item><b>OpenAI</b>：`reasoning_effort` / `reasoning.effort` 的取值里有 <c>none</c>
+    ///   ——gpt-5.1 起 `none` 就是默认档（Microsoft Learn「Azure OpenAI reasoning models」：
+    ///   “`gpt-5.1` `reasoning_effort` defaults to `none`”；OpenAI reasoning 指南的档位表里
+    ///   <c>none</c> = “Latency-critical tasks that do not benefit from any reasoning”）。</item>
+    /// </list></para>
+    ///
+    /// <para>⚠️ <b>于是「真禁用」也仍然是**取决于模型**的</b>——这是这一档必须写在明处的代价：
+    /// <ul>
+    ///   <item>Claude 的 adaptive-only 模型（Fable 5.1 / Mythos 5.1 / Fable 5 / Mythos 5）
+    ///   对 <c>enabled</c> 与 <c>disabled</c> **都**返回 400；Sonnet 5.5 的 extended thinking
+    ///   已弃用、关不掉（Bedrock 文档与 platform 文档都这么说）。</item>
+    ///   <item>OpenAI 的 GPT-6 Astra / GPT-6.1 Sol <b>不支持</b> <c>none</c>（也不支持
+    ///   <c>minimal</c>），发过去是 HTTP 400。</item>
+    /// </ul>
+    /// ⇒ 这一档在这些模型上是**响亮的 400**，不是静默降级——本仓要的就是这个：
+    /// 用户明确要「关掉思考」，那就把「这个模型关不了」如实喊出来，而不是让请求悄悄照旧思考。</para>
+    /// </summary>
+    public const string EffortOff = "off";
+
+    /// <summary>
     /// 联网能力（2026-10-22）。⚠️ 它管的是「这个会话能碰哪一类联网工具」，
     /// **不是凭据**——端点与 key 属于 `<数据根>/network.json` 的全局配置。
     /// 与权限轴是两道闸：这一根管能力开没开，`permission` 管 `Consuming` 这一类允不允许。
@@ -201,13 +233,30 @@ public static class Axes
         //      用户少一档能力、请求根本发不出去 —— **不会**抛异常（`ToEffort` 没机会看到）。
         //   ② 表**多**一档（`ToEffort` 不认的值）⇒ 表放行、走到 `_ =>` 抛
         //      `ArgumentException` —— 这才是「放行之后才炸」。
-        // ⇒ 两个集合应当**相等**（本表 5 档 = `ToEffort` 的 5 条臂）。
+        // ⇒ 两个集合应当**相等**（本表 6 档 = `ToEffort` 的 5 条臂 + `off` 那一条**不发**的分支）。
         // ⚠️ `01` §3.5 只写三档（低/中/高），这里取五档是**故意的**：**文档待对齐**；
         // 多出来的两档是 SDK 已有的能力，不是这里新造的。
+        // ⚠️ **`off` 是第 6 档且置首**（2026-11-03）：它不是 SDK 的某个取值，而是「不发这个字段」
+        // ——理由与后果见 `Axes.EffortOff`。置首是为了**显示顺序**（从最省到最费），
+        // 默认值仍是 `high`，所以老会话与新建会话的行为都不变。
         // ⚠️ `effort` 是**唯一** `InContext = false` 的枚举轴（`01` §3.5：纯请求参数，不进上下文）。
         new(Effort, "思考强度",
-            Array.AsReadOnly<string>(["low", "medium", "high", "xhigh", "max"]),
-            "high", InContext: false),
+            Array.AsReadOnly<string>([EffortOff, "low", "medium", "high", "xhigh", "max"]),
+            "high", InContext: false,
+            Descriptions: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                // 这一档的解释**必须把「取决于模型」写在明处**：头会把它显示在轴旁边，
+                // 而用户按这一档时最需要知道的正是「多数模型真关得掉，个别模型会 400」。
+                [EffortOff] = "禁用思考：Claude 发 thinking={\"type\":\"disabled\"} 且不请求思考强度；"
+                    + "OpenAI 两条链路发 reasoning_effort/reasoning.effort = none。"
+                    + "⚠️ 取决于模型：adaptive-only 的 Claude（Fable/Mythos 5.x）与 OpenAI 的 Astra/Sol 一系"
+                    + "不支持关档，会返回 400（响亮失败，不是静默照旧思考）。",
+                ["low"] = "请求最省的思考档（Anthropic low / OpenAI low）：回答快、分析浅。",
+                ["medium"] = "中等思考档；DeepSeek 一侧会自行把它映射到 high。",
+                ["high"] = "默认档：与建会话时的既有默认一致，够深的分析，不等最长的那一档。",
+                ["xhigh"] = "更高一档；DeepSeek 一侧会自行把它映射到 high。",
+                ["max"] = "最高档：给最费的那类任务，响应最慢。",
+            }),
 
         // 温度。⚠️ 这是**第二条** `InContext = false` 的轴（纯请求参数，与 effort 同侧）。
         // 默认 `1.0` = **两家 API 各自的默认采样温度** ⇒ 发它等于不发（按值等价），

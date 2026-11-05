@@ -791,7 +791,11 @@ public sealed class CommandDispatcher(
             ModelId = provider.DefaultModel,
             MaxTokens = 16,
             Protocol = adapter.Protocol,
-            Effort = Axes.ValuesOf(Axes.Effort)![0],   // 取最低档：自检不该挑贵的跑
+            // 取最低的**真档**：自检不该挑贵的跑，也不该挑 `off`（`Axes.EffortOff` 发的是
+            // `none` / `thinking=disabled`——那对只认 low~max 的老端点会直接 400，
+            // 于是自检会把「端点不认关档」误报成「供应商不通」）。
+            // ⇒ 跳过 `off` 取第一个真档（= `low`），至少还顺带验证 effort 字段发得出去。
+            Effort = Axes.ValuesOf(Axes.Effort)!.First(v => v != Axes.EffortOff),
             // 自检**不带温度**：探针要验的是「这个供应商通不通」，不是「用户此刻的采样偏好」。
             // 带上它反而会让「自检失败」多一种可疑原因（某个模型不认某个温度）。
             Temperature = null,

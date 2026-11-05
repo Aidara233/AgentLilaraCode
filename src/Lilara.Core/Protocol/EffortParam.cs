@@ -30,6 +30,23 @@ public static class EffortParam
 
     /// <summary><see cref="Kernel.ProviderDefinition.EffortParam"/> 的合法取值。</summary>
     public static readonly IReadOnlyList<string> Modes = [Auto, Reasoning];
+
+    /// <summary>
+    /// **`off` 档要不要走「不发」这条路——不走**（2026-11-03 第二版）。
+    ///
+    /// <para>⚠️ <b>这个判据现在只回答一件事</b>：「这一档是不是 `off`」。真正发什么由各链路决定：
+    /// Claude 发 <c>thinking: {"type":"disabled"}</c>、OpenAI 两条链路发
+    /// <c>reasoning_effort</c> / <c>reasoning.effort</c> = <c>none</c>。
+    /// 三处必须**同时**改：只改一处就会出现「Claude 关了、Chat 还开着」这种半关状态，
+    /// 而它在字节层面看不出来——这正是这个判据被收在一个地方的原因。</para>
+    ///
+    /// <para>⚠️ <b>第一版把它实现成「不发」是错的</b>：当时的理由是「三族都没有关的取值」，
+    /// 而那只查了 Anthropic SDK 的 <c>Effort</c> 枚举，漏了 <c>thinking.type</c> 这根杆
+    /// 与 OpenAI 的 <c>none</c> 档。证据与逐族口径见
+    /// <see cref="Kernel.Axes.EffortOff"/> 那段，别再按「不发」重写回去。</para>
+    /// </summary>
+    public static bool IsOff(string? effort) =>
+        string.Equals(effort, Kernel.Axes.EffortOff, StringComparison.Ordinal);
 }
 
 /// <summary>

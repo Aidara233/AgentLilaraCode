@@ -319,6 +319,39 @@ public sealed class CacheBreakpointTests
     }
 
     /// <summary>
+    /// **`effort=off` ⇒ 三条链路都发各家的「关思考」值**（2026-11-03 第二版）。
+    ///
+    /// <para>⚠️ 第一版实现成「什么都不发」是错的——那时漏了 Claude 的 <c>thinking.type</c> 这根杆
+    /// 与 OpenAI 的 <c>none</c> 档。现在钉住的是**字节**：`none` 必须真的出现在请求里，
+    /// 否则「off 就是关掉思考」这句话在线上仍然是假的。</para>
+    ///
+    /// <para>⚠️ 两条 OpenAI 链路仍受 provider 的 `effortParam` 开关管：没开就一个字段都不发
+    /// （`auto` 那条已有的断言在别的用例里）。</para>
+    /// </summary>
+    [Fact]
+    public void Effort_OffSendsTheNativeDisableValue_OnAllThreeLinks()
+    {
+        var request = Request([Say("u1", Speaker.User, "你好")]) with { Effort = Axes.EffortOff };
+
+        // Chat：顶层 `reasoning_effort: "none"`。
+        Assert.Contains("\"reasoning_effort\":\"none\"", OpenAiChatRequest.Build(request, sendEffort: true),
+            StringComparison.Ordinal);
+
+        // Responses：`reasoning.effort = "none"`（外壳随 effort 一起出现）。
+        Assert.Contains("\"effort\":\"none\"", OpenAiResponsesRequest.Build(request, sendEffort: true),
+            StringComparison.Ordinal);
+
+        // Claude：`thinking.type = "disabled"` 发出去，而 `output_config` 整块不发
+        // （「要不要思考」与「思考多深」是两根杆）。
+        // `p.Thinking` 是 SDK 的联合类型 `ThinkingConfigParam`（`Disabled → Param` 是**隐式转换**，
+        // 所以 `IsType<ThinkingConfigDisabled>` 反而不成立——实测），用它的 `TryPickDisabled` 判。
+        var p = ClaudeRequestBuilder.Build(request);
+        Assert.True(p.Thinking!.TryPickDisabled(out var thinking));
+        Assert.NotNull(thinking);
+        Assert.Null(p.OutputConfig);
+    }
+
+    /// <summary>
     /// **推理回传开关**（2026-10-28）：`include: ["reasoning.encrypted_content"]` 默认不发。
     /// 本仓不用 `previous_response_id` ⇒ 这是推理回传唯一可行的那条路。
     /// </summary>

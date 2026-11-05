@@ -40,7 +40,8 @@ public static class ClaudeRequestBuilder
             // 空值会改变前缀的字节，而「没有工具」的会话应当与加工具支持之前**逐字节相同**。
             Tools = BuildTools(request.Tools),
 
-            OutputConfig = new OutputConfig { Effort = ToEffort(request.Effort) },
+            OutputConfig = ToOutputConfig(request.Effort),
+            Thinking = ToThinking(request.Effort),
 
             // ⚠️ **两个事实同时成立，别只记一个：**
             //
@@ -397,8 +398,40 @@ public static class ClaudeRequestBuilder
         return text;
     }
 
+    /// <summary>
+    /// 思考强度轴 → `output_config`。**`off` 档在这里就被分流出去了**：返回
+    /// <see langword="null"/> ⇒ 整个 `output_config` 键**不发**。
+    ///
+    /// <para>⚠️ <b>为什么 `off` 不发 `output_config`</b>：那是「思考多深」这根杆，而 `off` 要说的
+    /// 是「不要思考」——两件事。关思考走另一根杆（<see cref="ToThinking"/> 的
+    /// <c>thinking.type = "disabled"</c>）。⚠️ 不能换成「发一个空对象」：`output_config: {}`
+    /// 既没表达意图又改了请求字节（与 `Tools` / `System` 那两条「空值不发这个键」同一条纪律）。</para>
+    /// </summary>
+    private static OutputConfig? ToOutputConfig(string effort) =>
+        EffortParam.IsOff(effort) ? null : new OutputConfig { Effort = ToEffort(effort) };
+
+    /// <summary>
+    /// 思考强度轴 → <c>thinking</c>。**只有 `off` 发这个键**（2026-11-03）：其余五档是「思考多深」，
+    /// 由 <c>output_config.effort</c> 表达，`thinking` 保持不出现（= 请求字节与加这个档之前逐字节相同）。
+    ///
+    /// <para>⚠️ <b>关思考必须走这根杆</b>：<c>thinking: {"type": "disabled"}</c> 是 Anthropic 官方的
+    /// 关闭写法（platform.claude.com/docs/en/build-with-claude/thinking），SDK 12.51.0 里就是
+    /// <c>ThinkingConfigDisabled</c> 这个专门类型。⚠️ 只看 SDK 的 <c>Effort</c> 枚举会以为「没有关档」
+    /// ——那正是第一版实现踩的坑（判据与证据见 <see cref="Kernel.Axes.EffortOff"/>）。</para>
+    ///
+    /// <para>⚠️ <b>它也是「取决于模型」的那一档</b>：Claude 的 adaptive-only 模型（Fable/Mythos 5.x）
+    /// 对 <c>disabled</c> 同样回 400，Sonnet 5.5 的 extended thinking 已弃用、关不掉
+    /// ⇒ 那些模型上这一档会**响亮地失败**。这是刻意的：用户明确要关，就不该让请求悄悄照旧思考。</para>
+    /// </summary>
+    private static ThinkingConfigParam? ToThinking(string effort) =>
+        // ⚠️ 显式转一次：`ThinkingConfigDisabled → ThinkingConfigParam` 是 SDK 的隐式转换，
+        // 而这行是三元表达式 + 目标类型可空，可空分析会把 `new` 那侧读成「可能为空」而报
+        // CS8604（实测）。写死转换比关警告诚实。
+        EffortParam.IsOff(effort) ? (ThinkingConfigParam)new ThinkingConfigDisabled() : null;
+
     // 思考强度轴 → 协议参数。SDK 支持五档：low / medium / high / xhigh / max，如实透传。
     // 未知值抛异常，不静默降级（否则拼写错误会悄悄跑成某一档）。
+    // ⚠️ `off` 到不了这里：它在 `ToOutputConfig` 就分流成「不发」了。
     private static Effort ToEffort(string effort) => effort switch
     {
         "low" => Effort.Low,
