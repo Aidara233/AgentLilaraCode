@@ -234,12 +234,36 @@ public static class CorePrompts
         + "它完成之后调用 advance_plan 把它推进掉，然后接着做下一个 ▶ 叶子，不必等用户再说一句。"
         + "计划空了、或某条叶子需要用户决定 / 缺少关键输入时，停下来汇报。";
 
+    /// <summary>
+    /// **iterate 档的那条线**（2026-11-03）。⚠️ 与 <see cref="GoalDirective"/> 同形同位置：
+    /// 进尾块、不落盘——「围绕 T0 反复工作」是**轴的一个档**，不是一条事件。
+    ///
+    /// <para>⚠️ <b>它为什么必须有</b>：这一档从 2026-11-03 起与 `goal` 一样由核心强制续跑
+    /// （`GoalMode.AutoContinues`），而它**没有模型侧出口**——模型若以为「说完这一段就可以停」，
+    /// 它会一遍遍被推起来，却不知道该做什么。⇒ 这条线讲三件事：
+    /// ① 停下来不是它能决定的事（除非把阻塞说清楚让用户接手）；
+    /// ② 每完成一段就按 T0 自己规划下一段；
+    /// ③ `finish_goal` 在这一档不算数。
+    ///
+    /// <para>⚠️ <b>它不许提到「压缩」</b>：尾块里另有两句压缩线
+    /// （<see cref="AutonomousCompactionDirective"/> / <see cref="ContextOverflowDirective"/>），
+    /// 而 `CompactionTests` 按出现次数钉住那两句的取舍——第三个提压缩的地方会让那些断言变成
+    /// 「两句话可以互相顶替」，也就是把那条判据读成假的。</para>
+    /// </summary>
+    public const string IterateDirective =
+        "iterate 模式：围绕上方 T0 固定长期任务持续推进。这一回合没有新输出不是停下的理由——"
+        + "每完成一段工作就按 T0 自己规划下一段（plan 写普通计划），然后接着做。"
+        + "finish_goal 在这一档不算数：T0 是固定长期任务，它不会被本次工作完成。"
+        + "需要用户决定、缺少关键输入、或要人接手时，用 ask 把阻塞说清楚——那是你自己能停下来等人的方式；"
+        + "用户也可以随时中断这一档，那是用户的事，不需要你替它停。";
+
     /// <summary>iterate 且普通计划已空时，模型应按固定 T0 为下一段制定普通计划。</summary>
     public const string IteratePlanningDirective =
         "iterate 模式的当前普通计划已经用完。先回顾上方 T0 固定长期任务与已有对话，"
         + "规划下一段可执行的普通计划（用 plan 工具），并说明本段边界；不要调用 finish_goal。"
-        + "计划写好后调用 switch_plan_mode(mode=act, reason=...) 请求用户批准进入行动，"
-        + "获得批准后按 ▶ 逐项推进。";
+        + "计划写好后调用 switch_plan_mode(mode=act, reason=...) 退出规划模式——"
+        + "iterate 下这一步不需要用户批准（T0 已经授权这段自主循环），"
+        + "退出后按 ▶ 逐项推进。";
 
     /// <summary>
     /// <b>规划模式</b>的那句话（2026-10-24，`mode` 轴 = <c>plan</c>）。

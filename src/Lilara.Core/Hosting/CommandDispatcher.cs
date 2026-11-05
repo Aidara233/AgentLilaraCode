@@ -2118,7 +2118,7 @@ public sealed class CommandDispatcher(
         // 「没调工具、队列空」时就停。指令会**一直躺在盘上**，直到用户下一次说话，
         // 而头那边看起来是「点了压缩，什么都没发生」。
         //
-        // ⚠️ 与 goal 那条**共用同一个推进器**（`ContinueGoalAsync` 的形状：空队列 + `explicitStart`），
+        // ⚠️ 与自主续跑那条**共用同一个推进器**（`ContinueAutonomouslyAsync` 的形状：空队列 + `explicitStart`），
         // 因为它做的正是同一件事——「没有新输入，但还没结束，再走一步」。
         // ⚠️ **不往队列里塞假消息**：记录里出现的每一条用户消息都必须是用户真的说过的话。
         if (handle.InterruptEpoch == interruptEpoch
@@ -2126,20 +2126,28 @@ public sealed class CommandDispatcher(
             && !reply.Refused
             && reply.Blocks.Count > 0
             && !reply.Blocks.OfType<Kernel.Block.ToolUseBlock>().Any())
-            return await ContinueGoalAsync(handle, throwOnFailure);
+            return await ContinueAutonomouslyAsync(handle, throwOnFailure);
 
-        // ---- goal 循环：模型停回合、而目标还没收（`01` §3.5 的 goal 档）----
+        // ---- 自主续跑：goal / iterate（`01` §3.5 的「模型不产生动作也强制继续」那两档）----
         //
         // ⚠️ **只在「没有工具调用」时走到这里**（有调用的话下面那条会接着推）。
         // 判据里的三格都是**停止**方向：拒答（同一句拒绝会无限重放）、空回复（没有可继续的内容）、
         // 以及用户在这条步期间按过停止（序号变了）。其余情况一路续跑——
-        // ⚠️ **没有步数上限**（用户 2026-10-22 明确选择）：唯一的停止是模型调用失败。
+        // ⚠️ **没有步数上限**（用户 2026-10-22 明确选择）：唯一的框架级停止是模型调用失败。
+        //
+        // ⚠️ **`iterate` 也在这里**（2026-11-03 用户裁定）：那一档的语义是「围绕固定 T0 反复
+        // 规划与执行」，而普通工具循环只在「调了工具」时续 ⇒ 模型一句纯文本收尾就把整档停在
+        // Idle，`iterate` 实际退化成 `step`（实测：连排三条纯文本回复，模型只被调 1 次）。
+        // ⚠️ **它不是 `finish_goal` 的活**：判据用 `AutoContinues`（goal + iterate），
+        // 而「拨回 standard」仍然只认 `goal`（`Stepper` 那边用的是 `IsActive`）——
+        // `iterate` 下 `finish_goal` 被拒，**这一档没有模型侧出口**，只能由用户
+        // interrupt / 改主动性轴、或模型调用失败来停。这句在 `Axes` 的等级解释里对用户可见。
         if (handle.InterruptEpoch == interruptEpoch
-            && GoalMode.IsActive(handle.State)
+            && GoalMode.AutoContinues(handle.State)
             && !reply.Refused
             && reply.Blocks.Count > 0
             && !reply.Blocks.OfType<Kernel.Block.ToolUseBlock>().Any())
-            return await ContinueGoalAsync(handle, throwOnFailure);
+            return await ContinueAutonomouslyAsync(handle, throwOnFailure);
 
         return await ContinueIfToolCalledAsync(handle, reply, throwOnFailure);
     }
@@ -2165,7 +2173,8 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
-    /// **goal 模式的自动续跑**：模型这一回合没调工具就结束了，而目标还没收 ⇒ 直接再推一步。
+    /// **自主续跑**（`goal` / `iterate`，以及「压缩指令还没兑现」那一条）：模型这一回合没调工具
+    /// 就结束了，而循环还没到头 ⇒ 直接再推一步。
     ///
     /// <para>⚠️ <b>它复用 `session.start` 那条「继续」（`explicitStart: true`）</b>：
     /// 队列可以是空的——自主续跑没有新输入，正是 `01` §6.2 说的那件事。
@@ -2174,8 +2183,13 @@ public sealed class CommandDispatcher(
     /// <para>⚠️ <b>不设步数上限</b>（用户 2026-10-22）：模型不调 `finish_goal` 就会一直推。
     /// 停止只有三条路：模型调用失败（异常分支返回 null）、用户中断（序号变了）、
     /// 或者模型拒答 / 空回复。</para>
+    ///
+    /// <para>⚠️ <b>`iterate` 那一档没有模型侧出口</b>（2026-11-03）：`finish_goal` 在它下面被拒、
+    /// T0 也不可完成 ⇒ 上面那三条是**全部**的停法。它照样走这里，因为「没有新输入、但还没到头」
+    /// 与 `goal` 是同一件事——两档共用这一个推进器，判据只在调用点那一处
+    /// （<see cref="GoalMode.AutoContinues"/>）。</para>
     /// </summary>
-    private async Task<ModelReply?> ContinueGoalAsync(SessionHandle handle, bool throwOnFailure)
+    private async Task<ModelReply?> ContinueAutonomouslyAsync(SessionHandle handle, bool throwOnFailure)
     {
         if (!handle.TryEnterStep()) return null;
 

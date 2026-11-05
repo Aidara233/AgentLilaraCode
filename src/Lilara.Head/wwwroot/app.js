@@ -1794,8 +1794,8 @@ function wirePlanPanel() {
 }
 
 // ---- 轴（义务 4 的落点） ----
-// 轴表、标签、inContext 都从核心拉（单一真相来源是核心的 Axes.Table，头不许手抄）：
-// 核心交 { name, label, values, inContext }，头只画控件。
+// 轴表、标签、inContext、**等级解释**都从核心拉（单一真相来源是核心的 `Axes.Table`，头不许手抄）：
+// 核心交 { name, label, values, inContext, descriptions }，头只画控件与那句解释。
 
 let AXES = [];
 async function loadAxes() {
@@ -1861,6 +1861,18 @@ function renderAxes(values) {
       ctl.appendChild(saved);
     }
     const axisName = a.name;   // 闭包捕获，别用循环变量
+    // **等级解释**（2026-11-03）：核心在 `/axes` 的 `descriptions` 里给「这一档怎么走、怎么停」——
+    // `iterate` 是没有模型侧出口的一档，那句「停下来只能靠 interrupt / 改轴 / 调用失败」
+    // 必须让人在**改轴的地方**看得到。⚠️ 头一个字都不许自己写这些句子（同轴名 / 档名 / 标签的纪律），
+    // 所以这里只有一条路：把核心给的那一句按**当前值**取出来显示。
+    const hint = document.createElement("div");
+    hint.className = "axis-desc";
+    const showHint = (v) => {
+      const text = a.descriptions ? a.descriptions[v] : "";
+      hint.textContent = text || "";
+      hint.style.display = text ? "" : "none";
+    };
+    showHint(ctl.value);
     const send = () => {
       if (!current) return;
       const value = ctl.value;
@@ -1871,7 +1883,10 @@ function renderAxes(values) {
         .then((r) => {
           // ⚠️ 被拒时**必须把控件退回真相**：数字框还留着用户敲的 0.75，而核心没接受它。
           // 不退的话页面上那个值看起来是设上了的——那是谎。
-          if (!r.accepted) { ctl.value = axes[axisName] ?? ""; renderMeta("✗ " + r.reason, "error"); }
+          if (!r.accepted) { ctl.value = axes[axisName] ?? ""; showHint(ctl.value); renderMeta("✗ " + r.reason, "error"); return; }
+          // 收下了就把解释换成**新那一档**的：下拉还显示 iterate、解释还写着 step，
+          // 两边都「看着对」而人是靠后一句决定要不要按停止的。
+          showHint(ctl.value);
         });
     };
     ctl.onchange = send;
@@ -1894,6 +1909,10 @@ function renderAxes(values) {
     }
 
     row.appendChild(lab); row.appendChild(ctl);
+    // 解释排在控件**下面一行**（CSS 里 `grid-column: 2`）：它是一句话，不是一个标题。
+    // ⚠️ 安全轴那一支 `continue` 走了，没有这一行——它自己的行在 `#safety-row` 里，
+    // 而那一条的「停下靠什么」不是安全轴要说的事（安全轴是纯提示，见 `01` §3.5）。
+    row.appendChild(hint);
     $("axes").appendChild(row);
   }
 

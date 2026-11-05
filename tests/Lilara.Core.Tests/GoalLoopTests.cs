@@ -171,6 +171,98 @@ public class GoalLoopTests : IDisposable
         Assert.Equal(SessionStatus.WaitingForInput, session.State.Status);
     }
 
+    // ---- iterate：与 goal 同形的自主续跑（2026-11-03）----
+    //
+    // ⚠️ **这一档原本不续跑**：判据只认 `goal`，于是模型一句纯文本收尾就把整档停在 Idle
+    // （实测：连排三条纯文本回复，模型只被调 1 次）⇒ `iterate` 实际退化成 `step`。
+    // 下面四条钉住的是「它现在会一直推」，以及**它停得下来的三条路**：
+    // 拒答 / 用户中断 / 模型调用失败。⚠️ `finish_goal` **不在**这个名单里——那一档没有模型侧出口。
+
+    [Fact]
+    public async Task Iterate_ContinuesOnTextOnlyReply()
+    {
+        var (_, dispatcher, session) = NewHarness();
+        await SetAxisAsync(dispatcher, session, Axes.Initiative, Axes.Iterate);
+
+        // 前两条都是纯文本（没有工具调用）——旧行为在这里就停了。
+        _adapter.Reply("这一段做完了。").Reply("还在做。").Reply("no", stopReason: "refusal");
+
+        await SendAsync(dispatcher, session, "start");
+
+        // 两次自主续跑 + 拒答那一步；拒答是停点（同一句拒绝会无限重放）。
+        Assert.Equal(3, _adapter.Calls.Count);
+        Assert.Equal(3, session.State.Turn);
+        Assert.Equal(Axes.Iterate, session.State.Axes![Axes.Initiative]);
+        Assert.Equal("Idle", session.State.Status.ToString());
+    }
+
+    [Fact]
+    public async Task Iterate_ContinuesEvenWithNoPlanAndNoT0()
+    {
+        var (_, dispatcher, session) = NewHarness();
+        await SetAxisAsync(dispatcher, session, Axes.Initiative, Axes.Iterate);
+
+        // 没有普通计划、也没有 T0：仍然续跑——判据是**档**，不是「有没有活」。
+        // ⚠️ 这条刻意与 `GoalMode.AutoContinues` 的「无条件」对齐：给 iterate 加一条
+        // 「计划空就停」的停点会把它变回 `step`，而那正是这一批要修的东西。
+        _adapter.Reply("working").Reply("no", stopReason: "refusal");
+
+        await SendAsync(dispatcher, session, "start");
+
+        Assert.Equal(2, _adapter.Calls.Count);
+        Assert.Null(session.State.Plan);
+    }
+
+    [Fact]
+    public async Task Iterate_FinishGoal_IsRejectedAndDoesNotEndTheLoop()
+    {
+        var (host, dispatcher, session) = NewHarness();
+        await SetAxisAsync(dispatcher, session, Axes.Initiative, Axes.Iterate);
+
+        // 模型想收尾：`finish_goal` 在 iterate 下被拒（轴不该被拨回 standard），
+        // 而「调了工具」本身又一次续跑 ⇒ 下一步照旧。
+        _adapter.ReplyBlocks(new CanonicalBlock.ToolUseBlock("c-finish", "finish_goal", "{}"))
+                .Reply("继续。")
+                .Reply("no", stopReason: "refusal");
+
+        await SendAsync(dispatcher, session, "start");
+
+        Assert.Equal(3, _adapter.Calls.Count);
+        Assert.Equal(Axes.Iterate, session.State.Axes![Axes.Initiative]);
+
+        var results = host.Store.ReadTimeline(session.ProjectKey, session.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .SelectMany(e => e.Content.OfType<CanonicalBlock.TextBlock>())
+            .Select(b => b.Text)
+            .ToList();
+        Assert.Contains(results, t => t.Contains("当前不在 goal 模式", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Iterate_UserInterrupt_Stops()
+    {
+        var adapter = new BlockingAdapter("working");
+        var (_, dispatcher, session) = NewHarness(adapter);
+
+        await SetAxisAsync(dispatcher, session, Axes.Initiative, Axes.Iterate);
+
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(session.SessionId, [new CanonicalBlock.TextBlock("start")]),
+            "s", false, CancellationToken.None);
+
+        // 自动续跑已经起来（第二次调用在等取消）。
+        await WaitUntil(() => adapter.Calls.Count >= 2);
+
+        await dispatcher.DispatchAsync(new CoreCommand.SessionInterrupt(session.SessionId),
+            "i", false, CancellationToken.None);
+
+        await Task.Delay(500);
+
+        Assert.Equal(2, adapter.Calls.Count);   // 没有第三次
+        Assert.Equal(Axes.Iterate, session.State.Axes![Axes.Initiative]);
+        Assert.Equal(SessionStatus.Idle, session.State.Status);
+    }
+
     // ---- 模型调用失败：唯一的框架级停止 ----
 
     [Fact]
@@ -270,6 +362,33 @@ public class GoalLoopTests : IDisposable
 
         var tail = FloatingTailText(_adapter.Calls[0].Timeline);
         Assert.DoesNotContain("目标模式", tail);
+        // iterate 那条线同理：只在那一档出现（主动性只有一格，两句话不可能同时成立）。
+        Assert.DoesNotContain(CorePrompts.IterateDirective, tail);
+    }
+
+    // ⚠️ **这条线与「续跑」是配套的**（2026-11-03）：核心会一直推，而这一档没有模型侧出口
+    // ⇒ 模型必须被告知「停不是你能决定的」与「要人接手就用 ask」。
+    // 它照样进尾块、不进历史（与目标线同一个形状、同一个理由）。
+    [Fact]
+    public async Task IterateDirective_GoesIntoTheFloatingTail_NotTheHistory()
+    {
+        var (host, dispatcher, session) = NewHarness();
+        await SetAxisAsync(dispatcher, session, Axes.Initiative, Axes.Iterate);
+
+        _adapter.Reply("working").Reply("no", stopReason: "refusal");
+
+        await SendAsync(dispatcher, session, "start");
+
+        var tail = FloatingTailText(_adapter.Calls[0].Timeline);
+        Assert.Contains(CorePrompts.IterateDirective, tail, StringComparison.Ordinal);
+        // 两档的命令式说明互斥：iterate 下不该出现 goal 那句。
+        Assert.DoesNotContain("目标模式", tail);
+
+        var history = host.Store.ReadTimeline(session.ProjectKey, session.SessionId);
+        var text = string.Concat(history.OfType<TimelineEvent.MessageEvent>()
+            .SelectMany(m => m.Blocks.OfType<CanonicalBlock.TextBlock>())
+            .Select(b => b.Text));
+        Assert.DoesNotContain(CorePrompts.IterateDirective, text, StringComparison.Ordinal);
     }
 
     /// <summary>末尾那对合成 `floating_context` 调用的结果文本（尾块在请求里的实际住处）。</summary>

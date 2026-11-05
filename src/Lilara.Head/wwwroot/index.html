@@ -826,6 +826,10 @@ button:disabled:hover { border-color: var(--rule); }
 /* 不进上下文的轴画灰 —— ⚠️ 类名叫 `no-context`，**不是** `effort`：
    曾经只有 effort 是这样的，所以那句 CSS 叫 `.axis.effort`。温度加进来之后
    它成了**两条**轴共有的一件事，沿用 effort 这个名字会让下一个人以为它只关 effort。 */
+/* 等级解释（2026-11-03）：核心在 `/axes` 的 `descriptions` 里给「这一档怎么走、怎么停」。
+   ⚠️ 它排在控件**下面一行**、跨到第 2 列（与控件的左边对齐）——它是那句话，不是轴的标题；
+   把两行都塞进第 1 列会让标签与解释抢那 68px。 */
+.axis-desc { grid-column: 2; font-size: 11px; line-height: 1.45; color: var(--ink-3); margin-top: -2px; }
 .axis.no-context { opacity: .55; }
 
 .claim { display: flex; gap: 8px; font-size: 11.5px; padding: 3px 0; border-bottom: 1px dotted var(--rule-soft); }

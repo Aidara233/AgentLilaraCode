@@ -492,15 +492,19 @@
 
 ```jsonc
 { "name": "permission", "label": "权限", "values": ["off","readonly",…],
-  "inContext": true, "range": null }          // 核心轴
+  "inContext": true, "range": null,
+  "descriptions": { "off": "所有工具调用均被拒绝；只能依据已有上下文回答。", … } }   // 核心轴
 
 { "name": "style.detail", "label": "详细程度", "values": ["brief","detailed"],
-  "inContext": true, "available": true, "problem": null, "pluginId": "style" }  // 插件轴
+  "inContext": true, "available": true, "problem": null, "pluginId": "style",
+  "descriptions": { "brief": "…", "detailed": "…" } }                              // 插件轴
 ```
 
 - **核心轴的元素没有 `available` / `problem` / `pluginId`**（那个匿名类型没有这几格）。
   客户端不能假定所有元素同形状。
 - `range` 是数值范围轴才有：`{ "min": 0, "max": 2, "step": 0.1 }`。
+- `descriptions` **每条轴都有**（2026-11-03）：档名 → 一句人话。数值轴与未知轴是 `{}`——
+  「没有解释」与「核心还没升级」在客户端上必须分得开（所以是空对象，不是缺失键）。
   ⚠️ **有 `range` 时 `values` 仍然是那张网格**（21 个字符串），不认识 `range` 的客户端画下拉照样可用。
 - `values` 的**顺序是契约**（权限轴按阶梯排，头据此算「授权及以上」）。
 
@@ -588,8 +592,12 @@
 ```jsonc
 {
   "axes": [
-    { "name": "initiative", "label": "主动性", "values": ["step","standard","goal"],
-      "inContext": true, "range": null }
+    { "name": "initiative", "label": "主动性", "values": ["step","standard","goal","iterate"],
+      "inContext": true, "range": null,
+      "descriptions": {
+        "step": "按用户明确给出的当前步骤行动；…",
+        "iterate": "围绕固定 T0 长期任务反复规划与执行：核心会自动一步接一步地推你…停下来只能靠用户 interrupt / 把主动性轴改回 standard / 模型调用失败…"
+      } }
   ],
   "alertSafety": "prod",
   "alertFrom": "authorized"
@@ -600,10 +608,14 @@
   **会话级的轴清单**用 `/state` 的 `axisDefinitions`。
 - `alertSafety` / `alertFrom`：跨轴告警的两端（安全轴取到 `prod` 且权限轴 `>= authorized` 时告警）。
 - `axes` 的元素与 `/state` 的 `axisDefinitions` 里的**核心轴**元素**同形**：
-  `{ name, label, values, inContext, range }`。
+  `{ name, label, values, inContext, range, descriptions }`。
   插件轴在这里**也是这个形状**（没有 `available` / `problem` / `pluginId`——那三格只在
   `/state` 的会话级清单里，见 §3.7）。
-- 证据：`ControlServer.cs:619-625`。
+- **`descriptions`（2026-11-03）**：这一轴**每一档**的一句人话（核心轴取 `Axes.Table` 的
+  `Descriptions`，插件轴取注册时冻结的 `LevelDescriptions`，数值轴 / 未知轴给 `{}`）。
+  ⚠️ **永远是对象，不是缺失键**：「没有解释」与「核心还没升级」必须分得开。
+  它是头显示「这一档怎么走、怎么停」的唯一来源（`iterate` 那条写的就是停法），头不许手抄。
+- 证据：`ControlServer.cs:798-803`、`Session/PluginSessionView.Definitions`。
 
 ### 3.11 `GET /claims`
 

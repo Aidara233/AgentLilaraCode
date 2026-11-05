@@ -90,8 +90,11 @@ public static class Subagent
     /// <para>⚠️ <b>逐条的理由</b>：</para>
     /// <list type="bullet">
     ///   <item><b>权限</b>：取 <see cref="NarrowerPermission"/> 的结果——这是唯一一条**必须**收窄的。</item>
-    ///   <item><b>主动性</b>：父在 `goal` 时子落到 `standard`。⚠️ 理由不是安全，是**它没有终点**：
-    ///   一个自动续跑的子会话会一直烧钱，而它的父正卡在等它之上——两层都没有自然的停点。</item>
+    ///   <item><b>主动性</b>：父在 `goal` **或 `iterate`** 时子落到 `standard`。⚠️ 理由不是安全，
+    ///   是**它没有终点**：这两个档都由核心强制续跑（`GoalMode.AutoContinues`），一个自动续跑的
+    ///   子会话会一直烧钱，而它的父正卡在等它之上——两层都没有自然的停点。
+    ///   ⚠️ `iterate` 是 2026-11-03 并进来的：它此前不续跑，所以「只降 goal」在那时是对的；
+    ///   今天两个档都必须降，否则一次 `spawn` 会造出一个永不落定、父永远等不到回报的孩子。</item>
     ///   <item><b>其余</b>（安全 / 验证 / 联网 / effort / 温度）：原样继承。它们不是「授权」，
     ///   而是「这个活儿在什么环境下干」——子会话干的是父交给它的同一件事，环境不该变。</item>
     /// </list>
@@ -107,10 +110,13 @@ public static class Subagent
 
         // ⚠️ **不调 `GoalMode.IsActive`**：它在 Session 层，而本文件在 Kernel
         //（`ArchitectureTests` 钉着 Kernel 对别层零依赖）。判据本身只有一行
-        //（「主动性轴是不是 goal」），所以这里直接读轴 —— **不是第二份实现**，
+        //（「主动性轴是不是会自己续跑的那两档」），所以这里直接读轴 —— **不是第二份实现**，
         // 是同一句话在两个层各需要一次，而中间隔着分层守卫。
+        // ⚠️ **两档都要降**（`goal` / `iterate`）：它们都由核心强制续跑，而一个自动续跑的
+        // 子会话没有终点——父正卡在等它落定之上（`ReportSettled` 只在循环真停下来时发）。
         if (copy.TryGetValue(Axes.Initiative, out var initiative)
-            && string.Equals(initiative, "goal", StringComparison.Ordinal))
+            && (string.Equals(initiative, "goal", StringComparison.Ordinal)
+                || string.Equals(initiative, Axes.Iterate, StringComparison.Ordinal)))
             copy[Axes.Initiative] = "standard";
 
         return copy;

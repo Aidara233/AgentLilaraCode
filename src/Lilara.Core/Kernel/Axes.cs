@@ -160,7 +160,7 @@ public static class Axes
             ("step", "按用户明确给出的当前步骤行动；完成本步后汇报，等待下一步指示，不自行扩展目标。"),
             ("standard", "在用户任务范围内自主行动；遇到需要用户决策的事项时征询，没有后续可执行动作时汇报并停止。"),
             ("goal", "围绕用户给定目标持续推进，自行处理可判断的实现细节；完成前继续执行可行动的后续工作，遇到审批或缺少关键输入时说明阻塞。此档不授予额外权限。"),
-            ("iterate", "围绕固定 T0 长期任务反复规划与执行：自行在 mode=plan/act 间切换；普通计划用完时核心在尾块提醒一次「按 T0 规划下一段」，切不切模式由你自己决定（这一档切 act 不问用户）；T0 未完成时不得调用 finish_goal。此档不授予额外权限。")),
+            ("iterate", "围绕固定 T0 长期任务反复规划与执行：核心会自动一步接一步地推你（与 goal 同形，不设步数上限），所以「本回合没有新输出」不是停下的理由；每完成一段就按 T0 自己规划下一段，自行在 mode=plan/act 间切换（这一档切 act 不问用户），普通计划用完时核心在尾块提醒一次「按 T0 规划下一段」。⚠️ 这一档没有模型侧出口：T0 未完成时不得调用 finish_goal，它也不会结束这一档——停下来只能靠用户 interrupt、用户把主动性轴改回 standard，或模型调用失败 / 拒答。要让用户接手时用 ask。此档不授予额外权限。")),
 
         // 权限 = 闸门。0..5 单调阶梯，低档是拒绝线、高档是询问线。
         // ⚠️ 档位**顺序是契约**：头的跨轴告警按
@@ -311,6 +311,25 @@ public static class Axes
     public static string? DescriptionOf(string? axis, string? value) =>
         Find(axis)?.Descriptions is { } descriptions && value is not null &&
         TryParse(axis, value, out var canonical) ? descriptions.GetValueOrDefault(canonical) : null;
+
+    /// <summary>
+    /// 这条轴**全部**档位的解释（2026-11-03，`/axes` 用）。
+    ///
+    /// <para>⚠️ <b>它为什么必须是核心给的</b>：`/axes` 是头唯一的轴来源（头不许手抄轴名、档名，
+    /// 更不许手抄这些解释）。而「这一档停下来靠什么」这类话必须对用户可见——
+    /// `iterate` 是没有模型侧出口的一档（<see cref="Table"/> 里那条解释就在讲停法），
+    /// 头要是画不出这句，用户只会看到会话被一遍遍推着走，却不知道停它的三个入口在哪。</para>
+    ///
+    /// <para>⚠️ <b>永远返回一份（可能是空的）只读字典，绝不返回 <see langword="null"/></b>：
+    /// 数值范围轴（温度）与未知轴都没有解释，而「没有解释」与「字段缺失」在线上必须分得开——
+    /// 后者会让头的 `a.descriptions?.[v]` 与「核心还没升级」混成一件事。</para>
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> DescriptionsOf(string? axis) =>
+        Find(axis)?.Descriptions ?? EmptyDescriptions;
+
+    private static readonly IReadOnlyDictionary<string, string> EmptyDescriptions =
+        new System.Collections.ObjectModel.ReadOnlyDictionary<string, string>(
+            new Dictionary<string, string>(StringComparer.Ordinal));
 
     /// <summary>
     /// ⚠️ **所有吃轴名的入口一律把 <see langword="null"/> 当「未知轴」**

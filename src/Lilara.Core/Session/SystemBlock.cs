@@ -62,7 +62,8 @@ public sealed record TailContext(
     SessionPlan? Plan = null,
     bool IterateReplan = false,
     string? UsageLine = null,
-    bool ContextFull = false)
+    bool ContextFull = false,
+    string? IterateDirective = null)
 {
     /// <summary>
     /// **从会话状态派生整份尾块输入**——步、答复路径、头槽位都走这一个入口。
@@ -94,6 +95,10 @@ public sealed record TailContext(
             Plugin: plugin,
             // 目标线：主动性 = goal 才有（目标是**状态**，不是事件）。
             GoalDirective: GoalMode.IsActive(handle.State) ? CorePrompts.GoalDirective : null,
+            // iterate 线（2026-11-03）：与目标线同形同位置，两档互斥（主动性只有一格）。
+            // ⚠️ 它讲的是「这一档会一直被推着走、以及你唯一能停下来等人的方式」——
+            // 没有它，模型会把「本回合没输出」当成停下的许可，而核心会立刻把它推起来。
+            IterateDirective: GoalMode.IsIterating(handle.State) ? CorePrompts.IterateDirective : null,
             // 压缩线：用户下过指令（`state.json` 的 `pendingCompact`）才有。
             CompactDirective: handle.State.PendingCompact
                 ? compactDirective ?? CorePrompts.CompactDirective
@@ -294,8 +299,8 @@ public static class SystemBlock
         var body = Join(table is null ? null : CorePrompts.TailAxesPrefix + table,
             Join(descriptions.ToArray()), tail.SubagentLine, subagentNorm,
             string.IsNullOrEmpty(planText) ? null : planText, planDirective, iterateDirective,
-            tail.UsageLine, compactionAdvice, tail.GoalDirective, tail.CompactDirective,
-            tail.Plugin?.Text(PromptSlot.Floating));
+            tail.UsageLine, compactionAdvice, tail.GoalDirective, tail.IterateDirective,
+            tail.CompactDirective, tail.Plugin?.Text(PromptSlot.Floating));
         return body is null ? null : $"{CorePrompts.TailDeclaration}\n{body}";
     }
 

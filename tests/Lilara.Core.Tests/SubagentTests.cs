@@ -549,6 +549,33 @@ public class SubagentTests : IDisposable
         Assert.Equal(["a", "b", "c"], store.ListSessions("pk"));
     }
 
+    /// <summary>
+    /// **会自己续跑的那两档不许被子会话继承**（2026-11-03）。
+    ///
+    /// <para>⚠️ `goal` 那条早就有；`iterate` 是 2026-11-03 并进来的——它此前不续跑，
+    /// 所以「只降 goal」在那时是对的。今天两个档都由核心强制续跑，而一个自动续跑的子会话
+    /// **没有终点**：`ReportSettled` 只在循环真停下来时才发，父会一直等一个永不落定的孩子。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("goal")]
+    [InlineData(Axes.Iterate)]
+    public void InheritAxes_DowngradesAutoContinuingInitiative_ToStandard(string parentInitiative)
+    {
+        var parent = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [Axes.Initiative] = parentInitiative,
+            [Axes.Permission] = "authorized",
+            [Axes.Safety] = "prod",
+        };
+
+        var child = Subagent.InheritAxes(parent, requestedPermission: null);
+
+        Assert.Equal("standard", child[Axes.Initiative]);
+        // 其余轴原样继承（它们不是授权，而是「这活儿在什么环境下干」）。
+        Assert.Equal("authorized", child[Axes.Permission]);
+        Assert.Equal("prod", child[Axes.Safety]);
+    }
+
     /// <summary>父记录里**全部**工具结果的正文（上面那条断言用它）。</summary>
     private static string ParentResults(CoreHost host, string parentId) =>
         string.Concat(host.Store.ReadTimeline(

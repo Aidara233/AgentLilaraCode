@@ -1776,10 +1776,14 @@ public class ControlServerTests : IAsyncLifetime
         foreach (var a in items)
         {
             var name = a.GetProperty("name").GetString()!;
+            // ⚠️ `descriptions` **每条轴都在**（2026-11-03）：数值轴与未知轴是空对象，不是漏字段——
+            // 头靠它把「这一档停下来靠什么」显示给人看（`iterate` 没有模型侧出口那条），
+            // 而「没有解释」与「核心还没升级」在头上必须分得开。
             var expected = Axes.RangeOf(name) is null
-                ? new[] { "label", "name", "values", "inContext" }
-                : ["label", "name", "values", "inContext", "range"];
+                ? new[] { "descriptions", "label", "name", "values", "inContext" }
+                : ["descriptions", "label", "name", "values", "inContext", "range"];
             Assert.Equal(expected.OrderBy(n => n, StringComparer.Ordinal), KeysOf(a));
+            Assert.Equal(JsonValueKind.Object, a.GetProperty("descriptions").ValueKind);
         }
 
         // 两支都走到（少了这句，一个只有枚举轴的实现也能让上面全绿）。
@@ -1898,6 +1902,14 @@ public class ControlServerTests : IAsyncLifetime
         // inContext 必须是真值而不是漏字段：effort 是 false，头据此把它画灰；少了这个字段头分不清「不进上下文」与「核心没这个信息」。
         var effort = axes.Single(a => a.GetProperty("name").GetString() == "effort");
         Assert.False(effort.GetProperty("inContext").GetBoolean());
+
+        // 等级解释也归核心（2026-11-03）：`iterate` 是没有模型侧出口的一档，那句「停下来只能靠
+        // 用户 interrupt / 改主动性轴 / 模型调用失败」必须由核心给、由头显示——头一个字都不许手抄。
+        var initiative = axes.Single(a => a.GetProperty("name").GetString() == "initiative");
+        var descriptions = initiative.GetProperty("descriptions");
+        foreach (var value in initiative.GetProperty("values").EnumerateArray())
+            Assert.False(string.IsNullOrWhiteSpace(descriptions.GetProperty(value.GetString()!).GetString()),
+                $"主动性档 {value.GetString()} 没有解释——头画不出这一档怎么走、怎么停");
 
         // 告警的两端也归核心：头里写字面量的话，轴里改一个档名就会让告警静默失效。
         Assert.Equal("prod", doc.RootElement.GetProperty("alertSafety").GetString());

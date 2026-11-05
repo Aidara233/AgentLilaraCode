@@ -20,7 +20,11 @@ public static class PluginSessionView
     {
         var result = Axes.Names.Select(n => (object)new
         { Name = n, Label = Axes.LabelOf(n), Values = Axes.ValuesOf(n),
-            InContext = Axes.InContext(n), Range = Axes.RangeOf(n) }).ToList();
+            InContext = Axes.InContext(n), Range = Axes.RangeOf(n),
+            // ⚠️ **等级解释也归核心**（2026-11-03）：头要把「这一档停下来靠什么」显示给人看
+            // （`iterate` 没有模型侧出口那条），而头不许手抄轴语义——它只能从这一格拿。
+            // ⚠️ 永远是对象（可能是 `{}`），不是 null：漏字段与「没有解释」在头上必须分得开。
+            Descriptions = Axes.DescriptionsOf(n) }).ToList();
         var bindings = spec is null ? host.Bind() : spec.Plugins ?? [];
         foreach (var binding in bindings)
         {
@@ -30,7 +34,9 @@ public static class PluginSessionView
                 var found = host.TryGetAxis(pair.Key, out var axis);
                 result.Add(new { Name = pair.Key, Label = found ? axis.Label : pair.Key,
                     Values = found ? axis.Values : new[] { pair.Value },
-                    InContext = found && axis.InContext, Available = problem is null, Problem = problem, PluginId = binding.Id });
+                    InContext = found && axis.InContext, Available = problem is null, Problem = problem, PluginId = binding.Id,
+                    // 插件轴的解释在注册时就被复制冻结（`AxisDefinition.LevelDescriptions`）。
+                    Descriptions = found ? axis.LevelDescriptions : Axes.DescriptionsOf(null) });
             }
         }
         return result.AsReadOnly();
