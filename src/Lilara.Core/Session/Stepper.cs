@@ -71,6 +71,27 @@ public sealed class Stepper(
     public Action<ModelDelta>? OnDelta { get; set; }
 
     /// <summary>
+    /// **一条工具调用真的开始跑了**（2026-11-05）。与 <see cref="OnRetry"/> / <see cref="OnDelta"/>
+    /// 同一个形状：解析口赋值一次，所有入口（`StepAsync` 与 `ResumeAsync`）自动带上。
+    ///
+    /// <para>⚠️ <b>为什么它不是 `StepOutcome` 的一格</b>：交回去的东西**只能等这一步结束**，
+    /// 而这条事实的全部价值就是**在等待之前**到达（一次跑五分钟的 `shell`）。
+    /// ⚠️ 也正因为它早于落盘，它**不能**冒充 `message.appended`——那会是一条盘上不存在的模型消息
+    /// （见 `WireEvent.ToolCallStarted` 的注释）。</para>
+    /// </summary>
+    public Action<Block.ToolUseBlock>? OnToolCallStarted { get; set; }
+
+    /// <summary>
+    /// **一条工具结果成形了**（2026-11-05）。⚠️ 与 <see cref="OnToolCallStarted"/> 同族，
+    /// 只是它晚一条调用的距离：一批五条时，第一条跑完就该有一条事件。
+    ///
+    /// <para>⚠️ 它**取代**了原先「步末一次性交回整批」的 <c>StepOutcome.ToolResults</c>：
+    /// 同一件事不要两个出处，否则「逐条发」与「整批发」谁算数会各说各话
+    /// （而那表现为头把同一条结果画两遍）。</para>
+    /// </summary>
+    public Action<TimelineEvent.ToolResultEvent>? OnToolResult { get; set; }
+
+    /// <summary>
     /// **子会话的活状态**（2026-10-26）：id ⇒ <c>SessionStatus</c> 的一个值，或 <c>null</c>
     /// （= 那一刻没激活 ⇒ 调用方回落到盘面那份）。
     ///
@@ -394,8 +415,6 @@ public sealed class Stepper(
         // 有问 ⇒ 事件列表**空**（模型消息也不落——见下），状态转 `WaitingForInput`，
         // 那次暂停冻进 handle，等用户答完由 `CommandDispatcher` 续跑。
         AskRequest? pending = null;
-        // 这一批工具结果——**给头的活事件**（`StepOutcome.ToolResults`）。有问时恒空。
-        IReadOnlyList<TimelineEvent.ToolResultEvent> toolResults = [];
 
         var goalEnded = false;
         SessionPlan? planAfter = null;
@@ -416,7 +435,11 @@ public sealed class Stepper(
             var executor = new ToolExecutor(
                 ToolsFor(handle), blobs, handle.State.Axes![Axes.Permission],
                 new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId),
-                handle.State.Axes![Axes.Mode]);
+                handle.State.Axes![Axes.Mode],
+                // ⚠️ **两条实时出口**（2026-11-05）：交出去的是事实，发不发、发到哪条流是调用方的事
+                // （`CommandDispatcher` 在解析口接一次，同 `OnRetry` / `OnDelta`）。
+                // ⇒ 于是「一次跑五分钟的 `shell`」在头上**跑起来那一刻**就看得见。
+                onCallStarted: OnToolCallStarted, onResult: OnToolResult);
             var context = new SessionToolContext(handle.Spec.WorkingDirectory, blobs, recorded,
                 // ⚠️ **与合成注入同一份字节**（`slots` 就是构造请求时用的那份尾块）：
                 // `floating_context` 若在这里现渲染，同一步里「核心注入的」与「模型自己要来的」
@@ -453,7 +476,6 @@ public sealed class Stepper(
             var batch = await executor.ExecuteAsync(toolCalls, context, ct);
             pending = batch.Pending;
             events.AddRange(batch.Results);
-            toolResults = batch.Results;
             executedCallIds = batch.ExecutedCallIds;
             spawns = batch.Spawns;
             tells = batch.Tells;
@@ -644,7 +666,7 @@ public sealed class Stepper(
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id,
-            ReleasedClaims: releasedClaims, ReleasedLines: releasedLines, ToolResults: toolResults,
+            ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
             GoalEnded: goalEnded, Compacted: compaction, Spawns: spawns, Tells: tells,
             Archives: archives,
             PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
@@ -995,8 +1017,6 @@ public sealed class Stepper(
         var events = new List<TimelineEvent>();
         var releasedClaims = new List<Claim>();
         var releasedLines = new List<TimelineEvent.ReleaseEvent>();
-        // 答复之后真正跑掉的那批结果——**给头的活事件**（与 `StepAsync` 同一个出口）。
-        IReadOnlyList<TimelineEvent.ToolResultEvent> toolResults = [];
         var goalEnded = false;
         // 计划落地结果（见 `ApplyPlanCalls`）——与 `StepAsync` 同一对变量、同一条判据。
         SessionPlan? planAfter = null;
@@ -1020,7 +1040,10 @@ public sealed class Stepper(
                 ToolsFor(handle), blobs, handle.State.Axes![Axes.Permission],
                 new ApprovalStore(_store.DataRoot, handle.ProjectKey, handle.SessionId),
                 // 同 `StepAsync`：模式硬闸按**答复这一刻**的模式值判。
-                handle.State.Axes![Axes.Mode]);
+                handle.State.Axes![Axes.Mode],
+                // ⚠️ 答复之后真正跑起来的那批也要实时报（2026-11-05）：用户刚点完「可以跑」，
+                // 那一批往往正是最慢的那几条（批准过的危险操作用来都不快）。
+                onCallStarted: OnToolCallStarted, onResult: OnToolResult);
             var context = new SessionToolContext(
                 handle.Spec.WorkingDirectory, blobs,
                 _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
@@ -1047,7 +1070,6 @@ public sealed class Stepper(
 
             var batch = await executor.ExecuteAsync(calls, context, ct, reply);
             events.AddRange(batch.Results);
-            toolResults = batch.Results;
             spawns = batch.Spawns;
             tells = batch.Tells;
             archives = batch.Archives;
@@ -1110,10 +1132,9 @@ public sealed class Stepper(
                     Plan = planChanged ? planAfter : s.Plan,
                 }, diskStatus: SessionStatus.WaitingForInput);
 
-                // ⚠️ **结果也要交给头**：这一批里已经跑掉的那几条有内容，
-                // 而「实时流里那批调用看起来没有下文」是本仓修过一次的老毛病。
+                // ⚠️ **结果此刻已经实时发过了**（2026-11-05：`OnToolResult` 在每条结果成形时就发），
+                // 所以这条返回路径上不再带结果——带上就是同一个出处两份，头会把它们画两遍。
                 return new StepOutcome(NoReply, again, handle.State.Ask?.DeadlineAt,
-                    ToolResults: toolResults,
                     ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
                     GoalEnded: goalEnded, Spawns: spawns, Tells: tells, Archives: archives,
                     PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
@@ -1132,7 +1153,7 @@ public sealed class Stepper(
         }, diskStatus: SessionStatus.Idle);
 
         return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
-            ToolResults: toolResults, GoalEnded: goalEnded, Spawns: spawns, Tells: tells,
+            GoalEnded: goalEnded, Spawns: spawns, Tells: tells,
             Archives: archives,
             PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
             ExecutedCallIds: executedCallIds);
@@ -1725,18 +1746,6 @@ public sealed class Stepper(
         string? HistoryId = null,
         IReadOnlyList<Claim>? ReleasedClaims = null,
         IReadOnlyList<TimelineEvent.ReleaseEvent>? ReleasedLines = null,
-        /// <summary>
-        /// 这一批工具结果——**给头的活事件**用的，不是落盘的另一份。
-        ///
-        /// <para>⚠️ 它们已经随 `events` 落盘了；这里交回去只是为了 `CommandDispatcher`
-        /// 能发 `tool.result.appended`（2026-10-17：此前没有这个出口，头的「工具结果」
-        /// 只在重拉 `/history` 时出现，正常对话流程里看不见）。</para>
-        ///
-        /// <para>⚠️ 交的是**记录那一份**（未回收、未解引用、未加框架）——与 `TimelineEvent`
-        /// 落盘的内容逐字相同。回收/截断是**渲染期**的事，头收到活事件时那条记录刚写，
-        /// 还没轮到任何判定；重拉时 `/history` 会给同一批结果套上最新形态。</para>
-        /// </summary>
-        IReadOnlyList<TimelineEvent.ToolResultEvent>? ToolResults = null,
         /// <summary>
         /// 本步**真的执行了** `finish_goal`，主动性已经拨回 `standard`。
         /// ⚠️ 调用方据此发 `axis.changed`（头的行 / 调音台靠它把目标标记撤掉）；

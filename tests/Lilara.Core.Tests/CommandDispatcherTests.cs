@@ -396,7 +396,115 @@ public class CommandDispatcherTests : IDisposable
     }
 
     /// <summary>
-    /// 请求里所有「核心注入的文字」。⚠️ **尾块通常不在 `Slots.Tail` 里**：
+    /// **模型正在跑的时候插进来的话，落盘必须排在「那一步的模型消息 + 它的结果」之后**
+    /// （2026-11-05，用户裁定：「不然模型会误以为自己刚才看过了而无视它」）。
+    ///
+    /// <para>⚠️ 这一条防的是一个**因果**错误，不是好看不好看：步 = 模型调用 **+ 它的工具执行**
+    /// （`01` §4），而那一步的模型消息 + 结果要等**步末同一次 append** 才写。若插话当场
+    /// （`session.send` 那一刻）就落盘，记录里的次序会变成「用户插话 → 模型回复它上一句」
+    /// ⇒ 模型下一步读到的是「我先说了话，然后它才调工具」，于是把刚跑出来的结果当成
+    /// 「用户不满意、要换一个」——实测里它就这么无视掉了自己两秒前才看过的东西。</para>
+    ///
+    /// <para>修法：会话在跑的时候 `session.send` **只入队、不落盘**，
+    /// 落盘推到那一步写完以后（`CommandDispatcher.FlushQueuedInput`）。
+    /// ⇒ 这里钉三件事：① 记录次序；② 事件次序（头那边「排队中」回声的终点）；③ 下一步的请求里
+    /// 那句话确实在末尾（且在它那条 `tool_result` 之后）。</para>
+    /// </summary>
+    [Fact]
+    public async Task InsertWhileStepIsRunning_LandsAfterThatStepsModelMessageAndResults()
+    {
+        var host = new CoreHost(_root, _work);
+        SaveProvider(host);
+        Directory.CreateDirectory(_work);
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "hi");
+
+        var bus = new EventBus();
+        var adapter = new FakeAdapter();
+        CommandDispatcher? dispatcher = null;
+        var sessionId = "";
+
+        var call = 0;
+        // ⚠️ 两次模型调用各要一个 factory（`_scripted` 是队列，一次调用取走一个）。
+        adapter.ReplyWith(_ =>
+        {
+            // ⚠️ **在模型调用「进行中」**插话：这一格就是用户说的那个时刻
+            //（factory 正是在 `CallAsync` 里面跑的）。
+            if (call++ == 0)
+                dispatcher!.DispatchAsync(
+                    new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("插一句")]),
+                    "insert", true, CancellationToken.None).GetAwaiter().GetResult();
+
+            return new ModelReply
+            {
+                Blocks = [new Block.ToolUseBlock("c1", "read", """{"path":"a.txt"}""")],
+                StopReason = "end_turn",
+                Refused = false,
+            };
+        });
+        adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [new Block.TextBlock("看过了")],
+            StopReason = "end_turn",
+            Refused = false,
+        });
+
+        dispatcher = new CommandDispatcher(host, bus, _ => new Stepper(host.Store, adapter, BuiltInTools.All));
+        sessionId = await CreateSessionAsync(dispatcher);
+
+        using var sub = bus.Subscribe(EventBus.SessionTopic(sessionId));
+
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("第一句")]),
+            "first", true, CancellationToken.None);
+
+        var payloads = new List<WireEvent>();
+        while (sub.Reader.TryRead(out var p)) payloads.Add(p.Payload);
+
+        // ---- ① 记录次序 ----
+        var projectKey = host.Store.FindSession(sessionId)!.Value.ProjectKey;
+        var timeline = host.Store.ReadTimeline(projectKey, sessionId).ToList();
+
+        var insertAt = timeline.FindIndex(e =>
+            e is TimelineEvent.MessageEvent { From: Speaker.User } m
+            && m.Blocks.OfType<Block.TextBlock>().Any(t => t.Text.Contains("插一句")));
+        Assert.True(insertAt >= 0, "那句插话根本没落盘");
+
+        // 它前面必须有：模型那条带 `tool_use` 的消息，以及那条调用的结果。
+        var modelAt = timeline.FindIndex(e =>
+            e is TimelineEvent.MessageEvent { From: Speaker.Model } m
+            && m.Blocks.OfType<Block.ToolUseBlock>().Any(u => u.CallId == "c1"));
+        var resultAt = timeline.FindIndex(e => e is TimelineEvent.ToolResultEvent { CallId: "c1" });
+
+        Assert.True(modelAt >= 0 && resultAt >= 0, "这一批工具调用没落盘");
+        Assert.True(insertAt > resultAt,
+            $"插话必须落在那批结果之后（model={modelAt} result={resultAt} insert={insertAt}）");
+
+        // ---- ② 事件次序：头的「排队中」回声靠这条权威事件退场 ----
+        var modelEvent = payloads.FindIndex(p => p is WireEvent.MessageAppended { From: "model" });
+        var insertEvent = payloads.FindIndex(p =>
+            p is WireEvent.MessageAppended { From: "user" } m
+            && m.Blocks.OfType<Block.TextBlock>().Any(t => t.Text.Contains("插一句")));
+        Assert.True(modelEvent >= 0 && insertEvent >= 0, "缺 `message.appended`");
+        // ⚠️ **跑着的时候啪地发一条，也不能提前发事件**：那一刻它还没进记录，
+        // 提前发就是让头把它画在模型回复**上面**（而那正是这次修掉的那个形状）。
+        Assert.True(insertEvent > modelEvent, "插话的事件提前到达了（它那时还在排队、没落盘）");
+
+        // ---- ③ 下一步请求里它在末尾，且在那条结果之后 ----
+        Assert.True(adapter.Calls.Count >= 2, "这一步应当调了两次模型（工具循环续推）");
+        var second = adapter.Calls[1].Timeline.ToList();
+        Assert.DoesNotContain(adapter.Calls[0].Timeline.OfType<TimelineEvent.MessageEvent>()
+            .SelectMany(m => m.Blocks.OfType<Block.TextBlock>())
+            .Select(b => b.Text), t => t.Contains("插一句"));
+
+        var lastUser = second.FindLastIndex(e =>
+            e is TimelineEvent.MessageEvent { From: Speaker.User } m
+            && m.Blocks.OfType<Block.TextBlock>().Any(t => t.Text.Contains("插一句")));
+        Assert.True(lastUser > second.FindIndex(e => e is TimelineEvent.ToolResultEvent { CallId: "c1" }),
+            "第二步的请求里，插话必须排在它那条工具结果之后");
+        Assert.Equal(second.Count - 1, lastUser);
+    }
+
+
     /// 工具表有 `floating_context` 时它被挪进末尾那条合成调用/结果（`Stepper.FloatingContextPair`），
     /// 而两者对模型是同一件事——只看 `Slots.Tail` 会得到一个假阴性。
     /// </summary>
@@ -882,7 +990,63 @@ public class CommandDispatcherTests : IDisposable
         Assert.False(sub.NeedsResync);
     }
 
-    // 拒答也必须走到 step.end（Stepper 的拒答分支不写模型消息，但 Turn 照样递增）；
+    // ⚠️ **工具的两条实时出口**（2026-11-05，用户实测「调用动作不该等它跑完才发」）。
+    //
+    // 钉三件事，每一件都是这条改动可能退回原样的地方：
+    //   ① 调用**开始跑**就有一条 `tool.call.started`（而不是等整步走完、随模型消息到达）；
+    //   ② 它先于**它自己的结果**（否则「执行中」这一幕永远不会出现）；
+    //   ③ 结果是**逐条**发的，而且只发一次——原先那句「步末整批发」已经删掉，
+    //      若它被谁加回来，这里会数到两条。
+    //
+    // ⚠️ 还有一条次序变化必须钉住：结果现在**早于它那条模型消息**到达
+    // （模型消息与结果是步末同一次落盘）。客户端按 `callId` 配对，不能假定「消息先到」。
+    [Fact]
+    public async Task ToolCalls_ArePublishedWhenTheyStart_AndTheirResultsFollowOneByOne()
+    {
+        var host = new CoreHost(_root, _work);
+        SaveProvider(host);
+        Directory.CreateDirectory(_work);
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "hi");
+
+        // 第一步：模型要一条 `read`；第二步（工具循环续推）：说完了。
+        _adapter.ReplyBlocks(new Block.ToolUseBlock("c1", "read", """{"path":"a.txt"}"""));
+        _adapter.Reply("看过了");
+
+        var bus = new EventBus();
+        var dispatcher = new CommandDispatcher(host, bus, _ => new Stepper(host.Store, _adapter, BuiltInTools.All));
+        var sessionId = await CreateSessionAsync(dispatcher);
+
+        using var sub = bus.Subscribe(EventBus.SessionTopic(sessionId));
+
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("看一眼")]),
+            "c", true, CancellationToken.None);
+
+        var payloads = new List<WireEvent>();
+        while (sub.Reader.TryRead(out var p)) payloads.Add(p.Payload);
+
+        var started = Assert.Single(payloads.OfType<WireEvent.ToolCallStarted>());
+        Assert.Equal("c1", started.CallId);
+        Assert.Equal("read", started.Name);
+        // 参数**逐字原文**（`01` §9）：核心不许解析后再拼一遍。
+        Assert.Equal("""{"path":"a.txt"}""", started.Arguments);
+        Assert.Equal(1, started.Turn);
+
+        var result = Assert.Single(payloads.OfType<WireEvent.ToolResultAppended>());
+        Assert.Equal("c1", result.CallId);
+
+        // 模型消息（含那条 `toolUse`）在这条结果**之后**——这正是被修的那个时机问题。
+        var modelMessage = payloads.FindIndex(
+            p => p is WireEvent.MessageAppended { From: "model" });
+        Assert.True(modelMessage >= 0, "这一步应当有一条模型消息（含 toolUse）");
+
+        var startedAt = payloads.IndexOf(started);
+        var resultAt = payloads.IndexOf(result);
+        Assert.True(startedAt < resultAt, "调用开始必须先于它自己的结果");
+        Assert.True(resultAt < modelMessage,
+            "结果现在早于它那条模型消息（逐条实时发，而模型消息仍是步末那条）");
+    }
+
     // 挂在「模型消息之后」会漏掉拒答，头永远等不到 step.end。
     [Fact]
     public async Task Refusal_StillPublishesStepEnd()

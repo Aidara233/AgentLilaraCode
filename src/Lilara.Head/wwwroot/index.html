@@ -662,6 +662,12 @@ button:disabled:hover { border-color: var(--rule); }
 }
 .turn.user .who { color: var(--accent); font-weight: 600; }
 .turn.user .body { border-left-color: var(--accent); }
+/* 「排队中」的本地回声（2026-11-05）：句子已经发出去，但核心还排在队里——
+   ⚠️ 它**不是记录里的一条**（没有 historyId），落盘之后会被权威那条换掉。
+   样式上就得更淡：它讲的是「我收到了」，不是「对话里已经有了这条」。 */
+.turn.user.queued { opacity: .55; }
+.turn.user.queued .body { border-left-style: dashed; }
+.turn.user.queued .who { font-weight: 400; }
 .turn.model .who { color: var(--ink-3); }
 .turn.model .body { color: var(--ink); }
 .turn.error .body { border-left-color: var(--danger); color: var(--danger); }

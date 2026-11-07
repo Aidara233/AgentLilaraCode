@@ -32,12 +32,31 @@ namespace Lilara.Core.Session.Tools;
 /// ⚠️ <b>它<b>只</b>决定「还要不要问」</b>——命中记忆 ⇒ 那条 `Ask` 变 `Allow`；
 /// **它从不放行一条 `Deny`**（档位不够是硬线，用户批过某一个参数不该让整类工具通过）。
 /// </param>
+/// <param name="onCallStarted">
+/// **一条调用真的开始执行了**（2026-11-05）。⚠️ 回调只交事实，发不发、发到哪条流是调用方的事
+/// （与 `StepOutcome` 同一条分工：执行器不认识事件总线）。
+///
+/// <para>⚠️ <b>它只在 <c>willRun</c> 那一支被调</b>——被闸门拒的、名字不存在的、
+/// 挂在询问上等答复的调用**一条都不报**。那些调用的 `tool_use` 照样会随模型消息到达，
+/// 头显示的是「被拒 / 等你答」；把它们也报成「执行中」是**假信息**。</para>
+/// <para>⚠️ 调用点在 `RunAsync` **之前**、`executed` 记名之后：那一刻「它要跑了」是事实，
+/// 而报告本身必须发生在等待之前——否则长工具跑完才有事件，这正是要修的那个毛病。</para>
+/// </param>
+/// <param name="onResult">
+/// **一条结果成形了**（2026-11-05）。⚠️ 与 <paramref name="onCallStarted"/> 同一条分工。
+/// 它在结果被 `Materialize` 之后、返回之前逐条触发 ⇒ 一批里第一条跑完就有一条事件，
+/// 而不是整批跑完才一起发。
+/// <para>⚠️ 交的是<b>记录那一份</b>（未回收、未截断、未加框架）——与落盘的内容逐字相同；
+/// 回收 / 截断是**渲染期**的事，那时这条记录还没写。</para>
+/// </param>
 public sealed class ToolExecutor(
     IReadOnlyList<ITool> tools,
     Storage.BlobStore blobs,
     string? permissionLevel,
     ApprovalStore? approvals = null,
-    string? mode = null)
+    string? mode = null,
+    Action<Block.ToolUseBlock>? onCallStarted = null,
+    Action<TimelineEvent.ToolResultEvent>? onResult = null)
 {
     /// <summary>
     /// **规划模式下被硬拦的工具名**（2026-10-24，用户裁定：「计划模式强制拦截几个内置的常见修改文件指令
@@ -291,6 +310,9 @@ public sealed class ToolExecutor(
                     // 也会让答案在转述里走样。
                     Content = [new Block.TextBlock(reply.Compose())],
                 });
+                // ⚠️ 它也是**一条结果**，所以也要报（2026-11-05）：这条路上工具一个字都没跑，
+                // 而「答完就没下文」正是 `tool.result.appended` 那一批要防的形状。
+                onResult?.Invoke(results[^1]);
                 continue;
             }
 
@@ -298,7 +320,13 @@ public sealed class ToolExecutor(
             // ⚠️ 这一格也是 `ExecutedCallIds` 的唯一写入点：名单在**执行前**记下，
             // 与 `RunAsync` 同一支，不会出现「结果落了、名单没有」或反过来。
             var willRun = plan.Tool is not null && plan.Verdict is Verdict.Allow;
-            if (willRun) executed.Add(plan.Call.CallId);
+            if (willRun)
+            {
+                executed.Add(plan.Call.CallId);
+                // ⚠️ **报在 `RunAsync` 之前**（2026-11-05）：这条事件的全部价值就是「别等它跑完」。
+                // ⚠️ 报的只是**要跑**：被拒 / 不存在的那几支不经过这里（见构造参数那条注释）。
+                onCallStarted?.Invoke(plan.Call);
+            }
 
             var outcome = willRun
                 ? await plan.Tool!.RunAsync(
@@ -327,6 +355,9 @@ public sealed class ToolExecutor(
                 DependsOn = outcome.DependsOn,
                 Fingerprint = outcome.Fingerprint,
             });
+            // ⚠️ **成形一条报一条**（2026-11-05）：一批五条时，第一条的结果不该等第五条文完
+            // 才到头上。⚠️ 报的是**记录那一份**（`Materialize` 之后、`AppendEvents` 之前）。
+            onResult?.Invoke(results[^1]);
         }
 
         return new Batch(results, asks.Count > 0 ? Merge(asks) : null)

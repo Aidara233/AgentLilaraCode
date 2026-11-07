@@ -20,6 +20,7 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(SessionDeleted), "session.deleted")]
 [JsonDerivedType(typeof(SessionReclaimed), "session.reclaimed")]
 [JsonDerivedType(typeof(ReleaseRecorded), "release.recorded")]
+[JsonDerivedType(typeof(ToolCallStarted), "tool.call.started")]
 [JsonDerivedType(typeof(ToolResultAppended), "tool.result.appended")]
 [JsonDerivedType(typeof(RetryAttempt), "retry.attempt")]
 [JsonDerivedType(typeof(ApprovalRequested), "approval.requested")]
@@ -185,6 +186,46 @@ public abstract record WireEvent
     /// </summary>
     public sealed record ToolResultAppended(
         string SessionId, string Id, string CallId, IReadOnlyList<Block> Blocks, DateTimeOffset At) : WireEvent;
+
+    /// <summary>
+    /// **一条工具调用开始执行了**（2026-11-05，用户实测）。
+    ///
+    /// <para>⚠️ <b>为什么需要它</b>：工具调用从来就不是「事件缺口」——它是模型消息里的
+    /// `toolUse` 块，随 <see cref="MessageAppended"/> 到达。⚠️ <b>但那条消息的到达时机不对</b>：
+    /// 模型消息与它那批结果**同一次落盘**（`01` §3.6 ④「步末按调用序一次落盘」），
+    /// 而步 = 模型调用 **+ 它的工具执行**（`01` §4）⇒ 一次跑五分钟的 `shell` 期间，
+    /// 头那边**一个字都没有**（只有相位条写着「工具处理」）。用户报的就是这个：「调用动作
+    /// 不该等它跑完才发」。</para>
+    ///
+    /// <para>⚠️ <b>为什么不干脆把 <see cref="MessageAppended"/> 提前发</b>（那样头一行都不用改）：
+    /// 那会在**没落盘的时候就宣告它落了盘**。这一步的中断 / 失败**不写任何记录**
+    /// （工具跑到一半被打断 = 这条 `tool_use` 永远配不上结果）⇒ 头手上会留下一条
+    /// **盘上不存在**的模型消息，而它还带着 <c>historyId</c>。头对 `error` 那条注释写得很清楚：
+    /// 「没成为事实的不能留着」。⇒ 早发的必须是**另一个类型**：它讲的是「正在跑」，
+    /// 不是「记录里多了一条」。</para>
+    ///
+    /// <para>⚠️ <b>只供显示，不保留</b>（<c>Publish(retained: false)</c>）——与
+    /// <see cref="TermDelta"/> 同族：重连之后不重放。理由是**它没有对应的记录**，
+    /// 而重放一条「正在跑」只会让头给一个早就结束的调用画上「执行中」；
+    /// 那一步的权威形态（模型消息 + 结果）会在步末照常到达。</para>
+    ///
+    /// <para>⚠️ <b>一条调用一条事件，且只在「真的要跑」时发</b>：被闸门拒的、名字不存在的、
+    /// 以及挂在询问上等答复的调用**一条都不发**（它们的 `tool_use` 会随模型消息到达，
+    /// 那时显示的是「被拒 / 等你答」这套既有形态，而不是「执行中」）。
+    /// 判据只有 <c>ToolExecutor</c> 那一处（`willRun`）。</para>
+    ///
+    /// <para>⚠️ <b>它与 <see cref="ToolResultAppended"/> 的次序是「一条调用、它自己的结果」</b>：
+    /// 结果为了一条调用能尽早显示，2026-11-05 起改成了**跑完一条就发一条**
+    /// ⇒ 结果事件**可能早于它那条模型消息**到达。记录里的次序一个字没变
+    /// （仍是「模型消息、然后按调用序的结果」），变的只是**事件到达的时机**——
+    /// 客户端按 `callId` 配对，不要假定「模型消息一定先到」。</para>
+    /// </summary>
+    /// <param name="Turn">这一步的步号（与 <see cref="TermDelta.Turn"/> 同一个约定：
+    /// 模型调用之前那一刻的 <c>Turn + 1</c>）。头用它决定这条调用行落在哪一段临时画面上。</param>
+    /// <param name="Arguments">模型给的那份**原文**（与 `toolUse` 块逐字相同）——头把它折叠显示，
+    /// 不去解析、不去美化（`01` §9：参数是逐字原文）。</param>
+    public sealed record ToolCallStarted(
+        string SessionId, int Turn, string CallId, string Name, string Arguments) : WireEvent;
 
     /// <summary>
     /// **核心在问用户**（`01` §3.8）。⚠️ <b>它同时投两条流</b>：

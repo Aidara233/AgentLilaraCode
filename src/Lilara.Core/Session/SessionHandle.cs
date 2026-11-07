@@ -48,9 +48,31 @@ public sealed record SessionHandle
     /// ⚠️ 那句话曾经写的是「磁盘格式已冻结」——本批之后它成了假话，别照抄。
     /// ⇒ 最小实现只在内存排队：崩溃会丢掉未开跑的待办，而磁盘上**看不出来**
     /// （`Pending` 恒为空列表，不是「有而没写」）。
+    ///
+    /// <para>⚠️ <b>2026-11-05：每条多带一格 <c>Appended</c></b>（有没有进过记录）。
+    /// 这一步跑着的时候插进来的话**先只入队、不落盘**，理由是<b>因果</b>：
+    /// 那一步的模型消息 + 它那批结果要等**步末同一次 append** 才写，若插话当场就落盘，
+    /// 记录里的次序会变成「用户插话 → 模型回复它上一句」⇒ 模型下一步会误以为
+    /// 那句话是它动手**之前**说的，于是把自己刚看过的结果当成「你不满意的东西」。
+    /// ⇒ 落盘推到「这一步写完」之后（`CommandDispatcher.FlushQueuedInput` 的四个调用点）。
+    /// ⚠️ <b>代价认得清楚</b>：这一步跑着期间进程崩掉，那句还没落盘的插话会没
+    /// （头上已经回声过 ⇒ 用户会以为发过了）。要堵这个窗口就得给待办一个磁盘日志，
+    /// 那是另一件事（见上面那段「还没到做待办持久化的时候」）。</para>
     /// </summary>
-    private readonly Queue<IReadOnlyList<Block>> _pending = new();
+    private readonly Queue<QueuedInput> _pending = new();
     private readonly Lock _queueLock = new();
+
+    /// <summary>
+    /// 队列里的一条。⚠️ <c>Appended</c> 是**可变**的，且在 `_queueLock` 下改：
+    /// 它由 `CommandDispatcher` 的步线程在两个时刻翻转——① 落盘之后（`Enqueue` 那条本来就是真），
+    /// ② 补落盘时（`ClaimUnappended` 原子地取走并置真）。
+    /// </summary>
+    public sealed class QueuedInput(IReadOnlyList<Block> blocks)
+    {
+        public IReadOnlyList<Block> Blocks { get; } = blocks;
+
+        public bool Appended { get; set; }
+    }
 
     /// <summary>
     /// 「这一步在跑」——`02` §3.1 说的「重入保护只剩**一把标志**」。
@@ -72,10 +94,48 @@ public sealed record SessionHandle
 
     public bool IsRunning => Volatile.Read(ref _step) == 1;
 
-    /// <summary>入队。⚠️ 调用方**已经**把这条消息追加进记录了（`01` §6.1 的次序）。</summary>
+    /// <summary>入队，且**这一条已经追加进记录了**（`01` §6.1 的次序：空闲时发送，当场落盘）。</summary>
     public void Enqueue(IReadOnlyList<Block> blocks)
     {
-        lock (_queueLock) _pending.Enqueue(blocks);
+        lock (_queueLock) _pending.Enqueue(new QueuedInput(blocks) { Appended = true });
+    }
+
+    /// <summary>
+    /// 入队，但**还没进记录**（2026-11-05：这一步正跑着时插进来的话）。
+    ///
+    /// <para>⚠️ 与 <see cref="Enqueue"/> 分成两个方法，因为它们承诺的事情不同：
+    /// 那条保证「磁盘上已经有了」，这条**什么都没有**——它什么时候落盘由
+    /// `CommandDispatcher.FlushQueuedInput` 决定（必须晚于那一步的模型消息 + 结果）。
+    /// 合成一个带 `bool` 参数的版本会让两个调用点看起来只是参数不同，而这正是
+    /// 「抄漏一条」最容易发生的地方。</para>
+    /// </summary>
+    public void EnqueuePending(IReadOnlyList<Block> blocks)
+    {
+        lock (_queueLock) _pending.Enqueue(new QueuedInput(blocks));
+    }
+
+    /// <summary>
+    /// 取走**所有还没进记录的**那几条（FIFO 次序），并原子地把它们标成已落。
+    ///
+    /// <para>⚠️ <b>只许步线程调</b>（`CommandDispatcher.FlushQueuedInput` 的所有调用点都在
+    /// 「拿着会话闸 / 拿着 `_step`」的那一侧）。标在**取的那一刻**而不是写完之后，
+    /// 是为了让「同一条被两个线程各写一遍」在结构上不可能——代价是写盘抛异常时
+    /// 那一条就丢了；而 `AppendEvent` 抛异常意味着这个会话的记录已经写不进去了，
+    /// 那时丢不丢这一条都不是主要问题。</para>
+    /// </summary>
+    public IReadOnlyList<IReadOnlyList<Block>> ClaimUnappended()
+    {
+        lock (_queueLock)
+        {
+            List<IReadOnlyList<Block>>? unappended = null;
+            foreach (var item in _pending)
+            {
+                if (item.Appended) continue;
+                item.Appended = true;
+                (unappended ??= []).Add(item.Blocks);
+            }
+            return unappended ?? [];
+        }
     }
 
     public int QueueDepth { get { lock (_queueLock) return _pending.Count; } }
@@ -92,7 +152,7 @@ public sealed record SessionHandle
             if (_pending.Count == 0) return [];
 
             var batch = new List<Block>();
-            while (_pending.Count > 0) batch.AddRange(_pending.Dequeue());
+            while (_pending.Count > 0) batch.AddRange(_pending.Dequeue().Blocks);
             return batch;
         }
     }

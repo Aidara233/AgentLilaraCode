@@ -210,6 +210,100 @@ public sealed class HeadScriptTests
     }
 
     /// <summary>
+    /// **会话在跑的时候发出去的话，头必须先本地回声一条「排队中」**（2026-11-05）。
+    ///
+    /// <para>⚠️ 为什么需要它：核心那边此刻**只入队、不落盘**（那句插话必须落在那一步的
+    /// 模型消息 + 结果之后——否则模型下一步会误以为它是在自己动手之前说的），
+    /// 所以权威的 `message.appended` 要等**这一步写完**才到，可能是几分钟之后
+    /// （一次跑到底的 `shell`）。不回声的话用户会以为自己没发出去，于是再发一遍
+    /// ——那就真成两条了。</para>
+    ///
+    /// <para>⚠️ 回声**不是记录里的一条**：它没有 `historyId`、不写 `data-history-id`
+    ///（写了就与随后那条真消息抢身份，而 `renderHistoryItem` 按 id 去重 ⇒ 真消息会被当成重复丢掉）。
+    /// ⚠️ 它必须在两处退场：① 权威用户消息到达时（FIFO 一条换一条）；② 清中栏时
+    ///（时间线整块换掉，留着引用只会去 `remove()` 一个孤儿）。</para>
+    /// </summary>
+    [Fact]
+    public void SendWhileRunning_EchoesLocally_AndTheEchoStepsAsideForTheAuthoritativeMessage()
+    {
+        var js = AppJs();
+
+        Assert.Contains("function echoQueued(text)", js, StringComparison.Ordinal);
+        Assert.Contains("function retireQueuedEcho()", js, StringComparison.Ordinal);
+
+        // 只有「在跑」才回声（空闲时核心当场落盘，事件毫秒级到达，不需要回声）。
+        var sendAt = js.IndexOf("function send()", StringComparison.Ordinal);
+        Assert.True(sendAt > 0, "没找到 send()");
+        var sendEnd = js.IndexOf("\n}", sendAt, StringComparison.Ordinal);
+        var sendBody = js[sendAt..sendEnd];
+        Assert.Contains("lastStatus === \"Running\"", sendBody, StringComparison.Ordinal);
+        Assert.Contains("echoQueued(", sendBody, StringComparison.Ordinal);
+
+        // ⚠️ 回声不许带正式身份。
+        var echoAt = js.IndexOf("function echoQueued(text)", StringComparison.Ordinal);
+        var echoEnd = js.IndexOf("\n}", echoAt, StringComparison.Ordinal);
+        var echoBody = js[echoAt..echoEnd];
+        Assert.False(echoBody.Contains("historyId", StringComparison.Ordinal),
+            "回声不许带 historyId：那是正式记录的身份，带了会把随后那条真消息挤掉。\n" + echoBody);
+
+        // ① 权威用户消息到达时退场。
+        var handlers = js[js.IndexOf("function handleEvent", StringComparison.Ordinal)..];
+        Assert.Contains("retireQueuedEcho()", handlers, StringComparison.Ordinal);
+        // ② 清中栏时作废。
+        var clearAt = js.IndexOf("function clearCenter()", StringComparison.Ordinal);
+        var clearEnd = js.IndexOf("\n}", clearAt, StringComparison.Ordinal);
+        Assert.Contains("queuedEchoes.length = 0", js[clearAt..clearEnd], StringComparison.Ordinal);
+    }
+
+    ///
+    /// <para>⚠️ 为什么它必须画进**临时气泡**：那一刻核心还没落盘那条模型消息（步末才写一次），
+    /// 而被中断 / 失败的那一步**什么都不落**。照正式行画，用户重开会话会看到
+    /// 「我明明看见它调了 `shell`，记录里没有」——画面撒谎。正式那一行只由
+    /// `message.appended` 给。</para>
+    ///
+    /// <para>⚠️ 随之而来的两条形状，静态守得住、运行时才会错，各钉一处：</para>
+    /// <list type="number">
+    ///   <item><b>结果可能先于模型消息到达</b>（核心改成「跑完一条发一条」）：那几行结果
+    ///   会被锚在**临时行**下面，而临时气泡会被 `clearLive()` 整块摘掉 ⇒ 必须在摘之前
+    ///   把它们**撕下来再归位**（`message.appended` 与 `step.end` 两处都要），
+    ///   而**不是**重画一遍（重画会让同一条结果出现两份，或被 `renderHistoryItem`
+    ///   的 id 去重当成旧的丢掉）。</item>
+    ///   <item><b>临时行必须带 `data-call-id`、不带 `data-history-id`</b>：前者是
+    ///   `appendToolResult` 找的锚（没有它，「调用开始 → 它自己的结果」就串不起来）；
+    ///   后者是正式记录的身份（带了就与随后那条真消息抢 id）。</item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public void ToolCallStarted_DrawsIntoTheLiveBubble_AndItsResultSurvivesTheSwap()
+    {
+        var js = AppJs();
+
+        // ① 事件有消费者（没有的话，核心发得再及时头也什么都不画）。
+        Assert.Contains("case \"tool.call.started\"", js, StringComparison.Ordinal);
+        Assert.Contains("function startLiveToolCall(p)", js, StringComparison.Ordinal);
+
+        // ② 临时行：画进气泡、留 `data-call-id` 锚、**不**带正式身份。
+        var start = js.IndexOf("function startLiveToolCall(p)", StringComparison.Ordinal);
+        var end = js.IndexOf("\n}", start, StringComparison.Ordinal);
+        Assert.True(end > start, "没找到 startLiveToolCall 的函数体结尾");
+        var body = js[start..end];
+        Assert.Contains("ensureLive(", body, StringComparison.Ordinal);
+        Assert.Contains("dataset.callId", body, StringComparison.Ordinal);
+        Assert.False(body.Contains("historyId", StringComparison.Ordinal),
+            "临时行不许带 historyId：那是正式记录的身份，带了会把随后那条真消息挤掉。\n" + body);
+
+        // ③ 结果行的救援：撕下来 → 画完正式那条 → 按 callId 归位。
+        Assert.Contains("function detachLiveResults()", js, StringComparison.Ordinal);
+        Assert.Contains("function placeResults(rows)", js, StringComparison.Ordinal);
+        Assert.Contains("data-result-call-id", js, StringComparison.Ordinal);
+
+        var handlers = js[js.IndexOf("function handleEvent", StringComparison.Ordinal)..];
+        var rescues = Regex.Matches(handlers, @"detachLiveResults\(\)").Count;
+        Assert.True(rescues >= 2,
+            $"至少两处要救结果行（`message.appended` 与 `session.step.end`），只有 {rescues} 处。");
+    }
+
+    /// <summary>
     /// <b>新建会话的目录输入是「输入即过滤的 combobox」，补全逻辑在头、core 只供 ls。</b>
     ///
     /// <para>⚠️ 2026-10-17 用户裁定换形状：原来是「逐层点『进入 X』按钮」，用户要的是

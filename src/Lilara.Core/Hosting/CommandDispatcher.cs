@@ -69,6 +69,28 @@ public sealed class CommandDispatcher(
         // 以及与最终消息的先后次序都在 `DeltaPump` 里判；这里只把事实交过去。
         stepper.OnDelta = delta => _deltas.Push(handle.SessionId, handle.State.Turn + 1, delta);
 
+        // ⚠️ **工具的两条实时出口也接在这里**（2026-11-05，用户实测：「调用动作不该等它跑完才发」）。
+        // 为什么必须早于这一步结束：模型消息 + 它那批结果是**步末同一次落盘**，而步包含工具执行
+        // ⇒ 一次跑五分钟的 `shell` 期间头一个字都收不到。⇒ 调用**开始跑**就报一条，
+        // 结果**成形一条**报一条。⚠️ 判据与「不发什么」都在 `ToolExecutor` 那一处，
+        // 这里只负责把它落到这条会话的流上（同 `OnRetry` / `OnDelta` 的分工：推进器不碰事件总线）。
+        //
+        // ⚠️ `Turn` 用 `handle.State.Turn + 1`——与 `OnDelta` 逐字同一个约定：那时 `Turn`
+        // 还没自增（它在步末才 +1），而这一步的步号就是 +1 那个值。
+        stepper.OnToolCallStarted = call => _bus.Publish(
+            EventBus.SessionTopic(handle.SessionId),
+            // ⚠️ **不保留**（同 `term.delta`）：它没有对应的记录，重连之后重放一条「正在跑」
+            // 只会给一个早就结束的调用画上「执行中」。
+            new WireEvent.ToolCallStarted(
+                handle.SessionId, handle.State.Turn + 1, call.CallId, call.Name, call.Arguments),
+            retained: false);
+        stepper.OnToolResult = result => _bus.Publish(
+            EventBus.SessionTopic(handle.SessionId),
+            // ⚠️ **保留**（与调用不同）：它是一条真实记录，只是"还没写盘就先报"——
+            // 重连之后补发它是对的（重拉 `/history` 也会给出同一条，靠 id 对上）。
+            new WireEvent.ToolResultAppended(
+                handle.SessionId, result.Id, result.CallId, result.Content, result.At));
+
         return stepper;
     }
 
@@ -1773,6 +1795,66 @@ public sealed class CommandDispatcher(
         if (BlockKinds.Reject(s.Blocks, new Storage.BlobStore(_host.Store.DataRoot)) is { } rejected)
             return Reject(id, rejected);
 
+        var accepted = new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = s.SessionId });
+
+        // ⚠️ **先判「这一步要不要我来起」——它同时决定「这条消息什么时候落盘」**（2026-11-05）。
+        //
+        // <para>⚠️ <b>为什么不能先落盘再判</b>：这一步正跑着的时候，它自己的模型消息 + 那批结果
+        // 要等**步末同一次 append** 才写。若插话当场就写进记录，记录里的次序会变成
+        // 「用户插话 → 模型回复上一句」⇒ 模型下一步会误以为那句话是它动手**之前**说的，
+        // 于是把自己刚跑出来的结果当成「你不满意的东西」无视掉（用户实测的原话）。
+        // ⇒ 跑着的时候**只入队、不落盘**，落盘推迟到那一步写完以后（`FlushQueuedInput`）。</para>
+        //
+        // <para>⚠️ <b>它同时确立了一条更值钱的不变量</b>：**落盘只发生在 `_step` 持有者那一侧**。
+        // 从前 supersede 那一块在拿标志之前就写盘，而步线程可能正写着它那批事件
+        // ——两条 append 交错能把「模型消息 + 结果」劈开（而那是上游 400 的形状之一）。</para>
+        if (!handle.TryEnterStep())
+        {
+            // 跑着呢：只入队。⚠️ **不发 `message.appended`**——它还没进记录，发了就是让头
+            // 看见一条「已经进了对话」的消息。头那边自己回声一个「排队中」，等落盘时
+            // 真事件到达再换掉（`send()` 那段注释）。
+            handle.EnqueuePending(s.Blocks);
+            return accepted;
+        }
+
+        try
+        {
+            // ⚠️ **只把「写盘」包在这个 try 里**：从这里往下到 `RunStepAsync` 之间不再有别的 append，
+            // 而 `RunStepAsync` 的 `finally` 会自己 `ExitStep`。若把它的那一段也包进来，
+            // 「成功跑完 + 抛出（`throwOnFailure`）」就会**再清一次**标志——
+            // 而那可能正好清掉另一个刚进来的 send 拿到的标志 ⇒ 两个步重叠跑（本仓修过一次的老毛病）。
+            // ⇒ 写盘失败（盘满之类）由这个 catch 把标志还回去；**跑**那一半的所有权归 `RunStepAsync`。
+            PrepareSend(handle, s);
+        }
+        catch
+        {
+            // ⚠️ 拿到标志之后抛出去，必须把标志还回去——否则这个会话永远起不了下一步
+            // （`TryEnterStep` 从此恒假，而盘上写得一切正常，看起来像「模型不理我」）。
+            handle.ExitStep();
+            throw;
+        }
+
+        if (awaitCompletion)
+        {
+            // 控制台：同步拿结果，失败抛给调用方（打印一行人话、REPL 继续活着）。
+            var reply = await RunStepAsync(handle, ct, throwOnFailure: true);
+            return accepted with { Reply = reply };
+        }
+
+        // 控制面：立刻回执、步在后台跑——否则 `session.interrupt` 无事可做
+        // （步若在命令里同步跑完，那条 interrupt 在它的「当前步」结束前根本轮不到执行）。
+        _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
+            CancellationToken.None);
+
+        return accepted;
+    }
+
+    /// <summary>
+    /// 拿到 <c>_step</c> 之后的**写盘那一半**：顶替询问 → 补落排队的 → 落这一条。
+    /// ⚠️ 同步、不碰步——「跑」那一段留在调用方，好让「标志由谁还回去」在代码形状上不含糊。
+    /// </summary>
+    private void PrepareSend(SessionHandle handle, CoreCommand.SessionSend s)
+    {
         // ⚠️ **撞上「正在等回答」⇒ 先顶替那次询问**（`01` §3.8 的 `Superseded`）。
         //
         // ⚠️ **不顶替的话，下一条请求会 400**，而**这次是实测的**（2026-10-08）：
@@ -1804,9 +1886,19 @@ public sealed class CommandDispatcher(
                 new WireEvent.ApprovalResolved(handle.SessionId, superseded.AskId, "superseded"));
         }
 
+        // ⚠️ **先把排着队、还没进记录的那几条补上**（2026-11-05）。它们属于「上一步跑着的时候
+        // 插进来的话」，此刻上一步的模型消息 + 结果**已经写完**（我们持有 `_step` ⇒ 没有别人
+        // 正在写），所以补在这里正是它们该在的位置：模型那一轮之后、这一条之前。
+        //
+        // ⚠️ **次序刻意放在 supersede 之后**：顶上那条路补的是一条 `tool_result`（回答模型那个
+        // 悬空的 `tool_use`），它必须**紧贴**在那条模型消息后面；插话排在它后面既保住了配对，
+        // 也保住了因果（插话是模型问完之后的下一句）。
+        FlushQueuedInput(handle);
+
         // 追加与入队必须紧挨着——分开会产生「已落盘未入队」/「已入队未落盘」两种中间态，各自丢消息。
-        // 这两步刻意不拿闸：合并是队列的副产品，而 no-op 的前提是后来的 send 先进得来。
         // 并发安全靠各自那层的锁：`HistoryLog.Append` 自带按路径的锁，`SessionHandle.Enqueue` 自带队列锁。
+        // ⚠️ 2026-11-05：这两句现在**只在 `_step` 持有者这一侧**发生（上面那条 `TryEnterStep`
+        // 之后），所以它们不再需要与「步线程正在写它那批事件」抢次序。
         var at = CoreClock.Now();
         var historyId = Ids.New();
 
@@ -1826,26 +1918,58 @@ public sealed class CommandDispatcher(
             {
                 HistoryId = historyId,
             });
+    }
 
-        // 启动去重：已有推进在飞时，本次只入队、不再安排一次推进。
-        if (!handle.TryEnterStep())
-            return new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = s.SessionId });
-
-        var accepted = new DispatchResult(new Ack.Accepted { CommandId = id, SessionId = s.SessionId });
-
-        if (awaitCompletion)
+    /// <summary>
+    /// **把排队等着、还没进记录的那几条补落盘**（2026-11-05）。
+    ///
+    /// <para>⚠️ <b>它存在的唯一理由：因果次序</b>。这一步正跑着时插进来的话不能当场落盘——
+    /// 那一步的模型消息 + 结果要等<b>步末同一次 append</b> 才写，先落的话记录里就成了
+    /// 「用户插话 → 模型回复它上一句」，模型下一步会把刚跑出来的结果当成「你不满意的东西」。
+    /// ⇒ 落盘推迟到「这一步写完」之后。</para>
+    ///
+    /// <para>⚠️ <b>四个调用点，每个都对应「这一步已经写完 / 压根没写」的一个时刻</b>：</para>
+    /// <list type="number">
+    ///   <item>`HandleSessionSendAsync`（拿到 `_step` 之后、写自己那条之前）：上一步的写已经完成；</item>
+    ///   <item>`RunStepAsync` 取空队列之前：装配请求之前必须已经进记录（否则模型看不到它）；</item>
+    ///   <item>中断那条 catch：那一步什么都没写，补在末尾就是对的；</item>
+    ///   <item>失败那条 catch：同上。</item>
+    /// </list>
+    ///
+    /// <para>⚠️ <b>只许 `_step` 持有者调</b>（`ClaimUnappended` 的注释说了为什么）。
+    /// ⚠️ **不在这条路的 `finally` 里**：挂起（`WaitingForInput`）那一步末尾补落的话，
+    /// 记录会成「模型消息（挂着 `tool_use`）→ 用户插话」——那条 `tool_use` 后面没有
+    /// `tool_result`，下一次请求就 400。⇒ 挂起那一步的插话**继续排队**，等用户答话/发话时
+    /// 由第 ① 个调用点补（顶替询问那条 `tool_result` 之后）。</para>
+    ///
+    /// <para>⚠️ <b>代价（认得清楚）</b>：排队期间它只在内存里——这一步跑着的时候进程崩了，
+    /// 那句话就没了，而头上已经回声过（用户会以为自己发过了）。要堵这个窗口得给待办一个
+    /// 磁盘日志，那是另一件事（见 `SessionHandle._pending` 的注释）。</para>
+    /// </summary>
+    private void FlushQueuedInput(SessionHandle handle)
+    {
+        foreach (var blocks in handle.ClaimUnappended())
         {
-            // 控制台：同步拿结果，失败抛给调用方（打印一行人话、REPL 继续活着）。
-            var reply = await RunStepAsync(handle, ct, throwOnFailure: true);
-            return accepted with { Reply = reply };
+            var at = CoreClock.Now();
+            var historyId = Ids.New();
+
+            _host.Store.AppendEvent(handle.ProjectKey, handle.SessionId, new TimelineEvent.MessageEvent
+            {
+                Id = historyId,
+                At = at,
+                From = Speaker.User,
+                Blocks = blocks,
+            });
+
+            // ⚠️ 落盘之后才发事件：头收到它就代表「这条已经进了记录」（`HistoryId` 非空）。
+            // ⚠️ 头在排队期间画着一条本地的「排队中」回声，这条事件到达时它按 FIFO 退场
+            // （见 `app.js` 的 `send()` 与 `message.appended` 那段）。
+            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                new WireEvent.MessageAppended(handle.SessionId, "user", blocks, at)
+                {
+                    HistoryId = historyId,
+                });
         }
-
-        // 控制面：立刻回执、步在后台跑——否则 `session.interrupt` 无事可做
-        // （步若在命令里同步跑完，那条 interrupt 在它的「当前步」结束前根本轮不到执行）。
-        _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
-            CancellationToken.None);
-
-        return accepted;
     }
 
     /// <summary>
@@ -1921,6 +2045,12 @@ public sealed class CommandDispatcher(
             else
             {
                 // 取空队列——合并是队列的副产品。
+                // ⚠️ **先补落盘、再取空**（2026-11-05）：队首那几条可能是「上一步跑着时插进来的」，
+                // 它们**还没进记录**（落盘被推到上一步写完以后）。请求是按记录渲染的 ⇒
+                // 不先补，这一步就会漏掉它们（模型读不到自己该看的话，而队列已被取空）。
+                // ⚠️ 次序不能反：`DrainQueue` 会把它们从队列里摘走，那时再补就找不到它们了。
+                FlushQueuedInput(handle);
+
                 // ⚠️ **第三个参数是「显式启动」**（`session.start`）——它不是一条用户消息
                 // （队列是空的），但它是**有人要它动**这一件事的另一个落点
                 // ⇒ 收尾的 ① 那一支也认它（否则那条命令在**唯一需要它的时候**是空的）。
@@ -1968,14 +2098,10 @@ public sealed class CommandDispatcher(
                 PublishPhase(handle, SessionPhase.Waiting);
             }
 
-            // ⚠️ **工具结果也要告诉头**（2026-10-17，用户实测）：此前只有 `message.appended`
-            // ⇒ 实时流里那批调用看起来「没有下文」，结果只有重拉 `/history` 才出现。
-            // ⚠️ 在模型消息**之后**发：头按到达次序画，而记录里的次序就是「模型消息、
-            // 然后它那批结果」。⚠️ 一条结果一条事件（见 `ToolResultAppended` 的注释）。
-            foreach (var result in step.ToolResults ?? [])
-                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
-                    new WireEvent.ToolResultAppended(
-                        handle.SessionId, result.Id, result.CallId, result.Content, result.At));
+            // ⚠️ **工具结果不在这里发**（2026-11-05 起）：它们在**成形那一刻**就由
+            // `Stepper.OnToolResult` 逐条发过了（见 `ResolveStepperWithReports` 的接线）。
+            // 原先这里是「步末一次性发整批」——那让一批五条时，第一条的结果要等第五条跑完
+            // 才看得见。⚠️ 别把它加回来：同一个出处两份，头会把每条结果画两遍。
 
             // ⚠️ **派生与注入在结果事件之后兑现**（2026-10-24）：此后它们只追加、不改这一步
             // 的任何字节（`SpawnChild` 写的都是**别的会话**）。
@@ -2050,6 +2176,12 @@ public sealed class CommandDispatcher(
             // ⚠️ 中止时也要收尾增量：`StateChanged(Idle)` 会让头清掉临时气泡，
             // 而缓冲区里剩下的那点字若晚一步发出，会在清空之后画出一个新的半截气泡。
             _deltas.Flush(handle.SessionId);
+
+            // ⚠️ **排队等这一步的插话在这里落盘**（2026-11-05）：这一步什么都没写，
+            // 所以「接在记录末尾」正是它该在的位置。⚠️ 不补的话它会一直只活在内存里，
+            // 而头上那条「排队中」回声永远等不到真事件（用户会以为没发出去）。
+            FlushQueuedInput(handle);
+
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                             new WireEvent.StateChanged(handle.SessionId, SessionStatus.Idle, handle.State.Turn));
 
@@ -2064,6 +2196,10 @@ public sealed class CommandDispatcher(
             // 真失败走事件，不走回执。
             // ⚠️ 收尾顺序与成功路径同一条：先把增量发完，再发 `error`（头据它清掉临时气泡）。
             _deltas.Flush(handle.SessionId);
+
+            // ⚠️ 排队的插话照样落盘（同中断那条）：这一步什么都没写，接在末尾就是对的。
+            FlushQueuedInput(handle);
+
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                 new WireEvent.Error(handle.SessionId, ex.Message));
 

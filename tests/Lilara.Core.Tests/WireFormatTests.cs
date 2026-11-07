@@ -189,7 +189,9 @@ public class WireFormatTests
         // 21 → 22：`session.phase`（2026-10-25，四态由核心判、头只显示）。
         // 22 → 23：`plan.updated`（2026-10-24 计划批，计划树变了）。
         // 23 → 24：`term.delta`（2026-11 流式批，正文 / 思考的实时增量——只供显示、不保留）。
-        Assert.Equal(24, declared.Length);
+        // 24 → 25：`tool.call.started`（2026-11-05，一条调用**开始跑**的那一刻就报——
+        //          工具调用原先要等整步（含执行）走完、随 `message.appended` 才到头上）。
+        Assert.Equal(25, declared.Length);
 
         // ⚠️ **扫整个 Hosting 目录，不只 `CommandDispatcher.cs`**（2026-11 改）：
         // 第一处不经分派器发出的类型出现了——`term.delta` 由 `DeltaPump`（攒批器）发出。
@@ -235,7 +237,30 @@ public class WireFormatTests
         // 21 → 22：`session.phase`（2026-10-25）。
         // 22 → 23：`plan.updated`（2026-10-24 计划批）。
         // 23 → 24：`term.delta`（2026-11 流式批）。
-        Assert.Equal(24, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+        // 24 → 25：`tool.call.started`（2026-11-05，「调用动作不该等它跑完才发」）。
+        Assert.Equal(25, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+    }
+
+    // ⚠️ **工具调用开始的载荷形状**（2026-11-05）：头按字段名取值
+    // （`p.turn` / `p.callId` / `p.name` / `p.arguments`），名字一漂头拿到的就是 `undefined`
+    // ——而那一行画的会是「执行中 · 调用 undefined」。
+    // ⚠️ 判别式必须是 `tool.call.started`：头是按 `p.kind` 分派的。
+    [Fact]
+    public void WireEvent_ToolCallStarted_CarriesTheCallIdentityAndItsRawArguments()
+    {
+        var json = WireEvent.StableSerialize(
+            new WireEvent.ToolCallStarted("s1", 3, "call-1", "shell", """{"command":"ls"}"""));
+
+        Assert.Contains("\"kind\":\"tool.call.started\"", json);
+        Assert.Contains("\"turn\":3", json);
+        Assert.Contains("\"callId\":\"call-1\"", json);
+        Assert.Contains("\"name\":\"shell\"", json);
+        // ⚠️ 参数是**逐字原文**（`01` §9）：序列化器不许把它解成嵌套对象。
+        // ⚠️ 断言走**解析**而不是比字符串：`WireJson.Options` 用的是
+        // `UnsafeRelaxedJsonEscaping`，引号在 JSON 里本该是 `\"`——照 `\u0022` 或照裸引号写
+        // 都会在**完全正确**的载荷上红（这条我先红过一次）。
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal("""{"command":"ls"}""", doc.RootElement.GetProperty("arguments").GetString());
     }
 
     // ⚠️ 重试上报的**载荷形状**（2026-10-21）：头按字段名取值（`p.attempt` / `p.maxAttempts` /

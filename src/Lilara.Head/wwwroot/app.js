@@ -815,6 +815,9 @@ function renderTurn(from, blocks, cls, historyId) {
 // 时**整块丢掉**，由最终气泡取代。⇒ 这里少画一段、多画一段都不影响记录。
 // ⚠️ 所以它**不写** `data-history-id`：写了就会与随后到达的正式消息抢同一个身份，
 // 而 `renderHistoryItem` 是按 id 去重的 ⇒ 正式消息会被当成重复丢掉。
+// ⚠️ 2026-11-05 起它多承载一样东西：**正在跑的工具调用**（`tool.call.started`）。
+// 同一块气泡、同一条「临时」纪律——工具调用那一刻模型消息还没落盘（步末才写），
+// 所以它只能画在这里，等 `message.appended` 到达时整块换成正式那条。
 let live = null;   // { sessionId, turn, el, parts: Map<key, HTMLElement> }
 
 function clearLive() {
@@ -825,27 +828,34 @@ function clearLive() {
   live = null;
 }
 
+/// **拿到本步的临时气泡**（没有就建一个）。⚠️ 抽出来是为了让「流式增量」与
+/// 「正在跑的工具调用」共用**一份**创建逻辑——两处各建一次，样式与位置迟早会漂。
+function ensureLive(sessionId, turn) {
+  if (live && live.sessionId === sessionId && live.turn === turn) return live;
+
+  clearLive();
+
+  const el = document.createElement("div");
+  // 类名与正式气泡同形（`.turn.model`），好让样式与位置一致。
+  el.className = "turn model";
+  el.dataset.live = "1";
+
+  const who = document.createElement("div");
+  who.className = "who";
+  who.textContent = "⏺";
+
+  const body = document.createElement("div");
+  body.className = "body";
+
+  el.append(who, body);
+  appendTimeline(el);
+
+  live = { sessionId, turn, el, parts: new Map() };
+  return live;
+}
+
 function appendDelta(p) {
-  if (!live || live.sessionId !== p.sessionId || live.turn !== p.turn) {
-    clearLive();
-
-    const el = document.createElement("div");
-    // 类名与正式气泡同形（`.turn.model`），好让样式与位置一致。
-    el.className = "turn model";
-    el.dataset.live = "1";
-
-    const who = document.createElement("div");
-    who.className = "who";
-    who.textContent = "⏺";
-
-    const body = document.createElement("div");
-    body.className = "body";
-
-    el.append(who, body);
-    appendTimeline(el);
-
-    live = { sessionId: p.sessionId, turn: p.turn, el, parts: new Map() };
-  }
+  ensureLive(p.sessionId, p.turn);
 
   const key = `${p.blockIndex}:${p.deltaKind}`;
   let part = live.parts.get(key);
@@ -859,6 +869,54 @@ function appendDelta(p) {
 
   part.textContent += p.text;
   $("timeline").scrollTop = $("timeline").scrollHeight;
+}
+
+/// **一条工具调用开始跑了**（`tool.call.started`，2026-11-05）——画进临时气泡。
+///
+/// <para>⚠️ <b>为什么不画成正式的一行</b>：这一刻核心**还没落盘**那条模型消息（步末才写），
+/// 而被中断 / 失败的那一步**什么都不落**（那条 `tool_use` 永远配不上结果）。照正式行画，
+/// 用户重开会话时会发现「我明明看见它调了 `shell`，记录里没有」。⇒ 正式那一行只由
+/// `message.appended` 给，这里只画「正在跑」。</para>
+///
+/// <para>⚠️ <b>行上带 `data-call-id`</b>（与 `installToolRow` 给正式行留的是同一个锚）：
+/// 于是随后到达的 `tool.result.appended` 会自己找到锚、挂在这一行下面——「调用开始 → 它自己的
+/// 结果」一条条出现，而不是整批跑完才一起出现。</para>
+///
+/// <para>⚠️ <b>不带 `data-history-id`</b>：理由同上面那段（临时行不许占正式身份）。</para>
+function startLiveToolCall(p) {
+  const bubble = ensureLive(p.sessionId, p.turn);
+  const row = detail(`执行中 · 调用 ${p.name}`, p.arguments, "tool");
+  if (p.callId) row.dataset.callId = p.callId;
+  // ⚠️ 打一个标记，好让 `appendToolResult` 在结果到达时把「执行中」这三个字摘掉
+  //（正式行没有这个标记 —— 那三个字只属于临时）。
+  row.dataset.liveToolRow = "1";
+  bubble.el.querySelector(".body").appendChild(row);
+  $("timeline").scrollTop = $("timeline").scrollHeight;
+}
+
+/// **把临时气泡里已经画上的结果行撕下来**（结果先到、权威消息还没到的情形）。
+///
+/// <para>⚠️ <b>为什么是「移动」而不是「重画」</b>：这些行带着 `data-history-id`（记录身份）。
+/// 重画一遍会让同一条结果在屏幕上出现两份，或者被 `renderHistoryItem` 的去重当成旧的丢掉。
+/// ⚠️ 而留在气泡里更糟——`clearLive()` 会把它们一起摘掉，可那些结果**已经落盘**。</para>
+function detachLiveResults() {
+  if (!live) return [];
+  return [...live.el.querySelectorAll("[data-result-call-id]")].map((row) => {
+    row.remove();
+    return row;
+  });
+}
+
+/// 把撕下来的结果行按 `callId` 放回它该在的地方（找不到锚就独立一行，同 `appendToolResult`）。
+function placeResults(rows) {
+  for (const row of rows) {
+    const callId = row.dataset.resultCallId;
+    const anchor = callId
+      ? document.querySelector(`[data-call-id="${CSS.escape(callId)}"]`)
+      : null;
+    if (anchor) anchor.after(row);
+    else appendTimeline(row);
+  }
 }
 
 function detail(label, text, cls) {
@@ -976,6 +1034,14 @@ function appendToolResult(t) {
   if (anchor) {
     anchor.after(row);
     // ⚠️ 调用项自己也是 `<details>`：结果跟在它**同级**时，折叠 / 展开互不牵连。
+    //
+    // ⚠️ **临时行上那句「执行中」到此为止**（2026-11-05）：结果都到了还写着「执行中」
+    // 就是画面上的一处假话。正式行没有这个标记（`installToolRow` 不打它），所以只影响临时行。
+    if (anchor.dataset.liveToolRow) {
+      const summary = anchor.querySelector("summary");
+      if (summary) summary.textContent = summary.textContent.replace("执行中 · ", "");
+      delete anchor.dataset.liveToolRow;
+    }
   } else {
     appendTimeline(row);
   }
@@ -1027,7 +1093,14 @@ function renderSlots(slots) {
   put($("floating-body"), slots && slots.floating);
 }
 
+// 最近一次状态（`Running` / `Idle` / `Waiting` …）。
+// ⚠️ 它只给 `send()` 用：会话在跑的时候发出去的话，核心**先只排队、不落盘**
+// （因果：它必须落在那一步的模型消息 + 结果之后），真事件要等那一步写完才到
+// ⇒ 头得先本地回声一条，否则一个跑几分钟的 `shell` 期间用户会以为自己没发出去。
+let lastStatus = null;
+
 function setStatus(status, turn, note) {
+  lastStatus = status;
   const el = $("status");
   // ⚠️ `turn` 可以是 undefined（调用方拿不到步数时不编一个——那会印出「第 undefined 步」）。
   //
@@ -1523,6 +1596,9 @@ async function deleteSession(id, spec) {
 // （用户会以为自己看的是现存的东西）。
 function clearCenter() {
   current = null;
+  // ⚠️ 「排队中」的本地回声跟着时间线一起作废（2026-11-05）：时间线整块换掉之后
+  // 那些元素已经不在树上了，留着引用只会在下一次落盘事件里 `remove()` 一个孤儿。
+  queuedEchoes.length = 0;
   $("jobs-toggle").disabled = true;
   resetJobsPanel();
   $("timeline").innerHTML = "";
@@ -2183,10 +2259,21 @@ function handleEvent(p) {
   switch (p.kind) {
     case "message.appended":
       if (p.sessionId === current) {
+        // ⚠️ **「排队中」的本地回声到此退场**（2026-11-05）：核心把这句话落盘之后才发事件
+        // （会话在跑时它先只排队——见 `send()` 那段），所以一条权威的用户消息 = 一条回声可以收了。
+        // ⚠️ 只在**用户消息**上收：模型消息到达时那条回声还在排队等，别误伤。
+        if (p.from === "user") retireQueuedEcho();
         // ⚠️ **先丢掉临时气泡，再画正式那条**（2026-11）：两者是同一段话的两种形态，
         // 留着就是屏幕上两遍。次序不能反——反了会先画出正式气泡、再把临时气泡追加到它后面。
+        //
+        // ⚠️ **但气泡里的结果行不陪葬**（2026-11-05）：结果现在**先于**模型消息到达
+        // （跑完一条就发一条），而它们被锚在临时行的 `data-call-id` 下面。
+        // 留在气泡里会跟着 `clearLive()` 一起消失——而那些结果**已经落盘**。
+        // ⇒ 先撕下来、画完正式那条再按 `callId` 归位。
+        const rescued = p.from === "model" ? detachLiveResults() : [];
         if (p.from === "model") clearLive();
         renderTurn(p.from, p.blocks, null, p.historyId);
+        placeResults(rescued);
       }
       break;
 
@@ -2200,9 +2287,19 @@ function handleEvent(p) {
     // 结果一条事件都没有 ⇒ 头要把页面重拉一遍才看得见（用户实测）。
     // ⇒ 与 `message.appended` 对称：带 `historyId`，`appendToolResult` 负责按 `callId`
     // 配到前面那条调用下面；重拉时同一批结果会以相同 id 出现，去重由 id 完成。
+    //
+    // ⚠️ **2026-11-05 起它可能先于它那条模型消息到达**（核心改成「跑完一条发一条」）：
+    // 那时锚是**临时行**（`tool.call.started` 画的 `data-call-id`），于是结果就挂在那行下面；
+    // 权威消息到达时那几行会被撕下来、再按 `callId` 归位（见 `message.appended` 那段）。
     case "tool.result.appended":
       if (p.sessionId === current)
         appendToolResult({ kind: "toolResult", id: p.id, callId: p.callId, blocks: p.blocks });
+      break;
+
+    // ⚠️ **一条调用开始跑了**（2026-11-05，用户实测：调用动作不该等它跑完才发）。
+    // 画进临时气泡，不画成正式记录——理由见 `startLiveToolCall` 的注释。
+    case "tool.call.started":
+      if (p.sessionId === current) startLiveToolCall(p);
       break;
 
     case "session.step.begin":
@@ -2228,8 +2325,15 @@ function handleEvent(p) {
       if (p.sessionId === current) {
         // 这一步结束了 ⇒ 临时气泡该让位（正常路径上 `message.appended` 已经清过它；
         // 拒答 / 空块那两条不会发模型消息，临时气泡得在这里收掉）。
+        //
+        // ⚠️ **结果行要留下来**（2026-11-05）：答复续跑那一步**没有模型消息**（它不是一次模型调用），
+        // 而那一批结果是真落盘的 ⇒ 照样先撕下来、再归位（找不到锚就独立一行），
+        // 别让它们跟着临时气泡一起消失。⚠️ 中断 / 失败那条路**不救**（`error` / `step.begin`
+        // 只 `clearLive()`）：那些结果核心**没有落盘**，留着就是画一条盘上不存在的记录。
+        const rescued = detachLiveResults();
         clearLive();
         setStatus("Idle", p.turn);
+        placeResults(rescued);
         if (p.refused) renderMeta("⚠️ 模型拒绝了这次请求");
         else if (["max_tokens", "length", "incomplete"].includes(p.stopReason))
           renderMeta(`（输出被截断了：${p.stopReason}）`);
@@ -2381,9 +2485,38 @@ function command(id, payload) {
 function send() {
   const text = $("text").value.trim();
   if (!text || !current) return;
+  // ⚠️ **会话在跑 ⇒ 先回声一条「排队中」**（2026-11-05）。核心那边此刻只入队、不落盘
+  // （那句插话必须落在那一步的模型消息 + 结果**之后**，否则模型下一步会以为它是在自己
+  // 动手之前说的），所以真 `message.appended` 要等这一步写完才到 —— 可能是几分钟之后。
+  // 不回声的话，用户会以为自己没发出去，于是再发一遍（那就真成两条了）。
+  if (lastStatus === "Running") echoQueued(text);
   command(crypto.randomUUID().slice(0, 8),
     { kind: "session.send", sessionId: current, blocks: [{ kind: "text", text }] });
   $("text").value = "";
+}
+
+// ---- 「排队中」的本地回声（2026-11-05）----
+//
+// ⚠️ 它**不是记录里的一条**：没有 `historyId`，也不写 `data-history-id`
+// （写了就会与随后那条真消息抢身份，而 `renderHistoryItem` 是按 id 去重的）。
+// ⚠️ 退场靠 FIFO：核心落盘之后会发权威的 `message.appended`(user)，一条权威事件换掉
+// 一条回声。核心那边的落盘次序与入队次序相同，所以 FIFO 是对得上的。
+// ⚠️ 用别的客户端（控制台）说话时，它那条权威事件也会换掉这里最旧的一条回声——罕见，
+// 后果只是「回声早一点退场」，不会多出或少掉一条记录。
+const queuedEchoes = [];
+
+function echoQueued(text) {
+  const el = createHistoryItem({ kind: "message", from: "user", blocks: [{ kind: "text", text }] });
+  el.classList.add("queued");
+  const who = el.querySelector(".who");
+  if (who) who.textContent = "你 · 排队中";
+  appendTimeline(el);
+  queuedEchoes.push(el);
+}
+
+function retireQueuedEcho() {
+  const el = queuedEchoes.shift();
+  if (el) el.remove();
 }
 
 // ---- 接线 ----
