@@ -232,18 +232,27 @@ public class SubagentTests : IDisposable
         var childSpec = Assert.Single(host.Store.ChildrenOf(parentId)).Spec;
 
         // 子会话的第二步会拿到 `c2`（第二段脚本），于是它试图再派一层。
+        //
+        // ⚠️ **等的是那一句话，不是「时间线里随便有一条结果」**（2026-11-07）：
+        // `cache=stable` 的会话在**每一步开始前**会先追加一条**真实读数**（`AppendReadout`
+        // → 一条 `floating-…-readout-result`）。它比这一步的任何工具结果都早 ⇒
+        // 「有任何结果」在子会话还没跑到 `spawn` 时就成立了，而那条判据拿到的是读数、
+        // 不是「派生深度上限」。⚠️ 单跑时看不出来（子会话往往在 `WaitUntil` 第一次探测前
+        // 就整步跑完了），整套并行时才露出来。
         await WaitUntil(
-            () => host.Store.ReadTimeline(childSpec.ProjectKey, childSpec.SessionId)
-                .OfType<TimelineEvent.ToolResultEvent>().Any(),
-            "子会话那一步跑完");
+            () => SaidAboutDepth().Contains("派生深度上限", StringComparison.Ordinal),
+            "子会话那一步跑完并说清深度到顶");
 
         Assert.Empty(host.Store.ChildrenOf(childSpec.SessionId));
 
         // ⚠️ **结果是「说清楚」而不是「什么都没返回」**：模型据此才知道该自己干。
-        var said = string.Concat(host.Store.ReadTimeline(childSpec.ProjectKey, childSpec.SessionId)
-            .OfType<TimelineEvent.ToolResultEvent>()
-            .SelectMany(r => r.Content).OfType<Block.TextBlock>().Select(t => t.Text));
+        var said = SaidAboutDepth();
         Assert.Contains("派生深度上限", said, StringComparison.Ordinal);
+
+        string SaidAboutDepth() => string.Concat(
+            host.Store.ReadTimeline(childSpec.ProjectKey, childSpec.SessionId)
+                .OfType<TimelineEvent.ToolResultEvent>()
+                .SelectMany(r => r.Content).OfType<Block.TextBlock>().Select(t => t.Text));
     }
 
     /// <summary>

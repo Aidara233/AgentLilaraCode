@@ -361,10 +361,20 @@ public class CommandDispatcherTests : IDisposable
         Assert.Equal("act", handle.State.Axes![Axes.Mode]);
 
         // 头已经处理这个事件；它必须在实际状态变化后发布。
+        //
+        // ⚠️ **等它到，而不是读一次**（2026-11-07）：发布点在 `UpdateStateAndPersist` **之后**
+        // ⇒ 上面那个 `WaitUntil` 成立时，这条事件可能还没进订阅队列。整台机器满载时
+        // （整套 1906 条并行）这个窗口是真实存在的，而症状是「条件都成立了，却断言空集合」。
+        // ⚠️ 判据仍然是「确实发过一条 mode=act 的 `axis.changed`」，只是给了它到达的时间。
         var modes = new List<string>();
-        while (sub.Reader.TryRead(out var published))
-            if (published.Payload is WireEvent.AxisChanged changed && changed.Axis == Axes.Mode)
-                modes.Add(changed.Value);
+        var drain = () =>
+        {
+            while (sub.Reader.TryRead(out var published))
+                if (published.Payload is WireEvent.AxisChanged changed && changed.Axis == Axes.Mode)
+                    modes.Add(changed.Value);
+            return modes.Contains("act");
+        };
+        await WaitUntil(drain);
         Assert.Contains("act", modes);
     }
 
