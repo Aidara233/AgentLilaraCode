@@ -1159,6 +1159,10 @@ public sealed class ControlServer(
             From = m.From == Kernel.Speaker.User ? "user" : "model",
             At = m.At,
             Blocks = m.Blocks,
+            // ⚠️ **半截那一条要交出去**（2026-11-07）：不交的话，重连 / 重拉之后
+            // 屏幕上就只剩一句说到一半的话，没有任何线索说明它是被打断的
+            //（而实时那条有——见 `app.js` 的 `message.appended`）。
+            Interrupted = m.Interrupted,
         },
 
         Kernel.TimelineEvent.ToolResultEvent r => new

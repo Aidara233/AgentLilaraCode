@@ -48,6 +48,18 @@ public abstract record WireEvent
     {
         // 持久消息对应的 TimelineEvent.Id；临时消息可以为空。
         public string? HistoryId { get; init; }
+
+        /// <summary>
+        /// **这条模型消息是半截的**（2026-11-07，用户裁定：流式模式下打断要保留半截生成结果）。
+        ///
+        /// <para>⚠️ <b>为什么走这条通道而不是另开一条事件</b>：它对头来说就是一条普通消息
+        /// （同一套气泡、同一套去重、同一段渲染），只多一个标记。另开一条会让头必须
+        /// 把它与 `message.appended` 排成一条（而那条排队的判据会立刻变成第二份真相）。</para>
+        ///
+        /// <para>⚠️ <b><c>null</c> ⇒ 整个键不出现</b>（`Json.Options` 的 `WhenWritingNull`）
+        /// ⇒ 老客户端看到的字节一个都没变。</para>
+        /// </summary>
+        public bool? Interrupted { get; init; }
     }
 
     public sealed record StateChanged(string SessionId, string Status, int Turn) : WireEvent;

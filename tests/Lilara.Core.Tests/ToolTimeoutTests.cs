@@ -60,19 +60,64 @@ public sealed class ToolTimeoutTests : IDisposable
     }
 
     [Fact]
-    public async Task Executor_CallerCancellation_StillThrows_SoItIsNotConfusedWithATimeout()
+    public async Task Executor_CallerCancellation_ComesBackAsAMarkedBatchInsteadOfThrowing()
     {
-        // ⚠️ 这一条与上一条**必须分开**：`RunStepAsync` 用 `OperationCanceledException`
-        // 认「用户点了停止」，而把打断写成一条「超时」结果会让中断变安静地继续跑。
+        // ⚠️ **这条判据 2026-11-07 反过来了**（用户裁定「工具执行了一半也保留半截输出」）：
+        // 从前这里断言「取消**必须抛** `OperationCanceledException`」——理由是
+        // `RunStepAsync` 靠那个类型区分「中断」与「失败」。而那条路有一个**代价**：
+        // 异常会把**已经跑完的那几条结果**和**半截输出**一起带走，于是记录里那一步
+        // 一个字都不留（模型说过的话、真跑过的副作用全部消失）。
+        //
+        // ⇒ 现在「打断」是一种**有内容的结局**：执行器正常返回一个 `Interrupted` 的批次，
+        // 每条调用都有结果（跑完的 / 半截的 / 还没开始的），由 `Stepper` 落盘并返回
+        // `StepOutcome.Interrupted`。**「中断 ≠ 失败」这条区分没有丢**，它从「异常类型」
+        // 换成了「批次上的一个标记」——而 `Stepper` 才是那个把它翻成结局的地方。
         var executor = new ToolExecutor(
             [new StuckTool()], new BlobStore(_root), "trusted",
             callTimeout: TimeSpan.FromSeconds(30));
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => executor.ExecuteAsync(
+        var batch = await executor.ExecuteAsync(
             [new Block.ToolUseBlock("c1", "stuck", """{"x":1}""")],
-            new SessionToolContext(_root, new BlobStore(_root)), cts.Token));
+            new SessionToolContext(_root, new BlobStore(_root)), cts.Token);
+
+        Assert.True(batch.Interrupted);
+        var result = Assert.Single(batch.Results);
+        Assert.Equal("c1", result.CallId);
+        // ⚠️ 它**开始跑过**（工具替身真的被调用了）⇒ 说「跑到一半、还没有输出」，
+        // 而不是「还没开始」——后者会抹掉「它可能已经动过世界」这件事。
+        Assert.Contains("跑到一半", TextOf(result));
+        Assert.Contains("interrupted", result.Framing!.Render());
+        Assert.Contains("partial", result.Framing!.Render());
+    }
+
+    /// <summary>
+    /// **同一批里排在后面的那几条**：前一条被打断时它们**一次都没轮到**
+    /// ⇒ 各自补一条「还没开始」（2026-11-07）。⚠️ 不补的话记录里会留下一批悬空的
+    /// `tool_use`，下一次请求直接非法（`01` §3.6 ①）。
+    /// </summary>
+    [Fact]
+    public async Task Executor_CallerCancellation_FillsTheRestOfTheBatchWithNotStarted()
+    {
+        var executor = new ToolExecutor(
+            [new StuckTool()], new BlobStore(_root), "trusted",
+            callTimeout: TimeSpan.FromSeconds(30));
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+
+        var batch = await executor.ExecuteAsync(
+            [
+                new Block.ToolUseBlock("c1", "stuck", """{"x":1}"""),
+                new Block.ToolUseBlock("c2", "stuck", """{"x":2}"""),
+            ],
+            new SessionToolContext(_root, new BlobStore(_root)), cts.Token);
+
+        Assert.True(batch.Interrupted);
+        Assert.Equal(["c1", "c2"], batch.Results.Select(r => r.CallId));
+        Assert.Contains("跑到一半", TextOf(batch.Results[0]));
+        Assert.Contains("还没开始", TextOf(batch.Results[1]));
+        Assert.Contains("not-started", batch.Results[1].Framing!.Render());
     }
 
     // ---- ② 接管：活进程被交给后台宿主 ----

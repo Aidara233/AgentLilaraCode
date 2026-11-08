@@ -302,6 +302,11 @@ public sealed class ToolExecutor(
         // ⚠️ **只有走到下面那个 `RunAsync` 的调用才进来**——「名字在批里」不足以说明
         // 「它执行过」（见 `Batch.ExecutedCallIds`）。`release` 的线按这份名单画。
         var executed = new List<string>(calls.Count);
+        // ⚠️ **这一批是不是被用户打断了**（2026-11-07）：判据只有 `ct` 的取消——
+        // 通用时限那条路在自己的 `RunWithDeadlineAsync` 里就把超时翻成了一条结果（不抛）。
+        var interrupted = false;
+        // ⚠️ 被打断那条调用的**半截结果**（工具在取消时交出来的，可能没有）。
+        ToolInterruptedException? cut = null;
         foreach (var plan in plans)
         {
             // ⚠️ **这一轮在问的那几条：不跑、也不配对**（见上面那个 `asked`）。
@@ -348,10 +353,27 @@ public sealed class ToolExecutor(
                 onCallStarted?.Invoke(plan.Call);
             }
 
-            var outcome = willRun
-                ? await RunWithDeadlineAsync(plan.Tool!, plan.Call, context, ct)
-                : new ToolOutcome { Content = [new Block.TextBlock(plan.Says!)] };
-
+            ToolOutcome outcome;
+            try
+            {
+                outcome = willRun
+                    ? await RunWithDeadlineAsync(plan.Tool!, plan.Call, context, ct)
+                    : new ToolOutcome { Content = [new Block.TextBlock(plan.Says!)] };
+            }
+            catch (OperationCanceledException ex) when (ct.IsCancellationRequested)
+            {
+                // ⚠️ **用户在这一条上打断了**（2026-11-07，用户裁定「工具执行了一半也保留
+                // 半截输出」）。从前这里让它原样冒出去，`Stepper` 也就不落盘
+                // ⇒ 模型**已经说过的话**与**真的跑过的副作用**一起从记录里消失，
+                // 而记录是事实（`01` §4）。现在：这一条收下它交出来的半截（如果有），
+                // 其余各条在循环外各补一条「还没开始」，整批照常交给调用方落盘。
+                //
+                // ⚠️ **判据是 `ct` 的取消，不是「任何 OCE」**：工具自己抛的取消（与用户无关）
+                // 仍然是一次失败，不能读成打断。
+                interrupted = true;
+                cut = ex as ToolInterruptedException;
+                break;
+            }
             // ⚠️ **两个「工具够不着、但它必须说出来」的出口**（2026-10-24）：与 `Ask`
             // 同一条判据——工具没有 store 的手，落地在核心。⚠️ **只收真正执行过的那些**
             // （`willRun` 那一支）：被闸门拒的调用不产出 `Spawn` / `Tell`，那是它
@@ -379,12 +401,21 @@ public sealed class ToolExecutor(
             onResult?.Invoke(results[^1]);
         }
 
+        // ⚠️ **被打断 ⇒ 把这一批补成「每条都有结果」**（2026-11-07）。
+        // 不补的话记录里会留下一批悬空的 `tool_use`，而下一次请求直接非法
+        // （`01` §3.6 ①）——那比「少了一条结果」坏得多。
+            if (interrupted)
+        {
+            results = CompleteInterrupted(calls, asked, executed, results, cut, onResult);
+        }
+
         return new Batch(results, asks.Count > 0 ? Merge(asks) : null)
         {
             ExecutedCallIds = executed,
             Spawns = spawns,
             Tells = tells,
             Archives = archives,
+            Interrupted = interrupted,
         };
     }
 
@@ -474,7 +505,104 @@ public sealed class ToolExecutor(
     }
 
     /// <summary>
-    /// 一趟执行的两个产出（`01` §3.8）。
+    /// **被打断之后把这一批补全**（2026-11-07，用户裁定「哪怕被打断的时候工具执行了一半，
+    /// 也保留半截工具输出」）。
+    ///
+    /// <para>⚠️ <b>三档结果必须分开写，合成一句就是假信息</b>（`01` §3.6 ①之二）：</para>
+    /// <list type="number">
+    ///   <item><b>已经跑完的</b>：原样（`results` 里就有）。</item>
+    ///   <item><b>跑到一半被打断的</b>：工具交出来的那半截 + `interrupted=partial`。</item>
+    ///   <item><b>还没轮到的</b>：一句「还没开始」+ `interrupted=not-started`。</item>
+    /// </list>
+    ///
+    /// <para>⚠️ <b>顺序按调用序重建</b>：`results` 是「跑到哪儿」的顺序，而记录里的次序是
+    /// **调用序**（`01` §3.6 ③）。补全这一步是唯一知道「谁缺」的地方，所以次序也在这里定。</para>
+    ///
+    /// <para>⚠️ **在问的那几条照旧不补**：它们的 `tool_use` 本就该悬着等用户回答
+    /// （那是既有语义，见 `asked` 的注释）——给它们补一条「被打断」会让那张卡
+    /// **再也等不到答复**（配对已经存在）。</para>
+    /// </summary>
+    /// <param name="executed">
+    /// **真的开始跑过的**调用 id（`Batch.ExecutedCallIds` 那份，执行前就记下了）。
+    /// ⚠️ 它是「跑到一半」与「还没开始」的**唯一判据**：名单里的那条被打断时**已经在跑了**
+    /// （只是没交出任何东西），名单外的那些**一次都没轮到**。两种情形各说各的话——
+    /// 把前者说成「还没开始」会抹掉「它可能已经动过世界」这件事。
+    /// </param>
+    private List<TimelineEvent.ToolResultEvent> CompleteInterrupted(
+        IReadOnlyList<Block.ToolUseBlock> calls,
+        HashSet<string> asked,
+        IReadOnlyList<string> executed,
+        List<TimelineEvent.ToolResultEvent> results,
+        ToolInterruptedException? cut,
+        Action<TimelineEvent.ToolResultEvent>? onResult)
+    {
+        var byCall = new Dictionary<string, TimelineEvent.ToolResultEvent>(StringComparer.Ordinal);
+        foreach (var result in results) byCall[result.CallId] = result;
+
+        if (cut is not null)
+        {
+            IReadOnlyList<Block> content = cut.Partial is { Content.Count: > 0 } partial
+                ? Reclaim.Materialize(partial.Content, blobs)
+                // ⚠️ 跑了但一个字都还没吐出来 —— 与「还没开始」分开说（后者见下面那支）。
+                : [new Block.TextBlock(Interruption.CutText(""))];
+
+            byCall[cut.CallId] = new TimelineEvent.ToolResultEvent
+            {
+                Id = Ids.New(),
+                At = CoreClock.Now(),
+                CallId = cut.CallId,
+                Content = content,
+                // ⚠️ 无指纹：它没跑完，说「世界没动过」是假信息（同超时那条）。
+                Fingerprint = null,
+                DependsOn = null,
+                Framing = new ToolFraming(
+                    calls.FirstOrDefault(c => string.Equals(c.CallId, cut.CallId, StringComparison.Ordinal))?.Name ?? "",
+                    [new ToolFramingField("interrupted", "partial")]),
+            };
+            onResult?.Invoke(byCall[cut.CallId]);
+        }
+
+        var completed = new List<TimelineEvent.ToolResultEvent>(calls.Count);
+        foreach (var call in calls)
+        {
+            if (asked.Contains(call.CallId)) continue;
+
+            if (byCall.TryGetValue(call.CallId, out var already))
+            {
+                completed.Add(already);
+                continue;
+            }
+
+            var filler = new TimelineEvent.ToolResultEvent
+            {
+                Id = Ids.New(),
+                At = CoreClock.Now(),
+                CallId = call.CallId,
+                Content =
+                [
+                    new Block.TextBlock(
+                        // ⚠️ **「跑到一半」与「还没开始」分开说**（见 `executed` 那条注释）。
+                        executed.Contains(call.CallId)
+                            ? Interruption.CutText("")
+                            : Interruption.UnrunText()),
+                ],
+                Framing = new ToolFraming(call.Name,
+                [
+                    new ToolFramingField("interrupted",
+                        executed.Contains(call.CallId) ? "partial" : "not-started"),
+                ]),
+            };
+            // ⚠️ 合成的一条也要报：不报的话头上那条调用会永远停在「执行中」
+            // ——而那正是这一批要修的形状（`tool.call.started` 已经发出去了）。
+            onResult?.Invoke(filler);
+            completed.Add(filler);
+        }
+
+        return completed;
+    }
+
+    /// <summary>
+    /// **一趟执行的两个产出（`01` §3.8）。
     ///
     /// <para>⚠️ <b>它们**不是**互斥的</b>（2026-10-29 改，而这一格是那条死循环的一半）：
     /// <see cref="Results"/> 非空、<see cref="Pending"/> 也非 null ⇒ 这是<b>答复那一步</b>
@@ -533,6 +661,18 @@ public sealed class ToolExecutor(
         /// 「它跑没跑」。⚠️ 按产出序（= 调用序）排：同一步里先后收起两个孩子的次序是事实。</para>
         /// </summary>
         public IReadOnlyList<ArchiveRequest> Archives { get; init; } = [];
+
+        /// <summary>
+        /// **这一批被用户打断了**（2026-11-07）。
+        ///
+        /// <para>⚠️ <b>它不是异常，而是一个正常返回的批次</b>——这是这一批改动的核心：
+        /// 「被打断」也是一种**有结果**的结局（跑完的那几条 + 半截的那条 + 还没开始的那几条），
+        /// 而异常会把它们全丢掉。调用方（`Stepper`）据此落盘并**不再续跑**。</para>
+        ///
+        /// <para>⚠️ <b>别把它读成「这些结果可以当正常结果用」</b>：里面至少有一条是
+        /// 半截或没跑。区分靠每条结果自己的 <c>Framing</c>（`interrupted=partial` / `not-started`）。</para>
+        /// </summary>
+        public bool Interrupted { get; init; }
     }
 
     /// <summary>
@@ -568,4 +708,29 @@ public sealed class ToolExecutor(
     /// <summary>第一趟的产物：一条调用 + 它该走哪条路。</summary>
     /// <param name="Says">不该执行时那条要说的话（工具不存在 / 被拒）。</param>
     private sealed record Plan(Block.ToolUseBlock Call, ITool? Tool, Verdict Verdict, string Says);
+}
+
+/// <summary>
+/// **一次工具调用跑到一半被用户打断了，而它已经有半截输出**（2026-11-07）。
+///
+/// <para>⚠️ <b>为什么用异常带内容，而不是让工具返回一条「被打断」的结果</b>：返回一条正常结果
+/// 意味着「这条结束了，接着跑下一条」——而打断意味着**后面一条都不该跑**。
+/// 异常是唯一能同时表达「停下」与「这是我已经产出的东西」的东西。</para>
+///
+/// <para>⚠️ <b>它必须是 <see cref="OperationCanceledException"/> 的子类</b>：整条链上
+/// （`ToolExecutor` → `Stepper` → `CommandDispatcher`）认「用户打断」的判据就是那个类型，
+/// 换一个正交的类型会让打断在某一层变成「失败」（`error` 事件、头上一片红）。</para>
+///
+/// <para>⚠️ <b>只有<有进程的工具>会抛它</b>（`shell` / `dotnet_*` —— 它们手上有活着的子进程，
+/// 能说清「到这一刻为止输出了什么」）。纯读的工具被取消时没有半截可言，
+/// 由 <see cref="ToolExecutor"/> 自己补一条「跑到一半、没有输出」的结果。</para>
+/// </summary>
+/// <param name="callId">哪一条调用（协议 id）。⚠️ 执行器靠它把半截放回**正确的那一格**。</param>
+/// <param name="partial">到这一刻为止的产出。⚠️ 内容由工具给（只有它知道自己的输出长什么样）。</param>
+public sealed class ToolInterruptedException(string callId, ToolOutcome? partial, CancellationToken token)
+    : OperationCanceledException($"工具调用 {callId} 被中断了。", token)
+{
+    public string CallId { get; } = callId;
+
+    public ToolOutcome? Partial { get; } = partial;
 }

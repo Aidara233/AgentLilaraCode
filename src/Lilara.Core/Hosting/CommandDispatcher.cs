@@ -1069,7 +1069,11 @@ public sealed class CommandDispatcher(
             return new DispatchResult(new Ack.Accepted
             {
                 CommandId = id,
-                Note = timedOut
+                Note = probe.Interrupted
+                    // ⚠️ 被打断**不是**「它坏了」（2026-11-07）：不分开说，用户会照着
+                    // 「输出不对」去查一个根本没问题的 sh。
+                    ? $"✗ 探测被打断了（{executable}）"
+                    : timedOut
                     ? $"✗ {executable} 10 秒内没有返回"
                     : exitCode == 0 && stdout.Trim() == "lilara-sh-ok"
                         ? $"✓ 通（{executable}）"
@@ -2041,6 +2045,11 @@ public sealed class CommandDispatcher(
         // `finish_goal` 真的执行过（主动性已拨回 standard）——要发 `axis.changed`。
         var goalEnded = false;
 
+        // ⚠️ **这一趟是「被打断但留住了东西」结束的**（2026-11-07）：`Stepper` 把那一趟的记录
+        // 落盘之后**正常返回**（不抛），所以这里要自己认出它——否则工具循环会接着往下推一步，
+        // 而打断就是没有下一步。
+        var interrupted = false;
+
         // ⚠️ **摘槽排在这里**（2026-10-12 打断批）——不是因为它必须早于下面那把闸
         // （**调用方已经拿过 `_step` 那把标志了**，所以这一趟本来就是独占的），
         // 而是因为它必须**早于**任何可能再放一次槽的路径。⚠️ 原先那两句挪到
@@ -2106,11 +2115,14 @@ public sealed class CommandDispatcher(
                 _deltas.Flush(handle.SessionId);
 
                 // 模型消息由这里发（`Stepper` 不碰事件总线）；判据与它落盘时一致：拒答 / 空块不产生模型消息。
+                // ⚠️ **`Interrupted` 原样带上**（2026-11-07）：半截那条也要走这条路——
+                // 它就是一条普通消息，只是少了后半句，头据此在本地上标记。
                 if (!reply.Refused && reply.Blocks.Count > 0)
                     _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                         new WireEvent.MessageAppended(handle.SessionId, "model", reply.Blocks, CoreClock.Now())
                         {
                             HistoryId = step.HistoryId,
+                            Interrupted = step.Interrupted ? true : null,
                         });
             }
 
@@ -2205,6 +2217,19 @@ public sealed class CommandDispatcher(
             }
 
             PublishStepEnd(handle, replyForLoop);
+
+            // ⚠️ **被打断的一步要自己说「我回到空闲了」**（2026-11-07）：正常步不发
+            // `state.changed`（头据 `step.end` 自己收），而这一趟是**异常结局的正常返回**
+            // ——不打这一枪，头会一直显示「正在生成」。（从前那条 OCE 路径本来就发它，
+            // 现在只是换到这里发，语义不变。）
+            if (step.Interrupted)
+            {
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.StateChanged(handle.SessionId, SessionStatus.Idle, handle.State.Turn));
+                PublishPhase(handle, SessionPhase.Idle);
+            }
+
+            interrupted = step.Interrupted;
             // ⚠️ **这里刻意不 `return`**：要让 `finally` 先跑（它 `ExitStep()` 放掉那把标志，
             // 而下一步要重新拿它）。返回值在 finally 之后的续推那一步给出。
         }
@@ -2266,6 +2291,16 @@ public sealed class CommandDispatcher(
         // 下面这次重新 `TryEnterStep()` 是一条普通的新步——不需要「步内循环」那种
         // 会打破状态机的东西。
         if (reply is null) return null;   // 取消 / 失败那两条路（它们的 `error` 事件已经在上面发过）
+
+        // ⚠️ **被打断的那一步没有下一步**（2026-11-07）：记录已经落盘了，但那不是「跑完」
+        // ——接着推一步等于让模型在「上一轮被砍断」的状态上继续干，而用户按的正是「停」。
+        if (interrupted)
+        {
+            // ⚠️ 同步路（控制台）要拿到一句人能读的话，与从前那条 OCE 路径同一个形状
+            // （`throwOnFailure` 就是这个意思：调用方在前面等着，它得知道这一步没跑完）。
+            if (throwOnFailure) throw new DispatchException("这一步被中断了。");
+            return null;
+        }
 
         // ⚠️ **挂起不是「调了工具」**（`01` §3.8）。
         //

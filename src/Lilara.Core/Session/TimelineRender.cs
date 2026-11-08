@@ -61,6 +61,14 @@ public static class TimelineRender
         //     ——不降级的话，那个会话从此每一步都被上游拒（用户无从补救：他删不掉那些块）。
         var rendered = Render(store, handle, raw, truncateForDelivery: true, materializeImages: true);
 
+        // ⚠️ **半截的那条模型消息要当场说明白**（2026-11-07，用户裁定：流式模式下打断要保留
+        // 半截生成结果）。⚠️ 加的是**渲染期的一块注记**，不是正文：盘上只有事实
+        // （`MessageEvent.Interrupted`），那句话由 `Interruption.TruncatedText()` 一处给。
+        // ⚠️ **只在「这条里没有 `tool_use`」时加**：带工具调用的消息是**完整**的那一种
+        // （工具相位被打断时它一字不缺），往一条带 `tool_use` 的 assistant 消息末尾补一块正文
+        // 会让部分上游把它读成「调用之后还有话」——那是另一类协议形状。
+        rendered = [.. rendered.Select(MarkTruncated)];
+
         // ⚠️ **浮动块不经过这里**（2026-10-26 用户裁定）：它由推进器在**装配请求时**现插
         // （`Stepper.FloatingContextPair`），不落库、也不从任何文件读回来。
         // ⇒ 渲染层只管记录：少一条来源，就少一条会漂的判据。
@@ -94,6 +102,22 @@ public static class TimelineRender
     /// <para>⚠️ 它只有 <see cref="RenderForModel"/> 一个用途：判断「这块插进去会不会撞上已有的那一对」。
     /// 判据必须比「事件 id 相同」更宽——撞车真正发生在上游按 `CallId` 配对那一步。</para>
     /// </summary>
+    /// <summary>
+    /// **半截的模型消息：补一块「它没说完」的注记**（2026-11-07）。
+    ///
+    /// <para>⚠️ <b>为什么不是把这句话写进正文</b>：正文是**模型自己说过的话**，
+    /// 往里掺一句我们的，等于让记录说它没说过的话（`01` §3.6 ①之二）。
+    /// 盘上只存 `Interrupted = true` 这个事实，一句人话在这里现渲染。</para>
+    ///
+    /// <para>⚠️ **带 `tool_use` 的消息一律不加**：那种消息是完整的（工具相位被打断），
+    /// 而一块跟在 `tool_use` 之后的正文在部分上游是另一种形状。</para>
+    /// </summary>
+    private static TimelineEvent MarkTruncated(TimelineEvent evt) =>
+        evt is TimelineEvent.MessageEvent { Interrupted: true } m
+        && !m.Blocks.OfType<Block.ToolUseBlock>().Any()
+            ? m with { Blocks = [.. m.Blocks, new Block.TextBlock(Interruption.TruncatedText())] }
+            : evt;
+
     private static IEnumerable<string> IdsOf(TimelineEvent evt) => evt switch
     {
         TimelineEvent.MessageEvent m =>

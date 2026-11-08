@@ -220,6 +220,10 @@ internal static class DotnetRunner
                     new ToolFramingField("project", project),
                     new ToolFramingField("exit", "background"));
 
+            // ⚠️ **被打断 ⇒ 半截输出照交**（2026-11-07，与 `shell` 同一条裁定与同一种做法）。
+            if (run.Interrupted)
+                throw new ToolInterruptedException(call.CallId, ForegroundRunner.InterruptedOutcome(run), ct);
+
             // ⚠️ 被杀那条路（显式时限到点、或没有后台能力）另说一句：它要给的是
             // 「怎么把它跑完」，而不是「已转后台」。
             return run.TimedOut

@@ -227,6 +227,8 @@ public sealed class Stepper(
         var callId = Ids.New();
         var attempts = 0;
         var startedAt = CoreClock.Now();
+        // ⚠️ **声明在 `try` 外面**：`catch` 要靠它判断「有没有半截可留」（见那条 warning）。
+        var partial = new PartialReply();
         ModelReply reply;
         try
         {
@@ -329,6 +331,16 @@ public sealed class Stepper(
             // 相位：请求发出去、回复还没回来（含重试等待）。判据只在核心里，头不许自己推。
             onPhase?.Invoke(SessionPhase.Generating);
 
+            // ⚠️ **增量一边发一边攒**（2026-11-07，用户裁定「流式模式下打断要保留半截生成结果」）：
+            // `OnDelta` 把每一片**只供显示**地发出去，然后就没人记得它们了 ⇒ 中断时
+            // 那半页字只存在于头上那个临时气泡里（而 `StateChanged(Idle)` 一来它就被清掉）。
+            // ⇒ 这里再攒一份，**只为在中断那一刻把已经说出来的话留住**。
+            // ⚠️ 攒的是**同一份 `ModelDelta`**（不是解析后的回复）：`RetryPolicy` 那条
+            // 「吐过就不重试」的判据、以及适配器的切片粒度都与它无关，别在中间解码两次。
+            var onDelta = OnDelta is { } sink
+                ? new Action<ModelDelta>(delta => { partial.Add(delta); sink(delta); })
+                : null;
+
             var outcome = await RetryPolicy.CallAsync(_adapter, request, ct,
                 delay: _retryDelay,
                 onFailedAttempt: failed =>
@@ -339,12 +351,22 @@ public sealed class Stepper(
                 },
                 onRetry: NotifyRetry,
                 // ⚠️ 判据全在 `RetryPolicy` 里（含「吐过就不重试」）——这里只转交。
-                onDelta: OnDelta);
+                onDelta: onDelta);
             reply = outcome.Reply;
             attempts = outcome.Attempts;
             RecordUsage(handle, callId, outcome.StartedAt, reply, "completed", attempt: attempts,
                 fingerprint: RequestFingerprint(request));
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested && partial.HasText)
+        {
+            // ⚠️ **生成到一半被打断，而已经吐出来的字要留着**（2026-11-07，用户裁定）。
+            //
+            // <para>⚠️ 这一步**不回滚**：回滚意味着「这一趟什么都没发生」，而事实是
+            // 模型说了半页、用户也看见了那半页（`term.delta` 已经发到头上）。
+            // 扔掉的代价不是磁盘上的几行——是下一步的模型**不知道自己说过那些话**
+            // （于是它可能重复一遍，或者把用户看见的东西当成从没发生过）。</para>
+            if (attempts == 0) RecordUsage(handle, callId, startedAt, reply: null, "failed");
+            return KeepPartialGeneration(handle, partial, at);        }
         catch
         {
             // ⚠️ **只有「一次请求都没发出去」才在这里补一行**（装配请求那一半抛了）。
@@ -421,6 +443,9 @@ public sealed class Stepper(
         var planChanged = false;
         string? modeAfter = null;
         var modeChanged = false;
+        // ⚠️ **工具相位被打断**（2026-11-07）：这一批里有半截 / 没跑的结果 ⇒ 这一步到此为止，
+        // 但那批结果照常落盘（见下面那条分支）。
+        var batchInterrupted = false;
 
         // ⚠️ 工具调用是**模型消息的一部分** ⇒ 有调用就一定有那条模型消息（上面那个 if 通过）。
         // `events.Count > 0` 不是多余的守卫，它挡的是「凭空落一堆悬空结果」——而悬空的
@@ -479,6 +504,7 @@ public sealed class Stepper(
 
             var batch = await executor.ExecuteAsync(toolCalls, context, ct);
             pending = batch.Pending;
+            batchInterrupted = batch.Interrupted;
             events.AddRange(batch.Results);
             executedCallIds = batch.ExecutedCallIds;
             spawns = batch.Spawns;
@@ -538,6 +564,58 @@ public sealed class Stepper(
                     releasedLines.Add(line);
                 }
         }
+
+        // ⚠️ **工具相位被打断 ⇒ 这一步仍然要落盘，而且仍然是一个「说清楚了」的原子**
+        // （2026-11-07，用户裁定「一旦生成完成进入工具调用阶段就保留结果」）。
+        //
+        // <para>⚠️ <b>为什么不能像从前那样让它冒泡</b>：模型**已经说过的话**（那条含
+        // `tool_use` 的消息）与**真的跑过的副作用**（可能已经写了文件）一起消失，
+        // 而记录是事实（`01` §4）——下一步的模型会以为那一轮从未发生，于是重做一遍
+        // （重做一次 `write` / `rm` 不是没有代价的）。</para>
+        //
+        // <para>⚠️ **落的是完整的一批**：`ToolExecutor` 已经把每条调用都补成了结果
+        // （跑完的 / 半截的 / 还没开始的）⇒ 记录里不会有悬空的 `tool_use`，
+        // 下一次请求合法（`01` §3.6 ①）。这就是 `Batch.Interrupted` 与「异常」的分界。</para>
+        //
+        // <para>⚠️ **计划 / 模式 / goal 照常落地**：它们只在 `ExecutedCallIds` 上生效，
+        // 而这个名单只说**真的跑过的**（被闸门拒的、还没开始的那几条不在里面）
+        // ⇒ 「部分执行」不会被读成「全部执行」。</para>
+        if (batchInterrupted)
+        {
+            var interruptedEvents = new List<TimelineEvent>(events);
+            interruptedEvents.AddRange(SealFloatingCall(handle, interruptedEvents, handle.State.Turn + 1, at));
+
+            // ⚠️ 用 `WritePair`（而不是「先 append 再写 state」）：它把**「我可能欠一条」的痕迹**
+            // 与记录写进同一个临界区。万一崩在这么靠后的地方，下一步的 `Recovery.BeforeStep`
+            // 仍然认得出「那一步没写完」，而不是留下一个没人认得的悬空调用。
+            WritePair(handle, interruptedEvents,
+                new PendingIntent(handle.State.Turn + 1, toolCalls[0].CallId), _store, s => s with
+                {
+                    Status = SessionStatus.Idle,
+                    Turn = s.Turn + 1,
+                    Plan = planChanged ? planAfter : s.Plan,
+                    Axes = WithMode(goalEnded ? WithStandardInitiative(s.Axes) : s.Axes,
+                        modeChanged ? modeAfter : null),
+                }, diskStatus: SessionStatus.Idle);
+
+            // ⚠️ 痕迹在两个产物都落成之后才清（同正常路径那条）。
+            handle.UpdateStateAndPersist(_store, s => s with { PendingIntent = null },
+                diskStatus: SessionStatus.Idle);
+
+            return new StepOutcome(reply,
+                // ⚠️ 从 `events`（封口**之前**那份）里取，不是从 `interruptedEvents`：
+                // `SealFloatingCall` 会往后追加一对占位，而那一对的第一条也是 `MessageEvent`
+                // ⇒ 取「最后一条消息」会拿到 `floating-…-reclaim-call`，头拿它当身份去重会把
+                // 真正的模型消息顶掉。
+                HistoryId: events.OfType<TimelineEvent.MessageEvent>()
+                    .LastOrDefault(m => m.From == Speaker.Model)?.Id,
+                ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
+                GoalEnded: goalEnded, Spawns: spawns, Tells: tells, Archives: archives,
+                PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
+                ExecutedCallIds: executedCallIds,
+                Interrupted: true);
+        }
+
 
         // ⚠️ **`claim.released` 由调用方发**（`Stepper` 刻意不碰事件总线，同 `StepOutcome` 的注释）：
         // 头靠它刷新「谁在动哪些文件」；不发的话，头会继续显示模型已经说用完了的锁。
@@ -675,6 +753,103 @@ public sealed class Stepper(
             Archives: archives,
             PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
             ExecutedCallIds: executedCallIds);
+    }
+
+    /// <summary>
+    /// **把半截生成留住**（2026-11-07，用户裁定：流式模式下打断要保留半截生成结果）。
+    ///
+    /// <para>⚠️ <b>它落的是什么</b>：一条 <c>From=Model</c> 的普通消息 + `Interrupted = true`。
+    /// 于是「模型说过这半页」与「它没说完」两件事都在记录里（渲染期那句注记由
+    /// `TimelineRender` 加，头靠事件上的 `interrupted` 画标记）。</para>
+    ///
+    /// <para>⚠️ <b>Turn 要 +1</b>：这一步真的产生了记录（`Turn` 与「记录里非结果事件数」的
+    /// 对应关系是 `Recovery.BeforeStep` 的判据）⇒ 不 +1 会让下一次收尾把这条半截消息
+    /// 当成「多出来的一步」去补配对。</para>
+    ///
+    /// <para>⚠️ <b>不写 `PendingIntent`</b>：它说的是「我可能欠一条 `tool_result`」，
+    /// 而半截正文里**没有任何 `tool_use`**（增量只有正文，见 `PartialReply`）⇒ 不欠。
+    /// 写上去反而会让下一步的收尾去补一条没人要的结果。</para>
+    /// </summary>
+    private StepOutcome KeepPartialGeneration(SessionHandle handle, PartialReply partial, DateTimeOffset at)
+    {
+        var blocks = partial.Build();
+        var message = new TimelineEvent.MessageEvent
+        {
+            Id = Ids.New(),
+            At = at,
+            From = Speaker.Model,
+            Blocks = blocks,
+            Interrupted = true,
+        };
+
+        // ⚠️ **浮动那一对照常封口**：记录里「每一步留一对占位」的形状不能因为打断就断一节
+        // （`SealFloatingCall` 的注释：形状一致才不会被模型读成「上一轮我没调用」）。
+        var events = new List<TimelineEvent> { message };
+        events.AddRange(SealFloatingCall(handle, events, handle.State.Turn + 1, at));
+        _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
+
+        handle.UpdateStateAndPersist(_store, s => s with
+        {
+            Status = SessionStatus.Idle,
+            Turn = s.Turn + 1,
+            PendingIntent = null,
+        }, diskStatus: SessionStatus.Idle);
+
+        return new StepOutcome(
+            new ModelReply { Blocks = blocks, StopReason = "interrupted", Refused = false },
+            HistoryId: message.Id,
+            Interrupted: true);
+    }
+
+    /// <summary>
+    /// **一路攒下来的增量**（2026-11-07）——只为「被打断时把已经说出来的话留住」而存在。
+    ///
+    /// <para>⚠️ <b>只留正文（<c>text</c>），坚决不碰思考（<c>reasoning</c>）</b>：
+    /// 思考块在上游是**带签名**的，而记录就是下一次请求的输入 ⇒ 半截思考回放过去
+    /// 会被拒（一条 400，而报的是「块不合法」这种与真因隔了一层的话）。
+    /// 正文没有这个问题：它就是模型说过的话。</para>
+    ///
+    /// <para>⚠️ <b>按块序号分开攒</b>：一次回复可以有多个正文块（头部一句、工具调用之间一句），
+    /// 拼成一块会把它们粘成一段——而「模型说过什么」是按块记的事实。</para>
+    ///
+    /// <para>⚠️ <b>它不是 `DeltaPump` 的替代品</b>：那个是**显示**用的（攒 50ms 就发走、
+    /// 发完就扔，`retained:false`），而这一份是**记录**用的（一步一份、只在中途被打断时读一次）。
+    /// 两件事恰好都吃同一串增量，所以共用一次投递、各攒各的。</para>
+    /// </summary>
+    private sealed class PartialReply
+    {
+        private readonly Lock _gate = new();
+        private readonly SortedDictionary<int, System.Text.StringBuilder> _text = [];
+
+        public void Add(ModelDelta delta)
+        {
+            if (!string.Equals(delta.Kind, "text", StringComparison.Ordinal)) return;
+
+            lock (_gate)
+            {
+                if (!_text.TryGetValue(delta.BlockIndex, out var text))
+                    _text[delta.BlockIndex] = text = new System.Text.StringBuilder();
+                text.Append(delta.Text);
+            }
+        }
+
+        /// <summary>⚠️ 「吐过字」才算有半截：一片空增量不该让中断变成一次「保留」。</summary>
+        public bool HasText
+        {
+            get { lock (_gate) return _text.Values.Any(t => t.Length > 0); }
+        }
+
+        public IReadOnlyList<Kernel.Block> Build()
+        {
+            lock (_gate)
+            {
+                return
+                [
+                    .. _text.Where(pair => pair.Value.Length > 0)
+                        .Select(pair => (Kernel.Block)new Kernel.Block.TextBlock(pair.Value.ToString())),
+                ];
+            }
+        }
     }
 
     /// <summary>
@@ -1115,6 +1290,29 @@ public sealed class Stepper(
                     releasedClaims.AddRange(UnlockReleased(handle, line.Scope));
                     releasedLines.Add(line);
                 }
+
+            // ⚠️ **答复这一批也被打断了 ⇒ 同样要落盘**（2026-11-07，与 `StepAsync` 那条同一条裁定）：
+            // 这几条调用**真的跑过**（用户刚点过「可以跑」的那些往往正是危险操作），
+            // 而它们的结果在前一条被打断时已经成形了。扔掉的话记录会少一整批，
+            // 而那几条 `tool_use` 会永远悬着（下一次请求非法）。
+            if (batch.Interrupted)
+            {
+                _store.AppendEvents(handle.ProjectKey, handle.SessionId, events);
+
+                handle.UpdateStateAndPersist(_store, s => s with
+                {
+                    Status = SessionStatus.Idle,
+                    Turn = s.Turn + 1,
+                    Axes = WithMode(goalEnded ? WithStandardInitiative(s.Axes) : s.Axes,
+                        modeChanged ? modeAfter : null),
+                    Plan = planChanged ? planAfter : s.Plan,
+                }, diskStatus: SessionStatus.Idle);
+
+                return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
+                    GoalEnded: goalEnded, Spawns: spawns, Tells: tells, Archives: archives,
+                    PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
+                    ExecutedCallIds: executedCallIds, Interrupted: true);
+            }
 
             // ⚠️ **还有没答到的**（一张卡只答了一部分）⇒ 重新挂起，那些 `tool_use` 继续悬着
             // ——而这次悬着是**对的**：它们确实还没被回答。
@@ -1806,7 +2004,19 @@ public sealed class Stepper(
         SessionPlan? Plan = null,
         bool ModeChanged = false,
         string? Mode = null,
-        IReadOnlyList<string>? ExecutedCallIds = null);
+        IReadOnlyList<string>? ExecutedCallIds = null,
+        /// <summary>
+        /// **这一步是「被打断」结束的，而不是跑完的**（2026-11-07）。
+        ///
+        /// <para>⚠️ <b>它非 <c>true</c> 时，这一趟的记录已经落盘了</b>（可能是一条半截的模型消息、
+        /// 也可能是一整批「跑完的 / 半截的 / 还没开始」的结果）——这正是它与「抛
+        /// `OperationCanceledException` 冒出去」的分界：那条路什么都没写。</para>
+        ///
+        /// <para>⚠️ <b>调用方要做的三件事</b>：① 把这一趟的模型消息发出去（`HistoryId` 在，
+        /// 且带 `interrupted`）；② 发 `state.changed(Idle)`（头据此收掉临时气泡）；
+        /// ③ <b>不要续跑</b>（打断就是没有下一步）。</para>
+        /// </summary>
+        bool Interrupted = false);
 
     /// <summary>
     /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。

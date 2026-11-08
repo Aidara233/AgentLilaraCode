@@ -762,7 +762,10 @@ function renderHistoryPage(page, prepend) {
   const fragment = document.createDocumentFragment();
   for (const item of items) {
     if (!item.id || timeline.querySelector(`[data-history-id="${CSS.escape(item.id)}"]`)) continue;
-    fragment.appendChild(createHistoryItem(item));
+    // ⚠️ **半截那一条重拉之后照样带标记**（2026-11-07）：`/history` 交了 `interrupted`
+    // （见 `ControlServer.Render`），不传给 `createHistoryItem` 的话，刷新一下标记就没了
+    // ——而记录里它仍然是半截的。
+    fragment.appendChild(createHistoryItem(item, item.interrupted ? "interrupted" : null));
   }
   if (prepend) {
     const first = [...timeline.children].find((el) => el.id !== "history-more");
@@ -953,7 +956,10 @@ function createHistoryItem(t, cls) {
 
   const wrap = document.createElement("div");
   if (t.id) wrap.dataset.historyId = t.id;
-  wrap.className = "turn " + (cls || (t.kind === "toolResult" ? "meta" : t.from));
+  // ⚠️ **`cls` 是追加，不是替换**（2026-11-07）：它此前是「有 cls 就用 cls」，于是
+  // 传一个 `interrupted` 会把 `from` 那一格**顶掉** ⇒ 模型气泡变成无名气泡，
+  // 而样式（`.turn.model …`）全部落空。判据只有一处：说话者永远在，附加类跟在后面。
+  wrap.className = "turn " + (t.kind === "toolResult" ? "meta" : t.from) + (cls ? " " + cls : "");
   const who = document.createElement("div");
   who.className = "who";
   who.textContent = t.kind === "toolResult" ? "·" : (t.from === "user" ? "你" : "⏺");
@@ -2272,7 +2278,10 @@ function handleEvent(p) {
         // ⇒ 先撕下来、画完正式那条再按 `callId` 归位。
         const rescued = p.from === "model" ? detachLiveResults() : [];
         if (p.from === "model") clearLive();
-        renderTurn(p.from, p.blocks, null, p.historyId);
+        // ⚠️ **半截的那条带一个类名**（2026-11-07）：它是一条**真的记录**（模型确实说了
+        // 这些字），只是没说完。`index.html` 里那个类对应一句尾注 + 虚线轨——
+        // 不标的话，屏幕上就是一句说到一半没了的话，用户分不清是「自己按停的」还是「模型就说到这儿」。
+        renderTurn(p.from, p.blocks, p.interrupted ? "interrupted" : null, p.historyId);
         placeResults(rescued);
       }
       break;

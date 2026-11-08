@@ -14,7 +14,8 @@ namespace Lilara.Core.Session.Tools;
 /// 已经读到的那一段（工具可以把它们附在结果里，也可以不提——日志里是从头开始的那一份）。</para>
 /// </summary>
 internal sealed record ForegroundResult(
-    string Stdout, string Stderr, int ExitCode, bool TimedOut, BackgroundJobInfo? Promoted);
+    string Stdout, string Stderr, int ExitCode, bool TimedOut, BackgroundJobInfo? Promoted,
+    bool Interrupted = false);
 
 /// <summary>
 /// **跑一个前台进程**——`shell` 与 `dotnet_*` 共用这一份（2026-11-07）。
@@ -36,7 +37,8 @@ internal static class ForegroundRunner
     ///   <item>超时且 <paramref name="tryAdopt"/> 成功接管 ⇒ <see cref="ForegroundResult.Promoted"/>
     ///   非 null（进程**归宿主**：这里不杀、不 dispose）。</item>
     ///   <item>超时且接管不了 ⇒ 杀掉整棵树，交回已经读到的输出 + <c>TimedOut</c>。</item>
-    ///   <item>外层取消（用户打断）⇒ 杀掉，抛 <see cref="OperationCanceledException"/>。</item>
+    ///   <item>外层取消（用户打断）⇒ 杀掉整棵树，交回**已经读到的输出** + <see cref="ForegroundResult.Interrupted"/>
+    ///   （2026-11-07：从前这里直接 `throw`，于是那半截输出连同进程一起消失）。</item>
     /// </list>
     /// </summary>
     /// <param name="start">启动参数。⚠️ 由调用方备好（`sh` 那条还带着 `-l -c` 与 `LC_ALL`）。</param>
@@ -112,8 +114,16 @@ internal static class ForegroundRunner
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
+                // ⚠️ **被打断：先把进程树杀干净，再把已经读到的输出**交给调用方**（2026-11-07）。
+                // 这里从前是 `throw`——于是那半截输出（可能是一次构建三十秒的报错、
+                // 一次迁移的进度）连同进程一起消失，而记录里那一步一个字都不留。
+                // 用户裁定：「哪怕被打断的时候工具执行了一半，也保留半截工具输出」。
+                // ⚠️ **例外仍然要冒出去**：调用方（工具 / `ToolExecutor`）靠 OCE 认出
+                // 「这是打断」——那件事由工具在那里做（`ToolInterruptedException`），
+                // 不是这里。这里只负责把**事实**（跑过、有这么多输出）带出去。
                 KillTree(process);
-                throw;
+                await DrainAsync(stdout, stderr).ConfigureAwait(false);
+                return new ForegroundResult(stdout.Text, stderr.Text, -1, false, null, Interrupted: true);
             }
             catch (OperationCanceledException)
             {
@@ -166,6 +176,33 @@ internal static class ForegroundRunner
         try { process.Kill(entireProcessTree: true); }
         catch (InvalidOperationException) { }
         catch (Win32Exception) { }
+    }
+
+    /// <summary>
+    /// **「被打断、只跑到一半」那条结果**（2026-11-07，用户裁定「保留半截工具输出」）。
+    ///
+    /// <para>⚠️ <b>它由工具在拿到 <see cref="ForegroundResult.Interrupted"/> 时抛出去</b>
+    /// （`ToolInterruptedException`，见 `ToolExecutor`），而不是直接返回：
+    /// 一条正常结果意味着「这次调用结束了，可以继续下一条」，而被打断意味着
+    /// <b>这一步到此为止</b>——后面那几条一条都不该跑。</para>
+    ///
+    /// <para>⚠️ 不给指纹：它没跑完，说「世界没动过」是假信息（同超时那条）。</para>
+    /// </summary>
+    internal static ToolOutcome InterruptedOutcome(ForegroundResult run)
+    {
+        var text = run.Stdout;
+        if (run.Stderr.Length > 0)
+        {
+            if (text.Length > 0 && !text.EndsWith('\n')) text += "\n";
+            text += "stderr:\n" + run.Stderr;
+        }
+
+        return new ToolOutcome
+        {
+            Content = [new Block.TextBlock(Interruption.CutText(text))],
+            Fingerprint = null,
+            DependsOn = null,
+        };
     }
 
     /// <summary>

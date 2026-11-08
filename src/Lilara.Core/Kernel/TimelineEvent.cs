@@ -38,6 +38,20 @@ public abstract record TimelineEvent
     {
         public required Speaker From { get; init; }
         public required IReadOnlyList<Block> Blocks { get; init; }
+
+        /// <summary>
+        /// **这条正文是半截的**（2026-11-07，用户裁定：流式模式下打断要保留半截生成结果）。
+        ///
+        /// <para>⚠️ <b>它记的是事实，不是状态</b>：生成到一半时 `session.interrupt` 来了
+        /// ⇒ 那一刻已经收到的那些字**真的被模型说过**，而它**没说完**。两件事都要留下：
+        /// 扔掉前半句，用户与模型都以为那一轮没发生过（而它可能已经说了半页有用的东西）；
+        /// 留着而不标记，下一轮模型会把半句话当成自己完整的发言。</para>
+        ///
+        /// <para>⚠️ <b>可空 + 不设值 ⇒ 盘上键整个不出现</b>（`Json.Options` 开了
+        /// `WhenWritingNull`）⇒ 老文件逐字节不变、金样不用改（与 `ToolResultEvent.Framing`
+        /// 同一个手法）。⚠️ 只有 `true` 有意义；`null` 与 `false` 都是「完整的一条」。</para>
+        /// </summary>
+        public bool? Interrupted { get; init; }
     }
 
     /// <summary>

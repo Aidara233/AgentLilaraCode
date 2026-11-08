@@ -670,6 +670,18 @@ button:disabled:hover { border-color: var(--rule); }
 .turn.user.queued .who { font-weight: 400; }
 .turn.model .who { color: var(--ink-3); }
 .turn.model .body { color: var(--ink); }
+/* ⚠️ **被打断的半截消息**（2026-11-07）：它是一条真的记录（模型确实说了这些字），
+   只是没说完。用虚线的轨 + 一句尾注标出来——不这样做，屏幕上就是一句说到一半没了的话，
+   而用户没有任何线索知道那是「被自己按停的」还是「模型就说到这儿」。 */
+.turn.model.interrupted .body { border-left-style: dashed; }
+.turn.model.interrupted .who { font-style: italic; }
+.turn.model.interrupted .body::after {
+  content: "⏹ 被打断 · 正文到此为止";
+  display: block;
+  margin-top: 4px;
+  font: 11px var(--f-mono);
+  color: var(--ink-3);
+}
 .turn.error .body { border-left-color: var(--danger); color: var(--danger); }
 .turn.error .who { color: var(--danger); }
 /* 线：模型说「这批资源用完了」的那条横线（`release`，01 §12.4）。 */

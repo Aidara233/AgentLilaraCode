@@ -264,6 +264,12 @@ public sealed class ShellTool : ITool
                 NameOf, promoted, timeout, run.Stdout,
                 new ToolFramingField("exit", "background"));
 
+        // ⚠️ **被打断 ⇒ 把已经读到的输出交出去**（2026-11-07，用户裁定）。
+        // 这里必须**抛**而不是返回：一条正常结果意味着「接着跑下一条」，
+        // 而打断意味着这一步到此为止。
+        if (run.Interrupted)
+            throw new ToolInterruptedException(call.CallId, ForegroundRunner.InterruptedOutcome(run), ct);
+
         var (exitCode, stdout, stderr, timedOut) = (run.ExitCode, run.Stdout, run.Stderr, run.TimedOut);
 
         var result = new StringBuilder();
