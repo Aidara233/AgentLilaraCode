@@ -270,6 +270,10 @@ public static class CoreCommandParser
         // shell 配置（2026-10-23）：`shell set …` / `shell test`。与 `network` 同一形状。
         if (StartsWithToken(trimmed, "shell")) return ParseShell(trimmed);
 
+        // 工具调用的通用时限（2026-11-07）：`tools set --timeout <秒>`。
+        // ⚠️ 与 `shell` 分开一个词，因为它**不属于 shell**——`read` / `git` / `fetch` 也吃这个上限。
+        if (StartsWithToken(trimmed, "tools")) return ParseTools(trimmed);
+
         // 预设：系统提示词的存放（`01` §3.1）。三条**都走命令通道**——
         // 连 `list` 也走，因为头要拿它做下拉，而头只有「命令 + 快照」两层的入口。
         // ⚠️ 动词判据在**归一化后**的行上（词是单个词，折空白无妨），
@@ -289,7 +293,8 @@ public static class CoreCommandParser
                 + "\n      session configure <id> [--provider <pid>] [--model <m>] [--ask-timeout <分钟>]"
                 + "\n      session deactivate <id> | session archive <id> [--unarchive] | session delete <id>"
                 + " | session gc <id>"
-                + "\n      preset list | preset set <id> <内容> | preset delete <id>");
+                + "\n      preset list | preset set <id> <内容> | preset delete <id>"
+                + "\n      tools set --timeout <秒>");
 
         // 光一个 `provider delete` 不能落回「当成消息」——用户以为删了，而 provider 还在盘上。
         if (string.Equals(trimmed, "provider delete", StringComparison.Ordinal))
@@ -864,6 +869,52 @@ public static class CoreCommandParser
         if (auto) executable = "";
 
         return (new CoreCommand.ShellConfigure(enabled, executable, timeout), null);
+    }
+
+    // `tools set --timeout <秒>`
+    //
+    // ⚠️ 只有**一个**标志：这个配置管「一次工具调用最长等多久」，没有第二个可调项。
+    // ⇒ 与 `shell set` 同一套拆词纪律（省略的标志 = null = 保留旧值），
+    // 但值域校验留给 dispatcher：控制台与头共用那一条判据。
+    private static (CoreCommand?, string?) ParseTools(string line)
+    {
+        const string usage = "用法：tools set --timeout <秒>";
+
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 1) return (null, usage);
+
+        if (!string.Equals(parts[1], "set", StringComparison.OrdinalIgnoreCase))
+            return (null, usage);
+
+        int? timeout = null;
+
+        for (var i = 2; i < parts.Length; i++)
+        {
+            var flag = parts[i];
+
+            if (i + 1 >= parts.Length) return (null, $"参数 {flag} 缺少值。");
+
+            var value = parts[i + 1];
+            if (value.StartsWith("--", StringComparison.Ordinal)) return (null, $"参数 {flag} 缺少值。");
+
+            switch (flag)
+            {
+                case "--timeout":
+                    if (!int.TryParse(value, out var seconds)) return (null, "--timeout 要一个整数（秒）。");
+                    timeout = seconds;
+                    break;
+
+                default: return (null, $"未知参数 '{flag}'。");
+            }
+
+            i++;
+        }
+
+        // ⚠️ `tools set` 什么都没给 = 一条**什么也不改**的命令。拒绝比静默成功好：
+        // 用户会以为改了。
+        if (timeout is null) return (null, usage);
+
+        return (new CoreCommand.ToolsConfigure(timeout), null);
     }
 
     // `provider delete <id>`：id 合法性由 dispatcher 判（控制台与头共用同一条判据），

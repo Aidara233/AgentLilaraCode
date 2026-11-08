@@ -439,7 +439,11 @@ public sealed class Stepper(
                 // ⚠️ **两条实时出口**（2026-11-05）：交出去的是事实，发不发、发到哪条流是调用方的事
                 // （`CommandDispatcher` 在解析口接一次，同 `OnRetry` / `OnDelta`）。
                 // ⇒ 于是「一次跑五分钟的 `shell`」在头上**跑起来那一刻**就看得见。
-                onCallStarted: OnToolCallStarted, onResult: OnToolResult);
+                onCallStarted: OnToolCallStarted, onResult: OnToolResult,
+                // ⚠️ **通用兜底**（2026-11-07）：每步读一次 `tools.json`、步内冻结
+                // （同 `ShellFor` / `NetworkFor` 那条）。它是「工具自己忘了管时间」的最后一层，
+                // 不是每个工具的正常时限——工具自己的都更短，先到点的那个算数。
+                callTimeout: TimeSpan.FromSeconds(ToolCallTimeoutSeconds()));
             var context = new SessionToolContext(handle.Spec.WorkingDirectory, blobs, recorded,
                 // ⚠️ **与合成注入同一份字节**（`slots` 就是构造请求时用的那份尾块）：
                 // `floating_context` 若在这里现渲染，同一步里「核心注入的」与「模型自己要来的」
@@ -1043,7 +1047,9 @@ public sealed class Stepper(
                 handle.State.Axes![Axes.Mode],
                 // ⚠️ 答复之后真正跑起来的那批也要实时报（2026-11-05）：用户刚点完「可以跑」，
                 // 那一批往往正是最慢的那几条（批准过的危险操作用来都不快）。
-                onCallStarted: OnToolCallStarted, onResult: OnToolResult);
+                onCallStarted: OnToolCallStarted, onResult: OnToolResult,
+                // ⚠️ 通用兜底同 `StepAsync`（且**同一份读数**，见 `ToolCallTimeoutSeconds`）。
+                callTimeout: TimeSpan.FromSeconds(ToolCallTimeoutSeconds()));
             var context = new SessionToolContext(
                 handle.Spec.WorkingDirectory, blobs,
                 _store.ReadTimeline(handle.ProjectKey, handle.SessionId),
@@ -1515,6 +1521,17 @@ public sealed class Stepper(
     /// </summary>
     private ShellAccess ShellFor(SessionHandle handle) =>
         new(new ShellStore(_store.DataRoot).Load(), _backgroundJobs, handle.SessionId);
+
+    /// <summary>
+    /// 这一刻的**工具调用通用上限**（`tools.json`，2026-11-07）。⚠️ 与 <see cref="ShellFor"/>
+    /// 同一条：**每步读一次配置**，步内冻结——用户在头上改了，下一步生效。
+    ///
+    /// <para>⚠️ 抽成一个属性而不是在构造点写 `new ToolStore(...).Load()`：`ResumeAsync`
+    /// 那一处也要造执行器，两处各读一遍的后果是「答复那一步用的是另一个上限」，
+    /// 而在两个数不同的那一瞬**没有任何东西会报错**。</para>
+    /// </summary>
+    private int ToolCallTimeoutSeconds() =>
+        new Lilara.Core.Tools.ToolStore(_store.DataRoot).Load().CallTimeoutSeconds;
 
     /// <summary>
     /// 这一刻的**派生关系快照**（`01` §10，2026-10-24）。⚠️ 与 <see cref="ShellFor"/> 同一条：

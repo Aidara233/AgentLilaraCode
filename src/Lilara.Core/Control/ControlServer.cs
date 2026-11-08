@@ -1536,6 +1536,9 @@ public sealed class ControlServer(
                 Opt(payload, "executable"),
                 ToInt(OptNumber(payload, "timeoutSeconds"))),
             "shell.test" => new CoreCommand.ShellTest(),
+            // 工具调用的通用时限（2026-11-07）。键缺失 = 保留旧值（与 `shell.configure` 同一条）。
+            "tools.configure" => new CoreCommand.ToolsConfigure(
+                ToInt(OptNumber(payload, "callTimeoutSeconds"))),
             // 预设：系统的系统提示词从哪来。三条同 `provider.*` 一族（id 闸也在 dispatcher）。
             // ⚠️ `content` 走 GetProperty（**必给**）——`preset.set` 没有别的字段，
             // 所以「没给 content」只可能是发命令的程序写错了；而「给了空串」是**合法值**（纯 chat）。

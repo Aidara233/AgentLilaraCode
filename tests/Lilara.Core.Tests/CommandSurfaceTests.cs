@@ -38,6 +38,10 @@ public class CommandSurfaceTests
         (typeof(CoreCommand.ShellConfigure),   "shell.configure",   "shell set --enabled on"),
         (typeof(CoreCommand.ShellTest),        "shell.test",        "shell test"),
 
+        // 工具调用的通用时限（2026-11-07）：设备级配置，与 `shell` 分开一个词
+        // （它不属于 shell——`read` / `git` / `fetch` 也吃这个上限）。
+        (typeof(CoreCommand.ToolsConfigure),   "tools.configure",   "tools set --timeout 600"),
+
         // 预设：系统提示词的存放（预设批）。三条**都有线上形态**——
         // 连 `preset list` 也有（它走线，不像 `provider list` 是控制台本地查询：
         // 头只有一个入口，而它要用这个做下拉）。

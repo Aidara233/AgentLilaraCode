@@ -135,6 +135,20 @@ public abstract record CoreCommand
     public sealed record ShellConfigure(bool? Enabled, string? Executable, int? TimeoutSeconds) : CoreCommand;
 
     /// <summary>
+    /// **配置「一次工具调用最长等多久」**（`&lt;数据根&gt;/tools.json`，2026-11-07）。
+    /// **null = 本次没提到 = 保留旧值**（与 <see cref="ShellConfigure"/> 同一条语义）。
+    ///
+    /// <para>⚠️ <b>它是兜底，不是「每个工具都等这么久」</b>：工具自己的时限（`shell` 120 秒、
+    /// `dotnet_build` 180 秒…）更短时，先到点的那个算数。它的职责只有一个：
+    /// 一个**没有时限、又不听取消**的工具不该把整步挂到天荒地老。</para>
+    ///
+    /// <para>⚠️ <b>到点的两种结局由「这个工具有没有异步模式」决定</b>：能转后台的
+    /// （`shell` / `dotnet_build` / `dotnet_test`）→ 把活着的进程交给后台宿主继续；
+    /// 其余的 → 终止并在结果里写明。</para>
+    /// </summary>
+    public sealed record ToolsConfigure(int? CallTimeoutSeconds) : CoreCommand;
+
+    /// <summary>
     /// 用**已保存的** shell 配置定位 `sh` 并真的跑一次（`echo`），回答「能不能用 + 在哪」。
     /// 与 <see cref="NetworkTest"/> 同形：业务失败走 <c>Ack.Accepted.Note</c>，不是 rejected。
     /// </summary>

@@ -153,6 +153,61 @@ public sealed record BackgroundJobRequest
 }
 
 /// <summary>
+/// **一个已经在跑的进程**——宿主之外的地方起的那一个，被交给宿主继续（2026-11-07）。
+///
+/// <para>⚠️ <b>它为什么存在</b>：一次**前台**工具调用跑到通用上限时，如果这个工具有异步模式
+/// （`shell` / `dotnet_build` / `dotnet_test`），正确的结局是**让它继续跑**、把结果改成
+/// 「已转到后台」（用户裁定）。⚠️ 而**不能**「杀掉、再以 background 重起一遍」：
+/// 同一条命令跑两遍会写两次盘、改两次仓库，而那个症状看起来完全正常
+/// ——这是这一整条设计里最不能走错的一步。</para>
+///
+/// <para>⚠️ <b>它不暴露 <c>System.Diagnostics.Process</c></b>：同
+/// <see cref="BackgroundJobRequest"/> 避开 <c>ProcessStartInfo</c> 那条纪律
+/// ——词汇层要能被任何实现使用（测试替身、将来的远端宿主）。</para>
+///
+/// <para>⚠️ <b>生命周期归宿主</b>：交出去之后工具**不许**再碰这个进程（不 kill、不 dispose）。
+/// 宿主拿它跟已经起来的后台任务走**同一条**监视路径（<c>BackgroundJobHost.Watch</c>）。</para>
+/// </summary>
+public interface IRunningProcess : IDisposable
+{
+    /// <summary>
+    /// 交给宿主写进 `job.json` 的那份描述。⚠️ <b>它的 <see cref="BackgroundJobRequest.TimeoutSeconds"/>
+    /// 应当是 <c>null</c></b>：转后台之后按「后台默认不限时」算（同 `shell background` 那条）。
+    /// </summary>
+    BackgroundJobRequest Request { get; }
+
+    bool HasExited { get; }
+
+    /// <summary>退出码。<c>null</c> = 还没退出 / 拿不到（同 <see cref="BackgroundJobInfo.ExitCode"/>）。</summary>
+    int? ExitCode { get; }
+
+    /// <summary>进程 id（诊断用）。</summary>
+    int? Pid { get; }
+
+    /// <summary>等它退出。</summary>
+    Task WaitForExitAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// **读泵**：把两条管道排空的那个任务。⚠️ 进程退出之后还要等它
+    /// （管道里可能还剩最后一段），否则日志会**少一截尾部**而看起来完全正常。
+    /// </summary>
+    Task Output { get; }
+
+    /// <summary>杀**整棵进程树**。⚠️ 幂等：已经退出时什么也不做。</summary>
+    void Kill();
+
+    /// <summary>
+    /// **把输出改道给 <paramref name="onChunk"/>，并把已经攒下的那一份先交给它**。
+    /// 返回那份已读文本（工具拿它写进自己的结果）。
+    ///
+    /// <para>⚠️ <b>先交旧的、再谈新的</b>：交接那一刻之前读到的输出只在工具的内存里，
+    /// 不先写进日志的话，`job_output` 从 0 读起的会是**半截**
+    /// （而「开头那段呢」这个问题没有任何答案）。</para>
+    /// </summary>
+    Task<string> AdoptAsync(Func<ReadOnlyMemory<byte>, Task> onChunk);
+}
+
+/// <summary>
 /// **后台任务的宿主**——进程表的唯一所有者（2026-10-24）。
 ///
 /// <para>⚠️ <b>它存在的理由：工具必须是纯的、无状态的</b>（`00` §5 铁律 1）。
@@ -176,6 +231,19 @@ public interface IBackgroundJobs
     /// 一个进程都没起（超过上限**拒绝，不排队**：排队会让模型以为它启动了）。
     /// </summary>
     BackgroundJobStart Start(string sessionId, BackgroundJobRequest request);
+
+    /// <summary>
+    /// **接管一个已经在跑的进程**（2026-11-07）：前台工具调用跑到通用上限、而它有异步模式时，
+    /// 由工具把自己的进程连同读泵交过来，宿主从此按**普通后台任务**对待它
+    /// （写 `job.json`、输出接进 `<jobId>.log`、走同一条 <c>Watch</c> 监视退出、`job_kill` 杀得掉）。
+    ///
+    /// <para>⚠️ <b>为什么是「接管」而不是「重起」</b>：见 <see cref="IRunningProcess"/> 的注释
+    /// ——重起会让同一条命令跑两遍。</para>
+    ///
+    /// <para>⚠️ <b>失败方向</b>：拿不到会话归属 / 登记失败 ⇒ <c>null</c>，
+    /// 那时**工具必须把进程杀掉**（不能既没交出去、又留着跑）——调用方负责那一步。</para>
+    /// </summary>
+    BackgroundJobInfo? Adopt(string sessionId, IRunningProcess running);
 
     /// <summary>本会话的全部任务，**新的在前**。⚠️ 只列本会话的。</summary>
     IReadOnlyList<BackgroundJobInfo> List(string sessionId);

@@ -120,93 +120,26 @@ internal static class ShRunner
     public static bool DefaultExists(string path) => File.Exists(path);
 
     /// <summary>
-    /// 跑一段脚本。⚠️ <b>参数经 <c>ArgumentList</c> 原样到达</b>（不拼命令行、不经第二层解析）：
+    /// 跑一段脚本。⚠️ **参数经 <c>ArgumentList</c> 原样到达**（不拼命令行、不经第二层解析）：
     /// 脚本是本进程看到的**字节**，<c>sh -lc &lt;script&gt;</c> 把它当一个字符串参数收下。
     /// </summary>
     /// <param name="executable">已定位的 <c>sh</c>。</param>
     /// <param name="script">模型给的命令原文。</param>
     /// <param name="workingDirectory">会话的工作目录（脚本的相对路径从这里算）。</param>
-    public static async Task<(int ExitCode, string Stdout, string Stderr, bool TimedOut)> RunAsync(
-        string executable, string script, string workingDirectory, TimeSpan timeout, CancellationToken ct)
-    {
-        var start = CreateStartInfo(executable, workingDirectory);
-        start.ArgumentList.Add("-l");
-        start.ArgumentList.Add("-c");
-        start.ArgumentList.Add(script);
-
-        using var process = new Process { StartInfo = start };
-        try
-        {
-            if (!process.Start()) throw new Win32Exception("无法启动 sh");
-        }
-        catch (Exception ex) when (ex is Win32Exception or FileNotFoundException)
-        {
-            throw new ShellStartException($"无法启动 `{executable}`：{ex.Message}");
-        }
-
-        // ⚠️ **立刻关掉 stdin**（2026-10-23 实测修）：`RedirectStandardInput` 让子进程拿到一个**空管道**
-        // 而不是继承核心的控制台 —— 后者会在某些组合下让 sh 起不来（实测：核心的 stdout 是管道、
-        // 控制台还是另一个句柄时，连 `sh -lc "echo hi"` 都会挂到超时，而同一台机器上换成管道 stdin 就正常）。
-        // 关掉写端 ⇒ 下一条命令的 `read` / `cat` 立刻看到 EOF，而不是挂到超时。
-        try { process.StandardInput.Close(); }
-        catch (IOException) { }
-
-        using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutSource.CancelAfter(timeout);
-
-        // ⚠️ **读取只跟外层的取消走，不跟超时走**：超时那一下要先把进程树杀掉、
-        // 再把**已经拿到的输出**如实交回——那常常已经能说明卡在哪（一条等输入的命令、一个坏掉的 profile）。
-        // 若读取也挂在超时令牌上，那一份现场会被取消一起扔掉。
-        var half = ToolLimits.MaxToolOutputBytes / 2;
-        var stdoutTask = ReadBoundedAsync(process.StandardOutput, half, ct);
-        var stderrTask = ReadBoundedAsync(process.StandardError, half, ct);
-
-        try
-        {
-            await process.WaitForExitAsync(timeoutSource.Token);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            KillTree(process);
-            throw;
-        }
-        catch (OperationCanceledException)
-        {
-            // ⚠️ 超时是**结果**，不是异常：杀掉整棵进程树，带回已经拿到的输出。
-            KillTree(process);
-            var (partialOut, partialErr) = await DrainAsync(stdoutTask, stderrTask);
-            return (-1, partialOut, partialErr, true);
-        }
-        catch (IOException ex)
-        {
-            KillTree(process);
-            throw new ShellStartException($"读取 sh 输出失败：{ex.Message}；进程已终止。");
-        }
-
-        try
-        {
-            return (process.ExitCode, await stdoutTask, await stderrTask, false);
-        }
-        finally
-        {
-            if (!process.HasExited) KillTree(process);
-        }
-    }
-
-    /// <summary>
-    /// 超时之后把两条读取的**已完成部分**收回来。⚠️ 有上限（3 秒）：
-    /// 一个孙进程若还攥着管道，杀树之后读取可能永远等不到 EOF——而这里是「超时处理」，
-    /// 不能再挂一个新的超时。
-    /// </summary>
-    private static async Task<(string Stdout, string Stderr)> DrainAsync(Task<string> stdout, Task<string> stderr)
-    {
-        var all = Task.WhenAll(stdout, stderr);
-        await Task.WhenAny(all, Task.Delay(TimeSpan.FromSeconds(3)));
-
-        return (
-            stdout.IsCompletedSuccessfully ? stdout.Result : "",
-            stderr.IsCompletedSuccessfully ? stderr.Result : "");
-    }
+    /// <param name="timeout">这一次的时限。⚠️ 到点之后的两种结局见 <paramref name="tryAdopt"/>。</param>
+    /// <param name="tryAdopt">
+    /// **到点时能不能转后台**（2026-11-07）。<c>null</c> = 不转（杀掉）。
+    /// ⚠️ `shell` 只在「用默认时限」时传它：模型显式给了 `timeoutSeconds` ⇒ 它点名了截止，
+    /// 那时到点就该杀，而不是把它挪到后台。
+    /// </param>
+    public static Task<ForegroundResult> RunAsync(
+        string executable, string script, string workingDirectory, TimeSpan timeout,
+        CancellationToken ct, Func<IRunningProcess, BackgroundJobInfo?>? tryAdopt = null) =>
+        ForegroundRunner.RunAsync(
+            ScriptStartInfo(executable, script, workingDirectory), executable, timeout,
+            // ⚠️ 元数据由**这里**给：`sh` 怎么拼 argv 只有 `ShellRequest` 知道。
+            () => ShellRequest(executable, script, workingDirectory, label: script),
+            tryAdopt, ct);
 
     private static ProcessStartInfo CreateStartInfo(string executable, string workingDirectory)
     {
@@ -408,46 +341,10 @@ internal static class ShRunner
         }
     }
 
-    /// <summary>
-    /// 有界读取：只保留开头，最多 <paramref name="maxBytes"/> 字节；到上限后**继续排空管道**但不保留。
-    /// ⚠️ 与 `DotnetRunner.ReadBoundedAsync` 同一个形状、同一个理由：工具不替核心做投递截断。
-    /// </summary>
-    private static async Task<string> ReadBoundedAsync(StreamReader reader, int maxBytes, CancellationToken ct)
-    {
-        var output = new StringBuilder();
-        var bytes = 0;
-        var buffer = new char[4096];
-        while (true)
-        {
-            var count = await reader.ReadAsync(buffer.AsMemory(), ct);
-            if (count == 0) break;
-            if (bytes >= maxBytes) continue;
-
-            var chunk = new string(buffer, 0, count);
-            var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
-            if (bytes + chunkBytes <= maxBytes)
-            {
-                output.Append(chunk);
-                bytes += chunkBytes;
-                continue;
-            }
-
-            var remaining = maxBytes - bytes;
-            var take = chunk.Length;
-            while (take > 0 && Encoding.UTF8.GetByteCount(chunk.AsSpan(0, take)) > remaining) take--;
-            output.Append(chunk, 0, take);
-            bytes = maxBytes;
-        }
-        return output.ToString();
-    }
-
-    /// <summary>⚠️ 整棵树：`sh -c 'make …'` 的孙进程不会随父进程一起走。</summary>
-    private static void KillTree(Process process)
-    {
-        try { process.Kill(entireProcessTree: true); }
-        catch (InvalidOperationException) { }
-        catch (Win32Exception) { }
-    }
+    // ⚠️ **读取与杀树那两份已经搬到 `ForegroundRunner`**（2026-11-07，前台/后台共用）：
+    // 「只保留开头、到上限后继续排空管道」与「整棵进程树」现在各只有**一处**实现。
+    // 别把它们加回来——两份实现的漂移**不会报错**，只会让保存上限在一路输出上悄悄变成两倍，
+    // 或者让孙进程活下来。
 }
 
 /// <summary>`sh` 起不来 / 输出读不了——工具把它转成一条说人话的结果（失败是内容）。</summary>

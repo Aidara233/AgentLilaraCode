@@ -64,10 +64,14 @@ public sealed class BackgroundJobHost(string dataRoot) : IBackgroundJobs
         public required BackgroundJobInfo Info { get; set; }
 
         /// <summary>
-        /// 进程句柄。⚠️ <b>可空、而且会变</b>：`Start` 必须先把这一项登记进表
+        /// **进程本体**。⚠️ <b>可空、而且会变</b>：`Start` 必须先把这一项登记进表
         /// （读泵的第一个回调可能比它更早到），那时进程还没起完；重启捡回来的任务是 `null`。
+        ///
+        /// <para>⚠️ <b>2026-11-07 起它是 <see cref="IRunningProcess"/> 而不是 <c>Process</c></b>：
+        /// 前台调用超时被**接管**过来的进程也住这一格（`Adopt`），而它必须是同一套监视 / 杀法
+        /// ——两套写法里必有一套在「等退出 + 排空 + 写终态」的顺序上出错，而那个错**不报错**。</para>
         /// </summary>
-        public Process? Process { get; set; }
+        public IRunningProcess? Running { get; set; }
         public Task? Completion { get; set; }
         public string? StopReason { get; set; }
 
@@ -142,14 +146,126 @@ public sealed class BackgroundJobHost(string dataRoot) : IBackgroundJobs
             return new BackgroundJobStart(null, ex.Message);
         }
 
-        entry.Process = process;
+        // ⚠️ 包装成 `IRunningProcess`：与「接管」那条路**共用**同一套监视 / 杀法（见 `Entry.Running`）。
+        entry.Running = new PumpedProcess(process, request, pump);
         lock (entry.Gate)
-            entry.Info = entry.Info with { ProcessId = TryPid(process) };
+            entry.Info = entry.Info with { ProcessId = entry.Running.Pid };
 
-        Watch(entry, pump, request.TimeoutSeconds);
+        Watch(entry, request.TimeoutSeconds);
 
         Persist(entry);
         return new BackgroundJobStart(Snapshot(entry), null);
+    }
+
+    /// <summary>
+    /// **接管一个已经在跑的进程**（2026-11-07）：前台工具调用到点、而它有异步模式时走这里。
+    ///
+    /// <para>⚠️ <b>它<b>不</b>重起任何东西</b>：进程、读泵、已经吐出来的输出全都在原地，
+    /// 变的只是「谁负责收尾」——从这里起归宿主（`Watch` 同一条路，`job_kill` 杀得掉）。</para>
+    ///
+    /// <para>⚠️ <b>先登记、再改道</b>：改道之后工具那边就不再攒正文了，若登记失败，
+    /// 那份输出就没人在管（而进程还在跑）。⇒ 顺序是「登记 → 改道 → 写元数据 → 开工监视」，
+    /// 任何一步之前的失败都让调用方把进程杀掉（它拿得到 <c>null</c>）。</para>
+    /// </summary>
+    public BackgroundJobInfo? Adopt(string sessionId, IRunningProcess running)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)) return null;
+
+        var id = Ids.NewJob();
+        var dir = Path.Combine(_root, sessionId);
+        var logPath = Path.Combine(dir, id + ".log");
+        var metaPath = Path.Combine(dir, id + ".json");
+
+        Directory.CreateDirectory(dir);
+
+        var entry = new Entry
+        {
+            Info = new BackgroundJobInfo
+            {
+                Id = id,
+                SessionId = sessionId,
+                Kind = running.Request.Kind,
+                Label = running.Request.Label,
+                WorkingDirectory = running.Request.WorkingDirectory,
+                StartedAt = CoreClock.Now(),
+                State = BackgroundJobState.Running,
+                // ⚠️ 转后台之后按**后台默认**算（不限时）：用户看到的那句「到点转后台」里
+                // 没有「然后一分钟后再杀」这半句（同 `shell background`）。
+                TimeoutSeconds = running.Request.TimeoutSeconds,
+            },
+            LogPath = logPath,
+            MetaPath = metaPath,
+            Gate = new Lock(),
+        };
+
+        _jobs[id] = entry;
+        entry.Running = running;
+
+        try
+        {
+            // ⚠️ **改道 + 把已经读到的那一份先写进日志**（同步等它：这一步必须在
+            // 「返回给工具」之前完成，否则工具会以为交接成功了、而开头那段还在内存里）。
+            running.AdoptAsync(chunk =>
+            {
+                Append(entry, chunk);
+                return Task.CompletedTask;
+            }).GetAwaiter().GetResult();
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or ObjectDisposedException)
+        {
+            // ⚠️ 登记撤掉、把进程交回调用方杀掉——**不能**既没接管、又留着跑。
+            _jobs.TryRemove(id, out _);
+            return null;
+        }
+
+        lock (entry.Gate)
+            entry.Info = entry.Info with { ProcessId = running.Pid, OutputBytes = entry.Written };
+
+        Watch(entry, running.Request.TimeoutSeconds);
+
+        Persist(entry);
+        return Snapshot(entry);
+    }
+
+    /// <summary>
+    /// **宿主自己起的那个进程**的 <see cref="IRunningProcess"/> 形状。
+    /// ⚠️ <see cref="AdoptAsync"/> 在这里是**不支持**的：它的输出从一开始就直奔日志，
+    /// 没有「攒在内存里的开头那一份」需要交出去。
+    /// </summary>
+    private sealed class PumpedProcess(Process process, BackgroundJobRequest request, Task pump)
+        : IRunningProcess
+    {
+        public BackgroundJobRequest Request => request;
+
+        public bool HasExited
+        {
+            get { try { return process.HasExited; } catch (InvalidOperationException) { return true; } }
+        }
+
+        public int? ExitCode
+        {
+            get
+            {
+                try { return process.HasExited ? process.ExitCode : null; }
+                catch (InvalidOperationException) { return null; }
+            }
+        }
+
+        public int? Pid
+        {
+            get { try { return process.Id; } catch (InvalidOperationException) { return null; } }
+        }
+
+        public Task WaitForExitAsync(CancellationToken ct = default) => process.WaitForExitAsync(ct);
+
+        public Task Output => pump;
+
+        public void Kill() => TryKillTree(process);
+
+        public Task<string> AdoptAsync(Func<ReadOnlyMemory<byte>, Task> onChunk) =>
+            throw new InvalidOperationException("后台任务的输出从一开始就写在日志里；没有需要改道的东西。");
+
+        public void Dispose() => process.Dispose();
     }
 
     /// <summary>
@@ -160,19 +276,23 @@ public sealed class BackgroundJobHost(string dataRoot) : IBackgroundJobs
     /// 会**少一截尾部**——而那看起来完全正常。</para>
     ///
     /// <para>⚠️ <b>读泵用有界等待（2 秒）</b>：孙进程若还攥着管道，管道永远不会 EOF
-    /// （`RunAsync` 里 `DrainAsync` 的同一条经验）。这里不能再挂一个新的无限等待。</para>
+    /// （`RunAsync` 里那条同源经验）。这里不能再挂一个新的无限等待。</para>
     ///
-    /// <para>⚠️ <b>超时在这条路上兑现</b>：`CancelAfter` 之后再走**同一条** Kill 路径，
+    /// <para>⚠️ <b>超时在这条路上兑现</b>：到点之后再走**同一条** Kill 路径，
     /// 于是「超时被杀」与「被 `job_kill` 杀掉」共用一套状态写入——两处各写一份的话，
     /// 「谁先到谁算数」这条判据会漂。</para>
+    ///
+    /// <para>⚠️ <b>2026-11-07 起它对「接管来的进程」也适用</b>（`Adopt`）：两条路都只认
+    /// <see cref="IRunningProcess"/>，因为「等退出 + 排空 + 写终态」的那套次序只有一份。</para>
     /// </summary>
-    private void Watch(Entry entry, Task pump, int? timeoutSeconds)
+    private void Watch(Entry entry, int? timeoutSeconds)
     {
         entry.Completion = Task.Run(async () =>
         {
             try
             {
-                var exit = entry.Process!.WaitForExitAsync();
+                var running = entry.Running!;
+                var exit = running.WaitForExitAsync();
                 if (timeoutSeconds is { } seconds)
                 {
                     using var timer = new CancellationTokenSource();
@@ -181,17 +301,17 @@ public sealed class BackgroundJobHost(string dataRoot) : IBackgroundJobs
                     {
                         lock (entry.Gate)
                         {
-                            if (entry.Info.State == BackgroundJobState.Running && !entry.Process.HasExited)
+                            if (entry.Info.State == BackgroundJobState.Running && !running.HasExited)
                             {
                                 entry.StopReason ??= $"超过 {seconds} 秒的时限，被核心终止（整棵进程树）。";
-                                TryKillTree(entry.Process);
+                                running.Kill();
                             }
                         }
                     }
                     await timer.CancelAsync();
                 }
                 await exit.ConfigureAwait(false);
-                await Task.WhenAny(pump, Task.Delay(TimeSpan.FromSeconds(2))).ConfigureAwait(false);
+                await Task.WhenAny(running.Output, Task.Delay(TimeSpan.FromSeconds(2))).ConfigureAwait(false);
                 lock (entry.Gate)
                 {
                     var stopped = entry.StopReason is not null;
@@ -199,7 +319,7 @@ public sealed class BackgroundJobHost(string dataRoot) : IBackgroundJobs
                     {
                         State = stopped ? BackgroundJobState.Killed : BackgroundJobState.Exited,
                         Reason = entry.StopReason,
-                        ExitCode = stopped ? null : entry.Process.ExitCode,
+                        ExitCode = stopped ? null : running.ExitCode,
                         EndedAt = CoreClock.Now(),
                         OutputBytes = entry.Written,
                     };
@@ -222,14 +342,8 @@ public sealed class BackgroundJobHost(string dataRoot) : IBackgroundJobs
                 }
                 PublishFinished(Snapshot(entry));
             }
-            finally { entry.Process?.Dispose(); }
+            finally { entry.Running?.Dispose(); }
         }, CancellationToken.None);
-    }
-
-    private static int? TryPid(Process process)
-    {
-        try { return process.Id; }
-        catch (InvalidOperationException) { return null; }
     }
 
     // ---- 读 ----
@@ -332,9 +446,9 @@ public sealed class BackgroundJobHost(string dataRoot) : IBackgroundJobs
         lock (entry.Gate)
         {
             if (entry.Info.State != BackgroundJobState.Running) return SnapshotCore(entry);
-            if (entry.Process is { HasExited: false })
+            if (entry.Running is { HasExited: false } running)
             {
-                TryKillTree(entry.Process);
+                running.Kill();
                 entry.StopReason ??= reason;
             }
         }
@@ -425,7 +539,7 @@ public sealed class BackgroundJobHost(string dataRoot) : IBackgroundJobs
                     _jobs[lost.Id] = new Entry
                     {
                         Info = lost,
-                        Process = null,
+                        Running = null,
                         LogPath = Path.ChangeExtension(metaPath, ".log"),
                         MetaPath = metaPath,
                         Gate = new Lock(),
@@ -451,7 +565,7 @@ public sealed class BackgroundJobHost(string dataRoot) : IBackgroundJobs
                 _jobs[info.Id] = new Entry
                 {
                     Info = info,
-                    Process = null,
+                    Running = null,
                     LogPath = Path.ChangeExtension(metaPath, ".log"),
                     MetaPath = metaPath,
                     Gate = new Lock(),

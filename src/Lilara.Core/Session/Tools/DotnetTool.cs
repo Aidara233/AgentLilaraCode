@@ -167,7 +167,6 @@ internal static class DotnetRunner
         var args = BuildArguments(verb, project, noRestore, noIncremental, filter);
 
         var start = CreateStartInfo(executable, context, args);
-        using var process = new Process { StartInfo = start };
         var gate = DirectoryGates.GetOrAdd(context.WorkingDirectory, _ => new SemaphoreSlim(1, 1));
         try
         {
@@ -181,58 +180,72 @@ internal static class DotnetRunner
 
         try
         {
+            // ⚠️ **默认时限 ⇒ 到点转后台；显式 `timeoutSeconds` ⇒ 到点就杀**（2026-11-07，用户裁定，
+            // 与 `shell` 同一条判据：谁定的这个数）。没有 shell 上下文就没有后台能力 ⇒ 退回「杀」。
+            var shell = context.Shell;
+            var tryAdopt = explicitTimeout is null
+                           && shell?.Jobs is { } jobs
+                           && !string.IsNullOrWhiteSpace(shell.SessionId)
+                ? new Func<IRunningProcess, BackgroundJobInfo?>(running => jobs.Adopt(shell.SessionId!, running))
+                : null;
+
+            ForegroundResult run;
             try
             {
-                if (!process.Start())
-                    return Decision(toolName, $"无法启动 `dotnet {verb}`；请确认已安装 .NET SDK 并在 PATH 中。");
+                run = await ForegroundRunner.RunAsync(
+                    start, executable, timeout,
+                    // ⚠️ 元数据由这里给：`dotnet` 怎么拼 argv / 清哪些环境变量只有它知道。
+                    () => new BackgroundJobRequest
+                    {
+                        Kind = toolName,
+                        Label = $"dotnet {verb} {project}" + (filter is null ? "" : $" --filter {filter}"),
+                        Executable = executable,
+                        Arguments = args,
+                        WorkingDirectory = context.WorkingDirectory,
+                        Environment = BuildEnvironment(),
+                        // ⚠️ 转后台之后按后台默认（**不限时**）算——用户看到的那句「到点转后台」里
+                        // 没有「然后一分钟后再杀」这半句。
+                        TimeoutSeconds = null,
+                    },
+                    tryAdopt, ct);
             }
-            catch (Exception ex) when (ex is Win32Exception or FileNotFoundException)
+            catch (ShellStartException ex)
             {
-                return Decision(toolName, $"无法启动 `dotnet {verb}`；请确认已安装 .NET SDK 并在 PATH 中。");
+                return Decision(toolName, $"无法启动 `dotnet {verb}`；{ex.Message}");
             }
 
-            using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeoutSource.CancelAfter(timeout);
-            try
-            {
-                // ⚠️ **工具侧只防炸盘**：完整输出入档，投递截断由
-                // `TimelineRender.RenderForModel` 一处做。
-                // ⚠️ stdout / stderr **共用**保存上限的一半：否则两路各自可以顶到上限，
-                // 拼起来就是一倍——保存上限从「上限」变成「建议」。
-                var half = ToolLimits.MaxToolOutputBytes / 2;
-                var stdoutTask = ReadBoundedAsync(process.StandardOutput, half, timeoutSource.Token);
-                var stderrTask = ReadBoundedAsync(process.StandardError, half, timeoutSource.Token);
-                await process.WaitForExitAsync(timeoutSource.Token);
-                var stdout = await stdoutTask;
-                var stderr = await stderrTask;
-                return Format(toolName, verb, project, process.ExitCode, stdout, stderr, timedOut: false);
-            }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-            {
-                KillTree(process);
-                return Decision(toolName,
+            if (run.Promoted is { } promoted)
+                return ForegroundRunner.PromotedOutcome(
+                    toolName, promoted, timeout, run.Stdout,
+                    new ToolFramingField("project", project),
+                    new ToolFramingField("exit", "background"));
+
+            // ⚠️ 被杀那条路（显式时限到点、或没有后台能力）另说一句：它要给的是
+            // 「怎么把它跑完」，而不是「已转后台」。
+            return run.TimedOut
+                ? Decision(toolName,
                     $"`dotnet {verb}` 超过 {timeout.TotalSeconds:F0} 秒被终止，输出不完整；"
-                    + "可以缩小范围（指定更小的 `project`，测试用 `filter`）后重试。");
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                KillTree(process);
-                throw;
-            }
-            catch (IOException ex)
-            {
-                KillTree(process);
-                return Decision(toolName, $"读取 `dotnet {verb}` 输出失败：{ex.Message}；构建进程已终止。");
-            }
-            finally
-            {
-                if (!process.HasExited) KillTree(process);
-            }
+                    + "可以缩小范围（指定更小的 `project`，测试用 `filter`）后重试，"
+                    + "或者让它去后台（`background: true`）。\n\n"
+                    + run.Stdout + (run.Stderr.Length > 0 ? "\nstderr:\n" + run.Stderr : ""))
+                : Format(toolName, verb, project, run.ExitCode, run.Stdout, run.Stderr, timedOut: false);
         }
         finally
         {
             gate.Release();
         }
+    }
+
+    /// <summary>
+    /// 前台与后台**共用**的那份环境变量覆盖（`StartBackground` 的请求与前台那个请求都从它来）。
+    /// ⚠️ 两处各拼一份的话，「前台过、后台不过」那种构建差异就会回来（见 `CreateStartInfo` 的注释）。
+    /// </summary>
+    private static Dictionary<string, string?> BuildEnvironment()
+    {
+        var environment = new Dictionary<string, string?>(StringComparer.Ordinal);
+        foreach (var key in BuildEnvironmentKeysToClear()) environment[key] = null;
+        foreach (var (key, value) in BuildEnvironmentOverrides()) environment[key] = value;
+        return environment;
     }
 
     /// <summary>
@@ -492,43 +505,12 @@ internal static class DotnetRunner
     ];
 
     /// <summary>
-    /// 有界读取：**只保留开头**，最多 <see cref="ToolLimits.MaxToolOutputBytes"/> 字节。
-    ///
-    /// <para>⚠️ <b>工具不再替核心做投递截断</b>（2026-10-17）：完整的构建 / 测试输出
-    /// 必须**入档**，否则 `fetch` 取不回被砍掉的部分。喂给模型时只显示开头一段 +
-    /// `fetch(id, offset)` 注记——那由 `TimelineRender.RenderForModel` 一处做。
-    /// ⇒ 这里只防「一次调用把内存 / 盘撑爆」，读到上限后**继续排空管道**但不保留。</para>
+    /// ⚠️ **读取的那一份已经搬到 `ForegroundRunner.OutputTap`**（2026-11-07，前台/后台共用）：
+    /// 「只保留开头、到上限后继续排空管道」那条判据现在只有**一处**实现
+    /// （`ToolLimits.MaxToolOutputBytes` 的一半，stdout / stderr 各一份）。
+    /// 所以这里不再有 `ReadBoundedAsync`——别把它加回来：两份实现的漂移**不会报错**，
+    /// 只会让「保存上限」在一路输出上悄悄变成两倍。
     /// </summary>
-    private static async Task<string> ReadBoundedAsync(StreamReader reader, int maxBytes, CancellationToken ct)
-    {
-        var output = new StringBuilder();
-        var bytes = 0;
-        var buffer = new char[4096];
-        while (true)
-        {
-            var count = await reader.ReadAsync(buffer.AsMemory(), ct);
-            if (count == 0) break;
-            if (bytes >= maxBytes) continue;
-
-            var chunk = new string(buffer, 0, count);
-            var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
-            if (bytes + chunkBytes <= maxBytes)
-            {
-                output.Append(chunk);
-                bytes += chunkBytes;
-                continue;
-            }
-
-            // 最后一段按字节裁到上限（字符同样按边界回退，避免半个字符）。
-            var remaining = maxBytes - bytes;
-            var take = chunk.Length;
-            while (take > 0 && Encoding.UTF8.GetByteCount(chunk.AsSpan(0, take)) > remaining) take--;
-            output.Append(chunk, 0, take);
-            bytes = maxBytes;
-        }
-        return output.ToString();
-    }
-
     private static ToolOutcome Format(
         string toolName, string verb, string project, int exitCode, string stdout, string stderr, bool timedOut)
     {
@@ -556,13 +538,6 @@ internal static class DotnetRunner
                 new ToolFramingField("exit", exitCode.ToString()),
             ]),
         };
-    }
-
-    private static void KillTree(Process process)
-    {
-        try { process.Kill(entireProcessTree: true); }
-        catch (InvalidOperationException) { }
-        catch (Win32Exception) { }
     }
 
     private static ToolOutcome Decision(string toolName, string text) => new()

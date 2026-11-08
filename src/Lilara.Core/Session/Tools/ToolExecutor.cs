@@ -56,7 +56,8 @@ public sealed class ToolExecutor(
     ApprovalStore? approvals = null,
     string? mode = null,
     Action<Block.ToolUseBlock>? onCallStarted = null,
-    Action<TimelineEvent.ToolResultEvent>? onResult = null)
+    Action<TimelineEvent.ToolResultEvent>? onResult = null,
+    TimeSpan? callTimeout = null)
 {
     /// <summary>
     /// **规划模式下被硬拦的工具名**（2026-10-24，用户裁定：「计划模式强制拦截几个内置的常见修改文件指令
@@ -80,6 +81,25 @@ public sealed class ToolExecutor(
     };
 
     private bool InPlanMode => string.Equals(mode, PlanModeTool.Plan, StringComparison.Ordinal);
+
+    /// <summary>
+    /// **一次工具调用的通用上限**（2026-11-07，用户裁定「加个通用兜底」）。
+    ///
+    /// <para>⚠️ <b>它是兜底，不是每个工具的正常时限</b>：工具自己的时限（`shell` 120 秒、
+    /// `dotnet_build` 180 秒、`git` 8/30 秒、联网 20 秒…）都更短 ⇒ 它们先到点。
+    /// 这一格只防一种情形：**一个没有时限、又不听取消的工具**把整步挂到天荒地老
+    /// ——从前唯一的救法是用户手动 `interrupt`。</para>
+    ///
+    /// <para>⚠️ <b>它不负责「转后台」</b>：那件事只有**拥有进程的工具**做得到（它手上有活着的
+    /// 子进程，能交给 <see cref="IBackgroundJobs.Adopt"/>）。这一层只做两件事：
+    /// 到点发取消，等不到就交一条「超时被终止」的结果。⇒ 分工是
+    /// 「能转后台的自己在时限里转（它们的时限更短），转不了/没转的由这里兜底终止」。</para>
+    ///
+    /// <para>⚠️ <b>数从 `tools.json` 来</b>（`Stepper` 每步读一次、步内冻结，同
+    /// `ShellAccess` / `NetworkAccess`）：用户在头上改，下一步生效。</para>
+    /// </summary>
+    private readonly TimeSpan _callTimeout =
+        callTimeout ?? TimeSpan.FromSeconds(ToolCallLimits.DefaultTimeoutSeconds);
 
     private static string PlanModeDenial(string tool) =>
         $"现在在规划模式：'{tool}' 会改本机文件，已被拦下。"
@@ -329,8 +349,7 @@ public sealed class ToolExecutor(
             }
 
             var outcome = willRun
-                ? await plan.Tool!.RunAsync(
-                    new ToolCall(plan.Call.CallId, plan.Call.Name, plan.Call.Arguments), context, ct)
+                ? await RunWithDeadlineAsync(plan.Tool!, plan.Call, context, ct)
                 : new ToolOutcome { Content = [new Block.TextBlock(plan.Says!)] };
 
             // ⚠️ **两个「工具够不着、但它必须说出来」的出口**（2026-10-24）：与 `Ask`
@@ -366,6 +385,91 @@ public sealed class ToolExecutor(
             Spawns = spawns,
             Tells = tells,
             Archives = archives,
+        };
+    }
+
+    /// <summary>
+    /// **跑一条工具调用，带通用上限**（2026-11-07）。三种出口，**判据只有两条**：
+    ///
+    /// <list type="number">
+    ///   <item>工具自己在时限内回来了（含它自己判的超时、它自己抛的异常）⇒ 原样交回/抛出。
+    ///   ⚠️ **用户打断也算这一支**：`ct` 被取消时工具 unwind 出来的 `OperationCanceledException`
+    ///   照旧抛上去（`RunStepAsync` 靠它区分「中断」与「失败」）。</item>
+    ///   <item>到了通用上限 ⇒ 先把**取消令牌**发下去（工具该照它收拾现场），给
+    ///   <see cref="ToolCallLimits.GraceSeconds"/> 收尾。它在这段时间里交回的答案**照样算数**
+    ///   ——一个已经写了「被终止、输出不完整」的工具不该被这句兜底盖掉。</item>
+    ///   <item>宽限也过完 ⇒ 交一条「超时被终止」的结果，**并丢下那个 task**。</item>
+    /// </list>
+    ///
+    /// <para>⚠️ <b>为什么是「丢下」而不是等它</b>：托管代码里的一个 task 杀不掉。等到它自己结束
+    /// 就等于没有上限。⇒ 丢掉是唯一诚实的做法，而那条被丢下的 task 靠我们发下去的取消令牌
+    /// 自己退（多数工具会）。⚠️ 它的异常必须**有人观察**，否则会变成一条没人看的
+    /// 未观测异常——下面那个 `ContinueWith` 就是干这个的。</para>
+    ///
+    /// <para>⚠️ <b>它<b>不</b>负责「转后台」</b>：那是拥有进程的工具自己的事
+    /// （`shell` / `dotnet_*` 在自己的时限里把活进程交给 `IBackgroundJobs.Adopt`）。
+    /// 这一层够不着进程句柄，也**不该**够着——见 `ITool` 那条「工具是纯的」。</para>
+    /// </summary>
+    private async Task<ToolOutcome> RunWithDeadlineAsync(
+        ITool tool, Block.ToolUseBlock call, IToolContext context, CancellationToken ct)
+    {
+        var arguments = new ToolCall(call.CallId, call.Name, call.Arguments);
+
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(_callTimeout);
+
+        var running = tool.RunAsync(arguments, context, deadline.Token);
+
+        // ⚠️ `CancellationToken.None`：这个计时器**不许**被那两把令牌影响，它就是判据本身。
+        var expired = Task.Delay(_callTimeout, CancellationToken.None);
+
+        if (await Task.WhenAny(running, expired).ConfigureAwait(false) == running)
+            return await running.ConfigureAwait(false);
+
+        // ⚠️ **先分清两种取消**：用户 `interrupt` 也会让 `ct` 触发，而那**不是超时**
+        // （`RunStepAsync` 靠 `OperationCanceledException` 把它区分成「中断」而不是「失败」）。
+        ct.ThrowIfCancellationRequested();
+
+        // 到点了：先让工具自己收尾。
+        await deadline.CancelAsync().ConfigureAwait(false);
+
+        var grace = Task.Delay(TimeSpan.FromSeconds(ToolCallLimits.GraceSeconds), CancellationToken.None);
+        if (await Task.WhenAny(running, grace).ConfigureAwait(false) == running)
+        {
+            try
+            {
+                return await running.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // 工具是**因为我们的取消**才抛的 ⇒ 这是超时，不是失败。
+            }
+        }
+        else
+        {
+            // 丢下它，但别让它的异常没人观察（同 `EventBus` 那条「抛出去会变成没人观测的
+            // 后台任务异常」）。
+            _ = running.ContinueWith(
+                t => _ = t.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
+        var seconds = (int)_callTimeout.TotalSeconds;
+        return new ToolOutcome
+        {
+            Content =
+            [
+                new Block.TextBlock(
+                    $"'{call.Name}' 超过 {seconds} 秒仍未结束，已被核心终止；这一条没有结果。\n"
+                    + "可以缩小范围后重试；需要跑很久的活请让它自己去后台"
+                    + "（`shell` / `dotnet_build` / `dotnet_test` 都有 `background` 参数）。"),
+            ],
+            // ⚠️ 无指纹：它**没跑完**，说「世界没动过」是假信息。
+            Fingerprint = null,
+            DependsOn = null,
+            Framing = new ToolFraming(call.Name, [new ToolFramingField("timeout", seconds.ToString())]),
         };
     }
 

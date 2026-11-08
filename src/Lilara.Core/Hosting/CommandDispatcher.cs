@@ -7,6 +7,7 @@ using Lilara.Core.Storage;
 using Lilara.Core.Providers;
 using Lilara.Core.Session;
 using Lilara.Core.Session.Tools;
+using Lilara.Core.Tools;
 
 namespace Lilara.Core.Hosting;
 
@@ -362,6 +363,7 @@ public sealed class CommandDispatcher(
                 // ---- shell（2026-10-23）----
                 case CoreCommand.ShellConfigure sc: return HandleShellConfigure(sc, commandId);
                 case CoreCommand.ShellTest st: return await HandleShellTestAsync(st, commandId, ct);
+                case CoreCommand.ToolsConfigure tc: return HandleToolsConfigure(tc, commandId);
 
                 // ---- 预设：系统块从哪来（`01` §3.1；`14` 未决项 6）----
                 case CoreCommand.PresetSet ps: return HandlePresetSet(ps, commandId);
@@ -1007,6 +1009,40 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
+    /// **保存「一次工具调用最长等多久」**（2026-11-07）。⚠️ 与 `shell.configure` 同一条合并语义：
+    /// null = 保留旧值。
+    ///
+    /// <para>⚠️ <b>越界在这里是拒绝、在盘上是夹紧</b>（同 `shell` 那条）：命令是有人在交互里敲的，
+    /// 当场说清比默默改成别的值好；而配置文件是手改的，夹紧只为了别让 0 或 999999999
+    /// 把每一步都弄坏。</para>
+    /// </summary>
+    private DispatchResult HandleToolsConfigure(CoreCommand.ToolsConfigure c, string id)
+    {
+        if (c.CallTimeoutSeconds is { } timeout
+            && (timeout < ToolCallLimits.MinTimeoutSeconds || timeout > ToolCallLimits.MaxTimeoutSeconds))
+            return Reject(id,
+                $"callTimeoutSeconds 要在 {ToolCallLimits.MinTimeoutSeconds}..{ToolCallLimits.MaxTimeoutSeconds} 秒之间"
+                + $"（给的是 {timeout}）。");
+
+        var store = new ToolStore(_host.DataRoot);
+        var current = store.Load();
+
+        var next = current with
+        {
+            CallTimeoutSeconds = c.CallTimeoutSeconds ?? current.CallTimeoutSeconds,
+        };
+
+        store.Save(next);
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Note = $"已保存：一次工具调用最多等 {next.CallTimeoutSeconds} 秒；"
+                + "到点后能转后台的转后台（shell / dotnet_*），其余的终止。",
+        });
+    }
+
+    /// <summary>
     /// **自检**（2026-10-23）。与 `network.test` 同一条判据：业务失败（关着 / 找不到 sh /
     /// 跑不起来）都走 `Ack.Accepted.Note`，只有命令本身不合法才是 rejected。
     /// ⚠️ 它**真的起一个进程**（`echo`），不是只看文件在不在——「能定位」与「能跑」是两件事。
@@ -1025,8 +1061,10 @@ public sealed class CommandDispatcher(
 
         try
         {
-            var (exitCode, stdout, stderr, timedOut) = await ShRunner.RunAsync(
+            var probe = await ShRunner.RunAsync(
                 executable, "echo lilara-sh-ok", _host.WorkingDirectory, TimeSpan.FromSeconds(10), ct);
+            var (exitCode, stdout, stderr, timedOut) =
+                (probe.ExitCode, probe.Stdout, probe.Stderr, probe.TimedOut);
 
             return new DispatchResult(new Ack.Accepted
             {

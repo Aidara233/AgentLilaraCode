@@ -239,18 +239,32 @@ public sealed class ShellTool : ITool
 
         if (overrideSeconds is { } seconds) timeout = TimeSpan.FromSeconds(seconds);
 
-        int exitCode;
-        string stdout, stderr;
-        bool timedOut;
+        // ⚠️ **默认时限 ⇒ 到点转后台；显式 `timeoutSeconds` ⇒ 到点就杀**（2026-11-07，用户裁定）。
+        // 判据是「谁定的这个数」：模型点名了截止，它要的就是那个答案（杀了、如实说，好让它改小范围）；
+        // 而默认那个数是我们自己拍的，到点就把活挪到后台继续——那才是「长活」的正确结局。
+        var jobs = shell.Jobs;
+        var sessionId = shell.SessionId;
+        var tryAdopt = overrideSeconds is null && jobs is not null && !string.IsNullOrWhiteSpace(sessionId)
+            ? new Func<IRunningProcess, BackgroundJobInfo?>(running => jobs.Adopt(sessionId, running))
+            : null;
+
+        ForegroundResult run;
         try
         {
-            (exitCode, stdout, stderr, timedOut) =
-                await ShRunner.RunAsync(executable, command, context.WorkingDirectory, timeout, ct);
+            run = await ShRunner.RunAsync(
+                executable, command, context.WorkingDirectory, timeout, ct, tryAdopt);
         }
         catch (ShellStartException ex)
         {
             return ToolText.Of(ex.Message);
         }
+
+        if (run.Promoted is { } promoted)
+            return ForegroundRunner.PromotedOutcome(
+                NameOf, promoted, timeout, run.Stdout,
+                new ToolFramingField("exit", "background"));
+
+        var (exitCode, stdout, stderr, timedOut) = (run.ExitCode, run.Stdout, run.Stderr, run.TimedOut);
 
         var result = new StringBuilder();
         // ⚠️ 第一行是**结论**：退出码必须一眼可见。超时**不说**「失败」——命令可能已经做完了大半，
