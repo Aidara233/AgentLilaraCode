@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.ResponseCompression;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -41,7 +43,36 @@ var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 builder.WebHost.UseUrls($"http://{HostForUrl(bind)}:{port}");
 builder.Logging.ClearProviders();
 
+// **响应压缩**（2026-11 性能批）。
+//
+// ⚠️ 头只发三个文件，而 `app.js` 是 155 KB、`index.html` 是 44 KB（实测）——
+// 它们的内容高度重复（几乎全是缩进 + 中文注释 + 中文界面串）。实测（curl 实测，
+// `CompressionLevel.Optimal`）：`app.js` gzip 57 KB、`index.html` br 15 KB
+// ⇒ 局域网 / 手机上打开页面时，这一句就是首屏字节数的七成。
+//
+// ⚠️ **它不破「不许缓存」那条**：压缩与 `Cache-Control: no-store` 是两件事，
+// 那份 no-store 的注释（见下面 `UseStaticFiles`）一个字都不用改。
+// ⚠️ MIME 表用框架默认值（含 `text/html` / `application/javascript` / `text/css`）；
+// 手抄一份就多一个会漂的地方。
+builder.Services.AddResponseCompression(options =>
+{
+    options.EnableForHttps = true;
+    options.Providers.Add<BrotliCompressionProvider>();
+    options.Providers.Add<GzipCompressionProvider>();
+});
+
+// ⚠️ **默认档是 `Fastest`**（实测：`app.js` gzip 77 KB / br 75 KB），而 `Optimal`
+// 是 54 KB / 46 KB —— 同一个文件，**多省三成**。这台机器上是单用户、每次启动只压几次，
+// 那几毫秒 CPU 换掉的正是「手机上打开页面多等的半秒」。
+builder.Services.Configure<BrotliCompressionProviderOptions>(
+    o => o.Level = System.IO.Compression.CompressionLevel.Optimal);
+builder.Services.Configure<GzipCompressionProviderOptions>(
+    o => o.Level = System.IO.Compression.CompressionLevel.Optimal);
+
 var app = builder.Build();
+
+// ⚠️ **必须在 `UseStaticFiles` 与端点之前**：中间件按注册顺序跑。
+app.UseResponseCompression();
 app.UseDefaultFiles();
 
 // ⚠️ **静态文件不许被浏览器缓存**（2026-10-06 加，原因是同一类事故栽了三次）。

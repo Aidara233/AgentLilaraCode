@@ -234,10 +234,44 @@ public abstract record WireEvent
     /// </summary>
     /// <param name="Turn">这一步的步号（与 <see cref="TermDelta.Turn"/> 同一个约定：
     /// 模型调用之前那一刻的 <c>Turn + 1</c>）。头用它决定这条调用行落在哪一段临时画面上。</param>
-    /// <param name="Arguments">模型给的那份**原文**（与 `toolUse` 块逐字相同）——头把它折叠显示，
-    /// 不去解析、不去美化（`01` §9：参数是逐字原文）。</param>
+    /// <param name="Arguments">模型给的那份参数的**预览**（与 `toolUse` 块逐字相同的那段原文开头）
+    /// ——头把它折叠显示，不去解析、不去美化（`01` §9：参数是逐字原文）。
+    ///
+    /// <para>⚠️ <b>它可能被截断</b>（2026-11 性能批）：这条事件只是「调用开始跑了」的
+    /// **瞬时提示**，而同一份参数还会随步末的 <see cref="MessageAppended"/> 里的 `toolUse`
+    /// 块**再发一次**——不截的话，一次 `write` 大文件就是双份字节（且这条还不保留，
+    /// 收益只是那一秒的「执行中」）。⇒ 发布点用 <see cref="PreviewOf"/> 把它关在
+    /// <see cref="MaxArgumentsPreviewChars"/> 以内。**完整原文以 `toolUse` 块为准**，
+    /// 客户端别把这里当成参数的权威来源。</para>
+    /// </param>
     public sealed record ToolCallStarted(
-        string SessionId, int Turn, string CallId, string Name, string Arguments) : WireEvent;
+        string SessionId, int Turn, string CallId, string Name, string Arguments) : WireEvent
+    {
+        /// <summary>
+        /// 这条事件的参数预览上限（**字符**，不是字节）。
+        ///
+        /// <para>⚠️ **占位值**，判据同 `ToolLimits` 那批：它要装得下一次普通调用的参数
+        /// （`read` / `git_read` / 短 `shell`），又不能让「一次 `write` 几十 KB」
+        /// 变成一次双份传输。2000 字符对折叠行来说也早已超过一屏。</para>
+        /// </summary>
+        public const int MaxArgumentsPreviewChars = 2000;
+
+        /// <summary>截断处的说明。⚠️ 它**必须**说出来，否则读的人会以为参数就这么长。</summary>
+        public const string PreviewSuffix = "\n…（参数较长，这里只显示开头；完整原文随这条模型消息到达）";
+
+        /// <summary>
+        /// 有界预览。⚠️ 退到**字符边界**：UTF-16 里一个代理对拆开会得到半个字符
+        /// （页面上是一个替换符），所以砍在低位代理上时往前退一格。
+        /// </summary>
+        public static string PreviewOf(string arguments)
+        {
+            if (arguments.Length <= MaxArgumentsPreviewChars) return arguments;
+
+            var cut = MaxArgumentsPreviewChars;
+            if (char.IsHighSurrogate(arguments[cut - 1])) cut--;
+            return string.Concat(arguments.AsSpan(0, cut), PreviewSuffix);
+        }
+    }
 
     /// <summary>
     /// **核心在问用户**（`01` §3.8）。⚠️ <b>它同时投两条流</b>：

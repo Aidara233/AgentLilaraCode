@@ -136,6 +136,10 @@ public sealed class ToolExecutor(
         /// <summary>
         /// 按 id 拼回**一条**结果（`01` §3.8：一次询问一个信封）。
         /// ⚠️ 缺项如实写「未回答」，**不编一个空值**——那是「多了一条假信息」。
+        ///
+        /// <para>⚠️ <b>附言另起一行、排在最后</b>（用户 2026-11-13）：它是「随这次答复
+        /// 一起说的一句话」，不是某个问题的答案 ⇒ 不按 id 归位，而是整段答复的收尾。
+        /// 空（或全空白）时**不出现**——那与「没写」是同一件事。</para>
         /// </summary>
         public string Compose()
         {
@@ -146,6 +150,8 @@ public sealed class ToolExecutor(
                     ? $"{item.Id}: {v}"
                     : $"{item.Id}: （未回答）");
             }
+
+            if (AskAnswers.RemarkOf(Answers) is { } remark) lines.Add(AskAnswers.RemarkLine(remark));
 
             return string.Join("\n", lines);
         }
@@ -292,6 +298,18 @@ public sealed class ToolExecutor(
 
         var results = new List<TimelineEvent.ToolResultEvent>(calls.Count);
 
+        // ⚠️ **授权卡「批准」时，用户写的那句附言落在哪**（用户 2026-11-13 裁定）。
+        //
+        // <para>提问卡（`Question`）那条不用它：答案本身就是内容，附言由
+        // <see cref="Reply.Compose"/> 拼在那段答复的最后一行。</para>
+        //
+        // <para>而授权卡批准时**没有「答复正文」这种东西**——那几条调用直接执行、
+        // 各落各的工具结果 ⇒ 附言只能**附在结果后面**（`WithRemark`），
+        // 而且**只附一次**（第一条第被批准的调用）：它是「用户对这次批准说的一句话」，
+        // 不是每条工具输出各说一遍。⚠️ 附的是**内容**、不是新的一条结果——
+        // 「一条 `tool_use` 对一条 `tool_result`」是结构性的（`01` §3.6 ①）。</para>
+        var remark = reply is { Kind: AskKind.Permission } ? AskAnswers.RemarkOf(reply.Answers) : null;
+
         // ⚠️ **工具声明、核心落地**的两族（2026-10-24）：`spawn` 派生、`tell_*` 注入。
         // 与 `Ask` 同一条判据——工具没有 store 的手，而这两件事都要碰会话。
         var spawns = new List<SpawnRequest>();
@@ -382,13 +400,23 @@ public sealed class ToolExecutor(
             if (outcome.Tell is { } tell) tells.Add(tell);
             if (outcome.Archive is { } archive) archives.Add(archive);
 
+            // ⚠️ **批准时那句附言**：附在这一条的结果后面，**只附一次**（见循环外那段）。
+            // ⚠️ 在 `Materialize` **之前**拼：库对象与落盘内容必须与事件里那条逐字一致
+            // （`onResult` 交的是记录那一份），事后改内容会让「头看到的」与「盘上的」分叉。
+            var content = outcome.Content;
+            if (remark is { } note && reply is not null && reply.Covers(plan.Call.CallId))
+            {
+                content = WithRemark(content, note);
+                remark = null;
+            }
+
             results.Add(new TimelineEvent.ToolResultEvent
             {
                 // ⚠️ 本记录的稳定 id（与协议 id `CallId` **不是一回事**）。见 `01` §8.0.2 第七节。
                 Id = Ids.New(),
                 At = CoreClock.Now(),
                 CallId = plan.Call.CallId,
-                Content = Reclaim.Materialize(outcome.Content, blobs),
+                Content = Reclaim.Materialize(content, blobs),
                 // ⚠️ 框架**不进 `Materialize`**：它是**事实**（薄薄几个字段），
                 // 不是"内容"——把它塞进库会为几十个字节开一个对象，而
                 // `Materialize` 的判据（`InlineThresholdBytes`）管的是**字节量**。
@@ -703,6 +731,30 @@ public sealed class ToolExecutor(
             // 答完要盖住的正是它们——而「这一批里的第一条」不是答案（见 `AskRequest.CallIds`）。
             CallIds = [.. same.SelectMany(a => a.CallIds).Distinct(StringComparer.Ordinal)],
         };
+    }
+
+    /// <summary>
+    /// 把用户那句**附言**拼进一条结果的内容末尾（授权卡批准时用，`01` §3.8）。
+    ///
+    /// <para>⚠️ <b>拼的是内容，不是新的一条结果</b>：「一条 `tool_use` 对一条 `tool_result`」
+    /// 是结构性的（`01` §3.6 ①）——多造一条结果就等于给同一个调用配了两次对。</para>
+    ///
+    /// <para>⚠️ <b>末尾是文本块就接在它后面，不是就另起一块</b>：另起一块会让本来能存成
+    /// 纯文本（`text/plain`）的大结果退化成块数组 JSON（见 `Reclaim.Materialize` 的分流），
+    /// 而那纯属排版事故。⚠️ 前面空两行：工具输出与「用户说的」之间必须看得出分界，
+    /// 否则那句话会被读成工具自己说的。</para>
+    /// </summary>
+    private static IReadOnlyList<Block> WithRemark(IReadOnlyList<Block> content, string remark)
+    {
+        var line = "\n\n" + AskAnswers.RemarkLine(remark);
+
+        var blocks = content.ToList();
+        if (blocks.Count > 0 && blocks[^1] is Block.TextBlock last)
+            blocks[^1] = last with { Text = last.Text + line };
+        else
+            blocks.Add(new Block.TextBlock(line));
+
+        return blocks;
     }
 
     /// <summary>第一趟的产物：一条调用 + 它该走哪条路。</summary>

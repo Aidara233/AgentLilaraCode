@@ -30,28 +30,69 @@ public sealed class UsageStore(string dataRoot)
             using var writer = new StreamWriter(stream, Utf8NoBom);
             writer.Write(line);
         }
+
+        // 见 `_cache` 的注释：写入即失效，不靠时间戳能不能分辨这一次追加。
+        lock (_cacheGate) _cache = null;
     }
+
+    /// <summary>
+    /// **账本解析结果的缓存**（2026-11 性能批）。
+    ///
+    /// <para>⚠️ <b>为什么必须有它</b>：`usage.jsonl` 是**只增**的，一条实际调用一行。
+    /// 而读它的地方全在热路径上——`GET /sessions/{id}/state` 的浮动槽要调
+    /// <c>ContextUsage.Line</c> 与 <c>OverLimit</c> **各一次**（两处都走
+    /// <see cref="ForSession"/> ⇒ <see cref="ReadAll"/>），头每次打开会话都拉一次 `/state`。
+    /// ⇒ 账本越长，「打开一个会话」里就有一份越贵的**与那个会话无关**的全量重解析。</para>
+    ///
+    /// <para>⚠️ <b>失效判据是「文件变了没有」，不是时间窗</b>：长度 + 修改时刻
+    /// （`LastWriteTimeUtc.Ticks`）。不用 TTL：一个 TTL 会把「刚刚这次调用的用量」
+    /// 藏起来几秒，而那个数是用户盯着看的。⚠️ 两次读之间文件被追加 ⇒ 长度变 ⇒ 下次重解析，
+    /// 不会给出旧账。</para>
+    ///
+    /// <para>⚠️ **写入路径照样要清缓存**（<see cref="Append"/>）：文件系统的时间戳精度
+    /// 不保证（尤其在容器 / 网络盘上），而同长度重写这件事在手改账本时是可能的
+    /// ——清一下的代价是零，猜错的代价是「显示一个已经不对的数」。</para>
+    /// </summary>
+    private (long Length, long Stamp, IReadOnlyList<UsageCall> Calls)? _cache;
+
+    private readonly Lock _cacheGate = new();
 
     public IReadOnlyList<UsageCall> ReadAll()
     {
         if (!File.Exists(_path)) return [];
-        var result = new List<UsageCall>();
-        using var stream = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        using var reader = new StreamReader(stream, Encoding.UTF8);
-        while (reader.ReadLine() is { } line)
-        {
-            if (string.IsNullOrWhiteSpace(line)) continue;
-            try
-            {
-                if (JsonSerializer.Deserialize<UsageCall>(line, Kernel.Json.Options) is { } call)
-                    result.Add(call);
-            }
-            catch (JsonException)
-            {
-                // 账本同样是追加文件；尾部半行不能让全部历史不可读。
-            }
-        }
+
+        var info = new FileInfo(_path);
+        var length = info.Length;
+        var stamp = info.LastWriteTimeUtc.Ticks;
+
+        lock (_cacheGate)
+            if (_cache is { } cached && cached.Length == length && cached.Stamp == stamp) return cached.Calls;
+
+        var result = Parse();
+
+        lock (_cacheGate) _cache = (length, stamp, result);
         return result;
+
+        IReadOnlyList<UsageCall> Parse()
+        {
+            var parsed = new List<UsageCall>();
+            using var stream = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            while (reader.ReadLine() is { } line)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                try
+                {
+                    if (JsonSerializer.Deserialize<UsageCall>(line, Kernel.Json.Options) is { } call)
+                        parsed.Add(call);
+                }
+                catch (JsonException)
+                {
+                    // 账本同样是追加文件；尾部半行不能让全部历史不可读。
+                }
+            }
+            return parsed;
+        }
     }
 
     public IReadOnlyList<UsageCall> ForSession(string sessionId) =>

@@ -65,6 +65,54 @@ public sealed class UsageStoreTests : IDisposable
             second => Assert.Equal("m2", second.Key));
     }
 
+    // ⚠️ **账本解析缓存的两条边界**（2026-11 性能批）：① 追加之后必须看得见新行
+    // （缓存不能把「刚刚这次调用」藏起来）；② 别的进程 / 手工往同一个文件追加也要看得见
+    // （判据是「文件变了没有」，不是「本对象 Append 过没有」）。
+    [Fact]
+    public void ReadAll_SeesNewRows_EvenThoughItCachesTheParsedLedger()
+    {
+        var store = new UsageStore(_root);
+        store.Append(new UsageCall
+        {
+            CallId = "a", ProviderId = "p", ModelId = "m", Protocol = "chat",
+            StartedAt = DateTimeOffset.UtcNow, Status = "completed", Usage = Usage(1, 1),
+        });
+
+        Assert.Single(store.ReadAll());
+
+        store.Append(new UsageCall
+        {
+            CallId = "b", ProviderId = "p", ModelId = "m", Protocol = "chat",
+            StartedAt = DateTimeOffset.UtcNow, Status = "completed", Usage = Usage(1, 1),
+        });
+
+        Assert.Equal(2, store.ReadAll().Count);
+        Assert.Equal(2, new UsageStore(_root).ReadAll().Count);
+    }
+
+    [Fact]
+    public void ReadAll_SeesRowsWrittenBySomebodyElse()
+    {
+        var store = new UsageStore(_root);
+        store.Append(new UsageCall
+        {
+            CallId = "a", ProviderId = "p", ModelId = "m", Protocol = "chat",
+            StartedAt = DateTimeOffset.UtcNow, Status = "completed", Usage = Usage(1, 1),
+        });
+        Assert.Single(store.ReadAll());   // 先把缓存喂上
+
+        // ⚠️ 直接往文件里追加一行（模拟另一个核心 / 手工编辑）。缓存必须靠
+        // 「长度 + 修改时刻」判出文件变了——判不出来的话，`/state` 会一直显示旧账。
+        var second = new UsageStore(_root);
+        second.Append(new UsageCall
+        {
+            CallId = "b", ProviderId = "p", ModelId = "m", Protocol = "chat",
+            StartedAt = DateTimeOffset.UtcNow, Status = "completed", Usage = Usage(1, 1),
+        });
+
+        Assert.Equal(2, store.ReadAll().Count);
+    }
+
     [Fact]
     public void ReadAll_SurvivesRestartAndKeepsUnknownDistinctFromZero()
     {

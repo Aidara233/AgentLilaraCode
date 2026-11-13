@@ -221,6 +221,32 @@ public sealed class EventBus(
         return state;
     }
 
+    /// <summary>
+    /// **扔掉一个 topic 的全部内存账**（空的订阅者时）——空闲会话卸载那条路调它。
+    ///
+    /// <para>⚠️ <b>为什么需要</b>：每个 topic 的补发缓冲是 `topicCapacity`（默认 512）条
+    /// **保留了载荷的对象**，而载荷里有消息块正文。一个会话被 `session.deactivate` 摘掉之后，
+    /// 它的 topic 仍钉着这 512 条（以及那串 `Subscribed`/泵的状态）——**摘了会话，内存没回来**。
+    /// 实测口径：512 条里只要有几十条带正文的消息，一个死掉的会话就能占住几 MB。</para>
+    ///
+    /// <para>⚠️ <b>只在没有订阅者时释放</b>：还有人在看的时候把缓冲清掉，
+    /// 等于让那个客户端的 `since` 游标静默失去补发来源——而它不会知道，只会少一段。
+    /// 有订阅者 ⇒ 什么都不做（下一次卸载扫描会再来一次，因为它本来就在空闲态）。</para>
+    ///
+    /// <para>⚠️ <b>代价：seq 从头开始</b>。之后有人用旧 `since` 订阅，会走
+    /// 「`from > state.Seq` ⇒ <see cref="EventSubscription.NeedsResync"/>」那条路
+    /// ——那正是设计里唯一的降级路径（拉快照重建），**不是**丢事件的静默路径。
+    /// 而卸载的判据本来就是「没人碰它十分钟以上」，那时订阅者的一侧是空的。</para>
+    /// </summary>
+    public void ReleaseTopic(string topic)
+    {
+        lock (_gate)
+        {
+            if (_topics.TryGetValue(topic, out var state) && state.Subs.Count == 0)
+                _topics.Remove(topic);
+        }
+    }
+
     /// <summary>topic 命名。**集中在这里，别让调用方各拼各的**。</summary>
     public static string SessionTopic(string sessionId) => $"session:{sessionId}";
 

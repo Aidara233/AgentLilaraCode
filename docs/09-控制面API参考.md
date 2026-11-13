@@ -29,6 +29,8 @@
 | WS 端点 | `ws://{监听地址}:{port}/ws`（鉴权开启时再带 `?token=…`） | `ControlServer.MapWebSocket` |
 | 鉴权 | **可选**：`LILARA_AUTH=1` 时校验访问 token（`ControlAuth`）。token 启动时生成并打印在控制台；HTTP 用 `Authorization: Bearer <token>`，WS 用 `?token=<token>`。**默认不校验** | `Control/ControlAuth.cs`、`Cli/Program.cs` |
 | CORS | `Access-Control-Allow-Origin: *`；允许头 `content-type, authorization`；允许动词 `GET, POST, PUT, DELETE, OPTIONS`；预检 `OPTIONS` 回 `204` | `ControlServer.StartAsync` |
+| 响应压缩 | **按 `Accept-Encoding` 压**（brotli / gzip，`CompressionLevel.Optimal`）；覆盖 `application/json` 与 `text/*`。客户端不带那个头就收到明文 | `ControlServer.StartAsync`（`AddResponseCompression`） |
+| 空闲卸载 | 每 20 秒一趟心跳把**10 分钟没被碰过**的会话摘出内存（`LILARA_IDLE_UNLOAD_MINUTES` 可改，`0` = 关闭）；磁盘一字不动，下一次访问照常载入 | `Hosting/IdleUnload.cs`、`CommandDispatcher.SweepIdleSessions` |
 
 ⚠️ **默认状态没有任何网络边界**：默认绑 `0.0.0.0` 且默认不校验 token ⇒
 任何能路由到该端口的人/程序都能建会话、发消息、执行工具、读本机能读到的文件、花掉 provider 的额度。
@@ -164,6 +166,8 @@
 | `session.reclaimed` | `sessionId` · `reason`（一句回执原话） | 会话流 | `session.gc`、询问超时收尾 |
 | `release.recorded` | `sessionId` · `id` · `scope` · `summary` · `at` | 会话流 | 模型侧 `release` 画了一条线 |
 | `tool.result.appended` | `sessionId` · `id` · `callId` · `blocks` · `at` | 会话流 | 工具结果落盘（一条结果一条事件） |
+| `tool.call.started` | `sessionId` · `turn` · `callId` · `name` · `arguments`（**参数原文的开头，可能被截断**） | 会话流（**不保留**） | 一条工具调用**开始跑**（被拒 / 不存在 / 挂着询问的不发） |
+| `term.delta` | `sessionId` · `turn` · `blockIndex` · `deltaKind` · `text` | 会话流（**不保留**） | 模型正文 / 思考的实时增量（约 50ms 攒一帧） |
 | `usage.updated` | `sessionId` · `call`（`UsageCall`）· `summary`（`UsageSummary`） | 会话流 | 一次会话模型调用记账之后 |
 | `retry.attempt` | `sessionId` · `attempt` · `maxAttempts` · `reason` · `delayMs` | 会话流 | 一次模型调用失败、**马上要自动重试**（在等待之前发；重试用尽 / 非瞬态失败不发，那两条走 `error`） |
 | `session.compaction.completed` | `sessionId` · `checkpointId` · `coveredThroughEventId` · `summaryTokens`（可空） | 会话流 | `session.compact` 完成 |
@@ -220,6 +224,15 @@
 - ⚠️ **一条结果一条事件，不打包**。头按 `callId` 挂到前面那条 `toolUse` 下面，按 `id` 去重。
 - ⚠️ 它和 `message.appended` 是两件事：模型消息走后者，工具结果走这一条。之前只有前者，
   所以实时流里工具结果看起来「没有下文」，只有重拉 `/history` 才出现。
+
+**`tool.call.started`**
+- `arguments`：模型给的那份参数的**原文开头**——⚠️ **2026-11 性能批起可能被截断**
+  （上限 2000 字符，截断处带一句「完整原文随这条模型消息到达」）。
+  完整原文以步末 `message.appended` 里那个 `toolUse` 块的 `arguments` 为准；
+  这一条只用来在临时气泡里画一行「执行中 · 调用 X」。
+- ⚠️ **不保留**：重连之后不会补发（它没有对应的记录）。
+- ⚠️ 它与 `tool.result.appended` 的**到达次序**是「一条调用 → 它自己的结果」，
+  而那条结果**可能早于**它所属的模型消息——客户端按 `callId` 配对，别假定「消息先到」。
 
 **`usage.updated`**
 - `call`：本次调用的 `UsageCall`（见 §3.14 的字段）。
@@ -1240,9 +1253,16 @@ PUT  /sessions/{id}/plan      ← { operation, nodes?, parentId?, index?, ids? }
 - 已过 `deadlineAt` ⇒ 答案**不采用**，按超时处理。
 - ⚠️ **`remember` 认 `"args"` / `"tool"`（小写，线上契约），也兼容 `"Args"` / `"Tool"`
   （大小写不敏感）**。认不出的值按「只这一次」处理——**不**拒绝整条命令（旧行为，方向安全）。
-- `answers` 里的键除 `decision` / `arguments` 外，按**问题 id**（`items[].id`）取值；
+- **`answers` 里的键除 `decision` / `reason` / `arguments` / `remark` 外，按**问题 id**（`items[].id`）取值；
   `submit` 时允许缺项，缺的会被写成「未回答」，不会编一个空值。
-- 证据：`ControlServer.cs:1292-1319`；`CommandDispatcher.cs:1536-1752`。
+- **`answers.remark` 是附言**（2026-11-13 加，可选）：用户在卡上写的那段自由文本。
+  空 / 全空白 ⇒ **等同于没给**（客户端应当让这个键根本不出现）。核心把它拼成
+  「（用户附言：…）」交给模型：提问卡排在答复正文最后一行；授权**批准**时附在
+  被批准那条调用的**结果内容末尾**；拒绝时跟在拒绝那句话后面。
+  ⚠️ 超时 / 作废 ⇒ **不采用**（与其它 `answers` 同一条判据）。
+  ⚠️ 它与 `decision` 一样是**保留键**：模型若把某个问题 id 起成 `remark`，那一问会读不到答案
+  （落成「未回答」——可见的取舍）。
+- 证据：`ControlServer.cs:1292-1319`；`CommandDispatcher.cs:1536-1752`；`AskAnswers`（`Kernel/Ask.cs`）。
 
 ## 5. 客户端校验清单
 
@@ -1255,7 +1275,7 @@ PUT  /sessions/{id}/plan      ← { operation, nodes?, parentId?, index?, ids? }
 4. `session.archive` 的 `archived` 发**真布尔**，别发字符串。
 5. `session.configure` 的模型键是 **`modelId`**。
 6. `approval.respond` 的授权判决放在 `answers.decision`（`"allow"`），
-   `remember` 发 `"tool"` 就是工具级放开。
+   `remember` 发 `"tool"` 就是工具级放开；附言放 `answers.remark`（可选，**空就别发这个键**）。
 7. `GET /sessions` 的 `ask` 空值是 `{}`，判据是 `ask?.askId`；`title` 可能整个不存在。
    ⚠️ 归档会话**不在** `GET /sessions` 里（2026-10-29 起），归档那份单独读
    `GET /sessions/archived`；两边行形状逐字相同，`archivedAt` 未归档时那个键不存在。

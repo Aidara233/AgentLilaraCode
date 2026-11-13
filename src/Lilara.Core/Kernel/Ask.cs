@@ -190,6 +190,46 @@ public enum AskMemory
 }
 
 /// <summary>
+/// **答复里的固定键**（`approval.respond` 的 `answers`，`01` §3.8）。
+///
+/// <para>⚠️ <b>这些键是三处共用的约定</b>：头（`wwwroot/app.js`）发、核心
+/// （<c>CommandDispatcher</c> / <c>ToolExecutor</c>）读。各写一份字面量的话，拼法一漂
+/// 就是「发了、但没人读」——本仓栽过同形的（`remember` 的 `"tool"` / `"Tool"`：
+/// 头发小写、核心比 `nameof` 的大写 ⇒「记住这个工具」从没生效过，且全程无报错）。
+/// ⇒ <b>能共用的键在这里写一次</b>。</para>
+///
+/// <para>⚠️ 它们与问题 id 共处一个字典（`answers`）：一张卡上既有「按 id 归位」的答案，
+/// 也有「不是答案」的那几格（`decision` / `reason` / `arguments` / 本类的 `remark`）。
+/// 模型若把某个问题 id 起成这几个名字，那一问就会读不到答案——这是**已知的**取舍，
+/// 代价是可见的（落成「未回答」）。</para>
+/// </summary>
+public static class AskAnswers
+{
+    /// <summary>
+    /// **附言**：用户在卡上写的那段自由文本（可空）。
+    ///
+    /// <para>⚠️ <b>它不是任何一个问题的答案</b>：问题按 id 归位（<see cref="AskItem.Id"/>），
+    /// 而附言是「随这次答复一起说的一句话」——一张卡只有一个附言框，与问几个问题、
+    /// 什么形状都无关（用户在 2026-11-13 裁定：每张询问卡都常驻它，为空则不出现）。</para>
+    /// </summary>
+    public const string Remark = "remark";
+
+    /// <summary>
+    /// 附言原文。⚠️ <b>空白 = 没有</b>（⇒ <c>null</c>，调用方据此**不写那一行**）：
+    /// 「用户什么都没写」与「用户写了一片空白」对模型是同一件事。
+    /// </summary>
+    public static string? RemarkOf(IReadOnlyDictionary<string, string> answers) =>
+        answers.TryGetValue(Remark, out var r) && !string.IsNullOrWhiteSpace(r) ? r.Trim() : null;
+
+    /// <summary>
+    /// 附言在正文里的那一行。⚠️ <b>只此一处拼</b>：提问卡的答复（<c>Reply.Compose</c>）、
+    /// 授权卡批准时附在结果末尾、以及拒绝时的答复，用的都是**同一句**——
+    /// 三处各拼一份的话，「附言长什么样」会分叉，而模型读的是同一件事。
+    /// </summary>
+    public static string RemarkLine(string remark) => $"（用户附言：{remark}）";
+}
+
+/// <summary>
 /// **一次询问**。
 ///
 /// <para>⚠️ <b>它是一次<b>返回</b>，不是一次等待</b>：谁发起询问，谁就**中止**自己的

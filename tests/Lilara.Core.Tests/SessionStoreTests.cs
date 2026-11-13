@@ -237,6 +237,37 @@ public class SessionStoreTests : IDisposable
         Assert.Null(_store.TryReadSpec("p1", "bad"));
     }
 
+    /// <summary>
+    /// **带 spec 的那份列表必须与只给 id 的那份逐项一致**（2026-11 性能批）。
+    ///
+    /// <para>⚠️ 这条钉的是「两个形状不会漂」：`ListSessions` 现在**就是**它的投影，
+    /// 而热路径上的四个调用点（`/sessions` · `ChildrenOf` · `/claims` · 控制台列表）
+    /// 分别用这两份——顺序或过滤差一格，用户就会在列表里看到两份不同的「最近的会话」。</para>
+    /// </summary>
+    [Fact]
+    public void ListSessionSpecs_AgreesWithListSessions_AndCarriesTheSameSpecs()
+    {
+        void Make(string id, DateTimeOffset createdAt) =>
+            _store.WriteSpec("p1", Spec() with { SessionId = id, CreatedAt = createdAt });
+
+        Make("old", new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        Make("new", new DateTimeOffset(2026, 6, 1, 0, 0, 0, TimeSpan.Zero));
+        Make("mid", new DateTimeOffset(2026, 3, 1, 0, 0, 0, TimeSpan.Zero));
+
+        var badDir = _store.SessionDirectory("p1", "bad");
+        Directory.CreateDirectory(badDir);
+        File.WriteAllText(Path.Combine(badDir, "spec.json"), "{ this is not json");
+
+        var pairs = _store.ListSessionSpecs("p1");
+
+        Assert.Equal(_store.ListSessions("p1").ToArray(), pairs.Select(x => x.SessionId).ToArray());
+        Assert.Equal(new[] { "new", "mid", "old" }, pairs.Select(x => x.SessionId).ToArray());
+        // ⚠️ **交出来的 spec 就是那个会话的**（不是隔壁那份）：id 与 spec 内的 sessionId 必须逐项相同。
+        Assert.All(pairs, x => Assert.Equal(x.SessionId, x.Spec.SessionId));
+        // 读不出来的照旧跳过（与 `ListSessions` 同一条容错）。
+        Assert.DoesNotContain(pairs, x => x.SessionId == "bad");
+    }
+
     // ---- 销毁面要用的四条（提上来的项目枚举 + 存在性 + 删除 + 按 id 找） ----
 
     // 「存在性」≠「spec.json 读得出来」。损坏的 spec 让 TryReadSpec 返回 null，

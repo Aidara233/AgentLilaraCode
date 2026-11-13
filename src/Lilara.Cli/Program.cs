@@ -125,6 +125,11 @@ if (host.RecoveredFromACrash)
 File.WriteAllText(heartbeatFile, "");   // ⚠️ 必须在**读**过之后才建
 
 using var heartbeat = new CancellationTokenSource();
+
+// ⚠️ **空闲会话卸载**（2026-11 性能批）：与询问到期**同一趟**跑（都是「每 20 秒一圈的维护」）。
+// 阈值由环境变量给（`IdleUnload` 一处解析），0 = 关闭。
+var idleUnload = Lilara.Core.Hosting.IdleUnload.Resolve();
+
 var heartbeatTask = Task.Run(async () =>
 {
     while (!heartbeat.Token.IsCancellationRequested)
@@ -136,6 +141,14 @@ var heartbeatTask = Task.Run(async () =>
         //（死了之后所有挂着的询问就永远没人收了，而**没有任何东西会告诉你**）。
         try { dispatcher.SweepExpiredAsks(); }
         catch (Exception ex) { Console.Error.WriteLine($"（心跳那一趟出错了：{ex.Message}）"); }
+
+        // ⚠️ 两件事分开 try：询问到期那条路坏了，卸载不该跟着一起停
+        //（它坏掉的样子是**静默的**：内存只涨不落，而没有任何东西会报错）。
+        if (idleUnload > TimeSpan.Zero)
+        {
+            try { dispatcher.SweepIdleSessions(idleUnload); }
+            catch (Exception ex) { Console.Error.WriteLine($"（空闲卸载那一趟出错了：{ex.Message}）"); }
+        }
     }
 }, heartbeat.Token);
 
@@ -166,6 +179,9 @@ try
 {
     api = await controlServer.StartAsync(CancellationToken.None);
     Console.WriteLine($"  控制面 {controlServer.Url}（{BindAddressResolver.Describe(bind.Source)}）");
+    // ⚠️ 这一行**必须印**：卸载是后台动作，用户能看见它的唯一地方就是这道横幅
+    //（否则「我设了 LILARA_IDLE_UNLOAD_MINUTES=0」与「我忘了设」在日志里一模一样）。
+    Console.WriteLine($"  空闲会话 {IdleUnload.Describe(idleUnload)}（{IdleUnload.EnvVar}）");
     Console.WriteLine($"  WS 只接受来自 {allowedOrigin.Origin} 的页面（{AllowedOriginResolver.Describe(allowedOrigin.Source)}）——{OriginMatcher.Describe(allowedOrigin.Origin)}。");
     Console.WriteLine($"  访问 token {authToken}");
     Console.WriteLine(authEnforced

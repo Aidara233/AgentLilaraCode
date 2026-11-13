@@ -189,6 +189,39 @@ public class ControlServerTests : IAsyncLifetime
     private string Http(string path) => $"http://127.0.0.1:{_port}{path}";
     private string Ws() => $"ws://127.0.0.1:{_port}/ws";
 
+    /// <summary>
+    /// **快照端点带响应压缩**（2026-11 性能批）。
+    ///
+    /// <para>⚠️ 这条钉的是**接上线了没有**（中间件注册顺序错了、MIME 表没覆盖 `application/json`
+    /// 都会让它静默变成「能跑但不压」），不是压缩比的精度。⚠️ 客户端不自动解压
+    /// （`HttpClient` 的默认 handler 没有 `AutomaticDecompression`），所以这里看得到原始那层。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Snapshots_AreCompressed_WhenTheClientAsksForIt()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, Http("/sessions"));
+        request.Headers.AcceptEncoding.ParseAdd("gzip");
+
+        using var response = await Client.SendAsync(request);
+        response.EnsureSuccessStatusCode();
+
+        Assert.Contains("gzip", response.Content.Headers.ContentEncoding);
+    }
+
+    /// <summary>
+    /// **客户端没要压缩时不许压**：那会把一份普通 JSON 变成一间「读得出、但要用 curl 的人
+    /// 读不出」的响应（`curl` 默认不发 `Accept-Encoding`）。
+    /// </summary>
+    [Fact]
+    public async Task Snapshots_StayPlain_WhenNoEncodingIsRequested()
+    {
+        using var response = await Client.GetAsync(Http("/sessions"));
+        response.EnsureSuccessStatusCode();
+
+        Assert.Empty(response.Content.Headers.ContentEncoding);
+    }
+
     private static readonly HttpClient Client = new() { Timeout = TimeSpan.FromSeconds(10) };
 
     // 默认对局域网开放（2026-11-05 用户裁定，原先是 127.0.0.1）。

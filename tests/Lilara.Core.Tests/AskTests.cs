@@ -841,6 +841,34 @@ public class AskTests : IDisposable
     }
 
     /// <summary>
+    /// **省略 `type` ⇒ 按普通的单选（`choice`）解析**（用户 2026-11-13 裁定）。
+    ///
+    /// <para>⚠️ <b>为什么这条值得钉</b>：`choice` 本来就是最朴素的形状（「确认」也只是它
+    /// 少一个选项，见 `AskShape`），而模型漏写 `type` 时，从前**整条询问变成一条错误结果**
+    /// ——它想说的其实是最朴素的那件事。⇒ 缺省值兜住「没说」，多选仍只看 `multi`。</para>
+    ///
+    /// <para>⚠️ 空白串与缺失**同一格**（模型偶尔发 `"type": ""` / `" "`）；
+    /// 而**不认识的** `type`（上面那条 theory 里的 `"nope"`）**照样拒绝**——
+    /// 把不认识的词读成 choice 是替模型猜。</para>
+    /// </summary>
+    [Theory]
+    [InlineData("""{"id":"q1","question":"用哪个布局？","options":["A","B"]}""")]
+    [InlineData("""{"id":"q1","question":"用哪个布局？","options":["A","B"],"type":""}""")]
+    [InlineData("""{"id":"q1","question":"用哪个布局？","options":["A","B"],"type":"   "}""")]
+    public async Task AskTool_MissingType_IsAnOrdinarySingleChoice(string question)
+    {
+        var outcome = await new AskTool().RunAsync(
+            new ToolCall("c1", "ask", $$"""{"questions":[{{question}}]}"""),
+            new SessionToolContext(_work, new BlobStore(_store.DataRoot)), CancellationToken.None);
+
+        Assert.NotNull(outcome.Ask);
+        var item = Assert.Single(outcome.Ask!.Items);
+        Assert.Equal(AskShape.Choice, item.Shape);
+        Assert.False(item.Multi);                       // ⚠️ 默认是**单选**
+        Assert.Equal(new[] { "A", "B" }, item.Options.Select(o => o.Value));
+    }
+
+    /// <summary>
     /// ⚠️ **参数写错时给一条正常结果，而不是一张空卡**：一张没有问题的卡会让用户
     /// 对着空白面板发呆，而模型**看不出自己写错了**。
     /// </summary>
@@ -848,6 +876,11 @@ public class AskTests : IDisposable
     [InlineData("not json")]
     [InlineData("""{"questions":[]}""")]
     [InlineData("""{"questions":[{"id":"q1","type":"nope","question":"x"}]}""")]
+    // ⚠️ **省略 `type` = 单选**（2026-11-13），所以它要 `options`；没有就给一句人话，
+    // 而**不是**一张空卡——这条与上面 `type:"nope"` 那一格是**两条不同的路**：
+    // 一个是「没说」，一个是「说了个不认识的」。
+    [InlineData("""{"questions":[{"id":"q1","question":"x"}]}""")]
+    [InlineData("""{"questions":[{"id":"q1","type":"  ","question":"x","options":[]}]}""")]
     [InlineData("""{"questions":[{"id":"q1","type":"text","question":"x"},{"id":"q1","type":"text","question":"y"}]}""")]
     public async Task AskTool_BadArguments_AreAResultNotAQuestion(string args)
     {
@@ -1109,6 +1142,89 @@ public class AskTests : IDisposable
         Assert.Equal(2, items[0].Options.Count);             // ⚠️ 选项在
     }
 
+    // ---- 附言（用户 2026-11-13 裁定）----
+    //
+    // ⚠️ **它是「随这次答复一起说的一句话」，不是任何一问的答案**：问题按 id 归位，
+    // 而附言走保留键 `remark`（`AskAnswers.Remark`）⇒ 三条路各钉一次：
+    // ① 提问卡的答复正文（`Reply.Compose`）② 授权卡批准（附在被批准调用的结果末尾）
+    // ③ 空 / 全空白 ⇒ **一个字都不出现**。
+
+    /// <summary>
+    /// **① 提问卡的答复正文**：附言排在最后一行；空 / 全空白时**没有那一行**。
+    /// ⚠️ 空与空白是同一件事——发一个空串过去会让模型读到一句空白的附言。
+    /// </summary>
+    [Fact]
+    public void Compose_AppendsTheRemarkAsTheLastLineAndOnlyWhenItIsNotEmpty()
+    {
+        static ToolExecutor.Reply ReplyWith(Dictionary<string, string> answers) =>
+            new(AskKind.Question, ["c1"], [AskItem.Choice("q1", "用哪个？", ["A", "B"])], answers);
+
+        var without = ReplyWith(new() { ["q1"] = "A" }).Compose();
+        Assert.Equal("q1: A", without);                       // ⚠️ 没写附言 ⇒ 逐字与从前一样
+
+        // 空白 ≠ 附言：键在、值没内容 ⇒ 不出现。
+        Assert.Equal("q1: A", ReplyWith(new() { ["q1"] = "A", [AskAnswers.Remark] = "   " }).Compose());
+
+        var with = ReplyWith(new() { ["q1"] = "A", [AskAnswers.Remark] = "别用 B" }).Compose();
+        Assert.Equal("q1: A\n（用户附言：别用 B）", with);      // ⚠️ 排在最后一行
+    }
+
+    /// <summary>
+    /// **② 授权卡批准**：附言附在**被批准那条调用的结果末尾**（不是新造一条结果——
+    /// 「一条 `tool_use` 对一条 `tool_result`」是结构性的）。
+    ///
+    /// <para>⚠️ <b>判据是落盘的那份内容</b>（模型下一次请求读的就是它）：
+    /// 断言「命令被受理」证明不了它送到了模型手上——`answers` 从 `<see cref="CoreCommand.ApprovalRespond"/>`
+    /// 到结果这条路上有好几格可以静默丢掉它。</para>
+    /// </summary>
+    [Fact]
+    public async Task Approved_WithARemark_DeliversItOnTheResultTheModelReads()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", """{"a":1}""")));
+        _adapter.Reply("好了。", "end_turn");
+
+        await StepperWith(_store, _adapter, [writer]).StepAsync(handle, "go", CancellationToken.None);
+        Assert.NotNull(handle.State.Ask);
+
+        var (dispatcher, _) = DispatcherFor(handle, writer);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ApprovalRespond(handle.SessionId, handle.State.Ask!.AskId, "submit",
+                new Dictionary<string, string> { ["decision"] = "allow", [AskAnswers.Remark] = "只改这一个文件" }),
+            "cmd-1", awaitCompletion: false, CancellationToken.None);
+
+        await WaitUntil(() => writer.Runs > 0);
+        await WaitUntil(() => TextOfCall(handle, "c1").Contains("用户附言"));
+
+        Assert.Contains("只改这一个文件", TextOfCall(handle, "c1"));
+        // ⚠️ 工具自己那句话还在（附言是**接在**结果后面，不是替掉它）。
+        Assert.Contains("写了", TextOfCall(handle, "c1"));
+    }
+
+    /// <summary>**② 的反面**：没写附言 ⇒ 结果逐字是工具自己的输出（不带任何多余的一行）。</summary>
+    [Fact]
+    public async Task Approved_WithoutARemark_LeavesTheResultUntouched()
+    {
+        var handle = NewSession();
+        var writer = new CountingWriter();
+        _adapter.ReplyWith(_ => Calls(("c1", "write_thing", """{"a":1}""")));
+        _adapter.Reply("好了。", "end_turn");
+
+        await StepperWith(_store, _adapter, [writer]).StepAsync(handle, "go", CancellationToken.None);
+
+        var (dispatcher, _) = DispatcherFor(handle, writer);
+        await dispatcher.DispatchAsync(
+            new CoreCommand.ApprovalRespond(handle.SessionId, handle.State.Ask!.AskId, "submit",
+                new Dictionary<string, string> { ["decision"] = "allow" }),
+            "cmd-1", awaitCompletion: false, CancellationToken.None);
+
+        await WaitUntil(() => writer.Runs > 0);
+        await WaitUntil(() => TextOfCall(handle, "c1").Length > 0);
+
+        Assert.Equal("写了", TextOfCall(handle, "c1"));
+    }
+
     // ---- 脚手架 ----
 
     /// <summary>
@@ -1134,4 +1250,11 @@ public class AskTests : IDisposable
 
         return string.Concat(last.Content.OfType<Block.TextBlock>().Select(b => b.Text));
     }
+
+    /// <summary>某一条调用的结果正文（拼所有文本块）。⚠️ 找不到时给空串——调用方自己 `WaitUntil`。</summary>
+    private string TextOfCall(SessionHandle handle, string callId) =>
+        string.Concat(_store.ReadTimeline(handle.ProjectKey, handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>()
+            .Where(r => string.Equals(r.CallId, callId, StringComparison.Ordinal))
+            .SelectMany(r => r.Content.OfType<Block.TextBlock>().Select(b => b.Text)));
 }

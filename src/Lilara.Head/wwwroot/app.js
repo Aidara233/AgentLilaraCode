@@ -337,11 +337,12 @@ function bootstrap() {
 }
 
 async function runBootstrap() {
-  // 轴表先拉：AXES 为空则右栏画不出任何控件。
-  await loadAxes();
-  await loadSchema();
-  await loadSessions();
-  await loadProviders();
+  // ⚠️ **四份快照一起拉**（2026-11 性能批）：它们互不依赖（各自只写自己那份状态、
+  // 只画自己那块面板），从前一条一条 await 是**四趟往返**——开了鉴权之后每趟还多一次
+  // CORS 预检 ⇒ 首屏白等。实测局域网里这就是几百毫秒。
+  // ⚠️ **失败的形状没变**：`Promise.all` 里任何一条 reject 就整段抛出去，与从前
+  // 「某一条 await 抛了」同一条路（上面的 `bootstrap()` 会清掉 `bootPromise` 让 onopen 重试）。
+  await Promise.all([loadAxes(), loadSchema(), loadSessions(), loadProviders()]);
   loadCoreFacts();                  // 底栏是自述，不阻塞引导 —— 失败了也只是底栏空着
 
   // ① 没有提供商就不能做别的（引导页挡住其余操作）
@@ -644,10 +645,16 @@ async function openSessionInner(id) {
   // ⚠️ 两条 fetch 必须**各自**带 catch：`session.delete` 会让它们 404，
   // 而 404 的 `.json()` 会**抛**。不接的话这个 async 函数变成一次未观测拒绝 ⇒
   // 页面停在「current 已经指向一个不存在的会话、时间线却被清空了」那个半截状态。
+  //
+  // ⚠️ **两份快照一起拉**（2026-11 性能批）：它们互不依赖，从前串行是两趟往返。
+  // ⚠️ 两者仍然**各自是完整的一次读取**：`Promise.all` 只是让它们并行飞出去，
+  // 任何一条失败都会走进同一个 catch（与从前逐条 await 的失败路径逐字相同）。
   let state, history;
   try {
-    state = await (await fetch(`${core}/sessions/${id}/state`)).json();
-    history = await (await fetch(`${core}/sessions/${id}/history?limit=50`)).json();
+    [state, history] = await Promise.all([
+      fetch(`${core}/sessions/${id}/state`).then((r) => r.json()),
+      fetch(`${core}/sessions/${id}/history?limit=50`).then((r) => r.json()),
+    ]);
   } catch (e) {
     if (gen !== epoch) return;
     // 没东西可画 ⇒ 退回「没选会话」，别留一个空壳。
@@ -3029,6 +3036,26 @@ function renderAsk(state) {
     inputs.set("__rememberTool", () => (cb.checked ? "tool" : null));
   }
 
+  // ---- 附言（用户裁定：每张询问卡常驻一个，空着就不发）----
+  //
+  // ⚠️ **它不是任何一问的答案**：答案按问题 id 归位，而附言是「随这次答复一起
+  // 说的一句话」⇒ 走保留键 `remark`（核心侧 `AskAnswers.Remark`），与 `decision` /
+  // `arguments` 同处 `answers`，而**不**去抢某个问题 id 的位置。
+  // ⚠️ **空着就不发**（见 `askButtons`）：核心那侧「空 = 没有」的判据是「键在不在」，
+  // 而发一个空串过去等于让模型读到一句空白的附言。
+  // ⚠️ 位置在按钮**之上**：用户是「先填、再点」，把它放在按钮后面会让人填完才发现。
+  const remarkWrap = document.createElement("label");
+  remarkWrap.className = "askfield";
+  const remarkLabel = document.createElement("span");
+  remarkLabel.textContent = "附言（可留空）——会随这次答复一起交给模型";
+  remarkWrap.appendChild(remarkLabel);
+  const remarkInput = document.createElement("textarea");
+  remarkInput.className = "asktext";
+  remarkInput.rows = 2;
+  remarkWrap.appendChild(remarkInput);
+  box.appendChild(remarkWrap);
+  inputs.set("__remark", () => remarkInput.value);
+
   box.appendChild(askButtons([
     // ⚠️ **`decision` 是必须的**（2026-10-11 修）。核心判「批没批」的唯一依据是
     // `answers.decision === "allow"`，而这里原先**一颗按钮都不发它** ⇒
@@ -3143,13 +3170,23 @@ function askButtons(specs, ask, inputs) {
 
     b.onclick = async () => {
       // 收集答案。⚠️ **`verbatim` 与 `form` 的取值函数返回对象**——摊平进 `answers`。
+      // ⚠️ 两个保留键不是答案：`__rememberTool` 走 `remember` 那一格，
+      // `__remark` 走 `answers.remark`（见下面）。混进答案里会让核心把它们当成问题 id。
       const answers = {};
       for (const [id, get] of inputs) {
-        if (id === "__rememberTool") continue;
+        if (id === "__rememberTool" || id === "__remark") continue;
         const v = get();
         if (v && typeof v === "object") Object.assign(answers, v);
         else if (typeof v === "string" && v.length > 0) answers[id] = v;
       }
+
+      // ⚠️ **附言：非空才发**（用户裁定）。空串 / 全空白 ⇒ **键根本不出现**——
+      // 核心那侧判「有没有附言」看的就是「键在不在」，而不是「值是不是空」。
+      // ⚠️ 键名 `remark` 与核心的 `AskAnswers.Remark` **必须同一拼法**：
+      // 头写一套、核心读一套的话，表现是「用户填了、模型没收到」，**且不报错**
+      // （本仓在 `remember` 上栽过同形的：`"tool"` vs `"Tool"`）。
+      const remark = inputs.has("__remark") ? String(inputs.get("__remark")() || "").trim() : "";
+      if (remark) answers.remark = remark;
 
       // ⚠️ **授权卡要有 `decision`**（2026-10-11 修）：核心只看这一个键。
       // ⚠️ 放在 `reason` **之前**塞——控制台也是这个次序，而 `reason` 是拒绝时

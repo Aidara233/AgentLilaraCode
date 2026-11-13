@@ -83,7 +83,10 @@ public sealed class CommandDispatcher(
             // ⚠️ **不保留**（同 `term.delta`）：它没有对应的记录，重连之后重放一条「正在跑」
             // 只会给一个早就结束的调用画上「执行中」。
             new WireEvent.ToolCallStarted(
-                handle.SessionId, handle.State.Turn + 1, call.CallId, call.Name, call.Arguments),
+                handle.SessionId, handle.State.Turn + 1, call.CallId, call.Name,
+                // ⚠️ **有界预览**（2026-11 性能批）：完整原文随步末那条模型消息的 `toolUse` 块
+                // 到达，这里再发一遍整份等于把一次 `write` 的正文传两次。
+                WireEvent.ToolCallStarted.PreviewOf(call.Arguments)),
             retained: false);
         stepper.OnToolResult = result => _bus.Publish(
             EventBus.SessionTopic(handle.SessionId),
@@ -257,28 +260,49 @@ public sealed class CommandDispatcher(
     /// **心跳那一趟收尾**（`01` §12.8 的第三条时机）。
     ///
     /// <para>⚠️ <b>它只做两件事，而且对没有断口的会话写零字节</b>
-    /// （`Recovery.BeforeStep` 在「没有痕迹 / 没有到期」时**立刻返回**）
-    /// ⇒ 一次扫描 = 每个已知会话一次 `history.jsonl` 读。</para>
+    /// （`Recovery.BeforeStep` 在「没有痕迹 / 没有到期」时**立刻返回**）。</para>
     ///
     /// <para>⚠️ <b>唯一一件必须在这里做的事是「询问到期」</b>：那是**唯一**一条
     /// 没有外部触发动的路（用户不理它、也没有别的客户端会碰那个会话）。
     /// 断裂那条不吃心跳——它下一次带输入 / `session.start` 时收得掉。</para>
+    ///
+    /// <para>⚠️ <b>2026-11 性能批：不再对每个会话读整份记录</b>。从前这里是
+    /// `foreach (Known()) { FindSession(扫全盘读 spec) → Activate → Recovery.BeforeStep(读整份 history) }`
+    /// ——而 <c>hasNewInput: false</c> 时 <see cref="Session.Recovery.BeforeStep"/> 的 ① 那一支
+    /// **根本不可能成立**（它的条件里就写着 `hasNewInput`），所以整份记录的读取只可能为 ②
+    /// 服务，而 ② 只认「`Status == WaitingForInput` 且 `DeadlineAt` 已过」。
+    /// ⇒ 现在先看 `state.json` 里那两格，不满足就**一个字节的记录都不读**；
+    /// 遍历也改成走激活表（它自带 `ProjectKey`，不必再扫盘找会话）。
+    /// 200 个会话 × 20 秒一趟的实测代价从「每趟 200 次全史解析」降到「每趟 200 次
+    /// `state.json` 读」。</para>
     ///
     /// <para>⚠️ <b>失败只吞不掉</b>：一条会话收尾失败不该让整轮扫描停掉
     /// （那会让排在它后面的会话永远收不了）。</para>
     /// </summary>
     public void SweepExpiredAsks()
     {
-        foreach (var sessionId in _host.Live.Known())
+        var now = Kernel.CoreClock.Now();
+
+        foreach (var handle in _host.Activated.ToList())
         {
+            var sessionId = handle.SessionId;
+
             // ⚠️ **先看「它在不在跑」**：在跑的会话自己会收（它下一步开头就干这件事）
             // ⇒ 插进去只会和那一趟抢闸。
-            if (_host.Live.IsLive(sessionId)) continue;
-            if (_host.Store.FindSession(sessionId) is not { } found) continue;
+            if (_host.Live.IsLive(handle)) continue;
+            if (!MayHaveExpiredAsk(handle, now)) continue;
 
-            var handle = _host.Activate(found.ProjectKey, sessionId);
-            if (Session.Recovery.BeforeStep(
-                    _host.Store, handle, Kernel.CoreClock.Now(), hasNewInput: false) == 0) continue;
+            try
+            {
+                if (Session.Recovery.BeforeStep(_host.Store, handle, now, hasNewInput: false) == 0) continue;
+            }
+            catch (Exception ex) when (ex is IOException or System.Text.Json.JsonException
+                                          or Storage.FileFormatException or UnauthorizedAccessException)
+            {
+                // 一条会话的记录读不出来，不该让排在它后面的会话永远收不了。
+                // ⚠️ 与从前那条「失败只吞不掉」一致，只是把范围收在这一条上。
+                continue;
+            }
 
             // ⚠️ **收尾真的动了手才发事件**：头要重拉才看得见新的那条结果。
             _bus.Publish(EventBus.SessionTopic(sessionId),
@@ -291,8 +315,96 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
-    /// **收尾之后接着走**（`01` §12.8）——三条时机的第三个，也是唯一一个**同步**的。
+    /// **这个会话有没有可能有一件「只有心跳收得掉」的事**——心跳的**廉价前置判据**。
     ///
+    /// <para>⚠️ <b>`hasNewInput: false` 时只剩「询问到期」那一支能动手</b>
+    /// （见 <see cref="Session.Recovery.BeforeStep"/> 的 ① 那条闸与 ② 的条件）。
+    /// ⇒ 判据就是那两支的条件本身，且**只读内存里的状态**（已激活的 handle 有它）。</para>
+    ///
+    /// <para>⚠️ **不超时的那一档（`DeadlineAt == null`，也是默认值）可以直接排除**：
+    /// ② 的条件里就要求有截止时刻（`ask.DeadlineAt is { } … && now >= deadline`）
+    /// ⇒ 没有截止时刻的询问，心跳这一趟**永远做不了任何事**，读那份记录纯属白读。
+    /// （⚠️ 别把「不知道」往「有可能」那边判——那条路会让每一个挂着等回答、
+    /// 又没设超时的会话，每 20 秒被完整解析一次历史。）</para>
+    /// </summary>
+    internal static bool MayHaveExpiredAsk(SessionHandle handle, DateTimeOffset now)
+    {
+        if (handle.State.Status != Kernel.SessionStatus.WaitingForInput) return false;
+        return handle.State.Ask is { DeadlineAt: { } deadline } && now >= deadline;
+    }
+
+    /// <summary>
+    /// **空闲会话卸载**（2026-11 性能批）——「谁决定换出」那条缺口的第一个落点
+    /// （`02` §5 / §8 一直写着它是**待定**）。
+    ///
+    /// <para>⚠️ <b>它做的事只有一件：把长时间没人碰的会话摘出内存</b>
+    /// （激活表一项 + stepper 缓存一份 + 事件总线那条 topic 的补发缓冲）。
+    /// 磁盘一字不动 ⇒ 与 `session.deactivate` **同一件事**，只是没人下这条命令时由它代劳。
+    /// 摘掉的会话下一次被 `/state` / `send` / 任何命令碰到，会照常
+    /// <c>CoreHost.Activate</c> 从盘载入——这正是「激活即缓存」那条设计的另一半。</para>
+    ///
+    /// <para>⚠️ <b>五条闸，一条都不能少</b>（每一条都对应一种「摘了就会说假话」）：
+    /// <list type="number">
+    ///   <item><b>有东西在动</b>（`Live.IsLive`：正在跑 / 队列非空 / 答复槽有东西）⇒ 不摘。
+    ///   摘了会丢队列里那几句还没落盘的话。</item>
+    ///   <item><b>挂着等回答</b>（`State.Ask != null`）⇒ 不摘。内存那份
+    ///   `AwaitingInput` 里带着 `Remember` 档位，摘了之后同一批答案会被当成「第一次问」——
+    ///   用户选了「记住这个工具」而它被悄悄忘掉。</item>
+    ///   <item><b>拿不到会话闸</b> ⇒ 不摘（那一刻有人正拿着它：新的一步正要开始）。</item>
+    ///   <item><b>闸内复查</b>上列三项——从看它到拿到闸之间，可能刚有一句话进来。</item>
+    ///   <item><b>真的空闲够久</b>（`Live.IsIdleSince`）⇒ 不摘刚活动过的。</item>
+    /// </list></para>
+    ///
+    /// <para>⚠️ <b>残余竞态如实写在这里</b>：`Start` 是「先 `TryEnterStep`、再等闸」，
+    /// 所以在最后那次复查与 `Deactivate` 之间仍有一瞬：一句话刚入队、标志刚翻起来，
+    /// 而我们已经把它摘掉了。**后果不是丢数据**——那一趟推进握着 handle 引用，
+    /// 照样跑完、照样落盘；头那边只是可能在这一步里把状态看成盘上的 `Idle`
+    /// （因为 `Running` 只在内存），下一步的快照就恢复了。要彻底堵住它得让
+    /// 「摘除」与「起一步」共用同一把标志，而那会把一次纯粹的内存维护塞进步的关键路径上
+    /// ——代价比这一瞬大。</para>
+    ///
+    /// <para>⚠️ **判据是「多久没人碰」而不是「多久没跑」**：活动时刻由 `Touch` / `Mark` /
+    /// `Clear` 更新（`LiveSessions` 一处），所以「刚跑完一步」的会话不算空闲；而
+    /// 「只被 `/state` 看了一眼」**不算活动**（`TryGetActivated` 刻意不打点）——
+    /// 那头每打开一次会话就会把所有被扫到的会话续命十分钟，等于没有卸载。</para>
+    /// </summary>
+    /// <param name="idle">空闲阈值。<see cref="TimeSpan.Zero"/> ⇒ 把所有「此刻没有东西在动、
+    /// 也没挂着询问」的会话都摘掉（测试用；生产由 <see cref="IdleUnload.Resolve"/> 给）。</param>
+    /// <returns>摘掉了几个（给启动日志 / 测试用）。</returns>
+    public int SweepIdleSessions(TimeSpan idle)
+    {
+        var now = Environment.TickCount64;
+        var unloaded = 0;
+
+        foreach (var handle in _host.Activated.ToList())
+        {
+            var sessionId = handle.SessionId;
+
+            if (_host.Live.IsLive(handle)) continue;
+            if (handle.State.Ask is not null) continue;
+            if (!_host.Live.IsIdleSince(sessionId, now, idle)) continue;
+
+            var gate = _host.GateFor(sessionId);
+            if (!gate.Wait(0)) continue;
+            try
+            {
+                // ⚠️ **闸内复查**（见 ⑤ 的注释）：判据必须与动作在同一个临界区里，
+                // 否则「刚发来一句话」与「摘掉」可以交错。
+                if (!_host.TryGetActivated(sessionId, out var live) || !ReferenceEquals(live, handle)) continue;
+                if (_host.Live.IsLive(live)) continue;
+                if (live.State.Ask is not null) continue;
+                if (!_host.Live.IsIdleSince(sessionId, now, idle)) continue;
+
+                UnloadFromMemory(live);
+                unloaded++;
+            }
+            finally { gate.Release(); }
+        }
+
+        return unloaded;
+    }
+
+
     /// <para>⚠️ <b>它复用的就是推进器自己那段收尾</b>（`Stepper.StepAsync` 开头那几行），
     /// 所以这里不需要知道「欠了哪一条」——`PendingIntent` 会告诉它。</para>
     /// </summary>
@@ -2776,17 +2888,40 @@ public sealed class CommandDispatcher(
         if (IsRunning(handle))
             return Reject(id, RunningRefusal(c.SessionId));
 
+        UnloadFromMemory(handle);
 
-        _host.Deactivate(c.SessionId);
-        // ⚠️ 只丢**这一个**会话的 stepper——它下次被激活时 `StepperFor` 会重新解析。
-        // 不丢的话缓存里那把还握着旧 provider 的 key/端点（同 `session.configure` 的理由）。
-        _host.ForgetStepper(c.SessionId);
+        return new DispatchResult(new Ack.Accepted { CommandId = id });
+    }
 
-        // 会话还在（磁盘上完好、还能再激活）⇒ 两条流都发，与控制台/头各自的订阅面无关。
+    /// <summary>
+    /// **把一个会话摘出内存**——`session.deactivate` 与空闲卸载**共用这一处**。
+    ///
+    /// <para>⚠️ <b>为什么必须是一处</b>：这一步有四件事，少一件就是本仓反复栽的那种「看着摘了、
+    /// 其实没摘干净」——
+    /// ① 激活表那一项（`Deactivate`，它顺手撤掉活跃性凭证）；
+    /// ② **stepper 缓存**（那把适配器握着旧 provider 的 key 与端点，而且它是一份没人再用的大对象）；
+    /// ③ **事件总线那条 topic 的补发缓冲**（512 条保留事件，里面带消息块正文
+    /// ——不释放的话，摘掉会话之后内存几乎没回来）；
+    /// ④ `session.deactivated` 事件（会话流 + 项目流：别的客户端——控制台——看得见这件事，
+    /// 而头的界面不显示它）。</para>
+    ///
+    /// <para>⚠️ **事件在释放 topic 之前发**：反过来的话，这条 `Publish` 会把刚释放的 topic
+    /// 又造出来（`StateOf` 是惰性创建），白释放一次。而 `ReleaseTopic` 自己会在
+    /// 「还有订阅者」时什么都不做——那时缓冲必须留着，否则那个客户端的 `since` 游标会静默少一段。</para>
+    ///
+    /// <para>⚠️ **调用方必须先确保没有东西在动**（`IsRunning` / 队列 / 答复槽 / 挂着询问）：
+    /// 这个函数不判那些，它只负责「摘干净」。两条调用点的判据见
+    /// <see cref="HandleSessionDeactivate"/> 与 <see cref="SweepIdleSessions"/>。</para>
+    /// </summary>
+    private void UnloadFromMemory(SessionHandle handle)
+    {
+        _host.Deactivate(handle.SessionId);
+        _host.ForgetStepper(handle.SessionId);
+
         PublishDestruction(handle.ProjectKey, handle.SessionId,
             new WireEvent.SessionDeactivated(handle.SessionId, handle.ProjectKey), toSessionTopic: true);
 
-        return new DispatchResult(new Ack.Accepted { CommandId = id });
+        _bus.ReleaseTopic(EventBus.SessionTopic(handle.SessionId));
     }
 
     /// <summary>
@@ -3336,7 +3471,10 @@ public sealed class CommandDispatcher(
         {
             // ⚠️ **批准走不到这里**（它在上面那条直接执行的路出去了）⇒ 只剩「拒」。
             _ = handle;
-            return ("用户拒绝了这次调用。" + Reason(c), null);
+            // ⚠️ **拒绝时那句附言也照送**（用户 2026-11-13 裁定附言框常驻每张询问卡）：
+            // 用户在卡上写的话对「为什么拒」是有用的一手信息，而拒绝这条路上
+            // **本来就没有别的地方**能把它交出去（`reason` 是另一格、来自单独的弹窗）。
+            return ("用户拒绝了这次调用。" + Reason(c) + RemarkOf(c), null);
         }
 
         // ---- 问意见：答案就是内容 ----
@@ -3355,8 +3493,9 @@ public sealed class CommandDispatcher(
             // ⚠️ 解不出来才认输：要么是**重启前内存那半丢了且盘上也没有**
             //（闸门那条询问没有工具参数），要么是模型的参数形状坏了。
             // **如实说**，不编答案——编一个空值比这坏得多（同 §3.6 ①之二）。
+            // ⚠️ 附言照样交出去：它是用户**亲口说的一句话**，与「问题解不解得出」无关。
             return ("用户回答了，但这次询问的问题没能取回来 ⇒ 这次答复对不上任何一项。"
-                  + "请重新问一次。", null);
+                  + "请重新问一次。" + RemarkOf(c), null);
         }
 
         var lines = new List<string>();
@@ -3379,8 +3518,22 @@ public sealed class CommandDispatcher(
                     + "它们没有执行——请重新发起。）");
         }
 
-        return (string.Join("\n", lines), null);
+        return (string.Join("\n", lines) + RemarkOf(c), null);
     }
+
+    /// <summary>
+    /// **用户那句附言**（用户 2026-11-13 裁定：每张询问卡常驻附言框，非空才交给模型）。
+    ///
+    /// <para>⚠️ 空 ⇒ <c>""</c>（**不出现**）；非空 ⇒ **另起一行**的
+    /// <see cref="AskAnswers.RemarkLine"/>。另起一行是必须的：它会接在既有句子后面，
+    /// 直接粘上去就成了那句理由的一部分。</para>
+    ///
+    /// <para>⚠️ 拼法只有一处（<see cref="AskAnswers.RemarkLine"/>）——提问卡的答复正文
+    /// 走 <c>ToolExecutor.Reply.Compose</c>，授权批准走 <c>ToolExecutor.WithRemark</c>，
+    /// 拒绝 / 兜底走这里；三处各拼一份的话，「附言长什么样」会分叉。</para>
+    /// </summary>
+    private static string RemarkOf(CoreCommand.ApprovalRespond c) =>
+        AskAnswers.RemarkOf(c.Answers) is { } remark ? "\n" + AskAnswers.RemarkLine(remark) : "";
 
     /// <summary>拒绝时带上用户给的理由（`01` §3.8：拒绝理由比「档位不允许」有用得多）。</summary>
     private static string Reason(CoreCommand.ApprovalRespond c) =>

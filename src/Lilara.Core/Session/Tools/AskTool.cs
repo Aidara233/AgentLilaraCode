@@ -36,7 +36,8 @@ public sealed class AskTool : ITool
         "向用户提问，然后**停下来等他回答**。可以一次问多个问题，它们会显示在同一张卡上。"
         + "用户答完之后，答案会作为这次调用的结果回到你手里。"
         + "适合：需要用户做选择、需要只有他知道的信息、或者一个动作要不要做。"
-        + "⚠️ 不要用它问「你还好吗」这类寒暄——每次提问都会打断用户。";
+        + "⚠️ 不要用它问「你还好吗」这类寒暄——每次提问都会打断用户。"
+        + "每个问题省略 `type` 时按 `choice`（单选）解析，那时必须给 `options`。";
 
     public string ParametersSchemaJson => """
         {
@@ -59,7 +60,7 @@ public sealed class AskTool : ITool
                   "type": {
                     "type": "string",
                     "enum": ["choice", "text", "form"],
-                    "description": "choice = 从选项里挑；text = 自由输入；form = 一组字段。"
+                    "description": "choice = 从选项里挑；text = 自由输入；form = 一组字段。⚠️ 省略 = choice（此时 options 必给）。"
                   },
                   "options": {
                     "type": "array",
@@ -84,7 +85,7 @@ public sealed class AskTool : ITool
                     }
                   }
                 },
-                "required": ["id", "question", "type"]
+                "required": ["id", "question"]
               }
             }
           },
@@ -247,7 +248,10 @@ public sealed class AskTool : ITool
 
                 var id = Str(q, "id");
                 var question = Str(q, "question");
+                // ⚠️ **空白串 = 没说**（模型偶尔发 `"type": ""` 或 `" "`）——
+                // 归一成 `null` 之后，下面只有一个「缺省」的判据。
                 var type = Str(q, "type");
+                if (string.IsNullOrWhiteSpace(type)) type = null;
 
                 if (string.IsNullOrWhiteSpace(id))
                     return ([], "每个问题都要有 `id`（回答靠它配对）。");
@@ -262,6 +266,17 @@ public sealed class AskTool : ITool
 
                 var item = type switch
                 {
+                    // ⚠️ **省略 `type` ⇒ 普通的单选**（用户 2026-11-13 裁定）。
+                    //
+                    // <para>形状上 `choice` 本来就是「最朴素的那个」：一个问句 + 几个选项
+                    // （「确认」也只是它的两个选项，见 `AskShape`）。而模型漏写 `type`
+                    // 曾经让**整条询问变成一条错误结果**——它本来想说的是最朴素的那件事。
+                    // ⇒ `null` 与空白串都按 `choice` 解析（`multi` 仍只看那个格子，默认单选）。</para>
+                    //
+                    // <para>⚠️ **不认识的名字仍然拒绝**：把 `type:"nope"` 读成 choice 是
+                    // 「替模型猜」，而它写的那个词可能与「单选」差得很远（`01` §3.6 ①之二
+                    // 那条「不编一条假信息」）。默认只兜「没说」这一格。</para>
+                    null => ChoiceOf(q, id, question),
                     "choice" => ChoiceOf(q, id, question),
                     "text" => AskItem.Text(id, question),
                     "form" => FormOf(q, id, question),
@@ -269,7 +284,14 @@ public sealed class AskTool : ITool
                 };
 
                 if (item is null)
-                    return ([], $"问题 '{id}' 的 `type` 是 '{type}'——只认 choice / text / form。");
+                {
+                    return ([], type is null
+                        // ⚠️ 说清**默认值**，否则模型只看到「没有 options」，看不出
+                        // 「我省了 type ⇒ 于是它按 choice 要 options」这条因果。
+                        ? $"问题 '{id}' 没写 `type`（省略 = 单选 choice），所以它必须有 `options` 数组；"
+                        + "要么给它选项，要么把 `type` 写成 text / form。"
+                        : $"问题 '{id}' 的 `type` 是 '{type}'——只认 choice / text / form。");
+                }
 
                 items.Add(item);
             }

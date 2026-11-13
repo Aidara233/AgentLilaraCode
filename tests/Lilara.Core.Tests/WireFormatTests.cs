@@ -263,6 +263,39 @@ public class WireFormatTests
         Assert.Equal("""{"command":"ls"}""", doc.RootElement.GetProperty("arguments").GetString());
     }
 
+    // ⚠️ **参数预览的边界**（2026-11 性能批）：这条事件只是「调用开始跑了」的瞬时提示，
+    // 而完整参数还会随步末的 `message.appended` 再发一次 ⇒ 这里必须有界。
+    // ⚠️ 但**短参数必须逐字不变**：那是绝大多数调用，任何改动都会让头上显示的东西变样。
+    [Fact]
+    public void ToolCallStarted_Preview_KeepsShortArgumentsVerbatim_AndBoundsLongOnes()
+    {
+        var shortArgs = """{"command":"ls"}""";
+        Assert.Equal(shortArgs, WireEvent.ToolCallStarted.PreviewOf(shortArgs));
+
+        var longArgs = new string('x', WireEvent.ToolCallStarted.MaxArgumentsPreviewChars * 2);
+        var preview = WireEvent.ToolCallStarted.PreviewOf(longArgs);
+
+        Assert.StartsWith(new string('x', WireEvent.ToolCallStarted.MaxArgumentsPreviewChars), preview);
+        Assert.EndsWith(WireEvent.ToolCallStarted.PreviewSuffix, preview);
+        // ⚠️ 上界不是「差不多」：它得真的能被一条注释说成「最多这么多」。
+        Assert.Equal(
+            WireEvent.ToolCallStarted.MaxArgumentsPreviewChars + WireEvent.ToolCallStarted.PreviewSuffix.Length,
+            preview.Length);
+    }
+
+    // ⚠️ 代理对被砍开会得到半个字符（页面上是替换符）⇒ 退一格。
+    [Fact]
+    public void ToolCallStarted_Preview_NeverSplitsASurrogatePair()
+    {
+        var head = new string('x', WireEvent.ToolCallStarted.MaxArgumentsPreviewChars - 1);
+        var preview = WireEvent.ToolCallStarted.PreviewOf(head + "😀" + new string('y', 100));
+
+        Assert.DoesNotContain('\uFFFD', preview);
+        Assert.StartsWith(head, preview);
+        // 那个表情装不下 ⇒ 整个不进去（而不是留下高代理）。
+        Assert.DoesNotContain("😀", preview);
+    }
+
     // ⚠️ 重试上报的**载荷形状**（2026-10-21）：头按字段名取值（`p.attempt` / `p.maxAttempts` /
     // `p.delayMs`），名字一漂头拿到的就是 `undefined`——而那个圆括号里写的仍是「重试 undefined/undefined」。
     [Fact]

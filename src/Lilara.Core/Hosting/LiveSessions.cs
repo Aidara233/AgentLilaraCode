@@ -26,8 +26,20 @@ public sealed class LiveSessions
 {
     // ⚠️ 判据是「有东西在动」，而那件事**只在内存里**（`Running` 从不落盘）
     // ⇒ 这个集合天然是进程内的，**不落盘**（`00` §7 判据 8：算得出来就不该持久化）。
-    private readonly Dictionary<string, int> _live = new(StringComparer.Ordinal);
+    //
+    // ⚠️ **从 2026-11 起每个条目还带一个「最后一次被碰的时刻」**（性能批）——
+    // 它是「空闲卸载」的判据（见 `IsIdleSince`）。两件事住在同一个字典里是刻意的：
+    // 它们问的是**同一个对象**（这个 id 在这个进程里的那一份），分两张表就要担心它们漂开
+    // （一张有条目、另一张没有时，「它算不算活着」就有了两个答案）。
+    private readonly Dictionary<string, Entry> _live = new(StringComparer.Ordinal);
     private readonly Lock _gate = new();
+
+    /// <summary>一条活跃性记录：凭证计数 + 最后一次活动时刻（`Environment.TickCount64`，单调）。</summary>
+    private sealed class Entry
+    {
+        public int Count;
+        public long LastActive;
+    }
 
     /// <summary>
     /// 这个会话现在有东西在动吗——**加上调用方手里那个把手自己的状态**。
@@ -40,7 +52,7 @@ public sealed class LiveSessions
     public bool IsLive(SessionHandle handle)
     {
         lock (_gate)
-            if (_live.TryGetValue(handle.SessionId, out var n) && n > 0) return true;
+            if (_live.TryGetValue(handle.SessionId, out var entry) && entry.Count > 0) return true;
 
         // ⚠️ `TakeResume` **不能在这里调**（它是取走即清的一次性交接槽）⇒ 换一个只读的问法。
         return handle.IsRunning
@@ -55,13 +67,18 @@ public sealed class LiveSessions
     /// </summary>
     public bool IsLive(string sessionId)
     {
-        lock (_gate) return _live.TryGetValue(sessionId, out var n) && n > 0;
+        lock (_gate) return _live.TryGetValue(sessionId, out var entry) && entry.Count > 0;
     }
 
     /// <summary>记下「这一趟推进起了」。⚠️ <b>必须与 <c>TryEnterStep()</c> 的返回同处一句</b>。</summary>
     public void Mark(string sessionId)
     {
-        lock (_gate) _live[sessionId] = _live.GetValueOrDefault(sessionId) + 1;
+        lock (_gate)
+        {
+            var entry = EntryOf(sessionId);
+            entry.Count++;
+            entry.LastActive = Environment.TickCount64;
+        }
     }
 
     /// <summary>
@@ -77,13 +94,18 @@ public sealed class LiveSessions
     public void Clear(string sessionId)
     {
         lock (_gate)
-            if (_live.TryGetValue(sessionId, out var n) && n > 0) _live[sessionId] = n - 1;
+            if (_live.TryGetValue(sessionId, out var entry))
+            {
+                if (entry.Count > 0) entry.Count--;
+                // 「这一趟跑完了」也是一次活动：它是这个会话在那个时刻真的动过的证据。
+                entry.LastActive = Environment.TickCount64;
+            }
     }
 
     /// <summary>此刻有东西在动的那些会话 id ——**一次一致性快照**（调用方按它遍历）。</summary>
     public IReadOnlyList<string> Snapshot()
     {
-        lock (_gate) return [.. _live.Where(kv => kv.Value > 0).Select(kv => kv.Key)];
+        lock (_gate) return [.. _live.Where(kv => kv.Value.Count > 0).Select(kv => kv.Key)];
     }
 
     /// <summary>
@@ -100,6 +122,12 @@ public sealed class LiveSessions
     }
 
     /// <summary>所有**曾经**进过推进的会话 id（含计数归零的那些）。见 <see cref="Clear"/> 那条代价。</summary>
+    /// <remarks>
+    /// ⚠️ **2026-11 性能批之后 `src/` 里没有调用点**（心跳那一趟改走激活表了，见
+    /// <see cref="Touch"/> 的注释）。保留它是因为它答的问题仍然是独立的
+    /// （「这次进程里碰过谁」，**包括已经不在激活表里的**），而调试 / 将来的诊断端点要的
+    /// 正是这个；⚠️ 但别拿它当「迭代维护」的入口——那会重新引入「为每个碰过的会话扫一次盘」。
+    /// </remarks>
     public IReadOnlyList<string> Known()
     {
         lock (_gate) return [.. _live.Keys];
@@ -109,16 +137,72 @@ public sealed class LiveSessions
     /// **这个会话被「碰过」了**——它进了内存（`Activate` / `Register`）。
     ///
     /// <para>⚠️ <b>与 <see cref="Mark"/> 的区别是「动没动」</b>：`Mark` 是「有一趟推进在飞」，
-    /// 而这个只是「它被载进来了」——两者都让这个 id 进 `Known()`（**心跳要遍历它**），
-    /// 但**只有 `Mark` 让 `IsLive` 答真**。</para>
+    /// 而这个只是「它被载进来了」——两者都让这个 id 有条目，但**只有 `Mark` 让 `IsLive` 答真**。</para>
     ///
-    /// <para>⚠️ **为什么心跳要遍历「被碰过」而不只是「在跑的」**：一个挂在
-    /// `WaitingForInput` 上的会话**没有任何东西在动**（那正是它挂着的定义），
-    /// 而它的询问**可能有截止时刻**（`01` §5「超时是盘面自证」）
-    /// ⇒ 不收尾的话它会**永久**停在那里（实测：过了 75 秒纹丝不动）。</para>
+    /// <para>⚠️ **它还负责记下「最后一次被碰的时刻」**（空闲卸载的输入，见 <see cref="IsIdleSince"/>）：
+    /// 一个会话被载入本身就是一次活动，否则「刚载入、还没跑过」的会话会立刻被判成空闲。</para>
+    ///
+    /// <para>⚠️ <b>2026-11 性能批之后，心跳不再遍历这张表</b>：它走激活表
+    /// （`CoreHost.Activated`，自带 `ProjectKey`，不必再扫盘找会话），而这本账在
+    /// 卸载时会 `Forget` 掉对应条目。见 <see cref="Known"/> 那条注释里剩下的用途。</para>
     /// </summary>
     public void Touch(string sessionId)
     {
-        lock (_gate) _ = _live.TryAdd(sessionId, 0);
+        lock (_gate)
+        {
+            _ = EntryOf(sessionId);
+        }
+    }
+
+    /// <summary>
+    /// **这个会话空闲够久了吗**——是 ⇒ 空闲卸载可以动手。
+    ///
+    /// <para>⚠️ <b>它与 <see cref="IsLive"/> 答的不是同一个问题，两者都要问</b>：
+    /// 那个说「有没有东西在替它往下走」（**此刻**），这个说「上一次有什么碰它是什么时候」
+    /// （**多久了**）。一个刚跑完一步、排队空了的会话是「不 live 但刚活动过」——
+    /// 那个必须留着（用户正要接着用）；而一个三步之前就没人理的会话才是该摘的。</para>
+    ///
+    /// <para>⚠️ <b>没有条目的 id 一律算空闲</b>：没有条目 = 这个进程没见过它活动
+    /// （或者它已经被摘掉了）。把「不知道」判成「忙」会让摘除永远不发生，
+    /// 而判成「闲」最多多摘一次——那件事的代价只是一次从盘载入。</para>
+    ///
+    /// <para>⚠️ <b>时钟用 `Environment.TickCount64`（单调）而不是墙上时间</b>：
+    /// 判的是「过了多久」，而墙上时间会被对时 / 夏令时往回拨——那会让「刚活动过」的会话
+    /// 突然被判成空闲。它与 `DeltaPump` 用的是同一个钟。</para>
+    /// </summary>
+    /// <param name="nowTicks">调用方取一次的当前刻度（`Environment.TickCount64`），
+    /// 让一次扫描里所有会话按**同一个时刻**比较。</param>
+    public bool IsIdleSince(string sessionId, long nowTicks, TimeSpan idle)
+    {
+        var idleMs = (long)idle.TotalMilliseconds;
+
+        lock (_gate)
+        {
+            if (!_live.TryGetValue(sessionId, out var entry)) return true;
+            if (entry.Count > 0) return false;   // 有东西在动 ⇒ 不空闲（凭证优先于时刻）
+            return nowTicks - entry.LastActive >= idleMs;
+        }
+    }
+
+    /// <summary>
+    /// **把这条记录的时刻往前拨**——只给测试用。
+    ///
+    /// <para>⚠️ 为什么需要它：空闲判据的唯一输入是真实流逝的时间，而一个单元测试
+    /// 不该 `Thread.Sleep(10 分钟)`。⚠️ 它刻意不从生产 API 上开一个「假时钟」口子
+    /// （那会让每个调用点都要想「传谁的时间」）：改的是**这一条数据的时刻**，
+    /// 判据本身一个字没变。</para>
+    /// </summary>
+    internal void BackdateForTest(string sessionId, TimeSpan ago)
+    {
+        lock (_gate)
+            if (_live.TryGetValue(sessionId, out var entry))
+                entry.LastActive = Environment.TickCount64 - (long)ago.TotalMilliseconds;
+    }
+
+    private Entry EntryOf(string sessionId)
+    {
+        if (!_live.TryGetValue(sessionId, out var entry))
+            _live[sessionId] = entry = new Entry { LastActive = Environment.TickCount64 };
+        return entry;
     }
 }

@@ -72,6 +72,21 @@ public sealed class SessionStore(string dataRoot)
         Directory.Exists(SessionDirectory(projectKey, sessionId));
 
     /// <summary>
+    /// 项目下的会话**目录名**（不读 spec）。判据同 <see cref="SessionExists"/>：**目录在就算在**
+    /// ——一份损坏的 `spec.json` 不该让那个会话从「存在性」这张表里消失。
+    ///
+    /// <para>⚠️ 它给的是「哪些 id 有目录」，**不是**「哪些会话读得出来」：需要 spec 的地方
+    /// 走 <see cref="ListSessionSpecs"/>（那份会跳过读不出来的）。两个问题、两条判据，
+    /// 别拿一个顶另一个。</para>
+    /// </summary>
+    public IReadOnlyList<string> ListSessionIdsOnDisk(string projectKey)
+    {
+        var dir = Path.Combine(ProjectsRoot, projectKey, "sessions");
+        if (!Directory.Exists(dir)) return [];
+        return [.. Directory.GetDirectories(dir).Select(d => Path.GetFileName(d)!).Where(x => x.Length > 0)];
+    }
+
+    /// <summary>
     /// 删掉整个会话目录（`spec.json` / `state.json` / `history.jsonl` 一起）。
     /// **不可逆**——`history.jsonl` 是**只追加永不重写**的，这一刀之后记录就没有了。
     ///
@@ -158,18 +173,37 @@ public sealed class SessionStore(string dataRoot)
     // 两个会话在同一刻度上出生**是可能的**（同一毫秒内连建两个、或时间源刻度粗）。
     // 少了这个 tiebreaker，并列的那些会**退回文件系统顺序**——正是上面那句注释要防的东西，
     // 只是从「全序未定义」缩小成了「并列时未定义」。判据一样：确定的顺序要**完整**才算确定。
-    public IReadOnlyList<string> ListSessions(string projectKey)
+    public IReadOnlyList<string> ListSessions(string projectKey) =>
+        [.. ListSessionSpecs(projectKey).Select(x => x.SessionId)];
+
+    /// <summary>
+    /// **一个项目下的会话，连 spec 一起**——`spec.json` 每个会话**只读一次**。
+    ///
+    /// <para>⚠️ <b>它是列表的唯一实现，`ListSessions` 只是它的投影</b>（2026-11 性能批）。
+    /// 在此之前，凡是要「列会话 + 还要 spec 的某一格」的调用点都是两步：先
+    /// <see cref="ListSessions"/>（它为了按 `CreatedAt` 排序，本来就要读一遍每个 spec）
+    /// 再对每个 id 调一次 <see cref="TryReadSpec"/> ⇒ <b>同一份文件读两遍</b>。
+    /// 而那些调用点恰好都在热路径上：`GET /sessions`（每个会话再读一次 `state.json`）、
+    /// `ChildrenOf`（挂在**每次** `/state` 上）、`GET /claims`。
+    /// 实测（200 个会话）：`/sessions` 与 `/state` 的耗时因此各多出约一半。</para>
+    ///
+    /// <para>⚠️ **判据（顺序）与 <see cref="ListSessions"/> 逐字相同**：`CreatedAt` 降序、
+    /// 同刻按 id 序数升序。调用方会取 `[0]` 当「最近的会话」，所以这里不是「顺手排一下」。</para>
+    /// </summary>
+    public IReadOnlyList<(string SessionId, SessionSpec Spec)> ListSessionSpecs(string projectKey)
     {
         var dir = Path.Combine(ProjectsRoot, projectKey, "sessions");
         if (!Directory.Exists(dir)) return [];
 
-        return Directory.GetDirectories(dir)
-            .Select(d => (Id: Path.GetFileName(d), Spec: TryReadSpec(projectKey, Path.GetFileName(d)!)))
-            .Where(x => x.Spec is not null)
-            .OrderByDescending(x => x.Spec!.CreatedAt)
-            .ThenBy(x => x.Id, StringComparer.Ordinal)
-            .Select(x => x.Id!)
-            .ToList();
+        return
+        [
+            .. Directory.GetDirectories(dir)
+                .Select(d => (Id: Path.GetFileName(d), Spec: TryReadSpec(projectKey, Path.GetFileName(d)!)))
+                .Where(x => x.Spec is not null)
+                .OrderByDescending(x => x.Spec!.CreatedAt)
+                .ThenBy(x => x.Id, StringComparer.Ordinal)
+                .Select(x => (SessionId: x.Id!, Spec: x.Spec!)),
+        ];
     }
 
     // 按 id 找会话：**只扫盘、不载入**。
@@ -299,9 +333,8 @@ public sealed class SessionStore(string dataRoot)
     /// </summary>
     public IReadOnlyList<(string ProjectKey, SessionSpec Spec)> ChildrenOf(string parentSessionId) =>
         [.. ListProjects()
-            .SelectMany(pk => ListSessions(pk)
-                .Select(sid => TryReadSpec(pk, sid))
-                .OfType<SessionSpec>()
+            .SelectMany(pk => ListSessionSpecs(pk)
+                .Select(x => x.Spec)
                 .Where(spec => spec.ArchivedAt is null
                                && string.Equals(spec.ParentSessionId, parentSessionId, StringComparison.Ordinal))
                 .Select(spec => (ProjectKey: spec.ProjectKey, Spec: spec)))

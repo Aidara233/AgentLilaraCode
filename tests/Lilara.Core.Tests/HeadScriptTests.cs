@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using Lilara.Core.Kernel;
 
 namespace Lilara.Core.Tests;
 
@@ -368,5 +369,38 @@ public sealed class HeadScriptTests
         // ④ 键盘：↑/↓ 选、回车补全、Esc 收起——这是「下拉」而不是「点按钮」的核心动作。
         foreach (var key in new[] { "ArrowDown", "ArrowUp", "Enter", "Escape" })
             Assert.Contains($"e.key === \"{key}\"", js, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// **询问卡上那个附言框：头发的键必须与核心读的键同一个拼法**（2026-11-13）。
+    ///
+    /// <para>⚠️ <b>为什么值得一条守卫</b>：这条链上是三个地方各写一份字面量——
+    /// 头的框（`__remark`）、头塞进 `answers` 的键、核心的 `AskAnswers.Remark`。
+    /// 前三者之一漂掉时的表现是「用户填了、模型一个字都没收到」，而**全程不报错**
+    /// ——本仓在 `remember` 上栽过一模一样的一次（`"tool"` vs `"Tool"`，
+    /// 详见 `09` §7 第 2 条）。</para>
+    ///
+    /// <para>⚠️ 判据是**从源码里解出那个键**再与常量比，不是断言「文件里有 `remark` 这个词」：
+    /// 后者在任何拼法下都绿（`answers.remarkX = remark` 也绿）。</para>
+    /// </summary>
+    [Fact]
+    public void AskCard_RemarkKey_MatchesTheOneTheCoreReads()
+    {
+        var js = AppJs();
+
+        // ① 框本身在（保留键那一格）。
+        Assert.Contains("inputs.set(\"__remark\"", js, StringComparison.Ordinal);
+
+        // ② 它**不是答案**：收答案那一圈必须跳过它（混进去会被核心当成问题 id）。
+        // ⚠️ 切的窗口是「从收答案开始、到取附言为止」——用 `}` 切不行（第一处 `}`
+        // 是 `{}` 自己的收尾，切出来正好把这一圈切掉）。
+        var collect = js[js.IndexOf("const answers = {};", StringComparison.Ordinal)..];
+        collect = collect[..collect.IndexOf("const remark", StringComparison.Ordinal)];
+        Assert.Contains("\"__remark\"", collect, StringComparison.Ordinal);
+
+        // ③ 非空才发，且键名与核心的常量同一拼法。
+        var m = Regex.Match(js, @"answers\.(?<key>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*remark\b");
+        Assert.True(m.Success, "app.js 里找不到「把附言塞进 answers」的那一行（`answers.<键> = remark`）。");
+        Assert.Equal(AskAnswers.Remark, m.Groups["key"].Value);
     }
 }
