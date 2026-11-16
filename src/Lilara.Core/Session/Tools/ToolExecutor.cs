@@ -101,6 +101,14 @@ public sealed class ToolExecutor(
     private readonly TimeSpan _callTimeout =
         callTimeout ?? TimeSpan.FromSeconds(ToolCallLimits.DefaultTimeoutSeconds);
 
+    /// <summary>
+    /// **一条调用抛了异常时落在结果里的那句话**（2026-11-13）。⚠️ 文案在
+    /// <see cref="Interruption.FailedText"/> 一处（与 `CutText` / `UnrunText` 同族）——
+    /// 这里只负责把「哪条调用、什么异常」装进去，不另写一套措辞。
+    /// </summary>
+    private static string ToolFailureText(Block.ToolUseBlock call, Exception ex) =>
+        Interruption.FailedText(call.Name, ex.Message);
+
     private static string PlanModeDenial(string tool) =>
         $"现在在规划模式：'{tool}' 会改本机文件，已被拦下。"
         + $"要动手请先调用 {PlanModeTool.NameOf}（mode=act）请求退出规划模式——那会让用户确认一次。"
@@ -254,8 +262,14 @@ public sealed class ToolExecutor(
         var asked = new HashSet<string>(StringComparer.Ordinal);
 
         // ---- 第二趟：收问。 ----
-        foreach (var plan in plans)
+        //
+        // ⚠️ **按序号走，不是 `foreach`**（2026-11-13）：下面那个预跑可能**抛异常**，
+        // 而处理它的方式是**把这一条换成一个 `Deny`**（一句人话跟着结果回给模型）。
+        // 用 `foreach` 就没有那个位置可写——而让它冒出去会**炸掉整步**：
+        // 模型那条含 `tool_use` 的消息与同批其它调用的结果一起消失（同第三趟那条注释）。
+        for (var i = 0; i < plans.Count; i++)
         {
+            var plan = plans[i];
             // 不存在的工具与硬拒：它们**不问**，理由在 `Says` 里。
             if (plan.Tool is null || plan.Verdict is Verdict.Deny) continue;
 
@@ -273,8 +287,27 @@ public sealed class ToolExecutor(
             // 跑它**没有副作用**——那正是它敢声明这个的前提（见 `ITool.AsksBeforeRunning`）。
             if (plan.Tool.AsksBeforeRunning)
             {
-                var outcome = await plan.Tool.RunAsync(
-                    new ToolCall(plan.Call.CallId, plan.Call.Name, plan.Call.Arguments), context, ct);
+                ToolOutcome outcome;
+                try
+                {
+                    outcome = await plan.Tool.RunAsync(
+                        new ToolCall(plan.Call.CallId, plan.Call.Name, plan.Call.Arguments), context, ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    // ⚠️ **用户打断照样原样冒出去**（整条链上认「打断」的判据就是这个类型）：
+                    // 这一趟发生在任何副作用之前，`Stepper` 那边还**没有**开始执行相位
+                    // ⇒ 记录里没有半批要救，抛出去是最诚实的结局（`RunStepAsync` 认它是中断）。
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // ⚠️ **预跑抛了 ⇒ 这条调用降级成「没有执行」**（`Deny` + 一句人话）：
+                    // 典型形状是参数解析失败（`ask` / `plan` 的 `RunAsync` 就是解析参数）。
+                    // 于是模型下一步拿到的是一条**说得清的结果**，而不是「整步没了」。
+                    plans[i] = new Plan(plan.Call, null, Verdict.Deny, ToolFailureText(plan.Call, ex));
+                    continue;
+                }
 
                 if (outcome.Ask is { } ask)
                 {
@@ -391,6 +424,32 @@ public sealed class ToolExecutor(
                 interrupted = true;
                 cut = ex as ToolInterruptedException;
                 break;
+            }
+            catch (Exception ex)
+            {
+                // ⚠️ **工具自己抛了异常 ⇒ 这条也是「内容」，不是「整步炸掉」**（2026-11-13，
+                // 用户裁定「就算发生报错也保留模型生成结果」）。
+                //
+                // <para>⚠️ <b>从前它从这里冒出去，后果比「少一条输出」大得多</b>：`Stepper` 的
+                // 工具相位**不在**任何 `try` 里 ⇒ 已经跑完的那几条结果、模型那条含 `tool_use`
+                // 的消息、以及**真的发生过的副作用**（可能已经写了文件）一起从记录里消失。
+                // 下一步的模型以为那一轮从未发生，于是重做一遍（重做一次 `write` / `rm`
+                // 不是没有代价的）。而 `01` §3.6 ① 那条配对要求也不谈判：缺一条结果
+                // 就等于下一条请求非法。</para>
+                //
+                // <para>⚠️ **与上面那条 OCE 分界是这个 `when`**：`ct` 被取消 = 用户在按停（那是
+                // 打断，整批收尾）；其余异常 = 这次调用失败了 ⇒ 一条结果、接着往下跑。
+                // ⚠️ **工具自己抛的 OCE**（与用户无关，比如它自己的超时）走这里 ⇒ 也是内容。
+                // 这正是 `ToolOutcome` 那条「失败也是结果，不是异常」在兜底层的实现。</para>
+                outcome = new ToolOutcome
+                {
+                    Content = [new Block.TextBlock(ToolFailureText(plan.Call, ex))],
+                    // ⚠️ 无指纹：它**没跑完**，说「世界没动过」是假信息（同超时那条）。
+                    Fingerprint = null,
+                    DependsOn = null,
+                    Framing = new ToolFraming(plan.Call.Name,
+                        [new ToolFramingField("error", ex.GetType().Name)]),
+                };
             }
             // ⚠️ **两个「工具够不着、但它必须说出来」的出口**（2026-10-24）：与 `Ask`
             // 同一条判据——工具没有 store 的手，落地在核心。⚠️ **只收真正执行过的那些**

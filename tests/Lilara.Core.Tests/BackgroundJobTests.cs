@@ -498,6 +498,54 @@ public sealed class BackgroundJobTests : IDisposable
     }
 
     [Fact]
+    public async Task JobOutput_WaitsForARunningJob_InsteadOfSayingItIsStillRunning()
+    {
+        if (!Locate(out var sh)) return;
+
+        // ⚠️ **这个标记只在进程跑到后半段时才出现**：`job_output` 紧接着启动就调，
+        // 那时它只写到 "started"，而结果里必须已经有 "finished-marker" ⇒ 它**等过**。
+        var job = _host.Start("s1", ShellRequest(sh,
+            "echo started; sleep 1; echo finished-marker")).Job!;
+
+        // 起完立刻读：那一刻它一定还在跑（起进程比 echo + sleep 1 快得多）。
+        Assert.Equal(BackgroundJobState.Running, _host.Find("s1", job.Id)!.State);
+
+        var outcome = await new JobOutputTool().RunAsync(
+            new ToolCall("c", JobOutputTool.NameOf, $$"""{"job":"{{job.Id}}"}"""),
+            NewContext(executable: sh), CancellationToken.None);
+
+        var text = Text(outcome);
+        Assert.Contains("finished-marker", text, StringComparison.Ordinal);
+        Assert.Contains("等到了", text, StringComparison.Ordinal);
+        Assert.Equal(BackgroundJobState.Exited, _host.Find("s1", job.Id)!.State);
+    }
+
+    [Fact]
+    public async Task JobOutput_PeekTrue_DoesNotWait()
+    {
+        if (!Locate(out var sh)) return;
+
+        var job = _host.Start("s1", ShellRequest(sh, "echo started; sleep 30")).Job!;
+        var clock = Stopwatch.StartNew();
+
+        var outcome = await new JobOutputTool().RunAsync(
+            new ToolCall("c", JobOutputTool.NameOf, $$"""{"job":"{{job.Id}}","peek":true}"""),
+            NewContext(executable: sh), CancellationToken.None);
+
+        clock.Stop();
+
+        Assert.Equal(BackgroundJobState.Running, _host.Find("s1", job.Id)!.State);
+        var text = Text(outcome);
+        Assert.Contains("peek", text, StringComparison.Ordinal);
+        Assert.Contains("还在跑", text, StringComparison.Ordinal);
+
+        // ⚠️ **只断言「远早于 sleep 30」**（同本文件那条纪律）：不钉精确耗时。
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(10), $"peek 不该等：{clock.Elapsed}");
+
+        _host.Kill("s1", job.Id, "测试收尾。");
+    }
+
+    [Fact]
     public async Task Finish_ReportsExactlyOnce_AfterOutputIsDrained()
     {
         Assert.True(Locate(out var sh));

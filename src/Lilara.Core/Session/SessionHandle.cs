@@ -180,6 +180,34 @@ public sealed record SessionHandle
     public void NoteInterrupt() => Interlocked.Increment(ref _interruptEpoch);
 
     /// <summary>
+    /// **连续失败了几个带半截的步**（2026-11-13）——「自动接续」的预算账。
+    ///
+    /// <para>⚠️ <b>为什么这笔账在内存里，而 <c>Turn</c> 在盘上</b>：它答的问题只属于
+    /// **这一次运行**——「刚才连着断了几次」。重启之后自动接续本来就不会接着跑
+    /// （那一步已经结束、记录已经落盘），于是这笔账**从零开始**才是对的。落盘还得为它动
+    /// `state.json` 的格式（`Json.FormatVersion` + 全部金样本），换不来任何东西。</para>
+    ///
+    /// <para>⚠️ <b>谁加、谁清</b>：<c>CommandDispatcher.RunStepAsync</c> 在
+    /// 「失败但有半截可留」那条路上 <see cref="NoteFailure"/>，在**成功的步**与
+    /// **用户新发的话**上 <see cref="ResetFailures"/>。⚠️ 只有一处判据
+    /// （<c>RetryPolicy</c> 那条纪律的同一条）：预算用完之前每一方都以为自己该管，
+    /// 那就会变成「谁都想接、谁都不停」。</para>
+    ///
+    /// <para>⚠️ <b>它<b>不</b>是重试计数</b>：同一件事在 <see cref="Protocol.RetryPolicy"/>
+    /// 里有一份（十次退避），那一份数的是**同一条请求被打了几次**；这一份数的是
+    /// **一步之后又起了几步**。⚠️ 两层各有各的预算，别合并——合并之后
+    /// 「吐过增量就不重试」那条判据会连带改掉自动接续的节奏。</para>
+    /// </summary>
+    private int _failures;
+
+    public int ConsecutiveFailures => Volatile.Read(ref _failures);
+
+    /// <summary>再记一次失败，返回**记完之后**的连击数（调用方拿它判预算）。</summary>
+    public int NoteFailure() => Interlocked.Increment(ref _failures);
+
+    public void ResetFailures() => Volatile.Write(ref _failures, 0);
+
+    /// <summary>
     /// **iterate 下「普通计划刚用完」的一次性提醒**（2026-10-26）。
     ///
     /// <para>⚠️ <b>不落盘</b>：它是一句「下一步才说得出的话」，不是状态。丢了最坏的结果是

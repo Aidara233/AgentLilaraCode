@@ -38,17 +38,14 @@ public sealed class WaitTool : ITool
         {
             if (context.Shell is not { Jobs: { } jobs, SessionId: { } sid })
                 return ToolText.Of("这个会话没有后台任务宿主。");
-            while (true)
-            {
-                ct.ThrowIfCancellationRequested();
-                var job = jobs.Find(sid, id);
-                if (job is null) return ToolText.Of($"本会话没有任务 {id}。");
-                if (job.State != BackgroundJobState.Running || clock.Elapsed >= limit)
-                    return Result(id, job.State, job.State != BackgroundJobState.Running,
-                        $"{job.Reason}\n" + (job.ExitCode is { } exit ? $"退出码 {exit}。\n" : "")
-                        + $"输出用 job_output(job=\"{id}\") 读取。");
-                await Task.Delay(100, ct);
-            }
+
+            // ⚠️ **循环只有一份**（`JobWait`，2026-11-13）：`job_output` 现在也要等同一个问题，
+            // 各写一遍的那天，两处对「终态是哪个」与「找不到怎么办」的判断会漂。
+            var job = await JobWait.UntilFinishedAsync(jobs, sid, id, limit, ct);
+            if (job is null) return ToolText.Of($"本会话没有任务 {id}。");
+            return Result(id, job.State, job.State != BackgroundJobState.Running,
+                $"{job.Reason}\n" + (job.ExitCode is { } exit ? $"退出码 {exit}。\n" : "")
+                + $"输出用 job_output(job=\"{id}\") 读取。");
         }
 
         if (context.Subagents is not { } scope || !scope.Children.Any(c => c.SessionId == id))

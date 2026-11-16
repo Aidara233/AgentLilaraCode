@@ -34,6 +34,51 @@ public sealed class CommandDispatcher(
     private readonly EventBus _bus = bus;
 
     /// <summary>
+    /// **一次失败之后最多自动接续几次**（2026-11-13，用户裁定「三次」）。
+    ///
+    /// <para>⚠️ <b>它数的是「又起了几步」，不是「同一条请求被打了几次」</b>——后者是
+    /// <see cref="Protocol.RetryPolicy.MaxRetries"/>（十次退避）。两层各有各的预算：
+    /// 那一层在上游抖动时把**同一条请求**重发；这一层在「模型说了半句话就断了」时
+    /// 让**下一步**去把那句话说完（历史变了，不是重发）。</para>
+    ///
+    /// <para>⚠️ <b>为什么必须有上限</b>：一个每次都「吐三个字就断」的上游会让这个循环
+    /// 无限烧钱、还让记录无限增长。三次是一条实测出来的分寸——一次抖动通常第一次就恢复了，
+    /// 而三次都接不上说明问题在上游，那时**如实报错**比继续花用户的钱更有用。</para>
+    /// <para>⚠️ <b>它只在「有半截可留」那条路上生效</b>（<c>StepOutcome.Failure</c>）：
+    /// 一条请求都没出结果的失败不进这个循环（`RetryPolicy` 已经试过十次，
+    /// 而这里再试是**同一个字节**的盲目重发）。</para>
+    /// </summary>
+    private const int MaxFailureContinuations = 3;
+
+    /// <summary>
+    /// **收尾动作失败不该把这一步判死**（2026-11-13，用户裁定「尽量报红错也继续」）。
+    ///
+    /// <para>⚠️ <b>它守的是「已经算完的活」</b>：`DeliverSubagents`（建子会话 / 转达 / 归档）
+    /// 与 `FlushQueuedInput`（把排队的插话补落盘）都跑在**一步已经成功之后**——
+    /// 它们抛出去，`RunStepAsync` 的兜底会把一次**本来跑成了**的步记成失败：
+    /// 用户看到一条红错、循环停下，而记录里那一步其实是完整的。⚠️ 更糟的是那一步的
+    /// `reply` 会被丢掉，于是「模型答完了」这件事在调用方看来等于没发生。</para>
+    ///
+    /// <para>⚠️ **代价如实说**：被吞掉的那一件事**真的没做成**（子会话没建出来 /
+    /// 排队的插话没落盘），而它现在只体现为一条 `error` 事件。⇒ 话里必须说清**哪一件事**
+    /// 失败了、以及**这一步本身没事**，否则用户会以为整步白跑。</para>
+    /// </summary>
+    private void SideEffect(SessionHandle handle, string what, Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception ex)
+        {
+            _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                new WireEvent.Error(handle.SessionId,
+                    $"{what}没做成：{ex.Message}"
+                    + "（这一步本身已经跑完、记录也已经落盘；受影响的那一项可以单独补一次。）"));
+        }
+    }
+
+    /// <summary>
     /// 增量攒批器（2026-11 流式批）。⚠️ **进程级一个**：它自己带定时器，
     /// 每步各造一个会让「谁在负责这一批」随步数变多而无从解释。
     /// </summary>
@@ -2009,6 +2054,11 @@ public sealed class CommandDispatcher(
     /// </summary>
     private void PrepareSend(SessionHandle handle, CoreCommand.SessionSend s)
     {
+        // ⚠️ **用户说了新的一句 ⇒ 自动接续的连击账清零**（2026-11-13）：那笔账说的是
+        // 「刚才连着断了几次」，而有了新的输入，预算就是新的一轮
+        // （否则上一次用完之后，这一句话只剩零次机会——而用户以为还有三次）。
+        handle.ResetFailures();
+
         // ⚠️ **撞上「正在等回答」⇒ 先顶替那次询问**（`01` §3.8 的 `Superseded`）。
         //
         // ⚠️ **不顶替的话，下一条请求会 400**，而**这次是实测的**（2026-10-08）：
@@ -2162,6 +2212,19 @@ public sealed class CommandDispatcher(
         // 而打断就是没有下一步。
         var interrupted = false;
 
+        // ⚠️ **这一趟是「失败但留住了半截」结束的**（2026-11-13，用户裁定「就算发生报错也
+        // 保留模型生成结果，然后自动接续而不是直接打断」）。非 null = 失败的那句原话。
+        //
+        // <para>⚠️ <b>它为什么必须与 `interrupted` 分开</b>：两条路都落了记录、都正常返回，
+        // 但调用方要做的**相反**——用户按停 ⇒ 不许再推；上游断了 ⇒ **要接着推**。
+        // 判据来自 `Stepper`（哪条 catch 走到的），这里只拿它做决定。</para>
+        var failure = (string?)null;
+
+        // ⚠️ **这一趟失败之后还接不接**——在 `try` 里算好（那里有 `interruptEpoch` 与
+        // 连击数），在 `finally` 之后用。⚠️ 别在尾部重算：那要再读一遍 `InterruptEpoch`，
+        // 而「用户在这条步期间按了停止」正是那个值能在这段时间里变的理由。
+        var continueAfterFailure = false;
+
         // ⚠️ **摘槽排在这里**（2026-10-12 打断批）——不是因为它必须早于下面那把闸
         // （**调用方已经拿过 `_step` 那把标志了**，所以这一趟本来就是独占的），
         // 而是因为它必须**早于**任何可能再放一次槽的路径。⚠️ 原先那两句挪到
@@ -2236,6 +2299,11 @@ public sealed class CommandDispatcher(
                             HistoryId = step.HistoryId,
                             Interrupted = step.Interrupted ? true : null,
                         });
+
+                // ⚠️ **失败那一路：认下来、算一笔账、决定接不接**（2026-11-13）。
+                // ⚠️ 它排在模型消息之后：头那边先看到「这半截已经进记录了」，再看到失败那句
+                // ——反过来会先亮一条红色告警、而屏幕上那半页字还没落成正式气泡。
+                failure = step.Failure;
             }
 
             // ⚠️ **挂起也要发事件**（`01` §3.8）：一条头收不到的问题 = 会话被**静默挂起**。
@@ -2269,7 +2337,9 @@ public sealed class CommandDispatcher(
             // 的任何字节（`SpawnChild` 写的都是**别的会话**）。
             // ⚠️ 次序在 `DeliverSubagents` 里（先建、后说）——同一步里既 spawn 又 tell 时，
             // 收件人必须是已经存在的那个。
-            DeliverSubagents(handle, step);
+            // ⚠️ **包在 `SideEffect` 里**（2026-11-13）：它跑在这一步已经成功之后，
+            // 抛出去会把「跑成了」记成「失败了」并把 `reply` 丢掉（见 `SideEffect` 的注释）。
+            SideEffect(handle, "兑现本步的派生 / 注入 / 归档", () => DeliverSubagents(handle, step));
 
             // ⚠️ **模型侧 `release` 摘掉的锁要告诉头**（2026-10-17）：摘锁只改 `claims.json`，
             // 而头右栏的「谁在动哪些文件」靠 `claim.released` 刷新——不发的话，
@@ -2330,11 +2400,34 @@ public sealed class CommandDispatcher(
 
             PublishStepEnd(handle, replyForLoop);
 
+            // ⚠️ **失败的一步也要说一句**（2026-11-13）：它不是抛出去的那种失败（记录已经落盘、
+            // 半截也留住了），但用户/头必须知道**这一步没说完，而为什么**。
+            // ⚠️ **预算在这里兑现，而且只在这里**：`NoteFailure` 的返回值同时决定「接不接」
+            // 与那句话怎么写——两处各算一次的话，头看到的次数会与真正发生的次数分叉。
+            if (failure is { } failureText)
+            {
+                var failures = handle.NoteFailure();
+                continueAfterFailure = failures <= MaxFailureContinuations
+                    && handle.InterruptEpoch == interruptEpoch;
+
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.Error(handle.SessionId, continueAfterFailure
+                        ? $"{failureText}（已自动接续第 {failures}/{MaxFailureContinuations} 次："
+                          + "那半截已经留在记录里，接着往下说。）"
+                        : $"{failureText}（连续 {failures} 次失败，自动接续的 {MaxFailureContinuations} 次"
+                          + "已经用完，先停在这里；那半截生成已经留在记录里，再发一句话我就接着来。）"));
+            }
+
             // ⚠️ **被打断的一步要自己说「我回到空闲了」**（2026-11-07）：正常步不发
             // `state.changed`（头据 `step.end` 自己收），而这一趟是**异常结局的正常返回**
             // ——不打这一枪，头会一直显示「正在生成」。（从前那条 OCE 路径本来就发它，
             // 现在只是换到这里发，语义不变。）
-            if (step.Interrupted)
+            // ⚠️ **自动接续那一趟不再额外补一枪**（2026-11-13）：下一步紧接着就要开始
+            // （`step.begin` 会把它顶回 Running），而 `step.end` 那一枪本来就带着
+            // `state(Idle)`（`PublishStepEnd` 照 `handle.State.Status` 发）⇒ 再补一条
+            // `state.changed(Idle)` 只是多一次「闲置」的闪动；`Phase(Idle)` 则会让相位在
+            // 两步之间白跳一格。
+            if (step.Interrupted && !continueAfterFailure)
             {
                 _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                     new WireEvent.StateChanged(handle.SessionId, SessionStatus.Idle, handle.State.Turn));
@@ -2355,7 +2448,10 @@ public sealed class CommandDispatcher(
             // ⚠️ **排队等这一步的插话在这里落盘**（2026-11-05）：这一步什么都没写，
             // 所以「接在记录末尾」正是它该在的位置。⚠️ 不补的话它会一直只活在内存里，
             // 而头上那条「排队中」回声永远等不到真事件（用户会以为没发出去）。
-            FlushQueuedInput(handle);
+            // ⚠️ **包起来**（2026-11-13）：这一步已经按「中断」收尾了，落盘再抛一次会让
+            // 下面那一枪 `state.changed(Idle)` 发不出去（头会一直显示「正在生成」），
+            // 而那条路是**中断唯一的出口**。
+            SideEffect(handle, "把排队等这一步的插话补落盘", () => FlushQueuedInput(handle));
 
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                             new WireEvent.StateChanged(handle.SessionId, SessionStatus.Idle, handle.State.Turn));
@@ -2373,19 +2469,70 @@ public sealed class CommandDispatcher(
             _deltas.Flush(handle.SessionId);
 
             // ⚠️ 排队的插话照样落盘（同中断那条）：这一步什么都没写，接在末尾就是对的。
-            FlushQueuedInput(handle);
+            // ⚠️ **包起来**（2026-11-13）：这一步已经失败了，落盘再抛一次会把下面那些收尾
+            // （`error` 事件、状态拨回、接续判断）整段跳过——而它们正是「别把会话弄成死局」
+            // 的全部内容。
+            SideEffect(handle, "把排队等这一步的插话补落盘", () => FlushQueuedInput(handle));
+
+            // ⚠️ **内存里的 `status` 可能还停在 `Running`**（2026-11-13）：`Stepper` 在步开始
+            // 时把它置成 Running，而**只有它的几条正常出口**才拨回 Idle。异常抛在
+            // 装配之后（工具相位 / 落盘 / 压缩）时没有那条出口 ⇒ 会话在内存里永远「在跑」
+            // （`session.state` 与 `LiveStatus` 都这么说），而没有任何东西在推它。
+            // ⚠️ 磁盘上本来就只写 Idle（`Running` 从不落盘），所以这一步只改内存。
+            // ⚠️ 它自己也可能失败（盘坏了就是这么失败的）⇒ 再包一层，别让收尾盖掉真正的原因。
+            if (handle.State.Status == SessionStatus.Running)
+            {
+                try
+                {
+                    handle.UpdateStateAndPersist(_host.Store, s => s with { Status = SessionStatus.Idle },
+                        diskStatus: SessionStatus.Idle);
+                }
+                catch
+                {
+                    // 盘已经不是这一步该解决的问题了：`error` 事件里那句话才是原因。
+                    handle.UpdateState(s => s with { Status = SessionStatus.Idle });
+                }
+            }
 
             _bus.Publish(EventBus.SessionTopic(handle.SessionId),
                 new WireEvent.Error(handle.SessionId, ex.Message));
 
-            // 失败 = 没有下一步了。
-            PublishPhase(handle, SessionPhase.Idle);
+            // ⚠️ **队列里还有没答的话 ⇒ 接着推一步**（2026-11-13，用户裁定「尽量报红错也继续」）。
+            //
+            // <para>⚠️ <b>判据是「下一步要发的字节变了没有」</b>：硬失败意味着记录里一个新字节
+            // 都没多出来 ⇒ 再推一步就是**同一条请求**重发（那正是 `RetryPolicy` 那十次退避的活，
+            // 这里再发只是烧钱）。而 `FlushQueuedInput` 刚刚把用户在这条步运行期间说的话
+            // **落进了记录** ⇒ 下一条请求不同了，并且**有人欠那句回话**。⇒ 只有这一种情形接。</para>
+            //
+            // <para>⚠️ 预算与「留半截」那条**共用一份账**（`ConsecutiveFailures`）：它们数的是
+            // 同一件事——「这一步之后又自动起了几步」。⚠️ 用户在这条步期间按过停止 ⇒ 不接。</para>
+            var hasNewInput = handle.QueueDepth > 0;
+            if (hasNewInput && handle.InterruptEpoch == interruptEpoch
+                && handle.NoteFailure() <= MaxFailureContinuations)
+            {
+                continueAfterFailure = true;
+
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.Error(handle.SessionId,
+                        "（队列里还有你刚说的话，接着处理；这一步本身没有推进任何东西。）"));
+
+                // ⚠️ **不在这里 `return`**：落到 `finally`（放掉那把标志），
+                // 再由末尾那段统一的接续逻辑起下一步。
+            }
+            else
+            {
+                // 失败 = 没有下一步了（队列里也没有人会指望它）。
+                handle.ResetFailures();
+                PublishPhase(handle, SessionPhase.Idle);
+            }
 
             // 后台路必须吞掉异常：自 .NET 4.5 起未观测的任务异常默认被吞、不终结进程
             // （`TaskScheduler.UnobservedTaskException` 只记日志）——它只是到一个没人看的地方去了。
             // 必须显式捕获并发成 `error` 事件，否则头只会看到「步开始了却永远等不到 `step.end`」。
-            if (throwOnFailure) throw new DispatchException(ex.Message, ex);
-            return null;
+            // ⚠️ **接续那条不抛**（2026-11-13）：同步路（控制台）要的是一句人能读的话，
+            // 而「我替你接着跑了」不是结局 —— 那条路的异常由接续那一趟自己抛。
+            if (throwOnFailure && !continueAfterFailure) throw new DispatchException(ex.Message, ex);
+            if (!continueAfterFailure) return null;
         }
         finally
         {
@@ -2402,15 +2549,43 @@ public sealed class CommandDispatcher(
         // ⚠️ 而**形状上也只可能是这样**：`finally` 刚跑完、这把标志已经放掉，
         // 下面这次重新 `TryEnterStep()` 是一条普通的新步——不需要「步内循环」那种
         // 会打破状态机的东西。
+        // ---- 自动接续（两条来路，共用末尾这一段）----
+        //
+        // ⚠️ **它必须排在 `reply is null` 那条判据之前**（2026-11-13）：硬失败那一路
+        // `reply` 是 null（这一趟什么都没产出），而它**可能要接着推**
+        // （队列里还有用户刚说的话，见下面 `catch` 里那段）。
+        if (continueAfterFailure)
+            return await ContinueAutonomouslyAsync(handle, throwOnFailure);
+
         if (reply is null) return null;   // 取消 / 失败那两条路（它们的 `error` 事件已经在上面发过）
+
+        // ⚠️ **这一步真的跑完了 ⇒ 连击清零**（2026-11-13）。它是「自动接续」的预算账
+        // （`SessionHandle.ConsecutiveFailures`）：那笔账说的是「刚才连着断了几次」，
+        // 而一次成功的步就把它结清了。⚠️ 放在这里而不是 `StepAsync` 里：只有这一层知道
+        // 「这个返回值是不是一次成功」（失败留半截那条也返回一个 `reply`）。
+        if (!interrupted) handle.ResetFailures();
 
         // ⚠️ **被打断的那一步没有下一步**（2026-11-07）：记录已经落盘了，但那不是「跑完」
         // ——接着推一步等于让模型在「上一轮被砍断」的状态上继续干，而用户按的正是「停」。
+        //
+        // ⚠️ **失败那一趟相反：要接着推**（2026-11-13，用户裁定「自动接续而不是直接打断」）：
+        // 半截已经进了记录（下一步的模型看得到自己说过什么 + 一句「正文到此为止」），
+        // 而用户交代的事还没做完 ⇒ 再推一步让模型把话说完。⚠️ 那条路走的是**上面**那个
+        // `continueAfterFailure`（两条来路共用一个出口，别在这里再判一次）。
         if (interrupted)
         {
+            // ⚠️ **停下来就把账清了**：下一次「用户说一句话」应当从头开始数预算，
+            // 否则第三次失败之后的每一句话都只剩零次机会（而人会以为还有三次）。
+            handle.ResetFailures();
+
             // ⚠️ 同步路（控制台）要拿到一句人能读的话，与从前那条 OCE 路径同一个形状
             // （`throwOnFailure` 就是这个意思：调用方在前面等着，它得知道这一步没跑完）。
-            if (throwOnFailure) throw new DispatchException("这一步被中断了。");
+            // ⚠️ 失败那条说**失败原话**，不套一句「被中断了」——那会指向错的方向
+            // （用户会以为自己按过停）。
+            if (throwOnFailure)
+                throw new DispatchException(failure is null
+                    ? "这一步被中断了。"
+                    : $"{failure}（没能自动接上；那半截生成已经留在记录里。）");
             return null;
         }
 

@@ -365,8 +365,33 @@ public sealed class Stepper(
             // 模型说了半页、用户也看见了那半页（`term.delta` 已经发到头上）。
             // 扔掉的代价不是磁盘上的几行——是下一步的模型**不知道自己说过那些话**
             // （于是它可能重复一遍，或者把用户看见的东西当成从没发生过）。</para>
+            //
+            // <para>⚠️ <b>`failure: null` 是这一条与下一条的全部分界</b>：用户按的正是「停」，
+            // 所以调用方**不许**自动接续。见 <see cref="StepOutcome.Failure"/>。</para>
             if (attempts == 0) RecordUsage(handle, callId, startedAt, reply: null, "failed");
-            return KeepPartialGeneration(handle, partial, at);        }
+            return KeepPartialGeneration(handle, partial, at, failure: null);
+        }
+        catch (Exception ex) when (partial.HasText)
+        {
+            // ⚠️ **失败也留半截**（2026-11-13，用户裁定「就算发生报错也保留模型生成结果」）。
+            //
+            // <para>⚠️ <b>它为什么与上一条分开，而不是把两条并成 `catch (Exception)`</b>：
+            // 两条落的东西**一样**，而交回去的那一格**不一样**——`Failure` 非 null ⇒ 调用方
+            // 会**自动接续**（再推一步让模型把自己那句话说完）；取消那条**不能**接，
+            // 因为用户按的正是「停」。把这一格藏在异常类型里去判，会让「接不接」由
+            // 一个 `when` 过滤器决定，而那段代码在另一个文件里。</para>
+            //
+            // <para>⚠️ <b>走到这里的典型形状</b>：流式生成到一半，上游断/超时/5xx。
+            // `RetryPolicy` 在「这一次已经吐过增量」时**不重试**（重发会把同一段话在
+            // 客户端屏幕上再打一遍），于是异常冒到这里。而从前的落点是「回滚 + 抛出去」
+            // ⇒ 模型说过的那半页、用户屏幕上看着的那半页，一起没了；下一步的模型
+            // 不知道自己说过那些话，于是要么重复一遍、要么把用户看见的东西当成从没发生过。</para>
+            //
+            // <para>⚠️ **不回滚**（同上面那条）：`Turn` 要 +1，因为这一趟真的产生了记录。
+            // 记账：模型调用本身的失败已被逐次记过，只有「一次请求都没发出去」才补一行。</para>
+            if (attempts == 0) RecordUsage(handle, callId, startedAt, reply: null, "failed", error: ex.Message);
+            return KeepPartialGeneration(handle, partial, at, failure: ex.Message);
+        }
         catch
         {
             // ⚠️ **只有「一次请求都没发出去」才在这里补一行**（装配请求那一半抛了）。
@@ -756,7 +781,8 @@ public sealed class Stepper(
     }
 
     /// <summary>
-    /// **把半截生成留住**（2026-11-07，用户裁定：流式模式下打断要保留半截生成结果）。
+    /// **把半截生成留住**（2026-11-07，用户裁定：流式模式下打断要保留半截生成结果；
+    /// 2026-11-13 扩到「失败」——用户裁定「就算发生报错也保留模型生成结果」）。
     ///
     /// <para>⚠️ <b>它落的是什么</b>：一条 <c>From=Model</c> 的普通消息 + `Interrupted = true`。
     /// 于是「模型说过这半页」与「它没说完」两件事都在记录里（渲染期那句注记由
@@ -769,8 +795,19 @@ public sealed class Stepper(
     /// <para>⚠️ <b>不写 `PendingIntent`</b>：它说的是「我可能欠一条 `tool_result`」，
     /// 而半截正文里**没有任何 `tool_use`**（增量只有正文，见 `PartialReply`）⇒ 不欠。
     /// 写上去反而会让下一步的收尾去补一条没人要的结果。</para>
+    ///
+    /// <para>⚠️ <b>记录里分不出「用户按停」与「失败」</b>（<c>Interrupted = true</c> 一个值），
+    /// 而这是**有意的**：两件事在记录这一层说的是同一件事——<i>这条正文没说完</i>。
+    /// 「要不要替他接着跑」是**运行时**的判断（<see cref="StepOutcome.Failure"/>），
+    /// 不是盘上的事实；把它落盘等于给记录加一条「上一次为什么断」，而
+    /// `TimelineEvent` 的格式是一扇单向门（见 `01` §12.8.2 的代价）。</para>
     /// </summary>
-    private StepOutcome KeepPartialGeneration(SessionHandle handle, PartialReply partial, DateTimeOffset at)
+    /// <param name="failure">
+    /// **失败原话**；<c>null</c> = 用户主动打断（不要自动接续）。
+    /// ⚠️ 它只随 <see cref="StepOutcome"/> 回到调用方，**不进记录**。
+    /// </param>
+    private StepOutcome KeepPartialGeneration(
+        SessionHandle handle, PartialReply partial, DateTimeOffset at, string? failure)
     {
         var blocks = partial.Build();
         var message = new TimelineEvent.MessageEvent
@@ -798,7 +835,8 @@ public sealed class Stepper(
         return new StepOutcome(
             new ModelReply { Blocks = blocks, StopReason = "interrupted", Refused = false },
             HistoryId: message.Id,
-            Interrupted: true);
+            Interrupted: true,
+            Failure: failure);
     }
 
     /// <summary>
@@ -2014,9 +2052,29 @@ public sealed class Stepper(
         ///
         /// <para>⚠️ <b>调用方要做的三件事</b>：① 把这一趟的模型消息发出去（`HistoryId` 在，
         /// 且带 `interrupted`）；② 发 `state.changed(Idle)`（头据此收掉临时气泡）；
-        /// ③ <b>不要续跑</b>（打断就是没有下一步）。</para>
+        /// ③ <b>不要续跑</b>（打断就是没有下一步）——⚠️ **除非** <see cref="Failure"/> 非空
+        /// （那是「失败留了半截」，那条路要自动接续，见那一格的注释）。</para>
         /// </summary>
-        bool Interrupted = false);
+        bool Interrupted = false,
+        /// <summary>
+        /// **这一趟是「失败但有东西可留」结束的**（2026-11-13，用户裁定「就算发生报错也
+        /// 保留模型生成结果」）。非 <c>null</c> = 失败的那句人话；<c>null</c> = 正常结束
+        /// 或用户主动打断。
+        ///
+        /// <para>⚠️ <b>它与 <see cref="Interrupted"/> 是两格，不是一格</b>，因为调用方要做的
+        /// 事**相反**：两条路都落了记录、都算一步（`Turn` 都 +1），但
+        /// 「用户按停」⇒ 不许再推；「上游断了」⇒ **要自动接续**——模型那半句话只是
+        /// 被打断了，用户要的事还没做完。把两者合成一个 bool，判据就只能靠
+        /// 「这个布尔是在哪个 catch 里置的」去猜，而那在另一个文件里。</para>
+        ///
+        /// <para>⚠️ <b>它<b>不</b>进记录</b>：盘上只有 `Interrupted = true`（「这条正文没说完」）。
+        /// 「为什么没说完」是运行时的事，落盘要给 `TimelineEvent` 加一格 = 一次磁盘格式迁移
+        /// （`Json.FormatVersion` + 全部金样本），而它今天只影响「下一步要不要自动跑」。</para>
+        ///
+        /// <para>⚠️ <b>非 <c>null</c> 时 <see cref="Interrupted"/> 一定为 <c>true</c></b>
+        /// （失败那一路也是「留了东西、正常返回」，不抛异常）。</para>
+        /// </summary>
+        string? Failure = null);
 
     /// <summary>
     /// 超时的**绝对时刻**（`01` §3.8）。⚠️ <b><c>null</c> = 不超时</b>。

@@ -334,6 +334,22 @@ public static class BackgroundJobLimits
     /// </remarks>
     public const int MaxReadBytes = 64 * 1024;
 
+    /// <summary>
+    /// **`job_output` 对着一个还在跑的任务最多等多久**（2026-11-13，用户裁定
+    /// 「模型主动调用 `job_output` 的时候视为 `wait`，防止模型反复轮询」）。
+    ///
+    /// <para>⚠️ <b>它必须小于 <see cref="ToolCallLimits.DefaultTimeoutSeconds"/>（600 秒）</b>：
+    /// 到了那个通用上限，这一条会变成一句「超时被终止、这一条没有结果」——而这里等的是
+    /// **别人的进程**，说「被终止」是假信息（那个任务还在跑，只是我们不等了）。
+    /// ⇒ 自己先到点，交一份**正常的结果**（输出照给 + 一句「它还在跑」）。</para>
+    ///
+    /// <para>⚠️ <b>为什么不是「无限等」</b>：一个 dev server 永远不退出。等它等于让这一步
+    /// 挂到通用上限——而用户要的是「别轮询」，不是「一气等到天荒地老」。
+    /// 到点之后如实说「它还在跑」，并且提醒：任务结束时核心会**自动叫醒**会话
+    /// （`IBackgroundJobs.Finished`），所以它本来就不需要再问一次。</para>
+    /// </summary>
+    public const int MaxWaitSeconds = 300;
+
     /// <summary>一个任务结束后**元数据保留多久**。占位值。⚠️ 清理只发生在下一次启动。</summary>
     public static readonly TimeSpan Retention = TimeSpan.FromHours(24);
 
