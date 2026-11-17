@@ -325,7 +325,7 @@
 {
   "dataRoot": "…",
   "workingDirectory": "…",
-  "coreVersion": "1.0.0.0",
+  "coreVersion": "1.1.0.0",
   "allowedOrigin": "http://*:17990",
   "authRequired": false,
   "endpoints": { "http": "http://0.0.0.0:17988", "ws": "ws://0.0.0.0:17988/ws" }
