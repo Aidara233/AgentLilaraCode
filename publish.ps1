@@ -74,4 +74,16 @@ foreach ($rid in $Rids) {
         Write-Host ("  {0} — {1:N1} MB" -f (Split-Path $tgz -Leaf), ((Get-Item $tgz).Length / 1MB))
     }
 }
+# 校验和：跟着发布包一起发出去。
+# ⚠️ 用 `*` 前缀（sha256sum 的二进制模式写法）：下载下来可以直接 `sha256sum -c SHA256SUMS`。
+$sums = Join-Path $out "SHA256SUMS"
+$rows = foreach ($file in (Get-ChildItem $out -File | Where-Object { $_.Extension -in ".zip", ".gz" } | Sort-Object Name)) {
+    $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$hash *$($file.Name)"
+}
+join(
+, # ⚠️ 用 WriteAllText 写 LF，不用 Set-Content：Set-Content 在 Windows PowerShell 上写 CRLF， #    而 `sha256sum -c` 在 Linux 上会把行尾那个 \r 当成文件名的一部分（实测：No such file or directory）。 [System.IO.File]::WriteAllText($sums, (($rows -join "`n") + "`n")))
+Write-Host ("SHA256SUMS — {0} 行" -f @($rows).Count)
+
 Write-Host "产物在 $out"
+
