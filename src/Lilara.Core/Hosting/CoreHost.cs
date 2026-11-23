@@ -29,6 +29,31 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
     /// <summary>进程内插件轴宿主；注册完成后由推进器只读其快照。</summary>
     public Lilara.Core.Plugins.PluginHost Plugins { get; } = new();
 
+    /// <summary>
+    /// **MCP 的连接宿主**（2026-11-18）。⚠️ 与 <see cref="BackgroundJobs"/> 同一条装配判据：
+    /// 进程级、一个数据根一份——它持有子进程句柄，而那些句柄属于**这个进程**。
+    ///
+    /// <para>⚠️ <b>构造它不会拉起任何进程</b>：连接由显式的 `ReloadAsync` / `mcp.test` 触发。
+    /// 这是刻意的——`mcp.json` 里多一条登记不该等于「悄悄执行一段代码」。</para>
+    /// </summary>
+    public Lilara.Core.Mcp.McpHost Mcp { get; } = new(new Lilara.Core.Mcp.McpStore(dataRoot), workingDirectory);
+
+    /// <summary>组合根连接 MCP 状态，事件只在核心级发布。</summary>
+    public void WireMcp(EventBus bus)
+    {
+        Mcp.Changed += OnMcpChanged;
+        Mcp.StatusChanged += view =>
+        {
+            OnMcpStatusChanged(view);
+            bus.Publish(EventBus.CoreTopic, new WireEvent.McpChanged(
+                view.Enabled, view.Servers, view.Problems, CoreClock.Now()));
+        };
+    }
+
+    private readonly Lock _mcpPublishGate = new();
+    private IReadOnlyList<Lilara.Core.Mcp.McpServerView> _mcpServers = [];
+    private IReadOnlyList<string> _mcpProblems = [];
+
     /// <summary>已激活的会话。快照端点先查这里——见 <see cref="TryGetActivated"/>。</summary>
     private readonly ConcurrentDictionary<string, SessionHandle> _activated = new();
 
@@ -243,9 +268,25 @@ public sealed class CoreHost(string dataRoot, string workingDirectory)
         {
             if (_steppers.TryGetValue(handle.SessionId, out var cached)) return cached;
 
-            var stepper = StepperResolver.Resolve(_store, _providers, handle.Spec.Model.ProviderId, Plugins, _usage, BackgroundJobs, StatusOf);
+            var stepper = StepperResolver.Resolve(_store, _providers, handle.Spec.Model.ProviderId, Plugins, _usage, BackgroundJobs, StatusOf, Mcp);
             _steppers[handle.SessionId] = stepper;
             return stepper;
+        }
+    }
+
+    private void OnMcpChanged()
+    {
+        InvalidateSteppers();
+        var view = Mcp.Snapshot();
+        OnMcpStatusChanged(view);
+    }
+
+    private void OnMcpStatusChanged(Lilara.Core.Mcp.McpView view)
+    {
+        lock (_mcpPublishGate)
+        {
+            _mcpServers = view.Servers;
+            _mcpProblems = view.Problems;
         }
     }
 

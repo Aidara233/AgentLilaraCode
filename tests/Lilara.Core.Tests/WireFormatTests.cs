@@ -191,7 +191,7 @@ public class WireFormatTests
         // 23 → 24：`term.delta`（2026-11 流式批，正文 / 思考的实时增量——只供显示、不保留）。
         // 24 → 25：`tool.call.started`（2026-11-05，一条调用**开始跑**的那一刻就报——
         //          工具调用原先要等整步（含执行）走完、随 `message.appended` 才到头上）。
-        Assert.Equal(25, declared.Length);
+        Assert.Equal(26, declared.Length);
 
         // ⚠️ **扫整个 Hosting 目录，不只 `CommandDispatcher.cs`**（2026-11 改）：
         // 第一处不经分派器发出的类型出现了——`term.delta` 由 `DeltaPump`（攒批器）发出。
@@ -238,7 +238,7 @@ public class WireFormatTests
         // 22 → 23：`plan.updated`（2026-10-24 计划批）。
         // 23 → 24：`term.delta`（2026-11 流式批）。
         // 24 → 25：`tool.call.started`（2026-11-05，「调用动作不该等它跑完才发」）。
-        Assert.Equal(25, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
+        Assert.Equal(26, typeof(WireEvent).GetNestedTypes().Count(t => t.IsSubclassOf(typeof(WireEvent))));
     }
 
     // ⚠️ **工具调用开始的载荷形状**（2026-11-05）：头按字段名取值

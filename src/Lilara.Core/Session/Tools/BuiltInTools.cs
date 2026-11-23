@@ -49,6 +49,8 @@ namespace Lilara.Core.Session.Tools;
 /// ⚠️ 与 `update` / `write` 的分工：那两个**动工作目录**，这一个**动上下文**——
 /// 而两者都是「核心的加载 / 渲染机制的入口」，同 `fetch` 给的是「模型能看见自己历史」。</para>
 ///
+/// <para><see cref="RuntimeInfoTool"/> 是只读的按需会话/框架元数据查询：可在系统提示词为空时读取工作目录，或查看上游最近报告模型；不返回凭据或 endpoint。</para>
+///
 /// <para><see cref="SystemInfoTool"/> 是只读的按需设备快照：报告 CPU、内存、磁盘和可用时的 NVIDIA GPU 状态，不持续采样。</para>
 ///
 /// <para>⚠️ <b><see cref="SearchTool"/>（2026-10-22）是「模型能看见自己的工作目录」的第三个入口</b>：
@@ -79,7 +81,7 @@ public static class BuiltInTools
     public static IReadOnlyList<ITool> All { get; } =
     [
         new ListTool(), new ReadTool(), new SearchTool(), new FetchTool(), new AskTool(),
-        new UpdateTool(), new WriteTool(), new ReleaseTool(),
+        new UpdateTool(), new WriteTool(), new ReleaseTool(), new RuntimeInfoTool(),
         new MakeDirectoryTool(), new DeleteTool(), new PathTool(), new SystemInfoTool(), new GitReadTool(), new GitWriteTool(),
         new DotnetBuildTool(), new DotnetTestTool(), new FloatingContextTool(),
         // 2026-10-23：shell。⚠️ 它是**高危**类（与 `delete` 同级）——在工作目录里跑任意命令，

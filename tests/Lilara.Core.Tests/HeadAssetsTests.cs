@@ -58,6 +58,7 @@ public class HeadAssetsTests
             ["claim.acquired"] = "项目流 → loadClaims()",
             ["claim.released"] = "项目流 → loadClaims()",
             ["session.deactivated"] = "头的界面不显示『激活』这件事（只给别的客户端看）",
+            ["mcp.changed"] = "设备级 MCP 状态；头部首批不提供 MCP 管理页面",
         };
 
         var handled = DeclaredEventKinds();

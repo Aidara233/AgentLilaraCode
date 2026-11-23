@@ -15,8 +15,13 @@ public sealed class KernelRuntime : IDisposable
 {
     private readonly IDisposable _dataRootLock;
     private readonly PluginHost _plugins = new();
+    private readonly Mcp.McpHost _mcp;
     private readonly Dictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
     private readonly object _gateLock = new();
+    private readonly Lock _mcpPublishGate = new();
+    private bool _mcpEnabled = true;
+    private IReadOnlyList<Lilara.Core.Mcp.McpServerView> _mcpServers = [];
+    private IReadOnlyList<string> _mcpProblems = [];
     private bool _disposed;
 
     /// <summary>
@@ -39,6 +44,15 @@ public sealed class KernelRuntime : IDisposable
         var jobs = new Session.Tools.BackgroundJobHost(DataRoot);
         jobs.Recover();
         BackgroundJobs = jobs;
+
+        // ⚠️ MCP 宿主与后台任务是同一条装配判据（进程级、一个数据根一份）。
+        // 构造它**不拉起任何连接**——第一份连接由显式 `Mcp.ReloadAsync()` 触发，
+        // 于是「嵌入方用不用 MCP」是一个可以看见的装配事实，不是启动时的副作用。
+        _mcp = new Mcp.McpHost(new Mcp.McpStore(DataRoot), WorkingDirectory);
+        _mcp.Changed += OnMcpChanged;
+        _mcp.StatusChanged += OnMcpStatusChanged;
+        var saved = new Mcp.McpStore(DataRoot).Load();
+        _mcpEnabled = saved.Enabled;
     }
 
     public string DataRoot { get; }
@@ -46,6 +60,13 @@ public sealed class KernelRuntime : IDisposable
     public SessionStore Store { get; }
     public UsageStore Usage { get; }
     public PluginHost Plugins => _plugins;
+
+    /// <summary>
+    /// **MCP 的连接宿主**。嵌入方要显式 `await Mcp.ReloadAsync()` 才会有 MCP 工具
+    /// （构造它不连、不拉进程）——这与「`spec.json` 是唯一必须非空的东西」同向：
+    /// 没有连接就没有工具，而那不是错误，是纯 chat。
+    /// </summary>
+    public Mcp.McpHost Mcp => _mcp;
 
     /// <summary>
     /// **后台任务的进程表**（2026-10-24）。⚠️ 嵌入方只要用 `KernelRuntime`，
@@ -171,7 +192,7 @@ public sealed class KernelRuntime : IDisposable
                     Blocks = input,
                 });
 
-            var stepper = new Stepper(Store, adapter, tools, _plugins, Usage,
+            var stepper = new Stepper(Store, adapter, tools ?? DefaultTools(), _plugins, Usage,
                 backgroundJobs: BackgroundJobs, sessionStatus: SessionStatusOf);
             return await stepper.StepAsync(handle, input, cancellationToken).ConfigureAwait(false);
         }
@@ -180,6 +201,15 @@ public sealed class KernelRuntime : IDisposable
             sessionGate.Release();
         }
     }
+
+    /// <summary>
+    /// 嵌入方没给工具表时用**同一份装配规则**（`内建 ⊕ MCP`）。
+    /// ⚠️ 不能退回 `BuiltInTools.All` 了事：那会让「嵌入方有没有接 MCP」变成一次静默分叉
+    /// ——同一个数据根、同一份 `mcp.json`，走 CLI 有 MCP 工具、走嵌入没有。
+    /// </summary>
+    private IReadOnlyList<ITool> DefaultTools() =>
+        Session.Tools.ToolTable.Build(
+            ("内建", Session.Tools.BuiltInTools.All), ("MCP", _mcp.Tools));
 
     /// <summary>
     /// **子会话状态的实况探针**（2026-10-27，`wait` 用）：内存优先、盘面回退。
@@ -194,6 +224,27 @@ public sealed class KernelRuntime : IDisposable
         return found is null ? null : Store.ReadState(found.Value.ProjectKey, sessionId).Status;
     }
 
+    private void OnMcpChanged()
+    {
+        lock (_mcpPublishGate)
+        {
+            var view = _mcp.Snapshot();
+            _mcpEnabled = view.Enabled;
+            _mcpServers = view.Servers;
+            _mcpProblems = view.Problems;
+        }
+    }
+
+    private void OnMcpStatusChanged(Mcp.McpView view)
+    {
+        lock (_mcpPublishGate)
+        {
+            _mcpEnabled = view.Enabled;
+            _mcpServers = view.Servers;
+            _mcpProblems = view.Problems;
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -203,6 +254,10 @@ public sealed class KernelRuntime : IDisposable
         // 顺序在释放闸之前：那些任务与这些闸无关，而它们若还活着，`Dispose` 之后
         // 就再也没有人能停掉它们了（句柄随这个对象一起没）。
         BackgroundJobs.KillAll("核心退出了（KernelRuntime 被释放）。");
+
+        // ⚠️ MCP 的子进程跟着一起走（同 BackgroundJobs 那条判据）。同步等它，是因为
+        // `Dispose` 之后再也没有人能关掉那些连接了——而 stdio server 是**我们拉起来的进程**。
+        _mcp.DisposeAsync().AsTask().GetAwaiter().GetResult();
 
         lock (_gateLock)
         {

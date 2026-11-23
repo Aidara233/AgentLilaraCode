@@ -226,6 +226,12 @@ public interface IToolContext
     string WorkingDirectory { get; }
 
     /// <summary>
+    /// Framework/session facts captured for this request. The default keeps existing external
+    /// tool-context implementations source-compatible; core-created contexts always provide it.
+    /// </summary>
+    RuntimeInfoSnapshot? RuntimeInfo => null;
+
+    /// <summary>
     /// 把**相对工作目录**的路径解析成绝对路径；**逃逸就是 <c>null</c>**。
     ///
     /// <para>⚠️ <b>这个闸不是可选的</b>：模型给的路径是**不可信输入**，

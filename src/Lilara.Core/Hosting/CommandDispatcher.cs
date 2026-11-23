@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Lilara.Core.Protocol;
 using Lilara.Core.Kernel;
+using Lilara.Core.Mcp;
 using Lilara.Core.Network;
 using Lilara.Core.Shell;
 using Lilara.Core.Storage;
@@ -521,6 +522,14 @@ public sealed class CommandDispatcher(
                 case CoreCommand.ShellConfigure sc: return HandleShellConfigure(sc, commandId);
                 case CoreCommand.ShellTest st: return await HandleShellTestAsync(st, commandId, ct);
                 case CoreCommand.ToolsConfigure tc: return HandleToolsConfigure(tc, commandId);
+
+                // ---- MCP（2026-11-18，第一批：只 tools）----
+                case CoreCommand.McpList: return HandleMcpList(commandId);
+                case CoreCommand.McpConfigure mc: return await HandleMcpConfigureAsync(mc, commandId, ct);
+                case CoreCommand.McpUpsert mu: return await HandleMcpUpsertAsync(mu, commandId, ct);
+                case CoreCommand.McpRemove mr: return await HandleMcpRemoveAsync(mr, commandId, ct);
+                case CoreCommand.McpReload: return await HandleMcpReloadAsync(commandId, ct);
+                case CoreCommand.McpTest mt: return await HandleMcpTestAsync(mt, commandId, ct);
 
                 // ---- 预设：系统块从哪来（`01` §3.1；`14` 未决项 6）----
                 case CoreCommand.PresetSet ps: return HandlePresetSet(ps, commandId);
@@ -1173,6 +1182,169 @@ public sealed class CommandDispatcher(
     /// 当场说清比默默改成别的值好；而配置文件是手改的，夹紧只为了别让 0 或 999999999
     /// 把每一步都弄坏。</para>
     /// </summary>
+    // ---- MCP（2026-11-18，第一批：只 tools）----
+
+    private async Task<DispatchResult> HandleMcpConfigureAsync(CoreCommand.McpConfigure c, string id, CancellationToken ct)
+    {
+        var store = new McpStore(_host.DataRoot);
+        var current = store.Load();
+        store.Save(current with { Enabled = c.Enabled ?? current.Enabled });
+        await _host.Mcp.ReloadAsync(ct).ConfigureAwait(false);
+        var view = _host.Mcp.Snapshot();
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Data = view,
+            Note = view.Enabled
+                ? $"MCP 已启用：{view.Servers.Count(s => s.State == "connected")}/{view.Servers.Count} 个 server 已连接。"
+                : "MCP 已关闭，连接已拆掉。",
+        });
+    }
+
+    private DispatchResult HandleMcpList(string id)
+    {
+        var view = _host.Mcp.Snapshot();
+        var connected = view.Servers.Count(s => s.State == "connected");
+        var tools = view.Servers.Sum(s => s.Tools.Count);
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Data = view,
+            Note = view.Servers.Count == 0
+                ? (view.Enabled ? "还没有登记任何 MCP server。" : "还没有登记任何 MCP server（总开关也关着）。")
+                : $"{(view.Enabled ? "总开关开" : "总开关关")} · {connected}/{view.Servers.Count} 个已连接 · "
+                    + $"{tools} 个工具"
+                    + (view.Problems.Count > 0 ? $" · {view.Problems.Count} 条配置问题" : ""),
+        });
+    }
+
+
+
+    /// <summary>
+    /// 登记 / 修改一个 server。⚠️ **只改 `mcp.json`，不拉起进程**——连接是
+    /// <see cref="HandleMcpReloadAsync"/> 的事。合并语义与 `shell.configure` 同一条：
+    /// null = 保留；`Command == ""` = 清掉；集合给空 = 清空。
+    /// </summary>
+    private async Task<DispatchResult> HandleMcpUpsertAsync(CoreCommand.McpUpsert c, string id, CancellationToken ct)
+    {
+        if (!McpNames.IsValidServerId(c.Id))
+            return Reject(id, $"server id '{c.Id}' 不合法（小写字母 / 数字 / 连字符，1..64 字符）。");
+
+        if (c.Transport is { } transport && transport is not ("stdio" or "http"))
+            return Reject(id, "transport 只认 'stdio' / 'http'（Streamable HTTP）。");
+
+        if (c.TimeoutSeconds is { } timeout
+            && (timeout < McpLimits.MinTimeoutSeconds || timeout > McpLimits.MaxTimeoutSeconds))
+            return Reject(id,
+                $"timeoutSeconds 要在 {McpLimits.MinTimeoutSeconds}..{McpLimits.MaxTimeoutSeconds} 之间。");
+
+        var store = new McpStore(_host.DataRoot);
+        var config = store.Load();
+        var current = config.Servers.FirstOrDefault(s => string.Equals(s.Id, c.Id, StringComparison.Ordinal));
+
+        var next = current is null
+            ? new McpServerConfig { Id = c.Id, Enabled = c.Enabled ?? false }
+            : current;
+
+        next = next with
+        {
+            Enabled = c.Enabled ?? next.Enabled,
+            Transport = c.Transport ?? next.Transport,
+            // ⚠️ 三态：null = 保留；"" = 清掉（这个 server 不可用）；其余 = 换新。
+            Command = c.Command is null ? next.Command : c.Command.Trim(),
+            Arguments = c.Arguments ?? next.Arguments,
+            WorkingDirectory = c.WorkingDirectory is null ? next.WorkingDirectory
+                : c.WorkingDirectory.Length == 0 ? null : c.WorkingDirectory,
+            Environment = c.Environment ?? next.Environment,
+            TimeoutSeconds = c.TimeoutSeconds ?? next.TimeoutSeconds,
+            ToolPermission = c.ToolPermission ?? next.ToolPermission,
+            Endpoint = c.Endpoint is null ? next.Endpoint : c.Endpoint.Trim(),
+            BearerTokenEnvironmentVariable = c.BearerTokenEnvironmentVariable is null
+                ? next.BearerTokenEnvironmentVariable : c.BearerTokenEnvironmentVariable.Trim(),
+            AllowPrivateNetwork = c.AllowPrivateNetwork ?? next.AllowPrivateNetwork,
+        };
+
+        var servers = config.Servers.ToList();
+        var index = servers.FindIndex(s => string.Equals(s.Id, c.Id, StringComparison.Ordinal));
+        if (index >= 0) servers[index] = next;
+        else servers.Add(next);
+
+        if (servers.Count > McpLimits.MaxServers)
+            return Reject(id, $"最多登记 {McpLimits.MaxServers} 个 server。");
+
+        store.Save(config with { Servers = servers });
+        _host.Mcp.NotifyConfigurationChanged();
+
+        // ⚠️ **这里不 reload**：登记是配置动作，拉起进程是显式动作（同 `shell.json` 的默认关）。
+        // `mcp.test` 验一次、`mcp.reload` 才进工具表。⇒ 本命令的 Note 必须说清这一点，
+        // 否则用户会以为「保存了就是跑起来了」。
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Note = $"已保存 server '{c.Id}'（{next.Transport}）。"
+                + "登记不等于拉起：用 `mcp.test` 验一次，或 `mcp.reload` 让它进工具表。",
+        });
+    }
+
+    private async Task<DispatchResult> HandleMcpRemoveAsync(
+        CoreCommand.McpRemove c, string id, CancellationToken ct)
+    {
+        if (!McpNames.IsValidServerId(c.Id))
+            return Reject(id, $"server id '{c.Id}' 不合法。");
+
+        var store = new McpStore(_host.DataRoot);
+        var config = store.Load();
+        var servers = config.Servers.Where(s => !string.Equals(s.Id, c.Id, StringComparison.Ordinal)).ToList();
+        if (servers.Count == config.Servers.Count)
+            return Reject(id, $"没有登记 server '{c.Id}'，无从删除。");
+
+        store.Save(config with { Servers = servers });
+        await _host.Mcp.ReloadAsync(ct).ConfigureAwait(false);
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Note = $"已删除 server '{c.Id}'，工具表已按新配置重建。",
+        });
+    }
+
+    private async Task<DispatchResult> HandleMcpReloadAsync(string id, CancellationToken ct)
+    {
+        await _host.Mcp.ReloadAsync(ct).ConfigureAwait(false);
+        var view = _host.Mcp.Snapshot();
+        var connected = view.Servers.Count(s => s.State == "connected");
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Data = view,
+            Note = view.Servers.Count == 0
+                ? "没有登记的 MCP server。"
+                : $"{connected}/{view.Servers.Count} 个 server 已连接 · {view.Servers.Sum(s => s.Tools.Count)} 个工具"
+                    + (view.Problems.Count > 0 ? $" · {view.Problems.Count} 条配置问题" : ""),
+        });
+    }
+
+    private async Task<DispatchResult> HandleMcpTestAsync(
+        CoreCommand.McpTest c, string id, CancellationToken ct)
+    {
+        if (!McpNames.IsValidServerId(c.Id))
+            return Reject(id, $"server id '{c.Id}' 不合法。");
+
+        var result = await _host.Mcp.TestAsync(c.Id, ct).ConfigureAwait(false);
+
+        return new DispatchResult(new Ack.Accepted
+        {
+            CommandId = id,
+            Data = result,
+            Note = result.Ok
+                ? $"server '{c.Id}' 连上了，{result.Tools.Count} 个工具：{string.Join(" / ", result.Tools)}"
+                : $"server '{c.Id}' 连不上：{result.Error}"
+                    + (result.Problems.Count > 0 ? $"（另有 {result.Problems.Count} 条配置问题）" : ""),
+        });
+    }
+
     private DispatchResult HandleToolsConfigure(CoreCommand.ToolsConfigure c, string id)
     {
         if (c.CallTimeoutSeconds is { } timeout
@@ -3432,7 +3604,8 @@ public sealed class CommandDispatcher(
             // ⚠️ 问题**按那张卡盖住的全部调用**解（一张卡可以同时替好几条问）：
             // 只解第一条的话，后面那几问的答案在 `Reply.Compose` 里会落成「没回答」。
             paused.Kind == AskKind.Question
-                ? Session.Tools.AskTool.ItemsOf(_host.Store, handle.ProjectKey, handle.SessionId, cardCallIds)
+                ? Session.Tools.AskTool.ItemsOf(_host.Store, handle.ProjectKey, handle.SessionId, cardCallIds,
+                    tools: _host.Mcp.Tools)
                 : [],
             c.Answers);
 
@@ -3661,7 +3834,8 @@ public sealed class CommandDispatcher(
         // ⚠️ 这条**是实测逼出来的**（2026-10-08）：我只修了 `/state` 那条（页面看得见问题了），
         // 忘了这里 ⇒ 用户答完之后拿到的是「会话在等待期间重启过，原来那批问题没能保留」
         // ——**而问题明明就在盘上**。⇒ 两处必须共用 `AskTool.ItemsOf` 那一份实现。
-        var items = Session.Tools.AskTool.ItemsOf(_host.Store, handle.ProjectKey, handle.SessionId, paused.CallId);
+        var items = Session.Tools.AskTool.ItemsOf(_host.Store, handle.ProjectKey, handle.SessionId, paused.CallId,
+            tools: _host.Mcp.Tools);
 
         if (items.Count == 0)
         {

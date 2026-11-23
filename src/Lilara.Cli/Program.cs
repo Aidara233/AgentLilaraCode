@@ -31,6 +31,27 @@ using var dataRootLock = DataRootLock.Acquire(dataRoot);
 var workingDirectory = Directory.GetCurrentDirectory();
 var host = new CoreHost(dataRoot, workingDirectory);
 
+// ⚠️ **不阻塞启动**：MCP server 可能是 `npx`（要下载），等它会让启动看起来像卡住。
+// 连接在后台完成；工具表的空窗由上面那条订阅收口——连上之后下一次解析就是新表。
+// ⚠️ 但**第一次会话若在连接完成前解析**，它的推进器缓存里没有 MCP 工具，
+// 而 `Changed` 会把它清掉 ⇒ 下一次 `StepperFor` 重建。这不是「掉线改表」，
+// 是「还没连上过」——两者在 `McpHost` 里是分开的状态。
+var mcpStartup = Task.Run(async () =>
+{
+    try
+    {
+        await host.Mcp.ReloadAsync();
+        var view = host.Mcp.Snapshot();
+        if (view.Servers.Count > 0)
+            Console.WriteLine($"  MCP：{view.Servers.Count(s => s.State == "connected")}/{view.Servers.Count} 个 server 已连接"
+                + (view.Problems.Count > 0 ? $"（{view.Problems.Count} 条配置问题，见控制面）" : ""));
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"（MCP 连接那一趟出错了：{ex.Message}）");
+    }
+});
+
 Console.WriteLine($"LILARA — 数据根 {dataRoot}");
 
 // ⚠️ 核心启动时**不建任何会话**（01 §8.1）。
@@ -102,6 +123,7 @@ else
 // ⇒ 这里不再需要在 `provider set` 之后整个重建 Repl（旧形状就是为了绕开「Repl 持一把固定
 //    stepper」才那么写的），那条记忆化 hack 随之消失。
 var bus = new EventBus();
+host.WireMcp(bus);
 var dispatcher = new CommandDispatcher(host, bus, host.StepperFor);
 
 // ⚠️ **心跳**（`01` §12.8 的第三条时机）：每 20 秒扫一遍**已知会话**，把到期没人答的询问收掉。
@@ -253,6 +275,11 @@ await heartbeatTask;
 // ⚠️ 而**强杀 / 断电走不到这里**，那条路由 `CoreHost.CreateBackgroundJobs` 里的 `Recover()` 兜底
 // （把残留的 Running 标成 Lost 并写明原因）。两条路互补，缺一条就会出现假活口。
 host.BackgroundJobs.KillAll("核心正常退出（控制台 quit / Ctrl-C）。");
+
+// ⚠️ **MCP 的子进程也跟着走**（同后台任务那条判据）。先等启动那一趟落定：
+// 否则它会在这之后才连上，留下一个**没有人再关**的进程。
+await mcpStartup;
+await host.Mcp.DisposeAsync();
 
 try { File.Delete(heartbeatFile); } catch (IOException) { /* 删不掉最多误报一次崩溃 */ }
 

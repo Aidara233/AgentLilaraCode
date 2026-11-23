@@ -154,6 +154,46 @@ public abstract record CoreCommand
     /// </summary>
     public sealed record ShellTest : CoreCommand;
 
+    // ---- MCP（2026-11-18，第一批：只 tools）----
+    //
+    // ⚠️ **登记与启用是两件事**：`mcp.upsert` 只改 `mcp.json`，**不拉起进程**；
+    // `mcp.reload` 才连接，`mcp.test` 只连一次、不改主机表。判据同 `shell.json` 的默认关：
+    // 一个配置文件不该等于一次任意代码执行。
+
+    /// <summary>读一份 MCP 快照（`McpView`）：每个 server 的状态、工具、stderr 尾。</summary>
+    public sealed record McpList : CoreCommand;
+
+    /// <summary>总开关（`mcp.json` 的 `enabled`）。⚠️ 关掉会拆掉全部连接，工具表随之清空。</summary>
+    public sealed record McpConfigure(bool? Enabled) : CoreCommand;
+
+    /// <summary>
+    /// 登记 / 修改一个 MCP server。**null = 本次没提到 = 保留旧值**
+    /// （与 <see cref="ShellConfigure"/> 同一语义）；`Command == ""` = 清掉命令（这个 server 不可用），
+    /// `Arguments == []` / `Environment == {}` / `ToolPermission == {}` = **清空**那几项。
+    /// </summary>
+    public sealed record McpUpsert(
+        string Id,
+        bool? Enabled,
+        string? Transport,
+        string? Command,
+        IReadOnlyList<string>? Arguments,
+        string? WorkingDirectory,
+        IReadOnlyDictionary<string, string>? Environment,
+        int? TimeoutSeconds,
+        IReadOnlyDictionary<string, string>? ToolPermission,
+        string? Endpoint = null,
+        string? BearerTokenEnvironmentVariable = null,
+        bool? AllowPrivateNetwork = null) : CoreCommand;
+
+    /// <summary>删掉一条登记。⚠️ **不发「已删」给一个还连着的 server**——下次 reload 才拆。</summary>
+    public sealed record McpRemove(string Id) : CoreCommand;
+
+    /// <summary>读配置、拆旧连接、连新连接、重建工具表。工具表变化会破一次前缀（`04` §7.2）。</summary>
+    public sealed record McpReload : CoreCommand;
+
+    /// <summary>**只连一次**、列一遍工具、断开。⚠️ 它不改主机表，也不要求总开关打开。</summary>
+    public sealed record McpTest(string Id) : CoreCommand;
+
     /// <summary>
     /// 写一份预设（`&lt;数据根&gt;/presets/&lt;id&gt;.md`）。<b>内容就是那段系统提示词</b>。
     ///

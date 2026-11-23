@@ -1,4 +1,5 @@
 using Lilara.Core.Kernel;
+using Lilara.Core.Mcp;
 using Lilara.Core.Protocol;
 using Lilara.Core.Storage;
 using Lilara.Core.Providers;
@@ -20,6 +21,17 @@ public static class StepperResolver
     /// 也仍然只有 `SystemBlock` 一处；测试构造推进器时不传它，行为就与加压缩之前逐字节相同。
     /// </summary>
     private const string CompactText = Kernel.CorePrompts.CompactDirective;
+
+    /// <summary>
+    /// **工具表的唯一装配点**（2026-11-18，MCP 第一批）：`内建 ⊕ MCP`。
+    /// ⚠️ 插件工具面还没落地；落地时在这里加第三段，**调用方不用改**。
+    /// ⚠️ MCP 工具在**解析时**取一次快照——`Stepper` 是每会话缓存的，
+    /// 所以这与「贡献集合每步取一次快照」（`04` §7.3 机制 1）等价；
+    /// 工具表变化后由 `CoreHost.ForgetStepper` 让下一次解析拿到新表。
+    /// </summary>
+    private static IReadOnlyList<ITool> Table(McpHost? mcp) =>
+        Tools.ToolTable.Build(("内建", Tools.BuiltInTools.All), ("MCP", mcp?.Tools ?? []));
+
     /// <summary>
     /// 优先用 <paramref name="preferredProviderId"/>（会话 spec 里快照的提供商）。
     /// ⚠️ 指定了 preferred 却**解析不出来**时，**绝不替换成别的提供商**——
@@ -31,15 +43,15 @@ public static class StepperResolver
     public static Stepper Resolve(
         SessionStore store, ProviderStore providers, string? preferredProviderId = null,
         PluginHost? plugins = null, UsageStore? usage = null, IBackgroundJobs? backgroundJobs = null,
-        Func<string, string?>? sessionStatus = null)
+        Func<string, string?>? sessionStatus = null, McpHost? mcp = null)
     {
         if (preferredProviderId is null)
         {
             var any = providers.List().FirstOrDefault();
             return any is null
-                ? new Stepper(store, new UnconfiguredAdapter(), Tools.BuiltInTools.All, plugins, usage,
+                ? new Stepper(store, new UnconfiguredAdapter(), Table(mcp), plugins, usage,
                     pendingCompactText: CompactText, backgroundJobs: backgroundJobs, sessionStatus: sessionStatus)
-                : new Stepper(store, AdapterFactory.Create(any), Tools.BuiltInTools.All, plugins, usage,
+                : new Stepper(store, AdapterFactory.Create(any), Table(mcp), plugins, usage,
                     pendingCompactText: CompactText, backgroundJobs: backgroundJobs, sessionStatus: sessionStatus);
         }
 
@@ -54,7 +66,7 @@ public static class StepperResolver
                 backgroundJobs: backgroundJobs, sessionStatus: sessionStatus);
         }
 
-        return new Stepper(store, AdapterFactory.Create(bound), Tools.BuiltInTools.All, plugins, usage,
+        return new Stepper(store, AdapterFactory.Create(bound), Table(mcp), plugins, usage,
             pendingCompactText: CompactText, backgroundJobs: backgroundJobs, sessionStatus: sessionStatus);
     }
 }

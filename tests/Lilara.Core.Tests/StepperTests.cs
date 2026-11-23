@@ -199,7 +199,8 @@ public class StepperTests : IDisposable
         await _stepper.StepAsync(handle, "hi", CancellationToken.None);
 
         var text = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[0].Slots.System));
-        Assert.Equal(CorePrompts.SystemFallback, text.Text);
+        Assert.StartsWith(CorePrompts.SystemFallback + "\n[lilara runtime metadata]\n",
+            text.Text, StringComparison.Ordinal);
     }
 
     [Fact]

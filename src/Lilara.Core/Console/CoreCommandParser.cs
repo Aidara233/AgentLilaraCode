@@ -270,6 +270,10 @@ public static class CoreCommandParser
         // shell 配置（2026-10-23）：`shell set …` / `shell test`。与 `network` 同一形状。
         if (StartsWithToken(trimmed, "shell")) return ParseShell(trimmed);
 
+        // MCP（2026-11-18）：`mcp list` / `mcp on|off` / `mcp reload` / `mcp test <id>`
+        // / `mcp remove <id>` / `mcp set <id> [flags]`。统一走命令通道，控制台与头同一语义。
+        if (StartsWithToken(trimmed, "mcp")) return ParseMcp(trimmed);
+
         // 工具调用的通用时限（2026-11-07）：`tools set --timeout <秒>`。
         // ⚠️ 与 `shell` 分开一个词，因为它**不属于 shell**——`read` / `git` / `fetch` 也吃这个上限。
         if (StartsWithToken(trimmed, "tools")) return ParseTools(trimmed);
@@ -873,9 +877,126 @@ public static class CoreCommandParser
 
     // `tools set --timeout <秒>`
     //
-    // ⚠️ 只有**一个**标志：这个配置管「一次工具调用最长等多久」，没有第二个可调项。
-    // ⇒ 与 `shell set` 同一套拆词纪律（省略的标志 = null = 保留旧值），
-    // 但值域校验留给 dispatcher：控制台与头共用那一条判据。
+    private static (CoreCommand?, string?) ParseMcp(string line)
+    {
+        const string usage =
+            "用法：mcp list | mcp on | mcp off | mcp reload | mcp test <id> | mcp remove <id>\n"
+            + "      mcp set <id> [--command <程序>] [--arg <值>]… [--cwd <目录>] [--timeout <秒>]"
+            + " [--transport stdio|http] [--endpoint <URL>] [--token-env <NAME>]"
+            + " [--allow-private on|off] [--enabled on|off]";
+
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2) return (null, usage);
+
+        switch (parts[1].ToLowerInvariant())
+        {
+            case "list":
+                return parts.Length == 2 ? (new CoreCommand.McpList(), null) : (null, usage);
+            case "reload":
+                return parts.Length == 2 ? (new CoreCommand.McpReload(), null) : (null, usage);
+            case "on":
+                return parts.Length == 2 ? (new CoreCommand.McpConfigure(true), null) : (null, usage);
+            case "off":
+                return parts.Length == 2 ? (new CoreCommand.McpConfigure(false), null) : (null, usage);
+            case "test":
+                return parts.Length == 3 ? (new CoreCommand.McpTest(parts[2]), null) : (null, usage);
+            case "remove":
+                return parts.Length == 3 ? (new CoreCommand.McpRemove(parts[2]), null) : (null, usage);
+            case "set":
+                break;
+            default:
+                return (null, usage);
+        }
+
+        if (parts.Length < 3) return (null, usage);
+        var id = parts[2];
+        bool? enabled = null;
+        string? transport = null;
+        string? endpoint = null;
+        string? tokenEnvironmentVariable = null;
+        bool? allowPrivate = null;
+        string? command = null;
+        var commandSeen = false;
+        string? cwd = null;
+        int? timeout = null;
+        var arguments = new List<string>();
+
+        for (var i = 3; i < parts.Length; i++)
+        {
+            var flag = parts[i];
+            if (i + 1 >= parts.Length || parts[i + 1].StartsWith("--", StringComparison.Ordinal))
+                return (null, $"参数 {flag} 缺少值。\n{usage}");
+
+            var value = parts[++i];
+            switch (flag)
+            {
+                case "--enabled":
+                    if (!TryOnOff(value, out var on)) return (null, "--enabled 只认 on / off。");
+                    enabled = on;
+                    break;
+                case "--transport":
+                    transport = value;
+                    break;
+                case "--endpoint":
+                    endpoint = value;
+                    break;
+                case "--token-env":
+                    tokenEnvironmentVariable = value;
+                    break;
+                case "--allow-private":
+                    if (!TryOnOff(value, out var allow)) return (null, "--allow-private 只认 on / off。");
+                    allowPrivate = allow;
+                    break;
+                case "--command":
+                    command = value;
+                    commandSeen = true;
+                    break;
+                case "--arg":
+                    arguments.Add(value);
+                    break;
+                case "--cwd":
+                    cwd = value;
+                    break;
+                case "--timeout":
+                    if (!int.TryParse(value, out var seconds)) return (null, "--timeout 要一个整数（秒）。");
+                    timeout = seconds;
+                    break;
+                default:
+                    return (null, $"未知参数 '{flag}'。\n{usage}");
+            }
+        }
+
+        return (new CoreCommand.McpUpsert(id, enabled, transport,
+            commandSeen ? command : null,
+            arguments.Count > 0 ? arguments : null,
+            cwd,
+            Environment: null,
+            timeout,
+            ToolPermission: null,
+            Endpoint: endpoint,
+            BearerTokenEnvironmentVariable: tokenEnvironmentVariable,
+            AllowPrivateNetwork: allowPrivate), null);
+    }
+
+    private static bool TryOnOff(string text, out bool enabled)
+    {
+        if (string.Equals(text, "on", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(text, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            enabled = true;
+            return true;
+        }
+        if (string.Equals(text, "off", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(text, "false", StringComparison.OrdinalIgnoreCase))
+        {
+            enabled = false;
+            return true;
+        }
+        enabled = false;
+        return false;
+    }
+
+    // `mcp set …` 的参数形状与控制面 mcp.upsert 共用语义（dispatcher 才是值域的唯一判据）。
     private static (CoreCommand?, string?) ParseTools(string line)
     {
         const string usage = "用法：tools set --timeout <秒>";

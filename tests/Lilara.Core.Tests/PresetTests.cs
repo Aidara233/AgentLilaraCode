@@ -383,7 +383,9 @@ public sealed class PresetTests : IDisposable
             new CoreCommand.SessionSend(sid, [new Block.TextBlock("在吗")]), "s1", true, CancellationToken.None);
 
         var sent = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[^1].Slots.System));
-        Assert.Equal("你是被测试的那一份。\n" + CorePrompts.SystemAddendum, sent.Text);
+        Assert.StartsWith("你是被测试的那一份。\n" + CorePrompts.SystemAddendum
+            + "\n[lilara runtime metadata]\n", sent.Text, StringComparison.Ordinal);
+        Assert.Contains("\"framework\":\"Lilara Core\"", sent.Text, StringComparison.Ordinal);
     }
 
     /// <summary>没配过任何预设 ⇒ 出站请求里带的是**内置模板**（那句话必须真的发得出去）。</summary>
@@ -401,7 +403,9 @@ public sealed class PresetTests : IDisposable
             new CoreCommand.SessionSend(sid, [new Block.TextBlock("在吗")]), "s1", true, CancellationToken.None);
 
         var sent = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[^1].Slots.System));
-        Assert.Equal(CorePrompts.SystemFallback, sent.Text);
+        Assert.StartsWith(CorePrompts.SystemFallback + "\n[lilara runtime metadata]\n",
+            sent.Text, StringComparison.Ordinal);
+        Assert.Contains("\"workingDirectory\"", sent.Text, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -434,6 +438,7 @@ public sealed class PresetTests : IDisposable
         Store.Save("mine", "第二版");
 
         var sent = Assert.IsType<Block.TextBlock>(Assert.Single(_adapter.Calls[^1].Slots.System));
-        Assert.Equal("第一版\n" + CorePrompts.SystemAddendum, sent.Text);
+        Assert.StartsWith("第一版\n" + CorePrompts.SystemAddendum
+            + "\n[lilara runtime metadata]\n", sent.Text, StringComparison.Ordinal);
     }
 }

@@ -149,8 +149,8 @@ public sealed class AskTool : ITool
     /// </param>
     public static IReadOnlyList<AskItem> ItemsOf(
         Storage.SessionStore store, string projectKey, string sessionId, string callId,
-        string? permissionLevel = null) =>
-        ItemsOf(store, projectKey, sessionId, [callId], permissionLevel);
+        string? permissionLevel = null, IReadOnlyList<ITool>? tools = null) =>
+        ItemsOf(store, projectKey, sessionId, [callId], permissionLevel, tools);
 
     /// <summary>
     /// 多条调用那一版：一张卡可以**同时**替好几条调用问（`ToolExecutor.Merge`），
@@ -161,7 +161,7 @@ public sealed class AskTool : ITool
     /// </summary>
     public static IReadOnlyList<AskItem> ItemsOf(
         Storage.SessionStore store, string projectKey, string sessionId, IReadOnlyList<string> callIds,
-        string? permissionLevel = null)
+        string? permissionLevel = null, IReadOnlyList<ITool>? tools = null)
     {
         var wanted = new HashSet<string>(callIds, StringComparer.Ordinal);
         var items = new List<AskItem>();
@@ -190,7 +190,7 @@ public sealed class AskTool : ITool
                     // ⚠️ **它是跑真模型实测抓出来的**（2026-10-11）——单元测试碰不到它，
                     // 因为那条路要「挂起之后重开进程」。而在此之前它**根本不可达**
                     // （闸门那两格没有生产者），所以这个洞一直没有露出来。
-                    : Gate.SecondHalfOf(b, permissionLevel));
+                    : Gate.SecondHalfOf(b, permissionLevel, tools));
             }
         }
 

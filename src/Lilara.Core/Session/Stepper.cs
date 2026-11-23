@@ -206,12 +206,14 @@ public sealed class Stepper(
         // 从前那六样是六个可空位置参数，于是「头里没有计划树」「答复路径没有计划树」
         // 这类漏传在编译期完全合法（三次）。现在少传一样东西在**结构上**不可能。
         // ⚠️ `iterateReplan:` 显式交「清之前读到的值」：那面旗子上面刚被清掉（只许说一次）。
+        var runtimeInfo = RuntimeInfoSnapshotFactory.Capture(handle, _adapter.Protocol, _usage);
         var slots = SystemBlock.Render(
             new PresetStore(_store.DataRoot, PresetStore.SystemDir),
             new PresetStore(_store.DataRoot, PresetStore.PremierDir),
             handle.Spec.SystemPromptPreset, handle.Spec.PremierPrompt,
             TailContext.For(handle, pluginAxes.Values, pluginPrompt, subagents, _usage,
-                compactDirective: _pendingCompactText, iterateReplan: iterateReplan));
+                compactDirective: _pendingCompactText, iterateReplan: iterateReplan),
+            runtimeInfo);
 
         // ⚠️ **引擎租约**：所有 `StepAsync` 调用都在 **_stepper 的会话内串行** 之内
         // （`CommandDispatcher` 的会话闸），所以这里不需要再同步。
@@ -522,7 +524,8 @@ public sealed class Stepper(
                 // ⚠️ **越过 900k 之后任何模式都压得成**（2026-10-27）：判据与尾块那句命令式
                 // 警告是**同一个谓词**（`ContextUsage.OverLimit`）——两处各判会分叉，
                 // 而分叉的表现是「尾块喊着现在就压、工具却回一句没有指令」。
-                ContextUsage.OverLimit(_usage, handle.SessionId));
+                ContextUsage.OverLimit(_usage, handle.SessionId),
+                runtimeInfo: runtimeInfo);
 
             // 相位：回复里有 tool_use，接下来是工具执行。
             onPhase?.Invoke(SessionPhase.Tools);
@@ -712,7 +715,8 @@ public sealed class Stepper(
                 initiative: handle.State.Axes![Axes.Initiative],
                 // ⚠️ 落检查点时**重判一次**超限（同 `Parse` 那条注释：以这一刻的上下文为准），
                 // 用的是与步开始那条工具上下文**同一个谓词**。
-                contextFull: ContextUsage.OverLimit(_usage, handle.SessionId));
+                contextFull: ContextUsage.OverLimit(_usage, handle.SessionId),
+                runtimeInfo: runtimeInfo);
             compactSummary = Tools.CompactTool.Parse(
                 new ToolCall(compactCall.CallId, compactCall.Name, compactCall.Arguments),
                 contextForCompact, out _);
@@ -1282,7 +1286,8 @@ public sealed class Stepper(
                 TaskStatus,
                 // 同上（2026-10-27）：答复路径也要知道「是不是已经越过那条硬线」，
                 // 否则用户批准的那次 compact 会被拒，而尾块刚刚才命令它压。
-                ContextUsage.OverLimit(_usage, handle.SessionId));
+                ContextUsage.OverLimit(_usage, handle.SessionId),
+                runtimeInfo: RuntimeInfoSnapshotFactory.Capture(handle, _adapter.Protocol, _usage));
 
             // 相位：答复之后真正跑掉的那批工具。
             onPhase?.Invoke(SessionPhase.Tools);

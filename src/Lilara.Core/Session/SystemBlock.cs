@@ -11,8 +11,8 @@ namespace Lilara.Core.Session;
 /// 三块的失效半径、来源、以及「空」的含义**没有一条相同**：</para>
 ///
 /// <list type="table">
-///   <item><description><b>系统块</b>（<see cref="System"/>）：核心提供的恒定单文件。
-///     文件不在 ⇒ 回落内置模板；非空预设附加机制说明；文件空且无插件系统贡献 ⇒ 无块。</description></item>
+///   <item><description><b>系统块</b>（<see cref="System"/>）：用户选定预设正文，加核心机制说明与稳定运行元数据。
+///     文件不在 ⇒ 回落内置模板；显式空预设且无插件系统贡献 ⇒ 无块，也不附运行元数据。</description></item>
 ///   <item><description><b>首要块</b>（<see cref="Premier"/>）：用户 / 项目 / 插件。**没有兜底内容**
 ///     ⇒ 文件不在 = 无块，不是「用回内置模板」。</description></item>
 ///   <item><description><b>尾块</b>（<see cref="Tail"/>）：核心每步现算（轴表）。
@@ -166,17 +166,19 @@ public static class SystemBlock
     /// <param name="tail">尾块的输入（<see cref="TailContext"/>）。⚠️ **要装配一个会话的三块，
     /// 就用 <see cref="TailContext.For"/>**——它是唯一一处派生规则，三个装配点共用。
     /// 轴值、插件贡献、派生关系快照这三样是它拿不到的（要调用方先取），别的全部由 handle 派生。</param>
+    /// <param name="runtimeInfo">核心生成的稳定运行元数据。仅在系统正文非空时附加；显式空系统预设不会被它撑成一个系统块。</param>
     public static PromptSlots Render(
         PresetStore presets, PresetStore premiers,
         string? systemPresetId, string? premierId,
-        TailContext tail) =>
+        TailContext tail, RuntimeInfoSnapshot? runtimeInfo = null) =>
         Build(
             // ⚠️ 传**可空**的预设正文，不在这里折成 `SystemFallback`：那一折会抹掉
             // 「文件不在」与「文件在」的区分，而 `SystemBody` 的判据正是它
             // （文件不在时兜底里已含机制说明；文件在时补一句）。
             Load(presets, systemPresetId),
             Load(premiers, premierId),
-            tail);
+            tail,
+            runtimeInfo);
 
     /// <summary>
     /// 三块槽位的**纯装配**——输入是已经读好的两份正文 + 轴 + 插件贡献，不碰任何存储。
@@ -190,21 +192,23 @@ public static class SystemBlock
     /// <c>null</c> = 没有这一块，<c>""</c> = 有但为空（系统块那一格甚至会产出空串块——
     /// 那是「用户明说纯聊天」的声明，见 <see cref="Text"/>）。</para>
     /// </summary>
-    internal static PromptSlots Build(string? systemText, string? premierText, TailContext tail) =>
+    internal static PromptSlots Build(
+        string? systemText, string? premierText, TailContext tail, RuntimeInfoSnapshot? runtimeInfo = null) =>
         new(
-            System: Text(SystemBody(systemText, tail.Plugin?.Text(PromptSlot.System))),
+            System: Text(SystemBody(systemText, tail.Plugin?.Text(PromptSlot.System), runtimeInfo)),
             Premier: Wrap(CorePrompts.PremierOpen,
                 Join(premierText, tail.Plugin?.Text(PromptSlot.Primary)), CorePrompts.PremierClose),
             Tail: Wrap(CorePrompts.TailOpen, TailBody(tail), CorePrompts.TailClose));
 
     // 非空自定义预设也需要机制说明；显式空预设且无系统贡献时仍不产生系统块。
-    private static string SystemBody(string? preset, string? plugin)
+    private static string SystemBody(string? preset, string? plugin, RuntimeInfoSnapshot? runtimeInfo)
     {
         var body = Join(preset ?? CorePrompts.SystemFallback, plugin);
         if (body is null) return "";
-        // ⚠️ 用户自己的预设正文之后追加的是**整份**框架说明（回收 + 浮动上下文 + 工作流程规范），
-        // 不是只有浮动那一段：漏掉哪一段都会让「用户写了预设」的会话静默少一条机制约定。
-        return preset is null ? body : Join(body, CorePrompts.SystemAddendum)!;
+        // ⚠️ 用户自己的预设正文之后追加的是**整份**框架说明。
+        // 显式空预设且没有系统贡献时，body 仍为 null，框架说明与运行元数据都不越过空块语义。
+        if (preset is not null) body = Join(body, CorePrompts.SystemAddendum)!;
+        return runtimeInfo is null ? body : Join(body, runtimeInfo.ToSystemPromptBlock())!;
     }
 
     private static string? Join(params string?[] values)

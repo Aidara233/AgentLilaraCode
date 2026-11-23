@@ -23,12 +23,14 @@ namespace Lilara.Core.Session.Tools;
 /// 由建设点（`Stepper` 两处 / 控制台的待答询问探测）交进来，**不是**在这里现渲染：
 /// 现渲染会让 `floating_context` 的返回值与核心合成注入的那份分叉。
 /// 省略 = 空串（没有浮动块，或调用方确实不需要它）。</param>
+/// <param name="runtimeInfo">核心在请求构造时冻结的非秘密运行信息。工具可按需查询，不需要自行重建 provider/model/路径事实。</param>
 public sealed class SessionToolContext(
     string workingDirectory, BlobStore blobs, IReadOnlyList<TimelineEvent>? timeline = null,
     string? floatingContext = null, NetworkAccess? network = null, bool goalActive = false,
     bool compactRequested = false, ShellAccess? shell = null, SubagentScope? subagents = null,
     SessionPlan? plan = null, string? mode = null, IReadOnlyList<string>? approvedCallIds = null,
-    string? initiative = null, Func<string, string?>? subagentStatus = null, bool contextFull = false)
+    string? initiative = null, Func<string, string?>? subagentStatus = null, bool contextFull = false,
+    RuntimeInfoSnapshot? runtimeInfo = null)
     : IToolContext
 {
     private readonly string _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workingDirectory));
@@ -37,6 +39,8 @@ public sealed class SessionToolContext(
         : StringComparison.Ordinal;
 
     public string WorkingDirectory => _root;
+
+    public RuntimeInfoSnapshot? RuntimeInfo { get; } = runtimeInfo;
 
     /// <summary>
     /// ⚠️ <b>这个闸不是可选的</b>：模型给的路径是**不可信输入**，

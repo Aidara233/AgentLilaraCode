@@ -34,7 +34,7 @@ public sealed class PluginHost
         if (_sealed) throw new InvalidOperationException("Plugin registration is closed.");
 
         var id = plugin.Identity.Id;
-        if (!IsPluginId(id)) throw new ArgumentException($"Invalid plugin id '{id}'.", nameof(plugin));
+        if (!IsValidPluginId(id)) throw new ArgumentException($"Invalid plugin id '{id}'.", nameof(plugin));
         if (string.IsNullOrWhiteSpace(plugin.Identity.Version))
             throw new ArgumentException("Plugin version is required.", nameof(plugin));
         if (_plugins.ContainsKey(id)) throw new InvalidOperationException($"Plugin '{id}' is already registered.");
@@ -211,12 +211,17 @@ public sealed class PluginHost
     }
 
     private static bool IsFieldKey(string value) => !string.IsNullOrWhiteSpace(value) &&
-        value.Length <= 128 && value.Split('.').All(IsPluginId);
+        value.Length <= 128 && value.Split('.').All(IsValidPluginId);
 
     private static string LevelText(AxisDefinition axis, string value, string explanation) =>
         $"{axis.Label} ({axis.Id}) {value}：{explanation}";
 
-    private static bool IsPluginId(string value) =>
+    /// <summary>
+    /// 插件 id 的形状：小写字母 / 数字 / 连字符，1–64 字符。
+    /// ⚠️ <b>公开成 public，是因为 MCP 的 serverId 用的是同一条规则</b>（`McpNames` 调它）
+    /// ——两层判据必须共用一个谓词，各写一份就会漂。
+    /// </summary>
+    public static bool IsValidPluginId(string? value) =>
         !string.IsNullOrWhiteSpace(value) &&
         value.Length <= 64 &&
         value.All(c => char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c) || c == '-');

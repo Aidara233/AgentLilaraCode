@@ -612,7 +612,7 @@ public sealed class ControlServer(
         // 「未知」，而用户**正是靠这句话判断该不该提权**（`01` §3.5：模型不能自提权）。
         IReadOnlyList<AskItem> ItemsOf(SessionHandle handle, PausedAsk paused) =>
             Session.Tools.AskTool.ItemsOf(host.Store, handle.ProjectKey, handle.SessionId, paused.CallId,
-                handle.State.Axes?.GetValueOrDefault(Axes.Permission));
+                handle.State.Axes?.GetValueOrDefault(Axes.Permission), host.Mcp.Tools);
 
         app.MapGet("/sessions/{id}/history", (string id, int? limit, string? before) =>
         {
@@ -970,6 +970,10 @@ public sealed class ControlServer(
             }, WireJson.Options);
         });
 
+        // MCP（2026-11-18）。⚠️ 与 `/shell-config` 同一条纪律：**这一刻的设备事实由核心算**，
+        // 头只显示。⚠️ 它**不触发连接**——快照是只读的；连接由 `mcp.reload` / `mcp.test` 发起。
+        app.MapGet("/mcp", () => Results.Json(host.Mcp.Snapshot(), WireJson.Options));
+
         // 后台任务（2026-10-27）。⚠️ **用户侧的那只眼**：模型那一侧的 `jobs` / `job_kill`
         // 受权限轴管（`off` 档下连看都看不到），而头必须永远看得见自己机器上跑了什么。
         // ⚠️ 与 `/claims` 同一条纪律：**不 Activate、不产生状态副作用**（纯读）。
@@ -1057,12 +1061,15 @@ public sealed class ControlServer(
         // 从前这里逐项传参，于是头那块浮动槽里**永远没有计划树、也没有上下文长度**
         // ——而模型那份有。两处都「看着对」，用户却无从发现「头上看不到注入情况」。
         // ⚠️ 上下文用量要交 usage：`ContextUsage.Line` 与 `/sessions/{id}/context` 是同一份测量。
+        var adapterProtocol = host.StepperFor(handle).Adapter.Protocol;
+        var runtimeInfo = RuntimeInfoSnapshotFactory.Capture(handle, adapterProtocol, host.Usage);
         var slots = SystemBlock.Render(
             new PresetStore(host.DataRoot, PresetStore.SystemDir),
             new PresetStore(host.DataRoot, PresetStore.PremierDir),
             handle.Spec.SystemPromptPreset,
             handle.Spec.PremierPrompt,
-            TailContext.For(handle, values, contribution, SubagentScopeOf(handle), host.Usage));
+            TailContext.For(handle, values, contribution, SubagentScopeOf(handle), host.Usage),
+            runtimeInfo);
 
         return new
         {
@@ -1576,6 +1583,29 @@ public sealed class ControlServer(
                 Opt(payload, "executable"),
                 ToInt(OptNumber(payload, "timeoutSeconds"))),
             "shell.test" => new CoreCommand.ShellTest(),
+            // MCP（2026-11-18，第一批：只 tools）。
+            // ⚠️ `id` 走 GetProperty（必给）；其余全是 Opt —— **键缺失 = 保留旧值**，
+            // 而 `command == ""` 是**有意义的值**（清掉命令），不能折进「没给」。
+            "mcp.list" => new CoreCommand.McpList(),
+            "mcp.configure" => new CoreCommand.McpConfigure(OptBool(payload, "enabled")),
+            "mcp.upsert" => new CoreCommand.McpUpsert(
+                payload.GetProperty("id").GetString()!,
+                OptBool(payload, "enabled"),
+                Opt(payload, "transport"),
+                Opt(payload, "command"),
+                OptStringList(payload, "arguments"),
+                Opt(payload, "workingDirectory"),
+                OptStringMap(payload, "environment"),
+                ToInt(OptNumber(payload, "timeoutSeconds")),
+                OptStringMap(payload, "toolPermission"),
+                Opt(payload, "endpoint"),
+                Opt(payload, "bearerTokenEnvironmentVariable"),
+                OptBool(payload, "allowPrivateNetwork")),
+            "mcp.remove" => new CoreCommand.McpRemove(
+                payload.GetProperty("id").GetString()!),
+            "mcp.reload" => new CoreCommand.McpReload(),
+            "mcp.test" => new CoreCommand.McpTest(
+                payload.GetProperty("id").GetString()!),
             // 工具调用的通用时限（2026-11-07）。键缺失 = 保留旧值（与 `shell.configure` 同一条）。
             "tools.configure" => new CoreCommand.ToolsConfigure(
                 ToInt(OptNumber(payload, "callTimeoutSeconds"))),

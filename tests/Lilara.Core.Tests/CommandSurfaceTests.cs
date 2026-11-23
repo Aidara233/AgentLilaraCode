@@ -42,6 +42,14 @@ public class CommandSurfaceTests
         // （它不属于 shell——`read` / `git` / `fetch` 也吃这个上限）。
         (typeof(CoreCommand.ToolsConfigure),   "tools.configure",   "tools set --timeout 600"),
 
+        // MCP（2026-11-18）：全局开关、登记、移除、连接重载与临时连通性检查。
+        (typeof(CoreCommand.McpList),          "mcp.list",          "mcp list"),
+        (typeof(CoreCommand.McpConfigure),     "mcp.configure",     "mcp on"),
+        (typeof(CoreCommand.McpUpsert),        "mcp.upsert",        "mcp set remote --transport http --endpoint https://mcp.example.com/mcp --token-env MCP_TOKEN --timeout 45"),
+        (typeof(CoreCommand.McpRemove),        "mcp.remove",        "mcp remove fs"),
+        (typeof(CoreCommand.McpReload),        "mcp.reload",        "mcp reload"),
+        (typeof(CoreCommand.McpTest),          "mcp.test",          "mcp test fs"),
+
         // 预设：系统提示词的存放（预设批）。三条**都有线上形态**——
         // 连 `preset list` 也有（它走线，不像 `provider list` 是控制台本地查询：
         // 头只有一个入口，而它要用这个做下拉）。
@@ -128,6 +136,18 @@ public class CommandSurfaceTests
             using var doc = JsonDocument.Parse(WirePayload(wire));
             Assert.Equal(cmd, ControlServer.ParseCommand(doc.RootElement).GetType());
         }
+    }
+
+    [Fact]
+    public void WireLine_ReadsRemoteMcpEndpointAndAuthConfiguration()
+    {
+        var command = ControlServer.ParseCommand(JsonDocument.Parse(
+            """{"kind":"mcp.upsert","id":"remote","transport":"http","endpoint":"https://mcp.example.com/mcp","bearerTokenEnvironmentVariable":"MCP_TOKEN","allowPrivateNetwork":false}""")
+            .RootElement);
+        var upsert = Assert.IsType<CoreCommand.McpUpsert>(command);
+        Assert.Equal("https://mcp.example.com/mcp", upsert.Endpoint);
+        Assert.Equal("MCP_TOKEN", upsert.BearerTokenEnvironmentVariable);
+        Assert.False(upsert.AllowPrivateNetwork);
     }
 
     // ---- ②补：线上**确实读到了**那几个「键名与属性名不一致 / 曾经被漏读」的字段 ----

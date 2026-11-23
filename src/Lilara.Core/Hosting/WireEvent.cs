@@ -25,6 +25,7 @@ namespace Lilara.Core.Hosting;
 [JsonDerivedType(typeof(RetryAttempt), "retry.attempt")]
 [JsonDerivedType(typeof(ApprovalRequested), "approval.requested")]
 [JsonDerivedType(typeof(ApprovalResolved), "approval.resolved")]
+[JsonDerivedType(typeof(McpChanged), "mcp.changed")]
 [JsonDerivedType(typeof(Error), "error")]
 [JsonDerivedType(typeof(UsageUpdated), "usage.updated")]
 [JsonDerivedType(typeof(CompactionCompleted), "session.compaction.completed")]
@@ -89,6 +90,11 @@ public abstract record WireEvent
     public sealed record ClaimAcquired(string SessionId, string Path) : WireEvent;
 
     public sealed record ClaimReleased(string SessionId, string Path) : WireEvent;
+
+    /// <summary>设备级 MCP 工具表或连接状态变了。只发在 core topic，头据此重拉 `/mcp`。</summary>
+    public sealed record McpChanged(
+        bool Enabled, IReadOnlyList<Lilara.Core.Mcp.McpServerView> Servers,
+        IReadOnlyList<string> Problems, DateTimeOffset At) : WireEvent;
 
     // 业务失败走这里（模型 400 / 上游 503）；回执里的 rejected 只用于「命令本身不合法」。
     public sealed record Error(string SessionId, string Message) : WireEvent;

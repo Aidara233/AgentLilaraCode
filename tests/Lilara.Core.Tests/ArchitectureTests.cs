@@ -36,7 +36,8 @@ public class ArchitectureTests
         // 26 → 27（2026-10-24 后台 shell 批）：加了 `ShellJobs.cs`（后台任务的词汇层）。
         // 27 → 28（2026-11-06 工具容量批）：见那一批的提交。
         // 28 → 29（2026-11-07 工具时限批）：加了 `ToolCalls.cs`（一次工具调用的通用上限 + `tools.json` 的形状）。
-        Assert.Equal(29, files.Length);
+        // 29 → 30（runtime metadata）：加了 `RuntimeInfoSnapshot.cs`（核心生成的系统运行数据视图）。
+        Assert.Equal(30, files.Length);
 
         var offenders = files
             .SelectMany(f => ExternalUsings(f).Select(u => $"{Path.GetFileName(f)}:{u.Line}  {u.Text}"))

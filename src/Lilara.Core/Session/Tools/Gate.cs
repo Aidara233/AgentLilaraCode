@@ -230,11 +230,24 @@ public static class Gate
     /// （<see cref="DenyReason"/>）**不冲突**——那条说的是**落进记录的**理由不能重算；
     /// 而这里是一张**问用户的卡**，它本来就该反映此刻的档位（用户要据此判断该不该提权）。</para>
     /// </summary>
-    public static IReadOnlyList<AskItem> SecondHalfOf(Block.ToolUseBlock call, string? level) =>
-        SecondHalfOf(call, ClassOf(call.Name),
+    /// <param name="extraTools">
+    /// **内建表之外的**工具（今天就是 MCP 工具）。⚠️ 少了它，一张**重启之后**重建的卡片会把
+    /// MCP 工具显示成「不可逆（高危）」——那是**一条假信息**，而用户正是靠这句话判断该不该提权。
+    /// </param>
+    public static IReadOnlyList<AskItem> SecondHalfOf(
+        Block.ToolUseBlock call, string? level, IReadOnlyList<ITool>? extraTools = null) =>
+        SecondHalfOf(call, ClassOf(call.Name, extraTools),
             level is null ? "未知" : Axes.LabelOf(Axes.Permission) + "＝" + level);
 
-    private static PermissionClass ClassOf(string toolName) =>
-        BuiltInTools.All.FirstOrDefault(t => string.Equals(t.Name, toolName, StringComparison.Ordinal))
-            ?.PermissionClass ?? PermissionClass.Destructive;
+    /// <summary>
+    /// 按名字找权限类别。⚠️ <b>先查传入的额外表，再查内建</b>——今天额外表里只有 MCP 工具，
+    /// 而它们**不在** <see cref="BuiltInTools.All"/> 里。找不到才退回 `Destructive`
+    /// （保守的那一侧；编一个更轻的类别会让用户看到一个假的「它是只读类」）。
+    /// </summary>
+    private static PermissionClass ClassOf(string toolName, IReadOnlyList<ITool>? extraTools) =>
+        extraTools?.FirstOrDefault(t => string.Equals(t.Name, toolName, StringComparison.Ordinal))
+            ?.PermissionClass
+        ?? BuiltInTools.All.FirstOrDefault(t => string.Equals(t.Name, toolName, StringComparison.Ordinal))
+            ?.PermissionClass
+        ?? PermissionClass.Destructive;
 }
