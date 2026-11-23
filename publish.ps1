@@ -1,7 +1,7 @@
 ﻿# 核心的两个发布版本（用户裁定 2026-10-23）：
 #   win-x64 / linux-x64，**单文件**、自包含（目标机不需要装 .NET）。
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File publish.ps1 [-Version 1.0.0]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File publish.ps1 [-Version 1.1.0]
 #
 # 产物：publish\lilara-<version>-win-x64.zip / lilara-<version>-linux-x64.tar.gz
 #       每个压缩包里是**一个可执行文件**（自解压单文件：.NET 运行时打进 exe）。
@@ -14,7 +14,7 @@
 #   自解压单文件在默认设置下每次启动会把内嵌的原生库解压到临时目录，压缩后包从 ~106 MB 降到 ~45 MB，
 #   代价是首次启动多几十毫秒。这里选体积。
 param(
-    [string]$Version = "1.0.0",
+    [string]$Version = "1.1.0",
     [string[]]$Rids = @("win-x64", "linux-x64")
 )
 $ErrorActionPreference = "Stop"
@@ -74,4 +74,16 @@ foreach ($rid in $Rids) {
         Write-Host ("  {0} — {1:N1} MB" -f (Split-Path $tgz -Leaf), ((Get-Item $tgz).Length / 1MB))
     }
 }
+# 校验和：跟着发布包一起发出去。
+# ⚠️ 用 `*` 前缀（sha256sum 的二进制模式写法）：下载下来可以直接 `sha256sum -c SHA256SUMS`。
+$sums = Join-Path $out "SHA256SUMS"
+$rows = foreach ($file in (Get-ChildItem $out -File | Where-Object { $_.Extension -in ".zip", ".gz" } | Sort-Object Name)) {
+    $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$hash *$($file.Name)"
+}
+join(
+, # ⚠️ 用 WriteAllText 写 LF，不用 Set-Content：Set-Content 在 Windows PowerShell 上写 CRLF， #    而 `sha256sum -c` 在 Linux 上会把行尾那个 \r 当成文件名的一部分（实测：No such file or directory）。 [System.IO.File]::WriteAllText($sums, (($rows -join "`n") + "`n")))
+Write-Host ("SHA256SUMS — {0} 行" -f @($rows).Count)
+
 Write-Host "产物在 $out"
+
