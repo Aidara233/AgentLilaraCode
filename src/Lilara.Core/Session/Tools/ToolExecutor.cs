@@ -349,6 +349,10 @@ public sealed class ToolExecutor(
         var tells = new List<TellRequest>();
         // 2026-10-26：第三族——`archive_child` 收起。同上：工具只说一句话，写 spec 在分派器。
         var archives = new List<ArchiveRequest>();
+        // 2026-11-19：`approve_child` 的放行请求（与上面三族同一条纪律：只有真跑过的才产出）。
+        // ⚠️ **不能叫 `approvals`**：那个名字是构造参数（人的批准记忆 `ApprovalStore`）的，
+        // 同名的局部变量会让它在本方法里整段被遮住（CS0841）。
+        var childApprovals = new List<ApproveChildRequest>();
 
         // ⚠️ **只有走到下面那个 `RunAsync` 的调用才进来**——「名字在批里」不足以说明
         // 「它执行过」（见 `Batch.ExecutedCallIds`）。`release` 的线按这份名单画。
@@ -458,6 +462,9 @@ public sealed class ToolExecutor(
             if (outcome.Spawn is { } spawn) spawns.Add(spawn);
             if (outcome.Tell is { } tell) tells.Add(tell);
             if (outcome.Archive is { } archive) archives.Add(archive);
+            // 2026-11-19：第四族——`approve_child` 替孩子放行。同上：工具只说一句话，
+            // 清挂起 + 续跑那一步在分派器（那里才有队列与事件总线）。
+            if (outcome.Approve is { } approve) childApprovals.Add(approve);
 
             // ⚠️ **批准时那句附言**：附在这一条的结果后面，**只附一次**（见循环外那段）。
             // ⚠️ 在 `Materialize` **之前**拼：库对象与落盘内容必须与事件里那条逐字一致
@@ -502,6 +509,7 @@ public sealed class ToolExecutor(
             Spawns = spawns,
             Tells = tells,
             Archives = archives,
+            Approvals = childApprovals,
             Interrupted = interrupted,
         };
     }
@@ -748,6 +756,16 @@ public sealed class ToolExecutor(
         /// 「它跑没跑」。⚠️ 按产出序（= 调用序）排：同一步里先后收起两个孩子的次序是事实。</para>
         /// </summary>
         public IReadOnlyList<ArchiveRequest> Archives { get; init; } = [];
+
+        /// <summary>
+        /// 本批执行出来的**放行请求**（`approve_child`，2026-11-19）。
+        ///
+        /// <para>⚠️ 与 <see cref="Spawns"/> / <see cref="Tells"/> / <see cref="Archives"/> 同一条纪律：
+        /// 只有**真的跑过**的工具才产出它（被闸门拒的那条不打这条通道）。
+        /// ⚠️ 与 <see cref="Tells"/> 分开是刻意的：那个只往孩子的记录里加一句话，
+        /// 这个会让被挡下的那条调用**真的执行**——落地次序也因此不同（见 `DeliveryOrder`）。</para>
+        /// </summary>
+        public IReadOnlyList<ApproveChildRequest> Approvals { get; init; } = [];
 
         /// <summary>
         /// **这一批被用户打断了**（2026-11-07）。

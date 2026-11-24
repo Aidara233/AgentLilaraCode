@@ -53,6 +53,12 @@ public sealed class WaitTool : ITool
         if (context is not SessionToolContext { SubagentStatus: { } probe })
             return ToolText.Of("缺少子会话实时状态通道，无法确认任务是否完成。");
 
+        // ⚠️ **「等」的时候要说清在等什么**（2026-11-19）：状态只有一个词，而父能做的事
+        // 对两种询问完全不同（提问它能答，授权它只看自己档位批不批得了）。
+        // ⚠️ 询问的细节取的是**步开始那份快照**（`scope`）：实况探针只给状态。
+        // 拿不到（那条询问是这一步跑起来之后才出现的）就只说状态，**不编一个种类**。
+        var waiting = scope.Children.FirstOrDefault(c => c.SessionId == id)?.Waiting;
+
         // Drivers briefly expose Idle between steps. Require a quiet observation interval too.
         TimeSpan? quietSince = null;
         while (true)
@@ -61,7 +67,7 @@ public sealed class WaitTool : ITool
             var state = probe(id);
             if (state is null) return ToolText.Of($"子会话 {id} 已不存在，完成情况未知。");
             if (state == SessionStatus.WaitingForInput)
-                return Result(id, state, false, "子会话需要回答或审批；请查看问题后处理。等待已返回，任务未被停止。");
+                return Result(id, state, false, WaitingNote(waiting));
             if (state == SessionStatus.Idle)
             {
                 quietSince ??= clock.Elapsed;
@@ -74,6 +80,26 @@ public sealed class WaitTool : ITool
             await Task.Delay(100, ct);
         }
     }
+
+    /// <summary>
+    /// **「它在等人」那一句该怎么写**（2026-11-19）。判据只有询问的 <see cref="AskKind"/>——
+    /// 一个词分两档，因为父能做的事分两档：
+    /// 提问 ⇒ `tell_child` 那句话就是答复；授权 ⇒ 只有「在自己档位之内」才批得了
+    /// （超出那一格就只能等人，`approve_child` 会如实拒绝）。⚠️ 拿不到询问细节时只说状态，
+    /// **不猜种类**（猜错会让父去点一个点了没用的动词）。
+    /// </summary>
+    private static string WaitingNote(Kernel.WaitingAsk? waiting) => waiting switch
+    {
+        null => "子会话需要回答或审批；请查看问题后处理。等待已返回，任务未被停止。",
+        { Kind: AskKind.Question } w =>
+            $"子会话挂着一条提问（ask {w.AskId}）：用 tell_child 把回答给它，那句话会落进那条提问的结果里。"
+            + "人也可以在界面上直接答——先到的那个生效。等待已返回，任务未被停止。",
+        { Kind: AskKind.Permission } w =>
+            $"子会话在等人批准 `{w.ToolName}`（ask {w.AskId}）。"
+            + "那条调用在你自己的档位之内就用 approve_child 放行；超出那一格就只有人能批"
+            + "（说给用户，或者用 tell_child 让它改道）。等待已返回，任务未被停止。",
+        _ => "子会话需要回答或审批；请查看问题后处理。等待已返回，任务未被停止。",
+    };
 
     private static ToolOutcome Result(string id, string state, bool done, string detail) => new()
     {

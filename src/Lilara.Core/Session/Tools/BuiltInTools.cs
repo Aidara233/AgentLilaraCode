@@ -111,5 +111,9 @@ public static class BuiltInTools
         // （可逆标记，`SessionSpec.ArchivedAt`），与 `release` 画线的判据同源。
         new SpawnTool(), new TellChildTool(), new TellParentTool(), new SubagentReportTool(),
         new ArchiveChildTool(),
+        // 2026-11-19：`approve_child` 进这一族——它开的是「父能替孩子放行」这扇门
+        // （判据是**父自己的档位**放行那一类，`01` §10.3 的「授权范围 ⊆ 父」）。
+        // ⚠️ 它与 `tell_child` 是两个动词：这个会让被挡下的调用真的执行，那个只是补一句话。
+        new ApproveChildTool(),
     ];
 }

@@ -1104,11 +1104,17 @@ public sealed class ControlServer(
             // ——**可见**，不是静默（同 `/sessions` 那条）。
             try
             {
+                var state = host.Store.ReadState(projectKey, spec.SessionId);
                 var status = host.TryGetActivated(spec.SessionId, out var child)
                     ? child.State.Status
-                    : host.Store.ReadState(projectKey, spec.SessionId).Status;
+                    : state.Status;
 
-                children.Add(new Kernel.SubagentChild(spec.SessionId, status));
+                // ⚠️ 与 `Stepper.SubagentScopeFor` **同一个装法**（`WaitingAsk.From`）：
+                // 两处各写一份的话，头显示的与模型收到的会在加字段时分叉。
+                children.Add(new Kernel.SubagentChild(spec.SessionId, status)
+                {
+                    Waiting = Kernel.WaitingAsk.From(state.Ask),
+                });
             }
             catch (Exception ex) when (ex is IOException or FileNotFoundException
                                           or UnauthorizedAccessException or Storage.FileFormatException)

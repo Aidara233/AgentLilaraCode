@@ -206,6 +206,19 @@ public sealed record ToolOutcome
     /// ——与 `release` 同一条判据：它做的唯一一件事是**说出一句话**。</para>
     /// </summary>
     public ArchiveRequest? Archive { get; init; }
+
+    /// <summary>
+    /// **这次执行其实是一次「父替孩子放行」**（`approve_child`，2026-11-19，用户裁定）。
+    ///
+    /// <para>⚠️ 与 <see cref="Spawn"/> / <see cref="Tell"/> / <see cref="Archive"/> 同一个形状、
+    /// 同一条理由：工具没有 `store` 的手，也碰不到队列 ⇒ 它只说「批哪一个」，
+    /// 「清挂起 + 把那条批准交给下一步」在 `CommandDispatcher`。</para>
+    ///
+    /// <para>⚠️ <b>它是<b>授权</b>，所以它必须走**结构化**通道</b>（不能与 `tell_child` 共用一个格子）：
+    /// 前者会让孩子那条被挡下的调用**真的执行**，后者只是往它记录里加一句话。
+    /// 合成一格的话，「父到底放没放行」在记录里就分不出来了。</para>
+    /// </summary>
+    public ApproveChildRequest? Approve { get; init; }
 }
 
 /// <summary>
@@ -230,6 +243,23 @@ public interface IToolContext
     /// tool-context implementations source-compatible; core-created contexts always provide it.
     /// </summary>
     RuntimeInfoSnapshot? RuntimeInfo => null;
+
+    /// <summary>
+    /// **本会话自己的权限档位**（`permission` 轴的此刻值，2026-11-19）。
+    /// ⚠️ 现读的口径与闸门一致——**执行那一刻读、步内冻结**（浮动字段，见 `SessionToolContext`
+    /// 的构造参数注释）：一步之内两条调用只能按同一个档位判。
+    /// <para>⚠️ 今天的读者只有 `approve_child`：父替孩子放行时，必须先知道**自己**允许多少
+    /// ——「子里程碑 ⊆ 父」那条委托边界（`01` §10.3）靠它判。默认 `null` 让外部实现照旧编译，
+    /// 而 `null` 在下游读作「未知档位」⇒ 最严那一档（`Gate.Decide` 的既有判据）。</para>
+    /// </summary>
+    string? PermissionLevel => null;
+
+    /// <summary>
+    /// 按名字查一个工具的**权限类别**（`PermissionClass`）；查不到 ⇒ <c>null</c>。
+    /// <para>⚠️ 与 `Gate.ClassOf` 同一条判据、同一个来源（工具表本身）：这里再抄一份类别名单
+    /// 就等于给「哪类工具要问」造了第二个真相。默认 `null` 同样只为兼容外部实现。</para>
+    /// </summary>
+    PermissionClass? ToolClass(string name) => null;
 
     /// <summary>
     /// 把**相对工作目录**的路径解析成绝对路径；**逃逸就是 <c>null</c>**。

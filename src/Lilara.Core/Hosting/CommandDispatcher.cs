@@ -482,6 +482,30 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
+    /// **答复已经放进槽 ⇒ 起那一步**（2026-11-19 抽出来）。
+    ///
+    /// <para>⚠️ <b>两条路（人的 `approval.respond` 与父的 `approve_child`）共用它</b>：
+    /// 「拿不到闸就交给在飞的那一步」这句话是**同一条语义**，两处各写一遍之后，
+    /// 一边记得 `Live.Mark` 而另一边忘了，就只剩一个会话在心跳里被跳过——而那种毛病
+    /// 在界面上看起来是「它卡住了」，没有任何一处报错。</para>
+    /// </summary>
+    private bool KickResume(SessionHandle handle)
+    {
+        if (!handle.TryEnterStep()) return false;
+
+        // ⚠️ **打点与 `TryEnterStep` 同处**（那两处就是 `_step` 翻转的地方）——
+        // 收尾的异常绝不许冒上来（它跑在心跳里，一条会话失败不该让整轮扫描停掉）。
+        _host.Live.Mark(handle.SessionId);
+        _ = Task.Run(async () =>
+        {
+            try { await RunStepAsync(handle, CancellationToken.None, throwOnFailure: false); }
+            finally { _host.Live.Clear(handle.SessionId); }
+        }, CancellationToken.None);
+
+        return true;
+    }
+
+    /// <summary>
     /// 分派一条命令。
     /// <paramref name="awaitCompletion"/>：控制台传 true——它没有视图，唯一的输出就是这次的返回值，
     /// 「命令投递即返回」于是在本地退化成同步拿回执；控制面传 false——立刻回 ack，模型回话经事件流出。
@@ -1586,11 +1610,83 @@ public sealed class CommandDispatcher(
         foreach (var spawn in step.Spawns ?? [])
             SpawnChild(handle, spawn);
 
+        // ⚠️ **放行排在补话前面**（2026-11-19，次序是契约）：两者都作用在「孩子此刻挂着的那一条」
+        // 上，而 `tell_child` 落到挂起的询问上会把它**顶掉**（提问：答掉；授权：作废）。
+        // 反过来排的话，同一步里既批又补话，那条批准会找不到它的对象。
+        foreach (var approve in step.Approvals ?? [])
+            DeliverApproval(handle, approve);
+
         foreach (var tell in step.Tells ?? [])
             DeliverTell(handle, tell);
 
         foreach (var archive in step.Archives ?? [])
             ArchiveChild(handle, archive);
+    }
+
+    /// <summary>
+    /// **父替孩子放行那条被挡下的调用**（`approve_child`，2026-11-19，用户裁定）。
+    ///
+    /// <para>⚠️ <b>它走的是人的 `approval.respond` 批准那一条路</b>（同一段恢复机制：
+    /// `QueueResume` → `Stepper.ResumeAsync` → 那批被盖住的调用**跳过闸门**照常执行）。
+    /// 不动那条路是对的：两边各写一遍的话，「批准之后到底跑不跑」会有两个答案。</para>
+    ///
+    /// <para>⚠️ <b>判据里那几条都是「静默不动、不猜」</b>：不是自己的孩子、它没在等、
+    /// 种类不是授权、`askId` 对不上、已经过期、**父自己的档位也不放行**——都把这一条丢掉，
+    /// 不抛（它跑在一步的收尾路径上，抛会把那一步已经算好的结果整个丢掉，同 `DeliverTell`）。
+    /// ⚠️ 而「工具说了已批准、其实没落地」在模型那边是**可见**的：孩子那边什么都不会发生，
+    /// 下一步它还在等（尾块那行会继续写「等你批准」）。</para>
+    /// </summary>
+    private void DeliverApproval(SessionHandle from, ApproveChildRequest request)
+    {
+        if (!TryFind(request.ChildSessionId, out var child, out _)) return;
+
+        // 「它真的是我的孩子」——工具那一侧已经判过一次，这里再判是因为这两步之间
+        // 那个孩子可能已经被删 / 被过继（同 `DeliverTell`）。
+        if (!string.Equals(child.Spec.ParentSessionId, from.SessionId, StringComparison.Ordinal)) return;
+
+        // ⚠️ **那个孩子可能没在内存里**（没激活）⇒ `Activate` 载入它才拿得到队列与挂起态。
+        // 这不是顺手捡的副作用：放行必须作用到盘上那个孩子（同 `StopDescendants` 的判据）。
+        try { child = _host.Activate(child.ProjectKey, child.SessionId); }
+        catch (Exception ex) when (ex is IOException or JsonException or FileFormatException)
+        {
+            return;
+        }
+
+        if (child.State.Status != SessionStatus.WaitingForInput || child.State.Ask is not { } paused) return;
+        if (paused.Kind != AskKind.Permission) return;
+        if (request.AskId is { } wanted
+            && !string.Equals(wanted, paused.AskId, StringComparison.Ordinal)) return;
+
+        // ⚠️ **过期 ⇒ 不采用**（同 `HandleApprovalRespond`：这个批准来晚了，按超时合成）。
+        if (paused.DeadlineAt is { } deadline && CoreClock.Now() >= deadline) return;
+
+        // ⚠️ **授权范围 ⊆ 父**：判据与工具那一侧、与升级正文**同一个谓词** `MayApprove`
+        // （`Gate.Decide` 那张表）。这里再判一次的理由很具体：「工具跑完」与「现在落地」
+        // 之间，父的档位可能已经被用户调低了。
+        if (!MayApprove(from, paused.ToolName)) return;
+
+        var waiting = child.AwaitingInput?.Calls
+            ?? Stepper.RecordedCalls(_host.Store, child.ProjectKey, child.SessionId, paused.CallId);
+
+        // ⚠️ 盖住的调用就是**那张卡替它们问的那些**（`AskRequest.CallIds`）；内存那半没了
+        // （重启过）时退回盘上那一条——同一处判据见 `HandleApprovalRespond`。
+        IReadOnlyList<string> covered = child.AwaitingInput?.Ask.CallIds is { Count: > 0 } ids
+            ? ids
+            : [paused.CallId];
+
+        child.QueueResume(new SessionHandle.PendingResume(
+            waiting,
+            new ToolExecutor.Reply(AskKind.Permission, covered, [], new Dictionary<string, string>()),
+            paused));
+
+        ClearPause(child);
+        // ⚠️ 报 `submit`：那张卡**被答复了**（人那边若还开着，也据此关掉）。
+        PublishApprovalResolved(child.SessionId, paused.AskId, "submit");
+
+        // ⚠️ **拿不到闸就不重复起**：槽里的那次放行会被在飞那一步的下一次 `TakeResume` 取走。
+        // ⚠️ 而「挂起那一趟的尾巴撞上它」那条窗口由 `RunStepAsync` 尾部的 `HasPendingResume`
+        // 补一次（同一次改动里加的）——两处合起来，这次放行终究会被执行到。
+        KickResume(child);
     }
 
     /// <summary>
@@ -1765,7 +1861,7 @@ public sealed class CommandDispatcher(
         // 这里再判是因为**这一步与那一步之间**那个孩子可能已经被删/被过继。
         if (!string.Equals(target.Spec.ParentSessionId, from.SessionId, StringComparison.Ordinal)) return;
 
-        DeliverToSession(target, blocks);
+        DeliverToSession(target, blocks, from.SessionId);
     }
 
     /// <summary>
@@ -1775,27 +1871,43 @@ public sealed class CommandDispatcher(
     /// 那条路还要处理「命令回执 / awaitCompletion / 事件里带 sessionId」等命令层的事，
     /// 而这一条只做投递。⚠️ 两者的次序完全一致（先追加、后入队、再启动）——
     /// 那条次序列是两处各写一遍就会漂的东西，所以这里把注释指回 `session.send`。</para>
+    ///
+    /// <para>⚠️ **挂起时按询问的种类分路（2026-11-19，用户裁定「父要能回应孩子的请求」）**：</para>
+    /// <list type="bullet">
+    ///   <item><b>提问（<see cref="AskKind.Question"/>）</b> ⇒ 这句话**就是答复**：它落进那条
+    ///   `ask` 的结果里（`ask` 的契约本来就是「答案作为结果回到你手里」），而且**不再另入队
+    ///   一遍**——同一句话让孩子看到两次是噪音。</item>
+    ///   <item><b>授权（<see cref="AskKind.Permission"/>）</b> ⇒ 仍然**顶替**：一句话**不是**
+    ///   批准，那条被挡下的调用**不会执行**（放行有它自己的动词 `approve_child`，
+    ///   判据是父自己的档位）。</item>
+    /// </list>
     /// </summary>
-    private void DeliverToSession(SessionHandle target, IReadOnlyList<Block> blocks)
+    private void DeliverToSession(SessionHandle target, IReadOnlyList<Block> blocks, string fromSessionId)
     {
-        // ⚠️ **撞上「正在等回答」⇒ 先顶替**（`01` §3.8）。不顶替的话，那条悬空的
+        var said = string.Concat(blocks.OfType<Block.TextBlock>().Select(b => b.Text));
+
+        // ⚠️ **撞上「正在等回答」⇒ 先把它了结**（`01` §3.8）。不处理的话，那条悬空的
         // `tool_use` 会让下一步请求当场 400（`HandleSessionSendAsync` 那条注释有实测记录）。
-        if (target.State.Status == SessionStatus.WaitingForInput && target.State.Ask is { } superseded)
+        if (target.State.Status == SessionStatus.WaitingForInput && target.State.Ask is { } paused)
         {
-            _host.Store.AppendEvent(target.ProjectKey, target.SessionId, Stepper.Supersede(
-                superseded, string.Concat(blocks.OfType<Block.TextBlock>().Select(b => b.Text))));
-
-            target.AwaitingInput = null;
-            target.UpdateStateAndPersist(_host.Store, st => st with
+            if (paused.Kind == AskKind.Question)
             {
-                Status = SessionStatus.Idle,
-                Ask = null,
-            }, diskStatus: SessionStatus.Idle);
+                DeliverAnswerToQuestion(target, paused, fromSessionId, said);
+                return;
+            }
 
-            _bus.Publish(EventBus.ApprovalsTopic,
-                new WireEvent.ApprovalResolved(target.SessionId, superseded.AskId, "superseded"));
-            _bus.Publish(EventBus.SessionTopic(target.SessionId),
-                new WireEvent.ApprovalResolved(target.SessionId, superseded.AskId, "superseded"));
+            // ⚠️ **授权那条：顶替，而且必须说清「这不是批准」**（放行是另一个动词
+            // `approve_child` 的事，判据是父自己的档位）。署名带父会话——孩子那边
+            // 「用户」指的是驱动它的人，而现在那个人是父。
+            var patch = OtherCallsOf(target, paused);
+            var text = Stepper.SupersedeText(paused, said, fromSessionId);
+            _host.Store.AppendEvents(target.ProjectKey, target.SessionId,
+                patch.Count == 0
+                    ? [Stepper.Answer(paused, text)]
+                    : [Stepper.Answer(paused, text), .. Stepper.Blocked(patch, paused.CallId, text)]);
+
+            ClearPause(target);
+            PublishApprovalResolved(target.SessionId, paused.AskId, "superseded");
         }
 
         var at = CoreClock.Now();
@@ -1817,6 +1929,63 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
+    /// **父会话回答了孩子挂着的那条提问**（2026-11-19，用户裁定「父要能回应孩子的请求」）。
+    ///
+    /// <para>⚠️ <b>它走的是「答复」这条路，而不是顶替</b>：孩子的驱动者就是父，所以父这句话
+    /// **就是那条提问的答案**——`ask` 的契约（「答案会作为这次调用的结果回到你手里」）
+    /// 在这里第一次对父生效。⚠️ 于是**不另入队那条消息**：同一句话再写成一条用户消息，
+    /// 等于让孩子在下一轮读到两遍，而其中一遍还署着「用户」。</para>
+    ///
+    /// <para>⚠️ <b>不截断</b>（`Stepper.Supersede` 那条超过 200 字会截断，因为全文还会作为
+    /// 一条用户消息入队、截断只裁掉回声）：这里**这条结果就是全文本身**，截断等于把父的答复
+    /// 吃掉一半。它的长度由父那一步的输出上限兜着。</para>
+    ///
+    /// <para>⚠️ <b>然后 `Start` 起一步</b>：不需要 `QueueResume`——提问那条**不执行任何工具**
+    /// （`ToolExecutor` 见到 `Question` 只把答案拼进结果），结果已经落盘，孩子只差一次
+    /// 「带着这条结果继续推」。（拒绝 / 超时那条路走到这里时**不续跑**，那是对的：它们
+    /// 没有新内容可推，而这里恰恰有一个新的答复。）</para>
+    /// </summary>
+    private void DeliverAnswerToQuestion(
+        SessionHandle target, PausedAsk paused, string fromSessionId, string said)
+    {
+        var answer = Stepper.AnsweredByDriverText(fromSessionId, said);
+        var patch = OtherCallsOf(target, paused);
+
+        // ⚠️ **一次 `AppendEvents` 写完整批**：被问的那条 + 同一张卡盖住的其余几条。
+        // 后者不补的话会**永远悬着**——而悬空的 `tool_use` 让下一步请求当场 400。
+        _host.Store.AppendEvents(target.ProjectKey, target.SessionId,
+            patch.Count == 0
+                ? [Stepper.Answer(paused, answer)]
+                : [Stepper.Answer(paused, answer), .. Stepper.Blocked(patch, paused.CallId, answer)]);
+
+        ClearPause(target);
+        // ⚠️ 报 `submit`：那次询问**真的被答了**（人那张卡也该收起来了）。
+        PublishApprovalResolved(target.SessionId, paused.AskId, "submit");
+
+        // ⚠️ **拿不到闸就不重复起**：已经有一步在飞，它会读到刚落的那条结果。
+        Start(target);
+    }
+
+    /// <summary>
+    /// **一张卡还盖住了哪几条别的调用**（2026-11-19）。
+    ///
+    /// <para>⚠️ `PausedAsk` 只装得下**一个** `CallId`，而 `ToolExecutor.Merge` 会把一批里
+    /// 多条被挡下的调用合成**一张**卡 ⇒ 「按那条被问的补了结果、其余几条永远悬着」
+    /// 是本仓栽过的形状（悬空的 `tool_use` 让下一步 400）。⚠️ 内存那半可能没了（重启过），
+    /// 那时只认盘上那一条（`PausedAsk.CallId`），**不凭空造**。</para>
+    /// </summary>
+    private IReadOnlyList<Block.ToolUseBlock> OtherCallsOf(SessionHandle target, PausedAsk paused) =>
+        target.AwaitingInput is { Calls.Count: > 1 } waiting ? waiting.Calls : [];
+
+    /// <summary>**那次询问结束了**：同投两条流（`approvals` 与这条会话流，理由见 `WireEvent.ApprovalResolved`）。</summary>
+    private void PublishApprovalResolved(string sessionId, string askId, string outcome)
+    {
+        var resolved = new WireEvent.ApprovalResolved(sessionId, askId, outcome);
+        _bus.Publish(EventBus.ApprovalsTopic, resolved);
+        _bus.Publish(EventBus.SessionTopic(sessionId), resolved);
+    }
+
+    /// <summary>
     /// **子会话 → 父会话的一条回报**：一对合成的工具对，追加进父的记录并入队。
     ///
     /// <para>⚠️ <b>为什么是「一对」而不是一条</b>：上游要求 `tool_result` 紧跟它的
@@ -1833,8 +2002,7 @@ public sealed class CommandDispatcher(
     /// </summary>
     private void ReportToParent(SessionHandle child, string text, string status)
     {
-        if (child.Spec.ParentSessionId is not { } parentId) return;
-        if (!TryFind(parentId, out var parent, out _)) return;   // 父没了 ⇒ 静默丢弃（同 `DeliverTell`）
+        if (ParentOf(child) is not { } parent) return;   // 父没了 ⇒ 静默丢弃（同 `DeliverTell`）
 
         var callId = $"{Injected.SubagentPrefix}{Ids.New()}";
         InjectReport(parent, callId, SubagentReportTool.NameOf,
@@ -1842,6 +2010,16 @@ public sealed class CommandDispatcher(
             new ToolFraming(SubagentReportTool.NameOf,
             [new("from", child.SessionId), new("status", status)]));
     }
+
+    /// <summary>
+    /// **这个孩子的父会话句柄**（`null` = 顶层 / 父已经没了）。
+    /// ⚠️ 两个读者（`ReportToParent` 与 `EscalateAsk`）共用它：各写一遍的话，
+    /// 「父找不到」的判据会在两处漂，而漂的表现是「回报发得出去、升级发不出去」。
+    /// </summary>
+    private SessionHandle? ParentOf(SessionHandle child) =>
+        child.Spec.ParentSessionId is { } parentId && TryFind(parentId, out var parent, out _)
+            ? parent
+            : null;
 
     // Both child reports and process completion enter the same durable, paired channel.
     private void InjectReport(SessionHandle target, string callId, string tool,
@@ -1889,26 +2067,108 @@ public sealed class CommandDispatcher(
     }
 
     /// <summary>
-    /// **子会话在提问 ⇒ 让父知道**（`01` §10.2 的「要我决策」那一类，2026-10-24 用户裁定）。
+    /// **子会话挂起了 ⇒ 让父知道，并且说清它此刻能做什么**（`01` §10.2 的「要我决策」那一类，
+    /// 2026-10-24 用户裁定；2026-11-19 按询问种类拆成两条）。
     ///
-    /// <para>⚠️ <b>只对 <see cref="AskKind.Question"/> 发</b>：`Permission` 类的询问
-    /// **不经父**（`01` §10.3：让父批孩子的危险操作是剧场——模型批模型不是安全边界）。
-    /// 那一路**已经上提到头了**：`approvals` 是全局流，载荷带 `sessionId`，
-    /// 所以人天然看得见（`Ask` 的类型注释写着「子会话上提不是第三个 Kind」）。</para>
+    /// <para>⚠️ <b>为什么要拆</b>：从前的升级只有一句「我卡在一个问题上」——父拿不到 `askId`
+    /// 与问题 id，于是它只能 `tell_child` 说一段话（那走的是顶替，孩子的 `ask` 结果被写成
+    /// 「用户没有回答…」）；而**授权那一路一条都不发**，父在 `wait` 上耗着却不知道在等什么。
+    /// 现在两条各自把「怎么回应」写进正文里（`00` §2.2：能写在这里的，绝不进系统提示词）。</para>
     ///
-    /// <para>⚠️ <b>父能回答（`tell_child`），但答不了也没关系</b>：那条询问仍然挂在子身上，
-    /// 人随时可以在头里回答它。两个回答者不冲突——先到的那个赢，后到的会拿到
-    /// 「这个询问已经结束了」（`HandleApprovalRespond` 的既有判据）。</para>
+    /// <para>⚠️ <b>授权这一条仍然不是「让父批」</b>（`01` §10.3 那条「模型批模型不是安全边界」
+    /// 的边界没有动）：父能批，**只因为那条调用属于父自己的档位**（`Gate.Decide` 同一条表）。
+    /// 超出的那一格它只能等人——正文会如实这么写，而 `approve_child` 也会如实拒绝。
+    /// 人那边本来就看得到（`approvals` 是全局流，载荷带 `sessionId`），
+    /// 父知情不等于它在替人做决定。</para>
     /// </summary>
     private void EscalateAsk(SessionHandle handle, AskRequest ask)
     {
-        if (handle.Spec.ParentSessionId is null) return;
-        if (ask.Kind != AskKind.Question) return;
+        if (ParentOf(handle) is not { } parent) return;
 
-        var text = string.Join("\n", ask.Items.Select(i => $"· {i.Question}"));
-        ReportToParent(handle, $"我卡在一个问题上，需要你回答：\n{text}\n"
-            + "（也可以让人在界面上直接回答——那条路同样生效。）", "asking");
+        ReportToParent(handle,
+            ask.Kind == AskKind.Permission
+                ? PermissionEscalation(handle, parent, ask)
+                : QuestionEscalation(handle, ask),
+            ask.Kind == AskKind.Permission ? "permission" : "asking");
     }
+
+    /// <summary>
+    /// **提问那条升级怎么写**（2026-11-19）。带 `askId` 与每个问题的 id/形状/选项——
+    /// 父要照着它回答，而这些是回答所需的**全部**输入（它没有那张卡的屏幕）。
+    /// </summary>
+    private static string QuestionEscalation(SessionHandle child, AskRequest ask)
+    {
+        var lines = new List<string> { $"我卡在一个问题上，需要你回答（ask {ask.Id}）：" };
+
+        foreach (var item in ask.Items)
+        {
+            // ⚠️ 形状要写出来：`choice` 的选项是**答案的值域**，不列出来父只能瞎猜
+            // （而它猜的那个标签可能根本不在卡上）。
+            var shape = item.Shape switch
+            {
+                AskShape.Choice => (item.Multi ? "多选" : "单选") + "：" + string.Join(" / ", item.Options.Select(o =>
+                    string.IsNullOrEmpty(o.Label) || o.Label == o.Value ? o.Value : $"{o.Value}（{o.Label}）")),
+                AskShape.Text => "文本",
+                AskShape.Form => "表单：" + string.Join(" / ", item.Fields.Select(f => f.Name)),
+                // ⚠️ `Verbatim`（参数原文）只在授权卡上出现，而授权那条走的是
+                // `PermissionEscalation`——这里留着它是为了**不静默**（不猜成别的形状）。
+                _ => "参数原文",
+            };
+
+            lines.Add($"· {item.Id}（{shape}）：{item.Question}");
+        }
+
+        lines.Add($"用 tell_child 把回答给 {child.SessionId}：那句话会落进这条提问的结果里，我带着它继续跑。"
+            + "人也可以在界面上直接答——两条路都行，先到的那个生效。");
+
+        return string.Join("\n", lines);
+    }
+
+    /// <summary>
+    /// **授权那条升级怎么写**（2026-11-19）。关键的一句是**父到底能不能批**——
+    /// 判据就是 <see cref="MayApprove"/>（`Gate.Decide` 那张表，与闸门同一个谓词），
+    /// 于是父不必先试一次再被告知不行。
+    /// </summary>
+    private string PermissionEscalation(SessionHandle child, SessionHandle parent, AskRequest ask)
+    {
+        // ⚠️ **工具名在 `PausedAsk` 上**（`ask.Items` 只有那句问话与参数原文）——它由
+        // `Stepper.PausedOf` 从那批调用上抄下来，与盘的 `state.json` 同一份。
+        var tool = child.State.Ask?.ToolName;
+
+        var lines = new List<string>
+        {
+            $"我卡在一条等人授权的调用上：`{tool ?? "（工具名没留下）"}`，ask {ask.Id}。",
+        };
+
+        var level = parent.State.Axes?[Axes.Permission];
+        lines.Add(MayApprove(parent, tool)
+            ? $"这条在你的档位（{Label(level)}）之内——你可以用 approve_child 放行它，我接着执行。"
+            : $"这条超出你的档位（{Label(level)} 不放行这一类）——只有人能批；"
+              + "把它说给用户，或者用 tell_child 让我改个道。");
+        lines.Add("⚠️ 不要用 tell_child 去「批准」：那只会把那条调用顶掉（它不会执行）。");
+
+        return string.Join("\n", lines);
+    }
+
+    /// <summary>档位的可读说法（`permission＝trusted`）——与 `Gate.DenyReason` 同一个形状。</summary>
+    private static string Label(string? level) =>
+        level is null ? "未知" : Axes.LabelOf(Axes.Permission) + "＝" + level;
+
+    /// <summary>
+    /// **父能不能替孩子放行这一条**（2026-11-19，用户裁定）：判据只有一条——
+    /// **父自己的档位本来就放行这一类**（`Gate.Decide` 那张 `档位 × 类别` 的表）。
+    /// 于是「委托的授权范围 ⊆ 父」（`01` §10.3）一格没动：孩子做的事从头到尾都在
+    /// 父已经有的授权之内。
+    ///
+    /// <para>⚠️ <b>它有两个读者，谓词只有一个</b>：升级正文（告诉父能不能批）与
+    /// `DeliverApproval`（真的批之前再判一次——「工具跑完」与「现在落地」之间
+    /// 父的档位可能已经变了）。⚠️ 工具那一侧还有第三处（`approve_child` 自己要如实回话），
+    /// 它读的是同一张表（`Gate.Decide`），不是另一份名单。</para>
+    /// </summary>
+    private bool MayApprove(SessionHandle parent, string? toolName) =>
+        toolName is { Length: > 0 }
+        && Gate.Decide(Gate.ClassOf(toolName, _host.Mcp.Tools),
+            parent.State.Axes?.GetValueOrDefault(Axes.Permission)) is Verdict.Allow;
 
     /// <summary>
     /// **级联停止**（用户 2026-10-24 裁定）：把这个会话**以及它整棵子树**的推进停掉。
@@ -2760,6 +3020,20 @@ public sealed class CommandDispatcher(
                     : $"{failure}（没能自动接上；那半截生成已经留在记录里。）");
             return null;
         }
+
+        // ⚠️ **挂起收尾时补一次答复**（2026-11-19）。
+        //
+        // <para>⚠️ <b>那个窗口是真的</b>：`Stepper` 落盘（状态转 `WaitingForInput`）之后，
+        // 这一趟还要发询问事件、兑现派生、跑 `finally` 放掉 `_step`。而「答复」可以就在
+        // 这段尾巴上进来——`approve_child`（父那一步的工具回执）与 `approval.respond`
+        // 都会 `QueueResume` 然后 `TryEnterStep`；那一刻拿不到闸，它们**不会报错**（回执写的是
+        // 「稍后执行」），可**挂起之后没有任何下一步**会去 `TakeResume` 取它 ⇒ 那次批准
+        // 一直躺在槽里，看起来像「点了批准，什么都没发生」。</para>
+        //
+        // <para>⚠️ 判据用「槽里有东西」，不是「状态是挂起」：`ClearPause` 可能已经把状态
+        // 拨回 `Idle` 了（答复正是它拨的），而槽里那件事**还没执行**。⇒ 只要槽里有东西
+        // 就补起一步；`Start` 拿不到闸（另一条真的在推进）时什么都不做，那是它原有的语义。</para>
+        if (handle.HasPendingResume && Start(handle)) return reply;
 
         // ⚠️ **挂起不是「调了工具」**（`01` §3.8）。
         //
@@ -3655,19 +3929,13 @@ public sealed class CommandDispatcher(
             handle.QueueResume(new SessionHandle.PendingResume(calls, reply, paused));
             ClearPause(handle);
 
-            _bus.Publish(EventBus.SessionTopic(c.SessionId),
-                new WireEvent.ApprovalResolved(c.SessionId, c.AskId, c.Outcome));
-            _bus.Publish(EventBus.ApprovalsTopic,
-                new WireEvent.ApprovalResolved(c.SessionId, c.AskId, c.Outcome));
+            PublishApprovalResolved(c.SessionId, c.AskId, c.Outcome);
 
             // ⚠️ **拿不到闸就不续跑**（已经有一次推进在飞）。
             // ⚠️ 拿不到时那次 `QueueResume` **留在槽里**，会被那次在飞的推进的**下一次**
             // `TakeResume` 取走：它取走的正是「用户刚答的那一件」，语义对。
-            if (!handle.TryEnterStep())
+            if (!KickResume(handle))
                 return new DispatchResult(new Ack.Accepted { CommandId = id, Note = "已记录答复，稍后执行。" });
-
-            _ = Task.Run(() => RunStepAsync(handle, CancellationToken.None, throwOnFailure: false),
-                CancellationToken.None);
 
             return new DispatchResult(new Ack.Accepted { CommandId = id, Note = "已批准，正在执行。" });
         }
