@@ -140,7 +140,8 @@ public static class TimelineRender
     ///
     /// <para>⚠️ <b>渲染<b>不</b>决定回收，只读已经落盘的窗口</b>（2026-10-17 更正）：
     /// `Reclaim.Decide` 只看 `ReclaimEvent` / `ReleaseEvent` 这两种记录——前者由
-    /// `session.gc` / 压缩在开窗那一刻解析好，后者由模型画线。渲染<b>不带</b> `staleProbe`、
+    /// `session.gc` / 压缩在开窗那一刻解析好，后者由模型画线（⚠️ 而**线要先在「会话落定」那一刻
+    /// 兑成一条窗口**，判据与理由见 `Reclaim.ReleaseIds` / `Reclaim.Decide`）。渲染<b>不带</b> `staleProbe`、
     /// 也不数保护带：那些判据会在每一步重新解析，而回收改的是前缀中段
     /// ⇒ 每步破一次缓存，且模型刚读到的内容在下一步就消失（`00` §3：热路径不做事后清理）。</para>
     /// </summary>

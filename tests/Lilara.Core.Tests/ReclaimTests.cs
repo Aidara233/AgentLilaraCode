@@ -197,6 +197,92 @@ public class ReclaimTests : IDisposable
         Assert.DoesNotContain("gone", decided);
     }
 
+    private TimelineEvent.ReleaseEvent Line(string id, params string[] scope) => new()
+    {
+        Id = id, At = CoreClock.Now(), Scope = scope,
+    };
+
+    /// <summary>一条带指称的结果（按写入侧的规则落一遍）。</summary>
+    private TimelineEvent.ToolResultEvent Source(string id, string dependsOn, string text) => new()
+    {
+        Id = id, At = CoreClock.Now(), CallId = "call-" + id, DependsOn = dependsOn,
+        Content = Reclaim.Materialize([new Block.TextBlock(text)], _blobs),
+    };
+
+    // ---- 线：回收的时机是「会话落定」（2026-11-14）----------------------------
+
+    /// <summary>
+    /// ⚠️ **线本身不再是回收判据**（2026-11-14，用户裁定「会话停止的时候执行释放刚好合适」）：
+    /// 回收的时机是**会话落定**——那一刻才把线解析成一条 `Trigger = "release"` 的窗口。
+    /// ⇒ 记录里只有线时 `Decide` **一条都不收**：线之后那几轮自动续跑全部保持**纯追加**
+    /// （前缀缓存整段命中），这正是这条时机的全部收益。
+    /// </summary>
+    [Fact]
+    public void Decide_ARecorderLineAlone_ReclaimsNothing()
+    {
+        var r1 = Source("r1", "src/a.cs", "甲");
+
+        Assert.Empty(Reclaim.Decide([r1, Line("line", "src")], _blobs));
+    }
+
+    /// <summary>
+    /// ⚠️ **落定那一刻的解析才是判据**：`ReleaseIds` 给出线覆盖的那批 id，落成窗口之后
+    /// `Decide` 才收它们——而且**只收线覆盖的**（作用域是词法前缀、线的上方不动）。
+    ///
+    /// <para>⚠️ 变异：把 `ReleaseIds` 的作用域判据去掉（收「线以下全部」）⇒ `sibling`（`src-evil/`）
+    /// 会被 `src` 盖住、`after`（线之后才读的）也会被收——本用例的断言都会红。</para>
+    /// </summary>
+    [Fact]
+    public void ReleaseIds_ThenTheWindow_ReclaimWhatTheLineCovers_AndOnlyThat()
+    {
+        var a = Source("a", "src/a.cs", "甲");
+        var sibling = Source("b", "src-evil/b.cs", "乙");   // 前缀相邻的兄弟目录：不许被 `src` 盖住
+        var after = Source("after", "src/c.cs", "丙");      // 线**之后**才读的：这次释放收不到它
+        var line = Line("line", "src");
+
+        var atStop = new TimelineEvent[] { a, sibling, line, after };
+
+        // ① 落定那一刻解析：只有 `a`。
+        Assert.Equal(["a"], Reclaim.ReleaseIds(atStop, _blobs));
+
+        // ② 只有线 ⇒ 还没收（中途那几轮不许破前缀）。
+        Assert.Empty(Reclaim.Decide(atStop, _blobs));
+
+        // ③ 落成窗口 ⇒ 收 `a`，而且只收它。
+        var withWindow = new TimelineEvent[]
+        {
+            a, sibling, line, after, Reclaim.Window("release", ["a"], null),
+        };
+        Assert.Equal(["a"], Reclaim.Decide(withWindow, _blobs).OrderBy(id => id, StringComparer.Ordinal));
+    }
+
+    /// <summary>
+    /// ⚠️ **注入的两族不算「一次释放事件」**——`floating-` 的浮动读数对与 `subagent-` / `job-`
+    /// 的合成对**都是 `From=Model`**，但它们既不是模型画的线、也不是会话落定，与回收无关。
+    /// （2026-11-14 之后判据只看记录里的**线**与**窗口**，所以这里钉的是「它们不会被误当成线」。）
+    /// </summary>
+    [Fact]
+    public void InjectedEvents_AreNotReleaseLines()
+    {
+        var r1 = Source("r1", "src/a.cs", "甲");
+
+        var readout = new TimelineEvent.MessageEvent
+        {
+            Id = "floating-abc-readout-result-call", At = CoreClock.Now(), From = Speaker.Model,
+            Blocks = [new Block.ToolUseBlock("floating-abc-readout-result", "floating_context", "{}")],
+        };
+        var report = new TimelineEvent.MessageEvent
+        {
+            Id = "subagent-abc-call", At = CoreClock.Now(), From = Speaker.Model,
+            Blocks = [new Block.ToolUseBlock("subagent-abc-result", "subagent_report", "{}")],
+        };
+
+        // 没有线 ⇒ 落定也解析不出任何 id（注入那两族不会被读成释放集）。
+        Assert.Empty(Reclaim.ReleaseIds([r1, readout, report], _blobs));
+        Assert.Empty(Reclaim.Decide([r1, readout, report], _blobs));
+    }
+
+
     // ---- 注记 ----------------------------------------------------------------
 
     /// <summary>

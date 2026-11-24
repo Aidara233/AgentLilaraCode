@@ -70,12 +70,32 @@ public class ReleaseLineTests : IDisposable
         [.. _adapter.Calls[^1].Timeline.OfType<TimelineEvent.ToolResultEvent>()];
 
     /// <summary>
-    /// ⚠️ **本批的核心一条**：读两个文件 → `release` 其中一个 → 下一步的请求里
+    /// **模拟「会话落定」**：驱动层那一刻做的事（`CommandDispatcher.SweepReleaseWindow`——
+    /// 同一份实现：<see cref="Reclaim.ReleaseIds"/> + <see cref="Reclaim.Window"/>）。
+    ///
+    /// <para>⚠️ 这些用例只推 `Stepper`、**没有驱动循环**，所以落定这一步得自己补；
+    /// 真正的接线（落定 ⇒ 开窗 ⇒ `session.reclaimed`）由 `CommandDispatcherTests` 那条钉。</para>
+    /// </summary>
+    private void Settle(SessionHandle? handle = null)
+    {
+        var h = handle ?? _handle;
+        var timeline = _store.ReadTimeline(h.ProjectKey, h.SessionId);
+        _store.AppendEvents(h.ProjectKey, h.SessionId,
+            [Reclaim.Window("release", Reclaim.ReleaseIds(timeline, new BlobStore(_store.DataRoot)), null)]);
+    }
+
+
+    /// <summary>
+    /// ⚠️ **本批的核心一条**：读两个文件 → `release` 其中一个 → **线生效之后**的请求里
     /// **只有那一个**换成了注记，另一个原样。
     ///
     /// <para>⚠️ 那一读一放之间**没有任何东西推进保护带**（两条结果而已），
     /// 所以这条绿**不可能**是「距离」那一档做的——它是线做的。
     /// 这正是本条与 `StepLagTests` 那条的区别：那里要靠垫 `ProtectedRecentResults` 条结果。</para>
+    ///
+    /// <para>⚠️ **断言点在「会话落定」之后**（2026-11-14）：线只是被记下来，回收要等落定那一刻
+    /// 由驱动层兑成窗口（`Reclaim.ReleaseIds`）。「落定之前一条注记都没有」由
+    /// <see cref="ARelease_ReclaimsNothingUntilTheLoopSettles"/> 钉。</para>
     /// </summary>
     [Fact]
     public async Task ARelease_ReclaimsWhatItCovers_AndOnlyThat()
@@ -112,7 +132,13 @@ public class ReleaseLineTests : IDisposable
         Assert.Contains(_store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
             .OfType<TimelineEvent.ReleaseEvent>(), e => e.Id == recorded.Id);
 
-        // 第 3 步：纯文本 ⇒ 这一趟的请求就是断言对象。
+        // 第 3 步：还是纯文本 ⇒ **落定之前一条注记都没有**（线只是记下来了，回收还没开窗）。
+        _adapter.Reply("好。");
+        await _stepper.StepAsync(_handle, [], default);
+        Assert.DoesNotContain("[已回收]", string.Concat(Sent().Select(TextOf)), StringComparison.Ordinal);
+
+        // **会话落定**（驱动层那一刻）⇒ 线兑成回收窗口。第 4 步的请求才是断言对象。
+        Settle();
         _adapter.Reply("好。");
         await _stepper.StepAsync(_handle, [], default);
 
@@ -120,6 +146,56 @@ public class ReleaseLineTests : IDisposable
         Assert.Contains("[已回收]", TextOf(sent.Single(r => r.Id == bId)), StringComparison.Ordinal);
         Assert.DoesNotContain("[已回收]", TextOf(sent.Single(r => r.Id == aId)), StringComparison.Ordinal);
         Assert.Contains("甲", TextOf(sent.Single(r => r.Id == aId)), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ **不停就不收**（2026-11-14 用户裁定「会话停止的时候执行释放刚好合适」）——端到端的那一半，
+    /// 而它同时是**缓存**那一半的判据：`release` 之后那几轮**自动续跑**必须与上一步是**纯追加**
+    /// （一个字都不换）⇒ 前缀缓存整段命中；回收要等**会话落定**那一刻才开窗。
+    ///
+    /// <para>⚠️ 变异：让线直接成为渲染期判据（`Reclaim.Decide` 读 `ReleaseEvent`）⇒
+    /// 第一条断言（「落定之前一条注记都没有」）当场红。</para>
+    /// </summary>
+    [Fact]
+    public async Task ARelease_ReclaimsNothingUntilTheLoopSettles()
+    {
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "甲");
+
+        // 第 1 步：读一个文件。
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReadOf("c1", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, "看一眼", default);
+
+        var aId = _store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ToolResultEvent>().Single(r => r.CallId == "c1").Id;
+
+        // 第 2 步：释放——线**这一步就落盘**（立刻，不等谁点头；等的是渲染）。
+        _adapter.ReplyWith(_ => new ModelReply
+        {
+            Blocks = [ReleaseOf("c2", "a.txt")], StopReason = "tool_use", Refused = false,
+        });
+        await _stepper.StepAsync(_handle, [], default);
+        Assert.Single(_store.ReadTimeline(_handle.ProjectKey, _handle.SessionId)
+            .OfType<TimelineEvent.ReleaseEvent>());
+
+        // 第 3 步：**紧接的那一次请求**——原文还在，一条注记都没有（缓存覆盖的就是这一轮）。
+        _adapter.Reply("好。");
+        await _stepper.StepAsync(_handle, [], default);
+        Assert.DoesNotContain("[已回收]", TextOf(Sent().Single(r => r.Id == aId)), StringComparison.Ordinal);
+        Assert.Contains("甲", TextOf(Sent().Single(r => r.Id == aId)), StringComparison.Ordinal);
+
+        // 第 4 步：**再自动续跑一轮**——仍然一条注记都没有（没落定 ⇒ 没开窗）。
+        _adapter.Reply("好。");
+        await _stepper.StepAsync(_handle, [], default);
+        Assert.DoesNotContain("[已回收]", TextOf(Sent().Single(r => r.Id == aId)), StringComparison.Ordinal);
+
+        // **会话落定** ⇒ 开窗；再推一步才换成注记。
+        Settle();
+        _adapter.Reply("好。");
+        await _stepper.StepAsync(_handle, [], default);
+        Assert.Contains("[已回收]", TextOf(Sent().Single(r => r.Id == aId)), StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -206,6 +282,8 @@ public class ReleaseLineTests : IDisposable
         });
         await _stepper.StepAsync(_handle, [], default);
 
+        // ⚠️ **回收在「会话落定」那一刻开窗**（2026-11-14）：先落定，再推一步看请求。
+        Settle();
         _adapter.Reply("好。");
         await _stepper.StepAsync(_handle, [], default);
 
@@ -247,6 +325,14 @@ public class ReleaseLineTests : IDisposable
         });
         await _stepper.StepAsync(_handle, [], default);
 
+        // ⚠️ **落定之前一条注记都没有**（2026-11-14）：线只是记下来了，回收等**会话落定**才开窗。
+        _adapter.Reply("好。");
+        await _stepper.StepAsync(_handle, [], default);
+        Assert.DoesNotContain("[已回收]", string.Concat(Sent().Select(TextOf)), StringComparison.Ordinal);
+
+        Settle();
+
+        // 再推一步 ⇒ 这一次的请求才读得到那条窗口。
         _adapter.Reply("好。");
         await _stepper.StepAsync(_handle, [], default);
 
@@ -419,7 +505,8 @@ public class ReleaseLineTests : IDisposable
             .OfType<TimelineEvent.ReleaseEvent>());
         Assert.Equal(["a.txt"], line.Scope);
 
-        // 线的效果：下一次请求里那条读结果已经换成注记。
+        // 线的效果：**会话落定**之后那一次请求才换成注记（2026-11-14：回收在落定那一刻开窗）。
+        Settle(handle);
         _adapter.Reply("好。");
         await stepper.StepAsync(handle, [], default);
         var sent = _adapter.Calls[^1].Timeline.OfType<TimelineEvent.ToolResultEvent>()
