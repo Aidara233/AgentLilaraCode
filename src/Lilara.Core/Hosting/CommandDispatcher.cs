@@ -2896,6 +2896,60 @@ public sealed class CommandDispatcher(
     /// `turn` 就 +2、+3。这是**对的**——步是持久化的原子单位，每一次模型调用都是一步。
     /// ⇒ 头看到的「会话推进了几步」与实际调用次数一致，而不是与用户按了几次回车一致。</para>
     /// </summary>
+    /// <summary>
+    /// **落定时开一次「释放窗口」**（2026-11-14，用户裁定「会话停止的时候执行释放刚好合适」）。
+    ///
+    /// <para>⚠️ <b>为什么在这里、而不在渲染里</b>：回收改的是前缀<b>中段</b>（`00` §3）⇒ 它只许在
+    /// <b>窗口</b>里发生，而窗口是<b>落盘的记录</b>。`release` 画的那条线只是「模型说过这句话」；
+    /// 什么时候把它兑成回收要由<b>时机</b>回答，而那个时机是<b>落定</b>——那一刻没有在飞的请求，
+    /// 线之后的几轮自动续跑全都保持纯追加（缓存整段命中），而下一趟（用户什么时候回来都行）
+    /// 才换渲染：缓存冷了改写免费，热了付一次后缀全价——那一笔正是这段内容<b>最后一次</b>被付费。</para>
+    ///
+    /// <para>⚠️ <b>只在「上一个释放窗口之后又画过线」时动手</b>：否则每一轮落定都会追一条同样的
+    /// 窗口记录（记录只追加，那是纯噪音）。判据是<b>索引</b>（最后一条线 vs 最后一个 `release` 窗口）。</para>
+    ///
+    /// <para>⚠️ <b>它不许把落定弄失败</b>：窗口只是优化（换个渲染），而落定是会话的事实
+    /// （`Turn` / `Status` / 子会话回报都在它之后）。⇒ 整段包住，坏盘 / 坏 JSON 一律只丢这一次窗口
+    /// ——⚠️ 而<b>不会永久丢</b>：下一次落定会把同一批线重新并进来（<see cref="Reclaim.ReleaseIds"/>
+    /// 是并集语义）。</para>
+    ///
+    /// <para>⚠️ <b>被打断 / 硬失败那两条出口不单独扫</b>：同上一条并集语义——它们画下的线
+    /// 会在<b>下一次落定</b>时一起并进来（最多晚一次落定，不会漏）。</para>
+    /// </summary>
+    private void SweepReleaseWindow(SessionHandle handle)
+    {
+        try
+        {
+            var timeline = _host.Store.ReadTimeline(handle.ProjectKey, handle.SessionId);
+
+            var lastLine = -1;
+            var lastWindow = -1;
+            for (var i = 0; i < timeline.Count; i++)
+            {
+                if (timeline[i] is TimelineEvent.ReleaseEvent) lastLine = i;
+                else if (timeline[i] is ReclaimEvent { Trigger: "release" }) lastWindow = i;
+            }
+
+            // 没有线，或者线已经被上一次落定兑过 ⇒ 不动（别把窗口当每轮都要追的流水账）。
+            if (lastLine < 0 || lastLine < lastWindow) return;
+
+            var ids = Reclaim.ReleaseIds(timeline, new Storage.BlobStore(_host.Store.DataRoot));
+            _host.Store.AppendEvents(handle.ProjectKey, handle.SessionId,
+                [Reclaim.Window("release", ids, null)]);
+
+            // ⚠️ **没有这一枪头就看不见**：回收不改已有记录，头看的是核心渲染的那份形态
+            // ⇒ 不告诉它一声，它会一直显示回收之前的（而且完全看不出来）。
+            if (ids.Count > 0)
+                _bus.Publish(EventBus.SessionTopic(handle.SessionId),
+                    new WireEvent.SessionReclaimed(handle.SessionId, $"释放了 {ids.Count} 条结果"));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                      or System.Text.Json.JsonException or FileFormatException)
+        {
+            // 见注释：窗口是优化，落定是事实。
+        }
+    }
+
     private async Task<ModelReply?> ContinueIfToolCalledAsync(
         SessionHandle handle, ModelReply reply, bool throwOnFailure)
     {
@@ -2912,6 +2966,11 @@ public sealed class CommandDispatcher(
             // 而上面几条早退都是别的语义）。把回报挂在这里 = 一个跑 20 步的子只叫父一次
             // （`01` §10.2：「中间步骤是子自己的事」）。
             // 循环真正停在这里（没工具调用、队列也空）——这才是「闲置」。
+            //
+            // ⚠️ **`release` 的那条线也在这里兑成回收**（2026-11-14，用户裁定「会话停止的时候
+            // 执行释放刚好合适」）：线之前是**纯追加**的自动续跑，从这里往后才换渲染
+            // （判据与代价见 `SweepReleaseWindow` / `Reclaim.ReleaseIds`）。
+            SweepReleaseWindow(handle);
             PublishPhase(handle, SessionPhase.Idle);
             ReportSettled(handle, reply);
             return reply;

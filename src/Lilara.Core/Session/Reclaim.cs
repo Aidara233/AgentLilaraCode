@@ -132,10 +132,12 @@ public static class Reclaim
     /// 这一批该回收哪些（按 <see cref="TimelineEvent.ToolResultEvent.Id"/>）。
     ///
     /// <para>⚠️ <b>2026-10-17 重定形状：它只读「已落盘的窗口」，不自己解析判据。</b>
-    /// 窗口有两个来源：①<b>显式的</b> <see cref="ReclaimEvent"/>
-    /// （`session.gc` / 压缩落检查点时，由 <see cref="Resolve"/> 当场解析好并写下 id）；
-    /// ②<b>语义的</b> <see cref="TimelineEvent.ReleaseEvent"/>（模型画的线，作用域见
-    /// <see cref="LineCovers"/>）。两者取<b>并集</b>。</para>
+    /// 窗口有两个来源，而它们**都是记录**：
+    /// ①<b>显式的</b> <see cref="ReclaimEvent"/>——`session.gc` / 压缩落检查点 / <b>会话落定</b>
+    /// （`session.gc` 由 <see cref="Resolve"/> 当场解析；压缩与落定各自管道自己的那一条）。
+    /// ②<b>语义的</b> <see cref="TimelineEvent.ReleaseEvent"/>（模型画的线）——⚠️ **它不再被这里读**：
+    /// 线在「会话落定」那一刻由驱动层解析成一条 `Trigger = "release"` 的
+    /// <see cref="ReclaimEvent"/>（<see cref="ReleaseIds"/>）。两者取<b>并集</b>。</para>
     ///
     /// <para>⚠️ <b>为什么距离与点杀不在这里现算</b>：渲染发生在<b>每一步</b>，而回收改的是
     /// 前缀<b>中段</b> ⇒ 只有失效窗口（前缀反正要重建）里才许动手（`00` §3）。
@@ -183,15 +185,18 @@ public static class Reclaim
                 if (byId.TryGetValue(id, out var r) && Recoverable(r.Content, blobs))
                     result.Add(id);
 
-        // ---- 语义窗口：线（`01` §12.4）----
+        // ---- 语义窗口（线，`01` §12.4）不在这里读 ----
         //
-        // ⚠️ **判据是「这个源被释放过吗」，不是「它在线的哪一侧」。**
-        // 位置那一读法（「最后一条线以下全收」）**不够用，而且会抖**：放第二次线之后，
-        // 第一条线的领地不再被覆盖 ⇒ 那些结果**又变回新鲜** ⇒ 前缀每放一次线抖一次。
-        // 而「释放过就是释放过」是**单调的** ⇒ 回收集合只增不减，前缀只往前走。
-        // ⇒ 把**所有**释放事件的作用域并起来（不是只看最后一条）。
-        foreach (var r in LineCovers(timeline))
-            if (!IsFloatingPlaceholder(r) && Recoverable(r.Content, blobs)) result.Add(r.Id);
+        // ⚠️ **2026-11-14：线改成「会话落定那一刻解析一次、落成一条 `Trigger = "release"` 的窗口」**
+        // （<see cref="ReleaseIds"/>，生产侧在 `CommandDispatcher.SweepReleaseWindow`）。
+        // 理由：渲染发生在**每一步**，而线后面通常还有几轮自动续跑——那些轮次与上一步是
+        // **纯追加**关系（缓存整段命中），在这里现读就等于让它们在**中段**分叉，
+        // 而「收掉的那点字节」根本抵不上那一整段重付。⇒ 判据只许在**开窗那一刻**解析，
+        // 而线的窗口是**会话落定**（那时没有在飞的请求，下一趟的缓存热不热也无所谓了）。
+        //
+        // ⚠️ 老口径（「把**所有**释放事件的作用域并起来」）没有丢，它整个搬进了
+        // <see cref="ReleaseIds"/>：判据仍然是**集合**（释放过就是释放过，单调、不会抖），
+        // 不是「在最后一条线的哪一侧」。
 
         return result;
     }
@@ -249,7 +254,7 @@ public static class Reclaim
     };
 
     /// <summary>
-    /// **线以下、且落在释放集里的那些结果**（`01` §12.4）。
+    /// **线覆盖的那些结果**（`01` §12.4）——「会话落定」那一刻解析一次，落成一条窗口。
     ///
     /// <para>⚠️ <b>两条口径都是刻意的，且都有出处</b>：</para>
     /// <list type="number">
@@ -271,28 +276,55 @@ public static class Reclaim
     /// ⇒ 一条形状怪的 scope 只会**什么也匹配不上**（失败方向是收得少，不是收得多）。
     /// ⚠️ 前缀那一条要求**落在分隔符上**：不加的话 `src-evil/a.cs` 会被判进 `src` ——
     /// 与 `SessionToolContext.ResolvePath` 和 §12.1 的路径判据是同一条规则。</para>
+    ///
+    /// <para>⚠️ <b>2026-11-14：它是<b>生产侧</b>，不是渲染期的判据</b>——用户裁定「会话停止的时候执行释放
+    /// 刚好合适」。调用点只有一处：`CommandDispatcher.SweepReleaseWindow`，即**驱动循环真正停下来
+    /// 的那一刻**（没工具调用、队列也空）。解析出来的 id 由它落成一条 `Trigger = "release"` 的
+    /// <see cref="ReclaimEvent"/>，之后渲染**只读那条窗口**（<see cref="Decide"/>）。</para>
+    ///
+    /// <para><b>为什么必须是「落定」而不是「线后面过一轮」</b>：回收改的是前缀<b>中段</b>（`00` §3），
+    /// 而模型调 `release` 的位置<b>通常是任务收尾</b>——它后面往往还有几轮**自动续跑**
+    /// （工具循环自己接着走）。那些轮次与上一步是<b>纯追加</b>关系 ⇒ 缓存整段命中；
+    /// 而在渲染里现读这条线，就等于让它们**从中段分叉**（一次后缀全价），而收掉的那点字节
+    /// 根本抵不上。⇒ 判据只许在**开窗那一刻**解析，而「线」的窗口是<b>会话落定</b>：
+    /// 那一刻没有在飞的请求，下一趟缓存热不热都无所谓了——冷则中段改写免费，
+    /// 热则付一次后缀全价，而那一笔正是这段内容<b>最后一次</b>被付费。</para>
+    ///
+    /// <para>⚠️ <b>代价如实记两条</b>：① <b>长循环里那一期内容会一直待在上下文里</b>——
+    /// `goal` / `iterate` 那种一口气跑二十步不停下来的会话，等于把「收」推到它真正停下的那一刻；
+    /// 这是有意选的（中途收 = 后面每一轮都可能破中段前缀）。② <b>被打断 / 硬失败那两条出口不单独扫</b>：
+    /// 扫描是<b>并集</b>语义（下一次落定会把那些线一起并进来）⇒ 它们最多「晚一次落定」，不会永久漏。</para>
     /// </summary>
-    private static IEnumerable<TimelineEvent.ToolResultEvent> LineCovers(IReadOnlyList<TimelineEvent> timeline)
+    public static IReadOnlyList<string> ReleaseIds(IReadOnlyList<TimelineEvent> timeline, BlobStore blobs)
     {
+        // ⚠️ **判据是「这个源被释放过吗」，不是「它在线的哪一侧」**：位置那一读法
+        //（「最后一条线以下全收」）**不够用，而且会抖**——放第二次线之后，第一条线的领地
+        // 不再被覆盖 ⇒ 那些结果**又变回新鲜** ⇒ 前缀每放一次线抖一次。而「释放过就是释放过」
+        // 是**单调的** ⇒ 回收集合只增不减。⇒ 把**所有**线的作用域并起来（不是只看最后一条）。
         var scope = new List<string>();
-        foreach (var evt in timeline)
-            if (evt is TimelineEvent.ReleaseEvent release)
-                scope.AddRange(release.Scope);
+        var lastLine = -1;
+        for (var i = 0; i < timeline.Count; i++)
+        {
+            if (timeline[i] is not TimelineEvent.ReleaseEvent release) continue;
+            scope.AddRange(release.Scope);
+            lastLine = i;
+        }
 
-        if (scope.Count == 0) yield break;
+        if (scope.Count == 0) return [];
 
         // ⚠️ **只收释放点<b>之前</b>的结果**：一次释放不可能回收它之后才发生的东西
         //（那时候它还没被读进来）。⇒ 位置在这里仍然有用，只是它管的是「在不在线上」，
         // 而「属不属于这个作用域」由上面那份集合管。
-        var lastRelease = -1;
-        for (var i = 0; i < timeline.Count; i++)
-            if (timeline[i] is TimelineEvent.ReleaseEvent) lastRelease = i;
-
-        for (var i = 0; i < lastRelease; i++)
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < lastLine; i++)
         {
             if (timeline[i] is not TimelineEvent.ToolResultEvent r) continue;
-            if (InScope(r.DependsOn, scope)) yield return r;
+            if (IsFloatingPlaceholder(r) || !Recoverable(r.Content, blobs)) continue;
+            if (InScope(r.DependsOn, scope)) ids.Add(r.Id);
         }
+
+        // ⚠️ 顺序必须确定：落盘的那条窗口要逐字节可复现（同 `Resolve` 那条纪律）。
+        return [.. ids.OrderBy(id => id, StringComparer.Ordinal)];
     }
 
     private static bool InScope(string? dependsOn, IReadOnlyList<string> scope)

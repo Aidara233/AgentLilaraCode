@@ -193,6 +193,69 @@ public class CommandDispatcherTests : IDisposable
     }
 
     /// <summary>
+    /// **`release` 的线在「会话落定」那一刻兑成回收窗口**（2026-11-14，用户裁定
+    /// 「会话停止的时候执行释放刚好合适」）。
+    ///
+    /// <para>⚠️ 这条钉的是**接线**：`ContinueIfToolCalledAsync` 那个「循环真停下来」的分支要调
+    /// <c>SweepReleaseWindow</c>。少了它，线永远不兑（`Reclaim.Decide` 已经不读线了）——
+    /// 而**没有任何东西会红**，只是上下文再也不收。</para>
+    ///
+    /// <para>判据分两层：① 记录里真的多了一条 `Trigger = "release"` 的窗口；
+    /// ② 下一轮请求里那条结果已经换成注记（窗口被渲染读到）。</para>
+    /// </summary>
+    [Fact]
+    public async Task ReleaseLine_BecomesAWindow_WhenTheLoopSettles()
+    {
+        var (host, _) = NewHarness();
+        SaveProvider(host);
+        Directory.CreateDirectory(_work);
+        File.WriteAllText(Path.Combine(_work, "a.txt"), "甲");
+
+        var adapter = new FakeAdapter()
+            .ReplyWith(_ => new ModelReply
+            {
+                Blocks = [new Block.ToolUseBlock("c1", "read", """{"path":"a.txt"}""")],
+                StopReason = "tool_use", Refused = false,
+            })
+            .ReplyWith(_ => new ModelReply
+            {
+                Blocks = [new Block.ToolUseBlock("c2", "release", """{"scope":["a.txt"]}""")],
+                StopReason = "tool_use", Refused = false,
+            })
+            .Reply("好。")
+            .Reply("第二句");
+
+        var dispatcher = new CommandDispatcher(host, new EventBus(),
+            _ => new Stepper(host.Store, adapter, BuiltInTools.All), _ => adapter);
+        var sessionId = await CreateSessionAsync(dispatcher);
+
+        // 一整轮：读 → 释放 → 纯文本收尾（**落定**）。
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("看一眼")]),
+            "seed", true, CancellationToken.None);
+
+        var projectKey = host.Store.FindSession(sessionId)!.Value.ProjectKey;
+        var timeline = host.Store.ReadTimeline(projectKey, sessionId);
+
+        Assert.Single(timeline.OfType<TimelineEvent.ReleaseEvent>());
+        var window = Assert.Single(timeline.OfType<ReclaimEvent>(), w => w.Trigger == "release");
+
+        var readId = timeline.OfType<TimelineEvent.ToolResultEvent>()
+            .Single(r => r.CallId == "c1").Id;
+        Assert.Contains(readId, window.Ids);
+
+        // 下一轮 ⇒ 那条结果已经是注记。
+        await dispatcher.DispatchAsync(
+            new CoreCommand.SessionSend(sessionId, [new Block.TextBlock("再来")]),
+            "again", true, CancellationToken.None);
+
+        var sent = adapter.Calls[^1].Timeline.OfType<TimelineEvent.ToolResultEvent>()
+            .Single(r => r.Id == readId);
+        Assert.Contains("[已回收]",
+            string.Concat(sent.Content.OfType<Block.TextBlock>().Select(b => b.Text)), StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// **`plan.updated` 真的会发，形状与 `/state.plan` 同源**（2026-10-24）。
     ///
     /// <para>⚠️ 头靠这条事件重画面板：没有它，用户改完计划页面只在重开会话时才更新，
