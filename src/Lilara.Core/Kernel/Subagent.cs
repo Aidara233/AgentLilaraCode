@@ -139,7 +139,44 @@ public static class Subagent
 /// `host.TryGetActivated`）。只喂盘面那份的话，一个正在跑的子会话恒显示 `Idle`——
 /// 上一版就是这样，模型据此以为它已经做完了。
 /// </param>
-public sealed record SubagentChild(string SessionId, string Status);
+public sealed record SubagentChild(string SessionId, string Status)
+{
+    /// <summary>
+    /// **它挂着的那条询问**（`null` = 没在等）。
+    ///
+    /// <para>⚠️ <b>2026-11-19 补这一格，是因为 `WaitingForInput` 这一个状态词答不了三个读者的问题</b>：
+    /// ① 尾块那行原先两种询问都写「等你回答」——父看不出孩子是在问意见还是在等人批；
+    /// ② `wait` 只能说「需要回答或审批」，说不出「等什么」；
+    /// ③ `tell_child` 判不出「我这句话会落到哪一条路上」。三处各查一遍盘的代价比这一格贵。
+    /// ⚠️ 它**取的是盘上那份**（`state.json` 的 `Ask`，挂起与清干净都在同一处落盘）——
+    /// 内存那一份只有 `CoreHost` 够得着，而装配点已经按「内存优先、盘面回退」取状态。</para>
+    /// </summary>
+    public WaitingAsk? Waiting { get; init; }
+}
+
+/// <summary>
+/// **一条挂着的询问的摘要**（给父的工具与尾块看，2026-11-19）。
+///
+/// <para>⚠️ <b>只装「父能据以行动」的三样：id · 哪种 · 什么工具</b>。问题正文**不进这里**
+/// ——它已经在升级报告里（`subagent_report`），再放一份会让同一段话在父的上下文里出现两次；
+/// 而 `问答` 那条要答的正文由父自己去读报告。</para>
+/// </summary>
+/// <param name="AskId">那条询问的稳定 id（`approval.respond` 的键；父批的时候回指它）。</param>
+/// <param name="Kind">授权还是提问——**父能做的事不同**（`01` §3.8）。</param>
+/// <param name="ToolName">
+/// 挂着的那条调用属于哪个工具。⚠️ 提问那条它指的是 `ask`（闸门那条指的是被挡下的那个工具）。
+/// 父要据此判「这一条在我的档位里吗」（`Gate.Decide`）。
+/// </param>
+public sealed record WaitingAsk(string AskId, AskKind Kind, string ToolName)
+{
+    /// <summary>从盘上那份（`state.json` 的 `Ask`）装出来；没在等 ⇒ `null`。</summary>
+    /// <remarks>
+    /// ⚠️ **两处装配点（`Stepper` / 控制面）都调它**：各写一份「怎么从 `PausedAsk` 装摘要」
+    /// 的话，两处会在加字段时分叉，而分叉的表现是「模型看到的与头显示的差一格」。
+    /// </remarks>
+    public static WaitingAsk? From(PausedAsk? ask) =>
+        ask is { } a ? new WaitingAsk(a.AskId, a.Kind, a.ToolName) : null;
+}
 
 /// <summary>
 /// **这一刻的派生关系快照**——工具能看见的那一份（`01` §10）。
@@ -206,6 +243,28 @@ public sealed record SpawnRequest(
 /// 归档不是一条跨会话的权限通道，模型不可能借它让别人的会话消失。
 /// </param>
 public sealed record ArchiveRequest(string ChildSessionId);
+
+/// <summary>
+/// **一次「父替孩子放行」**（`approve_child`，2026-11-19，用户裁定）。
+///
+/// <para>⚠️ <b>为什么父可以批，而这条不是提权</b>：授权范围 ⊆ 父（`01` §10.3）。
+/// 父批它，前提是**父自己的档位本来就放行这一类**（`Gate.Decide(类别, 父档位) == Allow`）——
+/// 于是孩子做的事从头到尾都在「父已经有的授权」之内，委托的边界没有被挪动一格。
+/// 父的档位也不够时，这条请求**只能等人**（`approve_child` 会如实拒绝，而不是"试一下"）。</para>
+///
+/// <para>⚠️ <b>判据只有一处</b>：`Gate.Decide`（`档位 × 类别` 那张表）。
+/// 别在这里抄一份「父能不能批」的名单——那会是本仓反复栽的「两层判据各自漂」。</para>
+///
+/// <para>⚠️ 形状与 <see cref="TellRequest"/> / <see cref="ArchiveRequest"/> 同族：工具只声明，
+/// 真正的「清挂起 + 续跑那一步」在 `CommandDispatcher`（`Stepper` 不碰事件总线，也没有队列）。</para>
+/// </summary>
+/// <param name="ChildSessionId">哪个孩子（只可能是本会话自己的孩子）。</param>
+/// <param name="AskId">
+/// 要批的是哪一条询问。⚠️ `null` = 「它此刻挂着的那一条」（工具侧会在回执里说出究竟批了哪一条）；
+/// 给了就必须**逐字对上**，对不上就不批（同 `approval.respond` 的既有判据：
+/// 把一次陈旧的批准**安到另一条调用上**比拒绝坏得多）。
+/// </param>
+public sealed record ApproveChildRequest(string ChildSessionId, string? AskId);
 
 /// <summary>
 /// **一次注入**——父对子说一句，或子对父说一句（`01` §10.1 的「纯注入，双向对称」）。

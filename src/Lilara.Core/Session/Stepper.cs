@@ -438,6 +438,9 @@ public sealed class Stepper(
         IReadOnlyList<TellRequest> tells = [];
         // 2026-10-26：同一条分工的第三族——`archive_child` 只说一句话，写 spec 在分派器。
         IReadOnlyList<ArchiveRequest> archives = [];
+        // 2026-11-19：第四族——`approve_child`（父替孩子放行）。同上：清挂起 + 续跑那一步
+        // 都在 `CommandDispatcher`（它才有队列与事件总线）。
+        IReadOnlyList<ApproveChildRequest> approvals = [];
 
         // ⚠️ **记录那一份**（未经回收、未经解引用）——`fetch` 取地址必须从它算，
         // 理由见 `SessionToolContext` 的构造参数注释。
@@ -525,7 +528,12 @@ public sealed class Stepper(
                 // 警告是**同一个谓词**（`ContextUsage.OverLimit`）——两处各判会分叉，
                 // 而分叉的表现是「尾块喊着现在就压、工具却回一句没有指令」。
                 ContextUsage.OverLimit(_usage, handle.SessionId),
-                runtimeInfo: runtimeInfo);
+                runtimeInfo: runtimeInfo,
+                // ⚠️ **父替孩子放行那两格**（2026-11-19）：档位与工具类别。档位与上面
+                // 喂给 `ToolExecutor` 的是**同一个读点、同一个值**——两处各读一次的话，
+                // 「闸门放行的类别」与「`approve_child` 认为父允许的类别」会在改档那一瞬分叉。
+                permission: handle.State.Axes![Axes.Permission],
+                toolClass: ToolClassOf);
 
             // 相位：回复里有 tool_use，接下来是工具执行。
             onPhase?.Invoke(SessionPhase.Tools);
@@ -538,6 +546,7 @@ public sealed class Stepper(
             spawns = batch.Spawns;
             tells = batch.Tells;
             archives = batch.Archives;
+            approvals = batch.Approvals;
         // T0 本身是固定目标；普通计划全部完成且不在 iterate 时，finish_goal 可以收尾当前 goal。
         // ⚠️ iterate 下即使普通计划暂时为空也不能收尾；它由下面那条自动切回 plan 续规划。
         var canFinishGoal = handle.State.Axes![Axes.Initiative] == "goal"
@@ -647,6 +656,7 @@ public sealed class Stepper(
                     .LastOrDefault(m => m.From == Speaker.Model)?.Id,
                 ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
                 GoalEnded: goalEnded, Spawns: spawns, Tells: tells, Archives: archives,
+                Approvals: approvals,
                 PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
                 ExecutedCallIds: executedCallIds,
                 Interrupted: true);
@@ -787,7 +797,7 @@ public sealed class Stepper(
         return new StepOutcome(reply, HistoryId: events.OfType<TimelineEvent.MessageEvent>().LastOrDefault()?.Id,
             ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
             GoalEnded: goalEnded, Compacted: compaction, Spawns: spawns, Tells: tells,
-            Archives: archives,
+            Archives: archives, Approvals: approvals,
             PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
             ExecutedCallIds: executedCallIds);
     }
@@ -1257,6 +1267,8 @@ public sealed class Stepper(
         IReadOnlyList<SpawnRequest> spawns = [];
         IReadOnlyList<TellRequest> tells = [];
         IReadOnlyList<ArchiveRequest> archives = [];
+        // 2026-11-19：第四族——`approve_child`（与 `StepAsync` 同一个出口、同一条分工）。
+        IReadOnlyList<ApproveChildRequest> approvals = [];
         IReadOnlyList<string> executedCallIds = [];
 
         if (calls.Count > 0)
@@ -1295,7 +1307,11 @@ public sealed class Stepper(
                 // 同上（2026-10-27）：答复路径也要知道「是不是已经越过那条硬线」，
                 // 否则用户批准的那次 compact 会被拒，而尾块刚刚才命令它压。
                 ContextUsage.OverLimit(_usage, handle.SessionId),
-                runtimeInfo: RuntimeInfoSnapshotFactory.Capture(handle, _adapter.Protocol, _usage));
+                runtimeInfo: RuntimeInfoSnapshotFactory.Capture(handle, _adapter.Protocol, _usage),
+                // 与 `StepAsync` 同一处、同一个理由（2026-11-19）：答复那条路上也会跑
+                // `approve_child`（比如父连着批两个孩子），而它要用的是**这一刻**的档位。
+                permission: handle.State.Axes![Axes.Permission],
+                toolClass: ToolClassOf);
 
             // 相位：答复之后真正跑掉的那批工具。
             onPhase?.Invoke(SessionPhase.Tools);
@@ -1305,6 +1321,7 @@ public sealed class Stepper(
             spawns = batch.Spawns;
             tells = batch.Tells;
             archives = batch.Archives;
+            approvals = batch.Approvals;
             var canFinishGoal = handle.State.Axes![Axes.Initiative] == "goal"
                 && PlanTree.Current(handle.State.Plan) is null;
             goalEnded = GoalMode.IsActive(handle.State) && canFinishGoal && EndedGoal(batch, calls);
@@ -1361,6 +1378,7 @@ public sealed class Stepper(
 
                 return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
                     GoalEnded: goalEnded, Spawns: spawns, Tells: tells, Archives: archives,
+                    Approvals: approvals,
                     PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
                     ExecutedCallIds: executedCallIds, Interrupted: true);
             }
@@ -1392,6 +1410,7 @@ public sealed class Stepper(
                 return new StepOutcome(NoReply, again, handle.State.Ask?.DeadlineAt,
                     ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
                     GoalEnded: goalEnded, Spawns: spawns, Tells: tells, Archives: archives,
+                    Approvals: approvals,
                     PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
                     ExecutedCallIds: executedCallIds);
             }
@@ -1409,7 +1428,7 @@ public sealed class Stepper(
 
         return new StepOutcome(NoReply, ReleasedClaims: releasedClaims, ReleasedLines: releasedLines,
             GoalEnded: goalEnded, Spawns: spawns, Tells: tells,
-            Archives: archives,
+            Archives: archives, Approvals: approvals,
             PlanChanged: planChanged, Plan: planAfter, ModeChanged: modeChanged, Mode: modeAfter,
             ExecutedCallIds: executedCallIds);
     }
@@ -1783,6 +1802,20 @@ public sealed class Stepper(
         new Lilara.Core.Tools.ToolStore(_store.DataRoot).Load().CallTimeoutSeconds;
 
     /// <summary>
+    /// **按名字查工具类别**（2026-11-19，`approve_child` 用）。
+    ///
+    /// <para>⚠️ <b>查的是工具表本身</b>（`_tools` 就是 `内建 ⊕ MCP`，见 `StepperResolver.Table`），
+    /// 不是另抄一份类别名单——本仓那条「哪类工具要问」只有一个真相（`Gate`）。
+    /// ⚠️ <b>查不到就交 <c>null</c></b>，由调用方按**最严**那一档处理（同 `Gate.ClassOf` 的
+    /// 保守方向）：在这里编一个更轻的类别，会让一次越权看起来像是被允许的。</para>
+    ///
+    /// <para>⚠️ 工具表在构造后不变（`_tools`），所以不需要 `ToolsFor(handle)` 那份
+    /// 「换掉 `floating_context`」的包装——类别与那个开关无关。</para>
+    /// </summary>
+    private PermissionClass? ToolClassOf(string name) =>
+        _tools.FirstOrDefault(t => string.Equals(t.Name, name, StringComparison.Ordinal))?.PermissionClass;
+
+    /// <summary>
     /// 这一刻的**派生关系快照**（`01` §10，2026-10-24）。⚠️ 与 <see cref="ShellFor"/> 同一条：
     /// **执行那一刻现算一次**，步内冻结。
     ///
@@ -1807,11 +1840,13 @@ public sealed class Stepper(
         {
             // ⚠️ **内存优先、盘面回退**（2026-10-26）：`Running` 只写内存，只读盘面的话
             // 一个正在跑的子会话永远显示「空闲」——而模型据此以为它已经做完了。
-            string status;
+            // ⚠️ **读写一次盘**（2026-11-19）：状态的回退分支本来就要读它，而
+            // `Waiting`（挂着哪条询问）也只有盘上那份说得清（内存那一份在 `CoreHost` 手里）。
+            // ⇒ 一次读、两处用；不再为状态单独读一次。
+            SessionState state;
             try
             {
-                status = LiveStatus?.Invoke(spec.SessionId)
-                         ?? _store.ReadState(projectKey, spec.SessionId).Status;
+                state = _store.ReadState(projectKey, spec.SessionId);
             }
             catch (Exception ex) when (ex is IOException or FileNotFoundException
                                           or UnauthorizedAccessException or FileFormatException)
@@ -1819,7 +1854,11 @@ public sealed class Stepper(
                 continue;
             }
 
-            children.Add(new SubagentChild(spec.SessionId, status));
+            children.Add(new SubagentChild(
+                spec.SessionId, LiveStatus?.Invoke(spec.SessionId) ?? state.Status)
+            {
+                Waiting = WaitingAsk.From(state.Ask),
+            });
         }
 
         return new SubagentScope(
@@ -2046,6 +2085,14 @@ public sealed class Stepper(
         /// </summary>
         IReadOnlyList<ArchiveRequest>? Archives = null,
         /// <summary>
+        /// 本步执行出来的**放行请求**（`approve_child`，2026-11-19）。
+        /// ⚠️ 与 <see cref="Spawns"/> / <see cref="Tells"/> 同一条分工：**清挂起 + 续跑那一步**
+        /// 都在调用方（`Stepper` 没有队列，也不碰事件总线）。
+        /// ⚠️ 与 <see cref="Tells"/> 必须分开：那个只往孩子的记录里加一句话，
+        /// 这个会让被挡下的那条调用**真的执行**——两件事在记录里必须分得开。
+        /// </summary>
+        IReadOnlyList<ApproveChildRequest>? Approvals = null,
+        /// <summary>
         /// 本步**真的改过计划**（`plan` / `advance_plan` 执行过、且落地成功）。
         /// ⚠️ 与 <see cref="GoalEnded"/> 同一条分工：交回去是为了让调用方发 `plan.updated`。
         /// ⚠️ <b>它和 <see cref="Plan"/> 必须成对看</b>：计划可以被清空，那时 <see cref="Plan"/>
@@ -2246,9 +2293,44 @@ public sealed class Stepper(
     /// 编一个答案比这坏得多：模型会以为它问的都得到了答复。</para>
     /// </summary>
     /// <param name="said">用户实际说的那句（截断到合理长度——它会进记录）。</param>
-    public static TimelineEvent.ToolResultEvent Supersede(PausedAsk paused, string said) =>
-        Answer(paused, "用户没有回答这个问题，而是说了别的："
-            + (said.Length > 200 ? said[..200] + "…" : said));
+    /// <param name="from">
+    /// **谁在说**（2026-11-19）：`null` = 用户（`session.send` 那条路，措辞逐字不变）；
+    /// 非 `null` = 父会话 id（父用 `tell_child` 顶掉孩子那条挂起）。
+    /// ⚠️ <b>署名不是客套</b>：孩子那边「用户」这两个字意味着**驱动它的人**，而现在
+    /// 那个人可能是父而不是人。不署名的话，孩子会以为人否决了它那条调用——而真相是
+    /// 它的驱动者换了输入（`00` §7 判据 4：结构上分得开，而不是靠它去猜）。
+    /// </param>
+    public static TimelineEvent.ToolResultEvent Supersede(PausedAsk paused, string said, string? from = null) =>
+        Answer(paused, SupersedeText(paused, said, from));
+
+    /// <summary>
+    /// [Supersede] 那句正文（**只此一处**拼：`Answer` 那条路与「同一批其余几条」的补丁
+    /// 都读它，所以它们不会一句话两种说法）。
+    ///
+    /// <para>⚠️ 措辞不能假装他答了：「…没有回答…，而是说了别的」——那既是事实，
+    /// 也告诉模型下一步该干什么（把那句新话当成输入）。编一个答案比这坏得多。</para>
+    /// <para>⚠️ **种类要说对**（2026-11-19）：授权那条不是「问题」，说成「这个问题」会让
+    /// 模型以为它问过什么；而它其实只是**在等人点头**。</para>
+    /// </summary>
+    public static string SupersedeText(PausedAsk paused, string said, string? from = null)
+    {
+        var who = from is null ? "用户" : $"你的驱动者——父会话 {from}——";
+        var what = paused.Kind == AskKind.Permission ? "这次授权" : "这个问题";
+
+        return $"{who}没有回答{what}，而是说了别的："
+            + (said.Length > 200 ? said[..200] + "…" : said);
+    }
+
+    /// <summary>
+    /// **父会话回答了孩子那条提问时，落进结果的那段正文**（2026-11-19）。
+    ///
+    /// <para>⚠️ <b>为什么必须先署名</b>：孩子调 `ask` 时想问的是「用户」。而这一次答它的是
+    /// **驱动它的父会话**——不署名的话，它会把父的判断当成人的决定（`00` §7 判据 4：
+    /// 结构上分得开，而不是靠它去猜）。⚠️ 而 `ask` 的契约本来就是「答案作为这次调用的结果
+    /// 回到你手里」，所以这条路**不另入队**任何用户消息（见 `CommandDispatcher.DeliverAnswerToQuestion`）。</para>
+    /// </summary>
+    public static string AnsweredByDriverText(string from, string said) =>
+        $"（这条提问由你的驱动者——父会话 {from}——回答，不是用户）\n{said}";
 
     /// <summary>
     /// 一步：**追加 + 入队 + 推进**——`01` §6.1 那条复合动作的完整形态。

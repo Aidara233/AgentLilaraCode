@@ -24,13 +24,24 @@ namespace Lilara.Core.Session.Tools;
 /// 现渲染会让 `floating_context` 的返回值与核心合成注入的那份分叉。
 /// 省略 = 空串（没有浮动块，或调用方确实不需要它）。</param>
 /// <param name="runtimeInfo">核心在请求构造时冻结的非秘密运行信息。工具可按需查询，不需要自行重建 provider/model/路径事实。</param>
+/// <param name="permission">
+/// **本会话自己的**权限档位（2026-11-19）。⚠️ 与 `network` / `shell` 同一条口径：
+/// **执行那一刻现读、步内冻结**（`Stepper` 在造这个上下文时读一次）。⚠️ 它与
+/// `ToolExecutor` 的 `permissionLevel` 是**同一个值、同一个来源**——两处各读一次的话，
+/// 「闸门放行的类别」与「`approve_child` 认为父允许的类别」会在改档的那一瞬分叉。
+/// </param>
+/// <param name="toolClass">
+/// 按名字查工具类别（`approve_child` 判「这一条在父的档位里吗」）。⚠️ 交进来的是**工具表本身**
+/// 的查询（`Stepper` 从 `ToolsFor(handle)` 造），不在这里抄一份类别名单。
+/// </param>
 public sealed class SessionToolContext(
     string workingDirectory, BlobStore blobs, IReadOnlyList<TimelineEvent>? timeline = null,
     string? floatingContext = null, NetworkAccess? network = null, bool goalActive = false,
     bool compactRequested = false, ShellAccess? shell = null, SubagentScope? subagents = null,
     SessionPlan? plan = null, string? mode = null, IReadOnlyList<string>? approvedCallIds = null,
     string? initiative = null, Func<string, string?>? subagentStatus = null, bool contextFull = false,
-    RuntimeInfoSnapshot? runtimeInfo = null)
+    RuntimeInfoSnapshot? runtimeInfo = null, string? permission = null,
+    Func<string, PermissionClass?>? toolClass = null)
     : IToolContext
 {
     private readonly string _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workingDirectory));
@@ -41,6 +52,12 @@ public sealed class SessionToolContext(
     public string WorkingDirectory => _root;
 
     public RuntimeInfoSnapshot? RuntimeInfo { get; } = runtimeInfo;
+
+    /// <summary>见 <see cref="IToolContext.PermissionLevel"/>。</summary>
+    public string? PermissionLevel { get; } = permission;
+
+    /// <summary>见 <see cref="IToolContext.ToolClass"/>：步开始时工具表的那份查询。</summary>
+    public PermissionClass? ToolClass(string name) => toolClass?.Invoke(name);
 
     /// <summary>
     /// ⚠️ <b>这个闸不是可选的</b>：模型给的路径是**不可信输入**，

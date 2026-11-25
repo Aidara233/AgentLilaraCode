@@ -30,6 +30,8 @@ public sealed class TellChildTool : ITool
     public string Description =>
         "给一个子会话补一句话。它会在自己的下一步里看到（不需要它在线，也不会等它回答）。"
         + "可以反复说——这就是你与它持续对话的方式。"
+        + "⚠️ 如果它正挂着一条**提问**，这句话会直接成为那条提问的答复（落进它的工具结果里）。"
+        + "如果它正挂着一条**授权**，这句话**不是批准**（那条被挡下的调用不会执行），你只是换了它的输入。"
         + "`child` 必须是**你自己派生出来的**会话 id。";
 
     public string ParametersSchemaJson => """
@@ -76,10 +78,30 @@ public sealed class TellChildTool : ITool
 
         return Task.FromResult(new ToolOutcome
         {
-            Content = [new Block.TextBlock($"已转达给子会话 {childId}。它会在下一步看到，不会立刻回答你。")],
+            Content = [new Block.TextBlock(LandingText(childId, known))],
             Tell = new TellRequest(childId, text),
         });
     }
+
+    /// <summary>
+    /// **这句话会怎么落地**（2026-11-19，用户裁定「父要能回应孩子的请求」）。
+    ///
+    /// <para>⚠️ <b>三句话而不是一句通用的话</b>：孩子挂着提问时这句话就是**答复**
+    /// （父是它的驱动者，那正是 `ask` 契约里「答案作为结果回到你手里」的形状）；
+    /// 挂着授权时它**不是批准**（那条被挡下的调用不会执行，父只是换了孩子的输入）；
+    /// 没挂着就还是「补一句话」。⚠️ 三种都如实说，因为**结果一落盘就改不了**——
+    /// 一句笼统的「已转达」会让父以为它批准了、或者以为它答上了。</para>
+    /// </summary>
+    private static string LandingText(string childId, SubagentChild known) => known.Waiting switch
+    {
+        { Kind: AskKind.Question } w =>
+            $"已作为答复交给子会话 {childId} 挂着的那条提问（ask {w.AskId}）。"
+            + "它会带着这条答复继续跑，不会立刻回答你。",
+        { Kind: AskKind.Permission } w =>
+            $"已转给子会话 {childId}——但这不是批准：它挂着的是 `{w.ToolName}` 的授权（ask {w.AskId}），"
+            + "那条调用**不会执行**。它会把你这句话当成新输入。要在你档位之内放行，用 approve_child。",
+        _ => $"已转达给子会话 {childId}。它会在下一步看到，不会立刻回答你。",
+    };
 }
 
 /// <summary>

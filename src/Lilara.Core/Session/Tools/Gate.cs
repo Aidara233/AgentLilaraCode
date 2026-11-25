@@ -243,8 +243,11 @@ public static class Gate
     /// 按名字找权限类别。⚠️ <b>先查传入的额外表，再查内建</b>——今天额外表里只有 MCP 工具，
     /// 而它们**不在** <see cref="BuiltInTools.All"/> 里。找不到才退回 `Destructive`
     /// （保守的那一侧；编一个更轻的类别会让用户看到一个假的「它是只读类」）。
+    /// <para>⚠️ <b>第三个读者是「父替孩子放行」那一路</b>（2026-11-19）：父要判
+    /// 「孩子挂着的那条调用的类别，我自己的档位放不放行」（`CommandDispatcher.MayApprove`）。
+    /// 它读的是**这张表**，不是另抄一份名单——`Gate.Decide` 那句「单调阶梯只有一处」同理。</para>
     /// </summary>
-    private static PermissionClass ClassOf(string toolName, IReadOnlyList<ITool>? extraTools) =>
+    public static PermissionClass ClassOf(string toolName, IReadOnlyList<ITool>? extraTools) =>
         extraTools?.FirstOrDefault(t => string.Equals(t.Name, toolName, StringComparison.Ordinal))
             ?.PermissionClass
         ?? BuiltInTools.All.FirstOrDefault(t => string.Equals(t.Name, toolName, StringComparison.Ordinal))

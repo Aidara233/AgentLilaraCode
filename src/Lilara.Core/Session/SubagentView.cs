@@ -42,7 +42,7 @@ public static class SubagentView
 
         if (scope.Children.Count > 0)
             parts.Add("子会话 " + string.Join(" · ", scope.Children.Select(
-                c => $"{c.SessionId} {StatusWord(c.Status)}")));
+                c => $"{c.SessionId} {StatusWord(c)}")));
 
         return parts.Count == 0 ? null : string.Join(" | ", parts);
     }
@@ -52,12 +52,20 @@ public static class SubagentView
     /// 所以调用方**必须**把内存那份优先交进来（`Stepper.LiveStatus`、`ControlServer` 的
     /// `host.TryGetActivated`）。只喂盘面那份的话，这一档永远落不到——一个正在跑的子会话
     /// 会恒显示「空闲」，而模型据此以为它已经做完了。
+    ///
+    /// <para>⚠️ <b>「等」这一档按询问的种类分（2026-11-19）</b>：从前两种询问都写「等你回答」，
+    /// 于是父分不出孩子是在问意见（它答得了）还是在等人批一条危险操作（它只在**自己档位之内**
+    /// 答得了）。而这两个词都是**状态迁移级**的读数（一条询问只在出现与消失时各变一次），
+    /// 不破「变化才注入」那条判据。⚠️ `Waiting` 拿不到（不该发生：它与状态同一份盘）时退回
+    /// 「等你回答」——那是这一档的通用说法，不是一句假话。</para>
     /// </summary>
-    private static string StatusWord(string status) => status switch
+    private static string StatusWord(SubagentChild child) => child.Status switch
     {
         SessionStatus.Running => "运行中",
-        SessionStatus.WaitingForInput => "等你回答",
+        SessionStatus.WaitingForInput => child.Waiting is { Kind: AskKind.Permission }
+            ? "等你批准"
+            : "等你回答",
         SessionStatus.Idle => "空闲",
-        _ => status,
+        _ => child.Status,
     };
 }
