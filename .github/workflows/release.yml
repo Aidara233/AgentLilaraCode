@@ -1,6 +1,6 @@
 # 推 v* 标签 → 自动出发布包并挂到 Release。
 #
-#   git tag v1.1.0 && git push origin v1.1.0
+#   git tag v1.2.0 && git push origin v1.2.0
 #
 # 为什么复用 publish.ps1 而不在 YAML 里重写一遍发布步骤：发布参数的每一格都是踩过坑的
 # （单文件 + 内嵌原生库 + 压缩、tar 的 --mode=755、相对路径躲开 MSYS 的冒号），

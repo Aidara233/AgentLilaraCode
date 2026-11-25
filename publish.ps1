@@ -5,7 +5,7 @@
 #   UTF-8 当 ANSI 读，中文注释被拆成乱字节 ⇒ 解析直接失败，报的是一串「表达式或语句中包含意外的
 #   标记」（2026-11-24 实测，真因只是编码）。改这个文件时别让 BOM 丢掉。
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File publish.ps1 [-Version 1.1.0]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File publish.ps1 [-Version 1.2.0]
 #
 # 产物：publish\lilara-<version>-win-x64.zip / lilara-<version>-linux-x64.tar.gz
 #       每个压缩包里是**一个可执行文件**（自解压单文件：.NET 运行时打进 exe）。
@@ -18,7 +18,7 @@
 #   自解压单文件在默认设置下每次启动会把内嵌的原生库解压到临时目录，压缩后包从 ~106 MB 降到 ~45 MB，
 #   代价是首次启动多几十毫秒。这里选体积。
 param(
-    [string]$Version = "1.1.0",
+    [string]$Version = "1.2.0",
     [string[]]$Rids = @("win-x64", "linux-x64")
 )
 $ErrorActionPreference = "Stop"
