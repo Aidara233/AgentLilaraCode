@@ -50,9 +50,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          $assets = @(Get-ChildItem publish -File |
-            Where-Object { $_.Extension -in ".zip", ".gz", ".txt" } |
+          # ⚠️ 只挂**这一次版本**的产物：`publish/` 是所有版本共用的目录，上一版的包还在那里。
+          # 不限定版本的话，一次发布会把旧包一起挂上去——而 Release 的资产是用户下载的那一份。
+          $assets = @(Get-ChildItem publish -File -Filter "lilara-${{ steps.v.outputs.version }}-*" |
+            Where-Object { $_.Extension -in ".zip", ".gz" } |
             ForEach-Object { $_.FullName })
+          $sums = Join-Path "publish" "SHA256SUMS"
+          if (Test-Path $sums) { $assets += (Resolve-Path $sums).Path }
           if (-not $assets) { throw "publish 里没有产物，别把空 release 发出去" }
 
           $notes = @(
